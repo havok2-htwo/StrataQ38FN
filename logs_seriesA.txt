@@ -1,0 +1,50 @@
+[A0-baseline] args: --pack --native --expert-profile --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp --max-context 32768 --kv int8 --resident-budget-gib 40
+[A0-baseline] env: []
+[A0-baseline] ready=True after 55s
+   log: strata generate: the file tier reads unbuffered (49.2 GiB available, 40.0 GiB of it still to be taken by the RAM copy, 15.4 GiB of experts read from the files: the file cache cannot keep them)
+   log: strata generate: 7 pool workers on logical processors 2,4,6,8,10,12,14, the host thread on 0 (draining too) (--host-core first)
+   log: strata generate: expert cache auto: 23.89 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 7092 slots
+   log: strata generate: expert cache 10137 slots, 22.84 GiB of VRAM; policy is
+   log: strata generate: 7 expert-pool workers + the host thread
+   log: FileExpertSource: RAM budget 40.00 GiB: 14439 of the 32.59 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+   log: strata generate: resident RAM mode: 32.59 GiB of experts in RAM (page-locked), 10137 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+   log: strata generate: the file tier reads unbuffered (re-checked with the RAM copy built (32.59 GiB): 14.4 GiB available, 0.0 GiB of it still to be taken by the RAM copy, 22.8 GiB of experts read from the files: the file cache cannot keep them)
+   log: strata serve: the prompt path borrows 1550 CUDA0 cache slots (3.49 GiB)
+A0-baseline              chat    run0: decode 19.17 tok/s | TTFT 1.354s | out 384 | prompt 36
+A0-baseline              chat    run1: decode 32.65 tok/s | TTFT 0.344s | out 384 | prompt 36
+A0-baseline              code    run0: decode 41.8 tok/s | TTFT 1.33s | out 384 | prompt 46
+A0-baseline              code    run1: decode 138.51 tok/s | TTFT 0.298s | out 384 | prompt 46
+A0-baseline              de      run0: decode 80.13 tok/s | TTFT 0.428s | out 384 | prompt 42
+A0-baseline              de      run1: decode 108.62 tok/s | TTFT 0.314s | out 384 | prompt 42
+A0-baseline              long4k  run0: decode 94.37 tok/s | TTFT 4.64s | out 384 | prompt 6191
+A0-baseline              long4k  run1: decode 116.16 tok/s | TTFT 3.548s | out 384 | prompt 6191
+MEDIAN decode tok/s: {"chat": 25.91, "code": 90.155, "de": 94.375, "long4k": 105.265}
+   eng: prompt 15 tokens = 0 reused + 15 read in 850 ms (17.7 tok/s), 8 generated in 707 ms (11.3 tok/s), drafts accepted 5 of 9, 1 checkpoints
+   eng: decode expert cache hit rate: 72.2% (3813 hits / 5284 lookups); 956 more read by the GPU over PCIe or from another GPU (15.3% of all 6240 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 36 tokens = 0 reused + 36 read in 1335 ms (27.0 tok/s), 384 generated in 19998 ms (19.2 tok/s), drafts accepted 234 of 334, 1 checkpoints
+   eng: decode expert cache hit rate: 93.3% (208365 hits / 223387 lookups); 9413 more read by the GPU over PCIe or from another GPU (4.0% of all 232800 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 3018 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 36 tokens = 0 reused + 36 read in 307 ms (117.1 tok/s), 384 generated in 11746 ms (32.7 tok/s), drafts accepted 223 of 329, 1 checkpoints
+   eng: decode expert cache hit rate: 97.1% (224988 hits / 231720 lookups); 3480 more read by the GPU over PCIe or from another GPU (1.5% of all 235200 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 4852 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 46 tokens = 0 reused + 46 read in 1297 ms (35.5 tok/s), 384 generated in 9173 ms (41.9 tok/s), drafts accepted 261 of 337, 1 checkpoints
+   eng: decode expert cache hit rate: 93.3% (196981 hits / 211222 lookups); 9578 more read by the GPU over PCIe or from another GPU (4.3% of all 220800 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 7340 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 46 tokens = 0 reused + 46 read in 271 ms (169.8 tok/s), 384 generated in 2774 ms (138.4 tok/s), drafts accepted 261 of 335, 1 checkpoints
+   eng: decode expert cache hit rate: 96.9% (208853 hits / 215634 lookups); 4206 more read by the GPU over PCIe or from another GPU (1.9% of all 219840 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 8655 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 42 tokens = 0 reused + 42 read in 405 ms (103.8 tok/s), 384 generated in 4801 ms (80.0 tok/s), drafts accepted 187 of 323, 1 checkpoints
+   eng: decode expert cache hit rate: 93.0% (223001 hits / 239716 lookups); 9884 more read by the GPU over PCIe or from another GPU (4.0% of all 249600 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 12283 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 42 tokens = 0 reused + 42 read in 277 ms (151.6 tok/s), 384 generated in 3540 ms (108.5 tok/s), drafts accepted 189 of 336, 1 checkpoints
+   eng: decode expert cache hit rate: 97.1% (244293 hits / 251472 lookups); 3408 more read by the GPU over PCIe or from another GPU (1.3% of all 254880 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 13962 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 6191 tokens = 0 reused + 6191 read in 4574 ms (1353.5 tok/s), 384 generated in 4082 ms (94.1 tok/s), drafts accepted 255 of 310, 1 checkpoints
+   eng: decode expert cache hit rate: 89.8% (176633 hits / 196694 lookups); 14026 more read by the GPU over PCIe or from another GPU (6.7% of all 210720 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 16923 exchanged with the VRAM tier, 1257 blob reads from the file
+   eng: prompt 6191 tokens = 0 reused + 6191 read in 3504 ms (1766.7 tok/s), 384 generated in 3312 ms (115.9 tok/s), drafts accepted 260 of 314, 1 checkpoints
+   eng: decode expert cache hit rate: 95.2% (195369 hits / 205230 lookups); 5970 more read by the GPU over PCIe or from another GPU (2.8% of all 211200 routed)
+   eng: resident RAM: 32.59 GiB of experts in RAM, 19344 exchanged with the VRAM tier, 2514 blob reads from the file
+[A1-host-last] args: --pack --native --expert-profile --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp --max-context 32768 --kv int8 --resident-budget-gib 40 --host-core last
+[A1-host-last] env: []

@@ -1,0 +1,166 @@
+[E1-diag] args: --pack --native --expert-profile --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp --max-context 32768 --kv int8 --resident-budget-gib 40 --vram-reserve-mib 1005 --mtp-q4 all --host-core last
+[E1-diag] env: ['STRATA_DECODE_TIMING=1']
+[E1-diag] ready=True after 50s
+   log: strata generate: the file tier reads unbuffered (54.0 GiB available, 40.0 GiB of it still to be taken by the RAM copy, 15.4 GiB of experts read from the files: the file cache cannot keep them)
+   log: strata generate: 7 pool workers on logical processors 0,2,4,6,8,10,12, the host thread on 14 (draining too) (--host-core last)
+   log: strata generate: expert cache auto: 23.86 GiB free, 1005 MiB reserved (+218 MiB for the draft head) -> 6988 slots
+   log: strata generate: expert cache 10057 slots, 22.66 GiB of VRAM; policy is
+   log: strata generate: 7 expert-pool workers + the host thread
+   log: FileExpertSource: RAM budget 40.00 GiB: 14519 of the 32.77 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+   log: strata generate: resident RAM mode: 32.77 GiB of experts in RAM (page-locked), 10057 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+   log: strata generate: the file tier reads unbuffered (re-checked with the RAM copy built (32.77 GiB): 19.8 GiB available, 0.0 GiB of it still to be taken by the RAM copy, 22.7 GiB of experts read from the files: the file cache cannot keep them)
+   log: strata serve: the prompt path borrows 1552 CUDA0 cache slots (3.49 GiB)
+E1-diag                  chat    run0: decode 108.77 tok/s | TTFT 0.307s | out 384 | prompt 36
+MEDIAN decode tok/s: {"chat": 108.77}
+   eng: prompt 20 tokens = 0 reused + 20 read in 350 ms (57.1 tok/s), 75 generated in 1235 ms (60.7 tok/s), drafts accepted 33 of 60, 1 checkpoints
+   eng: decode expert cache hit rate: 83.2% (37305 hits / 44821 lookups); 5099 more read by the GPU over PCIe or from another GPU (10.2% of all 49920 routed)
+   eng: resident RAM: 32.77 GiB of experts in RAM, 960 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 21 tokens = 0 reused + 21 read in 182 ms (115.6 tok/s), 256 generated in 2987 ms (85.7 tok/s), drafts accepted 164 of 232, 1 checkpoints
+   eng: decode expert cache hit rate: 87.1% (124257 hits / 142637 lookups); 12883 more read by the GPU over PCIe or from another GPU (8.3% of all 155520 routed)
+   eng: resident RAM: 32.77 GiB of experts in RAM, 3168 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 36 tokens = 0 reused + 36 read in 285 ms (126.3 tok/s), 384 generated in 3530 ms (108.8 tok/s), drafts accepted 232 of 331, 1 checkpoints
+   eng: decode expert cache hit rate: 93.9% (210434 hits / 224030 lookups); 8290 more read by the GPU over PCIe or from another GPU (3.6% of all 232320 routed)
+   eng: resident RAM: 32.77 GiB of experts in RAM, 6508 exchanged with the VRAM tier, 0 blob reads from the file
+req 0: 498 chunks, 85.4 chunks/s, gaps>150ms: 0 total 0.00s
+req 1: 493 chunks, 99.2 chunks/s, gaps>150ms: 0 total 0.00s
+req 2: 476 chunks, 102.7 chunks/s, gaps>150ms: 0 total 0.00s
+req 3: 496 chunks, 98.9 chunks/s, gaps>150ms: 0 total 0.00s
+req 4: 482 chunks, 117.4 chunks/s, gaps>150ms: 0 total 0.00s
+req 5: 499 chunks, 91.2 chunks/s, gaps>150ms: 0 total 0.00s
+req 6: 479 chunks, 65.4 chunks/s, gaps>150ms: 1 total 0.16s
+req 7: 489 chunks, 21.0 chunks/s, gaps>150ms: 26 total 4.18s
+req 8: 500 chunks, 25.7 chunks/s, gaps>150ms: 14 total 2.33s
+req 9: 493 chunks, 81.0 chunks/s, gaps>150ms: 2 total 0.30s
+req 10: 474 chunks, 79.0 chunks/s, gaps>150ms: 3 total 0.50s
+req 11: 496 chunks, 104.9 chunks/s, gaps>150ms: 0 total 0.00s
+req 12: 487 chunks, 118.2 chunks/s, gaps>150ms: 0 total 0.00s
+req 13: 499 chunks, 98.0 chunks/s, gaps>150ms: 0 total 0.00s
+req 14: 481 chunks, 105.4 chunks/s, gaps>150ms: 0 total 0.00s
+req 15: 491 chunks, 115.4 chunks/s, gaps>150ms: 0 total 0.00s
+
+GAP 178 ms at 17:21:18
+    {"t": 1791300077.9164567, "gpu": "100, 3060, 164.43, 5"}
+    {"t": 1791300078.19, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 28, "procs": ["strata=276", "MsMpEng=112", "python#11=95", "python#9=90"]}
+    {"t": 1791300078.4172218, "gpu": "90, 3052, 164.57, 5"}
+    {"t": 1791300078.9322827, "gpu": "100, 3060, 164.02, 5"}
+    {"t": 1791300079.059, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 24, "procs": ["strata=208", "Antigravity IDE#2=39", "Taskmgr=28", "python#4=28"]}
+
+GAP 177 ms at 17:21:23
+    {"t": 1791300082.9768717, "gpu": "91, 3060, 158.35, 5"}
+    {"t": 1791300083.454, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 31, "procs": ["strata=531"]}
+    {"t": 1791300083.477858, "gpu": "100, 3052, 165.50, 5"}
+    {"t": 1791300083.9925082, "gpu": "100, 3052, 186.93, 5"}
+    {"t": 1791300084.336, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 15, "procs": ["strata=242"]}
+    {"t": 1791300084.494165, "gpu": "100, 3060, 175.39, 5"}
+
+GAP 177 ms at 17:20:56
+    {"t": 1791300056.2353637, "gpu": "100, 3060, 154.82, 5"}
+    {"t": 1791300056.36, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 22, "procs": ["strata=245"]}
+    {"t": 1791300056.7381217, "gpu": "91, 3052, 161.07, 5"}
+    {"t": 1791300057.2405777, "gpu": "100, 3060, 168.69, 5"}
+    {"t": 1791300057.242, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 22, "procs": ["strata=167"]}
+
+GAP 177 ms at 17:21:16
+    {"t": 1791300075.3926718, "gpu": "100, 3052, 172.84, 5"}
+    {"t": 1791300075.559, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 17, "procs": ["strata=292"]}
+    {"t": 1791300075.8956506, "gpu": "100, 3052, 174.51, 5"}
+    {"t": 1791300076.4001079, "gpu": "90, 3060, 178.22, 5"}
+    {"t": 1791300076.422, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 0, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 33, "procs": ["strata=207"]}
+    {"t": 1791300076.9053094, "gpu": "100, 3060, 171.04, 5"}
+
+GAP 176 ms at 17:21:39
+    {"t": 1791300098.422, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "1 X:"}], "cpu": 60, "procs": ["strata=764", "Antigravity IDE#2=39"]}
+    {"t": 1791300098.6040366, "gpu": "86, 3037, 289.67, 5"}
+    {"t": 1791300099.118043, "gpu": "90, 3045, 234.52, 5"}
+    {"t": 1791300099.297, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 35, "procs": ["strata=202", "Antigravity IDE#2=28"]}
+    {"t": 1791300099.6327984, "gpu": "90, 3060, 180.25, 5"}
+
+GAP 176 ms at 17:21:19
+    {"t": 1791300078.9322827, "gpu": "100, 3060, 164.02, 5"}
+    {"t": 1791300079.059, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 24, "procs": ["strata=208", "Antigravity IDE#2=39", "Taskmgr=28", "python#4=28"]}
+    {"t": 1791300079.436422, "gpu": "90, 3060, 160.04, 5"}
+    {"t": 1791300079.9399288, "gpu": "98, 3060, 155.14, 5"}
+    {"t": 1791300079.941, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 11, "procs": ["strata=211"]}
+
+GAP 175 ms at 17:21:07
+    {"t": 1791300066.323149, "gpu": "100, 3060, 171.75, 5"}
+    {"t": 1791300066.8249059, "gpu": "100, 3060, 161.77, 5"}
+    {"t": 1791300066.895, "disk": [{"q": 0, "wr": 1, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 0, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 30, "procs": ["strata=303", "System=44", "Antigravity IDE#2=33"]}
+    {"t": 1791300067.3297718, "gpu": "100, 3060, 160.70, 5"}
+    {"t": 1791300067.762, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 24, "procs": ["strata=257"]}
+    {"t": 1791300067.8342354, "gpu": "100, 3060, 157.79, 5"}
+
+GAP 174 ms at 17:20:58
+    {"t": 1791300057.2405777, "gpu": "100, 3060, 168.69, 5"}
+    {"t": 1791300057.242, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 22, "procs": ["strata=167"]}
+    {"t": 1791300057.7554047, "gpu": "100, 3052, 165.60, 5"}
+    {"t": 1791300058.116, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 13, "procs": ["strata=234", "Antigravity IDE#2=33"]}
+    {"t": 1791300058.2575006, "gpu": "100, 3060, 159.92, 5"}
+    {"t": 1791300058.7599761, "gpu": "91, 3060, 161.91, 5"}
+
+GAP 172 ms at 17:20:53
+    {"t": 1791300052.854, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 23, "procs": ["strata=207"]}
+    {"t": 1791300053.18095, "gpu": "86, 3060, 177.38, 5"}
+    {"t": 1791300053.6943293, "gpu": "90, 3060, 156.33, 5"}
+    {"t": 1791300053.741, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 25, "procs": ["strata=255", "Antigravity IDE#2=34"]}
+    {"t": 1791300054.1953735, "gpu": "100, 3060, 155.46, 5"}
+
+GAP 169 ms at 17:20:48
+    {"t": 1791300048.1218433, "gpu": "100, 3045, 201.32, 5"}
+    {"t": 1791300048.461, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 0, "lat": 0, "n": "1 X:"}], "cpu": 24, "procs": ["strata=258"]}
+    {"t": 1791300048.6242683, "gpu": "100, 3052, 197.38, 5"}
+    {"t": 1791300049.1256747, "gpu": "100, 3060, 176.98, 5"}
+
+GAP 168 ms at 17:21:40
+    {"t": 1791300099.118043, "gpu": "90, 3045, 234.52, 5"}
+    {"t": 1791300099.297, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 35, "procs": ["strata=202", "Antigravity IDE#2=28"]}
+    {"t": 1791300099.6327984, "gpu": "90, 3060, 180.25, 5"}
+    {"t": 1791300100.1458085, "gpu": "90, 3052, 176.50, 5"}
+    {"t": 1791300100.167, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 32, "procs": ["strata=404"]}
+    {"t": 1791300100.6463928, "gpu": "100, 3060, 181.09, 5"}
+
+GAP 167 ms at 17:21:29
+    {"t": 1791300088.5147915, "gpu": "100, 3052, 169.43, 5"}
+    {"t": 1791300088.734, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 27, "procs": ["strata=167"]}
+    {"t": 1791300089.0154524, "gpu": "100, 3060, 164.51, 5"}
+    {"t": 1791300089.5295854, "gpu": "100, 3060, 155.22, 5"}
+    {"t": 1791300089.609, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 13, "procs": ["strata=168"]}
+strata decode timing: 44 windows, avg T 2.36, 1.70 tokens/window, 28.06 ms/window = verify 23.11 (GPU-reach wait 7.47 + per-layer host 14.72 [plan 0.08 actq 0.28 jobs 0.02 CPU 9.48] + stage 4.86) + commit/emit 0.09 + draft 0.80; per layer-window: CPU experts 2.44 (3.56 entries), VRAM hits 17.66, PCIe 2.06
+strata serve: prompt 20 tokens = 0 reused + 20 read in 350 ms (57.1 tok/s), 75 generated in 1235 ms (60.7 tok/s), drafts accepted 33 of 60, 1 checkpoints
+strata decode timing: 92 windows, avg T 3.52, 2.78 tokens/window, 32.47 ms/window = verify 26.97 (GPU-reach wait 8.14 + per-layer host 18.32 [plan 0.14 actq 0.49 jobs 0.02 CPU 13.14] + stage 4.51) + commit/emit 0.12 + draft 1.12; per layer-window: CPU experts 2.94 (4.16 entries), VRAM hits 28.14, PCIe 2.60
+strata serve: prompt 21 tokens = 0 reused + 21 read in 182 ms (115.6 tok/s), 256 generated in 2987 ms (85.7 tok/s), drafts accepted 164 of 232, 1 checkpoints
+strata decode timing: 153 windows, avg T 3.16, 2.51 tokens/window, 23.07 ms/window = verify 18.04 (GPU-reach wait 8.31 + per-layer host 9.27 [plan 0.09 actq 0.32 jobs 0.01 CPU 5.45] + stage 3.38) + commit/emit 0.09 + draft 1.00; per layer-window: CPU experts 1.46 (1.85 entries), VRAM hits 28.65, PCIe 1.03
+strata serve: prompt 36 tokens = 0 reused + 36 read in 285 ms (126.3 tok/s), 384 generated in 3530 ms (108.8 tok/s), drafts accepted 232 of 331, 1 checkpoints
+strata decode timing: 239 windows, avg T 3.00, 2.14 tokens/window, 24.49 ms/window = verify 19.64 (GPU-reach wait 8.79 + per-layer host 10.36 [plan 0.10 actq 0.31 jobs 0.01 CPU 6.36] + stage 3.57) + commit/emit 0.09 + draft 1.06; per layer-window: CPU experts 1.41 (1.83 entries), VRAM hits 27.08, PCIe 0.99
+strata serve: prompt 23 tokens = 0 reused + 23 read in 399 ms (57.7 tok/s), 512 generated in 5853 ms (87.5 tok/s), drafts accepted 275 of 478, 1 checkpoints
+strata decode timing: 212 windows, avg T 3.25, 2.42 tokens/window, 23.46 ms/window = verify 18.84 (GPU-reach wait 8.54 + per-layer host 9.81 [plan 0.10 actq 0.32 jobs 0.01 CPU 5.67] + stage 3.69) + commit/emit 0.10 + draft 1.11; per layer-window: CPU experts 1.31 (1.67 entries), VRAM hits 29.85, PCIe 0.90
+strata serve: prompt 23 tokens = 0 reused + 23 read in 205 ms (112.2 tok/s), 512 generated in 4974 ms (102.9 tok/s), drafts accepted 300 of 477, 1 checkpoints
+strata decode timing: 189 windows, avg T 3.39, 2.71 tokens/window, 24.54 ms/window = verify 19.50 (GPU-reach wait 8.68 + per-layer host 10.32 [plan 0.10 actq 0.36 jobs 0.01 CPU 6.65] + stage 3.18) + commit/emit 0.08 + draft 1.10; per layer-window: CPU experts 1.81 (2.44 entries), VRAM hits 29.89, PCIe 1.41
+strata serve: prompt 21 tokens = 0 reused + 21 read in 180 ms (117.0 tok/s), 512 generated in 4638 ms (110.4 tok/s), drafts accepted 323 of 452, 1 checkpoints
+strata decode timing: 228 windows, avg T 2.98, 2.25 tokens/window, 22.01 ms/window = verify 17.58 (GPU-reach wait 8.39 + per-layer host 8.71 [plan 0.08 actq 0.30 jobs 0.01 CPU 4.98] + stage 3.33) + commit/emit 0.08 + draft 0.95; per layer-window: CPU experts 1.53 (2.07 entries), VRAM hits 26.46, PCIe 1.13
+strata serve: prompt 28 tokens = 0 reused + 28 read in 231 ms (121.3 tok/s), 512 generated in 5017 ms (102.0 tok/s), drafts accepted 284 of 451, 1 checkpoints
+strata decode timing: 199 windows, avg T 3.30, 2.57 tokens/window, 20.66 ms/window = verify 16.66 (GPU-reach wait 8.51 + per-layer host 7.68 [plan 0.08 actq 0.29 jobs 0.01 CPU 4.23] + stage 3.05) + commit/emit 0.08 + draft 1.06; per layer-window: CPU experts 1.26 (1.68 entries), VRAM hits 30.35, PCIe 0.87
+strata serve: prompt 22 tokens = 0 reused + 22 read in 176 ms (125.3 tok/s), 512 generated in 4112 ms (124.5 tok/s), drafts accepted 314 of 458, 1 checkpoints
+strata decode timing: 285 windows, avg T 2.50, 1.80 tokens/window, 19.20 ms/window = verify 15.65 (GPU-reach wait 7.98 + per-layer host 7.23 [plan 0.06 actq 0.28 jobs 0.01 CPU 3.62] + stage 3.25) + commit/emit 0.07 + draft 0.82; per layer-window: CPU experts 1.08 (1.37 entries), VRAM hits 22.89, PCIe 0.69
+strata serve: prompt 22 tokens = 0 reused + 22 read in 192 ms (114.5 tok/s), 512 generated in 5473 ms (93.6 tok/s), drafts accepted 227 of 428, 1 checkpoints
+strata decode timing: 186 windows, avg T 3.33, 2.75 tokens/window, 39.35 ms/window = verify 34.16 (GPU-reach wait 8.30 + per-layer host 25.37 [plan 0.10 actq 0.36 jobs 0.01 CPU 6.98] + stage 17.90) + commit/emit 0.10 + draft 1.05; per layer-window: CPU experts 2.01 (2.68 entries), VRAM hits 28.90, PCIe 1.58
+strata serve: prompt 22 tokens = 0 reused + 22 read in 177 ms (124.3 tok/s), 512 generated in 7318 ms (70.0 tok/s), drafts accepted 327 of 434, 1 checkpoints
+strata decode timing: 220 windows, avg T 3.14, 2.33 tokens/window, 105.91 ms/window = verify 101.11 (GPU-reach wait 8.23 + per-layer host 92.41 [plan 0.10 actq 0.33 jobs 0.01 CPU 5.22] + stage 86.74) + commit/emit 0.10 + draft 0.99; per layer-window: CPU experts 1.49 (1.95 entries), VRAM hits 28.23, PCIe 1.07
+strata serve: prompt 21 tokens = 0 reused + 21 read in 315 ms (66.6 tok/s), 512 generated in 23300 ms (22.0 tok/s), drafts accepted 295 of 470, 1 checkpoints
+strata decode timing: 226 windows, avg T 3.04, 2.27 tokens/window, 85.95 ms/window = verify 81.35 (GPU-reach wait 8.21 + per-layer host 72.67 [plan 0.10 actq 0.31 jobs 0.01 CPU 5.00] + stage 67.24) + commit/emit 0.10 + draft 0.95; per layer-window: CPU experts 1.40 (1.88 entries), VRAM hits 27.48, PCIe 0.98
+strata serve: prompt 23 tokens = 0 reused + 23 read in 167 ms (137.7 tok/s), 512 generated in 19424 ms (26.4 tok/s), drafts accepted 288 of 462, 1 checkpoints
+strata decode timing: 208 windows, avg T 3.22, 2.46 tokens/window, 29.26 ms/window = verify 25.09 (GPU-reach wait 8.44 + per-layer host 16.17 [plan 0.08 actq 0.30 jobs 0.01 CPU 4.37] + stage 11.40) + commit/emit 0.08 + draft 1.04; per layer-window: CPU experts 1.24 (1.55 entries), VRAM hits 29.76, PCIe 0.83
+strata serve: prompt 23 tokens = 0 reused + 23 read in 169 ms (135.9 tok/s), 512 generated in 6085 ms (84.1 tok/s), drafts accepted 304 of 462, 1 checkpoints
+strata decode timing: 186 windows, avg T 3.37, 2.75 tokens/window, 32.27 ms/window = verify 27.29 (GPU-reach wait 8.57 + per-layer host 18.24 [plan 0.16 actq 0.35 jobs 0.01 CPU 5.85] + stage 11.86) + commit/emit 0.09 + draft 1.02; per layer-window: CPU experts 1.76 (2.34 entries), VRAM hits 29.82, PCIe 1.35
+strata serve: prompt 21 tokens = 0 reused + 21 read in 160 ms (131.1 tok/s), 512 generated in 6001 ms (85.3 tok/s), drafts accepted 328 of 440, 1 checkpoints
+strata decode timing: 232 windows, avg T 2.92, 2.21 tokens/window, 20.40 ms/window = verify 15.94 (GPU-reach wait 8.23 + per-layer host 7.25 [plan 0.08 actq 0.29 jobs 0.01 CPU 5.29] + stage 1.57) + commit/emit 0.08 + draft 0.93; per layer-window: CPU experts 1.56 (2.07 entries), VRAM hits 25.84, PCIe 1.15
+strata serve: prompt 28 tokens = 0 reused + 28 read in 220 ms (127.1 tok/s), 512 generated in 4732 ms (108.2 tok/s), drafts accepted 281 of 445, 1 checkpoints
+strata decode timing: 213 windows, avg T 3.12, 2.40 tokens/window, 19.40 ms/window = verify 15.56 (GPU-reach wait 8.37 + per-layer host 6.72 [plan 0.08 actq 0.27 jobs 0.01 CPU 4.27] + stage 2.08) + commit/emit 0.08 + draft 0.98; per layer-window: CPU experts 1.11 (1.48 entries), VRAM hits 28.87, PCIe 0.73
+strata serve: prompt 22 tokens = 0 reused + 22 read in 186 ms (118.3 tok/s), 512 generated in 4133 ms (123.9 tok/s), drafts accepted 301 of 451, 1 checkpoints
+strata decode timing: 299 windows, avg T 2.37, 1.71 tokens/window, 17.03 ms/window = verify 13.54 (GPU-reach wait 7.87 + per-layer host 5.22 [plan 0.06 actq 0.21 jobs 0.01 CPU 3.50] + stage 1.43) + commit/emit 0.06 + draft 0.85; per layer-window: CPU experts 1.01 (1.27 entries), VRAM hits 21.77, PCIe 0.63
+strata serve: prompt 22 tokens = 0 reused + 22 read in 178 ms (123.3 tok/s), 512 generated in 5092 ms (100.6 tok/s), drafts accepted 213 of 411, 1 checkpoints
+strata decode timing: 177 windows, avg T 3.53, 2.89 tokens/window, 25.83 ms/window = verify 20.33 (GPU-reach wait 8.62 + per-layer host 11.21 [plan 0.10 actq 0.40 jobs 0.02 CPU 8.62] + stage 2.06) + commit/emit 0.09 + draft 1.07; per layer-window: CPU experts 2.55 (3.68 entries), VRAM hits 29.16, PCIe 2.17
+strata serve: prompt 22 tokens = 0 reused + 22 read in 163 ms (134.7 tok/s), 512 generated in 4571 ms (112.0 tok/s), drafts accepted 335 of 448, 1 checkpoints
+strata decode timing: 193 windows, avg T 3.35, 2.65 tokens/window, 22.05 ms/window = verify 16.95 (GPU-reach wait 8.63 + per-layer host 7.84 [plan 0.09 actq 0.34 jobs 0.01 CPU 5.37] + stage 2.02) + commit/emit 0.08 + draft 1.01; per layer-window: CPU experts 1.64 (2.18 entries), VRAM hits 29.92, PCIe 1.23
+strata serve: prompt 21 tokens = 0 reused + 21 read in 163 ms (128.8 tok/s), 512 generated in 4256 ms (120.3 tok/s), drafts accepted 319 of 453, 1 checkpoints
+DIAG-DONE

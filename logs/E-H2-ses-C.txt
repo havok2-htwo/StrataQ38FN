@@ -1,0 +1,32 @@
+[H2-ses-C] changes: set=[] add=[] drop=[] env=[] cfg=[] server=['--slot-save-path', 'C:/StrataQ38FN-sessions'] tune= workload=session
+[H2-ses-C] ready=True after 91s
+   log: [strata] 2026-10-08 13:09:53 engine started: X:\dev\StrataQ38FN\Strata\engine\strata.exe --serve --pack X:\dev\StrataQ38FN\Strata-data\packs\unsloth-ud-iq4_xs --native C:\StrataQ38FN-models\unsloth-UD-IQ4_XS\Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf --e
+   log: strata generate: expert cache 9332 slots, 21.03 GiB of VRAM; policy is
+   log: strata generate: routing-aware prefetch of the file tier on (the next layer's router)
+   log: FileExpertSource: 1550 of the prompt path's 1550 lendable slots keep their experts in RAM too
+   log: strata generate: resident RAM mode: 37.89 GiB of experts in RAM (page-locked), 9332 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+   log: strata serve: the prompt path borrows 1550 CUDA0 cache slots (3.49 GiB)
+   log: strata serve: 747 MiB of VRAM free with everything loaded
+   srv: [strata] slot save/restore on: C:\StrataQ38FN-sessions (session files are kept until deleted: about 1.2 GB per 63K-token conversation; restore only files this server wrote)
+   M0-cold        prompt  91196 TTFT   80.34s decode  103.53 out 108 | Based on the documentation, here are the expert cache tiers Strata use
+   slot save    main.ses       -> {"id_slot": 0, "filename": "main.ses", "n_saved": 91305, "n_written": 1630583232, "timings": {"save_ms": 917.4}, "wall_s": 0.935}
+   slot save    main2.ses      -> {"id_slot": 0, "filename": "main2.ses", "n_saved": 91305, "n_written": 1630583232, "timings": {"save_ms": 971.3}, "wall_s": 0.982}
+   S0-cold        prompt  17948 TTFT   13.01s decode  116.82 out 200 | Based on `FileExpertSource` and its helper functions in `src/core/expe
+   slot restore main.ses       -> {"id_slot": 0, "filename": "main.ses", "n_restored": 91305, "n_read": 1630583232, "timings": {"restore_ms": 795.0}, "wall_s": 0.797}
+   M1-restored    prompt  94196 TTFT    1.90s decode  122.13 out 200 | The grep output shows a static, hardcoded mapping of `cache_slot` indi
+[H2-ses-C] ready=True after 95s
+   slot restore main.ses       -> {"id_slot": 0, "filename": "main.ses", "n_restored": 91305, "n_read": 1630583232, "timings": {"restore_ms": 817.2}, "wall_s": 0.819}
+   M1-after-restart prompt  94196 TTFT    2.36s decode   96.28 out 132 | The grep output shows a static, hardcoded expert-to-slot mapping (like
+   eng: strata generate: session is up (engine 0.1.40)
+   eng: prompt 20 tokens = 0 reused + 20 read in 418 ms (47.8 tok/s), 75 generated in 1251 ms (60.0 tok/s), drafts accepted 33 of 64, 1 checkpoints
+   eng: prompt 91196 tokens = 0 reused + 91196 read in 79988 ms (1140.1 tok/s), 108 generated in 1046 ms (103.2 tok/s), drafts accepted 69 of 90, 6 checkpoints
+   eng: session saved 91305 tokens, 1 of 6 checkpoints, 1630583232 bytes to C:\StrataQ38FN-sessions\main.ses in 917.4 ms (state 80.2 ms)
+   eng: session saved 91305 tokens, 1 of 6 checkpoints, 1630583232 bytes to C:\StrataQ38FN-sessions\main2.ses in 971.3 ms (state 77.0 ms)
+   eng: prompt 17948 tokens = 0 reused + 17948 read in 12913 ms (1390.0 tok/s), 200 generated in 1713 ms (116.7 tok/s), drafts accepted 122 of 169, 2 checkpoints
+   eng: session restored 91305 tokens, 1 checkpoints, 1630583232 bytes from C:\StrataQ38FN-sessions\main.ses in 794.9 ms (read+check 713.7 ms)
+   eng: prompt 94196 tokens = 91305 reused + 2891 read in 1588 ms (1820.1 tok/s), 200 generated in 1640 ms (121.9 tok/s), drafts accepted 111 of 143, 2 checkpoints
+   eng: strata generate: session is up (engine 0.1.40)
+   eng: prompt 20 tokens = 0 reused + 20 read in 478 ms (41.8 tok/s), 75 generated in 1175 ms (63.8 tok/s), drafts accepted 33 of 64, 1 checkpoints
+   eng: session restored 91305 tokens, 1 checkpoints, 1630583232 bytes from C:\StrataQ38FN-sessions\main.ses in 817.2 ms (read+check 738.1 ms)
+   eng: prompt 94196 tokens = 91305 reused + 2891 read in 2031 ms (1423.3 tok/s), 132 generated in 1408 ms (93.8 tok/s), drafts accepted 81 of 116, 2 checkpoints
+[H2-ses-C] SUMMARY dec_short_med=None dec_longctx=None vram_share=0.8280243104175136 ttft={'M0-cold': 80.341, 'S0-cold': 13.006, 'M1-restored': 1.898, 'M1-after-restart': 2.363} reused={'M0-cold': None, 'S0-cold': None, 'M1-restored': None, 'M1-after-restart': None} commit_free_min=7.01 vram_free=1012

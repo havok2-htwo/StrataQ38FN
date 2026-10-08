@@ -1,0 +1,39 @@
+[F3-both] args: --pack --native --expert-profile --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp --max-context 32768 --kv int8 --resident-budget-gib 40 --vram-reserve-mib 1005 --ple-row-cache 16777216 --ple-io mmap --mtp-q4 all --host-core last
+[F3-both] env: ['STRATA_DECODE_TIMING=1']
+[F3-both] ready=True after 36s
+   log: strata generate: the file tier reads unbuffered (52.4 GiB available, 40.0 GiB of it still to be taken by the RAM copy, 15.4 GiB of experts read from the files: the file cache cannot keep them)
+   log: strata generate: 7 pool workers on logical processors 0,2,4,6,8,10,12, the host thread on 14 (draining too) (--host-core last)
+   log: strata generate: expert cache auto: 23.86 GiB free, 1005 MiB reserved (+218 MiB for the draft head) -> 6988 slots
+   log: strata generate: expert cache 9937 slots, 22.39 GiB of VRAM; policy is
+   log: strata generate: 7 expert-pool workers + the host thread
+   log: FileExpertSource: RAM budget 40.00 GiB: 14639 of the 33.05 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+   log: strata generate: resident RAM mode: 33.05 GiB of experts in RAM (page-locked), 9937 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+   log: strata generate: the file tier reads unbuffered (re-checked with the RAM copy built (33.05 GiB): 18.4 GiB available, 0.0 GiB of it still to be taken by the RAM copy, 22.4 GiB of experts read from the files: the file cache cannot keep them)
+   log: strata serve: the prompt path borrows 1554 CUDA0 cache slots (3.49 GiB)
+F3-both                  chat    run0: decode 130.61 tok/s | TTFT 0.244s | out 384 | prompt 36
+MEDIAN decode tok/s: {"chat": 130.61}
+   eng: prompt 20 tokens = 0 reused + 20 read in 290 ms (69.1 tok/s), 74 generated in 1074 ms (68.9 tok/s), drafts accepted 31 of 60, 1 checkpoints
+   eng: decode expert cache hit rate: 83.7% (37925 hits / 45328 lookups); 5072 more read by the GPU over PCIe or from another GPU (10.1% of all 50400 routed)
+   eng: resident RAM: 33.05 GiB of experts in RAM, 1056 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 21 tokens = 0 reused + 21 read in 153 ms (137.6 tok/s), 256 generated in 2384 ms (107.4 tok/s), drafts accepted 166 of 229, 1 checkpoints
+   eng: decode expert cache hit rate: 87.2% (122543 hits / 140470 lookups); 12650 more read by the GPU over PCIe or from another GPU (8.3% of all 153120 routed)
+   eng: resident RAM: 33.05 GiB of experts in RAM, 3168 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 36 tokens = 0 reused + 36 read in 233 ms (154.7 tok/s), 384 generated in 2942 ms (130.5 tok/s), drafts accepted 221 of 322, 1 checkpoints
+   eng: decode expert cache hit rate: 94.7% (214172 hits / 226066 lookups); 6734 more read by the GPU over PCIe or from another GPU (2.9% of all 232800 routed)
+   eng: resident RAM: 33.05 GiB of experts in RAM, 6140 exchanged with the VRAM tier, 0 blob reads from the file
+req 0: 496 chunks, 114.2 chunks/s, gaps>150ms: 0 total 0.00s
+req 1: 495 chunks, 126.9 chunks/s, gaps>150ms: 0 total 0.00s
+req 2: 478 chunks, 117.7 chunks/s, gaps>150ms: 0 total 0.00s
+req 3: 495 chunks, 115.6 chunks/s, gaps>150ms: 0 total 0.00s
+req 4: 485 chunks, 126.2 chunks/s, gaps>150ms: 0 total 0.00s
+req 5: 500 chunks, 105.4 chunks/s, gaps>150ms: 0 total 0.00s
+req 6: 479 chunks, 116.0 chunks/s, gaps>150ms: 0 total 0.00s
+req 7: 493 chunks, 109.5 chunks/s, gaps>150ms: 0 total 0.00s
+req 8: 493 chunks, 95.7 chunks/s, gaps>150ms: 0 total 0.00s
+req 9: 496 chunks, 126.7 chunks/s, gaps>150ms: 0 total 0.00s
+req 10: 477 chunks, 110.1 chunks/s, gaps>150ms: 0 total 0.00s
+req 11: 496 chunks, 105.9 chunks/s, gaps>150ms: 0 total 0.00s
+req 12: 488 chunks, 97.5 chunks/s, gaps>150ms: 0 total 0.00s
+req 13: 499 chunks, 86.3 chunks/s, gaps>150ms: 0 total 0.00s
+req 14: 485 chunks, 110.0 chunks/s, gaps>150ms: 0 total 0.00s
+req 15: 492 chunks, 114.4 chunks/s, gaps>150ms: 0 total 0.00s

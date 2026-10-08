@@ -1,0 +1,129 @@
+[F1-plecache16m] args: --pack --native --expert-profile --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp --max-context 32768 --kv int8 --resident-budget-gib 40 --vram-reserve-mib 1005 --ple-row-cache 16777216 --mtp-q4 all --host-core last
+[F1-plecache16m] env: ['STRATA_DECODE_TIMING=1']
+[F1-plecache16m] ready=True after 117s
+   log: strata generate: the file tier reads unbuffered (51.8 GiB available, 40.0 GiB of it still to be taken by the RAM copy, 15.4 GiB of experts read from the files: the file cache cannot keep them)
+   log: strata generate: 7 pool workers on logical processors 0,2,4,6,8,10,12, the host thread on 14 (draining too) (--host-core last)
+   log: strata generate: expert cache auto: 23.86 GiB free, 1005 MiB reserved (+218 MiB for the draft head) -> 6988 slots
+   log: strata generate: expert cache 9936 slots, 22.38 GiB of VRAM; policy is
+   log: strata generate: 7 expert-pool workers + the host thread
+   log: FileExpertSource: RAM budget 40.00 GiB: 14640 of the 33.05 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+   log: strata generate: resident RAM mode: 33.05 GiB of experts in RAM (page-locked), 9936 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+   log: strata generate: the file tier reads unbuffered (re-checked with the RAM copy built (33.05 GiB): 19.0 GiB available, 0.0 GiB of it still to be taken by the RAM copy, 22.4 GiB of experts read from the files: the file cache cannot keep them)
+   log: strata serve: the prompt path borrows 1554 CUDA0 cache slots (3.49 GiB)
+F1-plecache16m           chat    run0: decode 111.34 tok/s | TTFT 0.29s | out 384 | prompt 36
+MEDIAN decode tok/s: {"chat": 111.34}
+   eng: prompt 20 tokens = 0 reused + 20 read in 363 ms (55.1 tok/s), 117 generated in 1671 ms (70.0 tok/s), drafts accepted 51 of 93, 1 checkpoints
+   eng: decode expert cache hit rate: 87.4% (61998 hits / 70911 lookups); 5889 more read by the GPU over PCIe or from another GPU (7.7% of all 76800 routed)
+   eng: resident RAM: 33.05 GiB of experts in RAM, 1476 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 21 tokens = 0 reused + 21 read in 166 ms (126.4 tok/s), 256 generated in 2647 ms (96.7 tok/s), drafts accepted 168 of 219, 1 checkpoints
+   eng: decode expert cache hit rate: 86.1% (115483 hits / 134145 lookups); 13215 more read by the GPU over PCIe or from another GPU (9.0% of all 147360 routed)
+   eng: resident RAM: 33.05 GiB of experts in RAM, 3588 exchanged with the VRAM tier, 0 blob reads from the file
+   eng: prompt 36 tokens = 0 reused + 36 read in 262 ms (137.2 tok/s), 384 generated in 3449 ms (111.3 tok/s), drafts accepted 221 of 310, 1 checkpoints
+   eng: decode expert cache hit rate: 93.9% (205964 hits / 219281 lookups); 7759 more read by the GPU over PCIe or from another GPU (3.4% of all 227040 routed)
+   eng: resident RAM: 33.05 GiB of experts in RAM, 6671 exchanged with the VRAM tier, 0 blob reads from the file
+req 0: 501 chunks, 92.3 chunks/s, gaps>150ms: 0 total 0.00s
+req 1: 493 chunks, 111.5 chunks/s, gaps>150ms: 0 total 0.00s
+req 2: 476 chunks, 103.3 chunks/s, gaps>150ms: 0 total 0.00s
+req 3: 496 chunks, 96.7 chunks/s, gaps>150ms: 0 total 0.00s
+req 4: 488 chunks, 28.1 chunks/s, gaps>150ms: 21 total 3.36s
+req 5: 498 chunks, 15.6 chunks/s, gaps>150ms: 40 total 6.43s
+req 6: 485 chunks, 44.5 chunks/s, gaps>150ms: 17 total 2.81s
+req 7: 490 chunks, 111.6 chunks/s, gaps>150ms: 0 total 0.00s
+req 8: 494 chunks, 104.2 chunks/s, gaps>150ms: 0 total 0.00s
+req 9: 496 chunks, 121.9 chunks/s, gaps>150ms: 0 total 0.00s
+req 10: 476 chunks, 117.2 chunks/s, gaps>150ms: 0 total 0.00s
+req 11: 496 chunks, 109.8 chunks/s, gaps>150ms: 0 total 0.00s
+req 12: 484 chunks, 123.3 chunks/s, gaps>150ms: 0 total 0.00s
+req 13: 499 chunks, 98.4 chunks/s, gaps>150ms: 0 total 0.00s
+req 14: 482 chunks, 117.2 chunks/s, gaps>150ms: 0 total 0.00s
+req 15: 488 chunks, 114.0 chunks/s, gaps>150ms: 0 total 0.00s
+
+GAP 188 ms at 17:26:32
+    {"t": 1791300391.565, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 23, "procs": ["strata=306", "Antigravity IDE#2=35"]}
+    {"t": 1791300391.5856895, "gpu": "100, 3060, 154.84, 5"}
+    {"t": 1791300392.0900233, "gpu": "100, 3060, 157.27, 5"}
+    {"t": 1791300392.477, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 19, "procs": ["strata=217"]}
+    {"t": 1791300392.604251, "gpu": "100, 3060, 157.33, 5"}
+    {"t": 1791300393.1171305, "gpu": "100, 3060, 155.64, 5"}
+
+GAP 182 ms at 17:26:34
+    {"t": 1791300393.6177208, "gpu": "100, 3060, 156.56, 5"}
+    {"t": 1791300394.1184118, "gpu": "100, 3060, 169.58, 5"}
+    {"t": 1791300394.3, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 34, "procs": ["strata=292"]}
+    {"t": 1791300394.619602, "gpu": "100, 3060, 169.66, 5"}
+    {"t": 1791300395.133887, "gpu": "100, 3060, 158.87, 5"}
+    {"t": 1791300395.226, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 17, "procs": ["strata=227", "Antigravity IDE#2=40"]}
+
+GAP 181 ms at 17:26:25
+    {"t": 1791300384.439111, "gpu": "100, 3060, 159.41, 5"}
+    {"t": 1791300384.457, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 16, "procs": ["strata=221"]}
+    {"t": 1791300384.9403007, "gpu": "100, 3060, 154.29, 5"}
+    {"t": 1791300385.37, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 23, "procs": ["strata=168"]}
+    {"t": 1791300385.4515486, "gpu": "95, 3060, 155.41, 5"}
+
+GAP 180 ms at 17:26:06
+    {"t": 1791300365.54, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 14, "procs": ["strata=214", "Taskmgr=29"]}
+    {"t": 1791300365.603216, "gpu": "100, 3060, 158.23, 5"}
+    {"t": 1791300366.1179209, "gpu": "89, 3060, 157.89, 5"}
+    {"t": 1791300366.482, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 24, "procs": ["strata=246", "Antigravity IDE#2=40"]}
+    {"t": 1791300366.6220405, "gpu": "100, 3060, 157.73, 5"}
+
+GAP 179 ms at 17:26:03
+    {"t": 1791300362.5787356, "gpu": "100, 3060, 156.37, 5"}
+    {"t": 1791300362.802, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 19, "procs": ["strata=298", "Antigravity IDE#2=28"]}
+    {"t": 1791300363.0799851, "gpu": "100, 3060, 157.15, 5"}
+    {"t": 1791300363.580241, "gpu": "100, 3060, 158.54, 5"}
+    {"t": 1791300363.707, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 21, "procs": ["strata=84"]}
+    {"t": 1791300364.0831053, "gpu": "100, 3060, 156.03, 5"}
+
+GAP 177 ms at 17:26:37
+    {"t": 1791300396.677903, "gpu": "100, 3060, 164.56, 5"}
+    {"t": 1791300396.962, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 30, "procs": ["strata=262"]}
+    {"t": 1791300397.1930811, "gpu": "100, 3060, 163.53, 5"}
+    {"t": 1791300397.708317, "gpu": "100, 3052, 165.00, 5"}
+    {"t": 1791300397.813, "disk": [{"q": 0, "wr": 0, "rd": 35, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 27, "procs": ["strata=257", "taskhostw#2=35"]}
+
+GAP 177 ms at 17:25:59
+    {"t": 1791300358.523918, "gpu": "100, 3060, 161.04, 5"}
+    {"t": 1791300359.0270207, "gpu": "100, 3060, 166.20, 5"}
+    {"t": 1791300359.197, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 30, "procs": ["strata=269", "WmiPrvSE#2=29"]}
+    {"t": 1791300359.5299745, "gpu": "100, 3060, 164.13, 5"}
+    {"t": 1791300360.0439305, "gpu": "100, 3060, 157.05, 5"}
+    {"t": 1791300360.081, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 12, "procs": ["strata=250"]}
+
+GAP 176 ms at 17:25:48
+    {"t": 1791300347.3523912, "gpu": "91, 3060, 164.49, 5"}
+    {"t": 1791300347.8527713, "gpu": "100, 3060, 165.79, 5"}
+    {"t": 1791300347.962, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 33, "procs": ["strata=341", "WmiPrvSE#2=34"]}
+    {"t": 1791300348.3679993, "gpu": "94, 3052, 171.33, 5"}
+    {"t": 1791300348.811, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 1, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 13, "procs": ["strata=304", "WmiPrvSE#2=29"]}
+    {"t": 1791300348.8829765, "gpu": "100, 3060, 159.38, 5"}
+
+GAP 173 ms at 17:26:00
+    {"t": 1791300359.0270207, "gpu": "100, 3060, 166.20, 5"}
+    {"t": 1791300359.197, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 30, "procs": ["strata=269", "WmiPrvSE#2=29"]}
+    {"t": 1791300359.5299745, "gpu": "100, 3060, 164.13, 5"}
+    {"t": 1791300360.0439305, "gpu": "100, 3060, 157.05, 5"}
+    {"t": 1791300360.081, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 12, "procs": ["strata=250"]}
+    {"t": 1791300360.5594268, "gpu": "96, 3060, 156.24, 5"}
+
+GAP 173 ms at 17:26:35
+    {"t": 1791300394.619602, "gpu": "100, 3060, 169.66, 5"}
+    {"t": 1791300395.133887, "gpu": "100, 3060, 158.87, 5"}
+    {"t": 1791300395.226, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 17, "procs": ["strata=227", "Antigravity IDE#2=40"]}
+    {"t": 1791300395.648981, "gpu": "100, 3060, 156.45, 5"}
+
+GAP 173 ms at 17:26:30
+    {"t": 1791300389.5422273, "gpu": "95, 3060, 166.15, 5"}
+    {"t": 1791300389.816, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 28, "procs": ["strata=174"]}
+    {"t": 1791300390.0427432, "gpu": "100, 3060, 159.71, 5"}
+    {"t": 1791300390.5569491, "gpu": "89, 3052, 168.54, 5"}
+    {"t": 1791300390.711, "disk": [{"q": 1, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 32, "procs": ["strata=464", "Antigravity IDE#2=34"]}
+    {"t": 1791300391.0714824, "gpu": "100, 3060, 165.19, 5"}
+
+GAP 172 ms at 17:26:11
+    {"t": 1791300370.915, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 1, "lat": 0, "n": "1 X:"}], "cpu": 24, "procs": ["strata=279", "Antigravity IDE#2=39"]}
+    {"t": 1791300371.1874719, "gpu": "100, 3060, 158.78, 5"}
+    {"t": 1791300371.7021916, "gpu": "100, 3060, 157.68, 5"}
+    {"t": 1791300371.775, "disk": [{"q": 0, "wr": 0, "rd": 0, "lat": 0, "n": "0 C:"}, {"q": 1, "wr": 0, "rd": 2, "lat": 0, "n": "1 X:"}], "cpu": 13, "procs": ["strata=256"]}
+    {"t": 1791300372.2024724, "gpu": "100, 3060, 153.37, 5"}
