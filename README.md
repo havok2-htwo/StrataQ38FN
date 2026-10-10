@@ -12,6 +12,8 @@ Dieses Repo enthält **nicht** die Engine und **nicht** die Modelle, sondern all
 - ein **LAN-Dashboard** (`dashboard/`) mit Tempo, Caches, Speicher, Strom und Kosten
 - Benchmark- und A/B-Werkzeuge samt Messdaten und Analyseberichten
 
+**Linux mit 4× RTX 3090** (Setup, Batching bis 32 Slots, Vergleich mit vLLM): **[linux/README.md](linux/README.md)**
+
 Einrichtung Schritt für Schritt: **[docs/EINRICHTUNG.md](docs/EINRICHTUNG.md)** · Änderungen: [CHANGELOG.md](CHANGELOG.md)
 
 ## Modelle
