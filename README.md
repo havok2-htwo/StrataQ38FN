@@ -26,6 +26,9 @@ Einrichtung Schritt für Schritt: **[docs/EINRICHTUNG.md](docs/EINRICHTUNG.md)**
 
 `Stop-All.bat` beendet Modell und Fassade. Ein Start beendet automatisch das vorher laufende Modell.
 
+`Start-Alles.bat [IQ4_XS|Q4_K_XL|Coder]` startet zusätzlich SearXNG (Websuche) und Open WebUI; was schon läuft,
+bleibt unangetastet (ein geladenes Modell wird nicht neu geladen). `Stop-Alles.bat` beendet alles außer dem Dashboard.
+
 ## Dienste und Ports
 
 | Port | Dienst | Adresse |
@@ -34,9 +37,16 @@ Einrichtung Schritt für Schritt: **[docs/EINRICHTUNG.md](docs/EINRICHTUNG.md)**
 | 8081 | vLLM-Fassade (für vLLM-Clients) | `http://<PC>:8081/v1` |
 | 8082 | Dashboard (nur Zahlen, keine Prompts) | `http://<PC>:8082/` |
 | 8090 | nur Benchmarks (`agent_bench.py`) | – |
+| 3000 | Open WebUI (eigenes Setup, `X:\dev\OpenWebUI`) | `https://<PC>:3000/` |
+| 8888 | SearXNG (Websuche für Open WebUI, `X:\dev\SearXNG`) | – |
 
 Alle API-Aufrufe brauchen den Header `Authorization: Bearer <Key aus api_key.txt>`. Ports, LAN/lokal und den
 Modellnamen für genesis3 stellt man in `settings.cmd` ein.
+
+**Browser-Clients (CORS):** Web-Apps, die direkt aus dem Browser auf `/v1/*` zugreifen (z. B. Genesis unter
+`http://localhost:3000`), brauchen ihren Origin in `cors_origins` der Strata-Config. Eingetragen sind
+`http://localhost:3000` und `http://127.0.0.1:3000`. Fehlt er, verwirft der Browser die Antwort, und der Client
+meldet irreführend „Could not connect“. Nach einer Änderung muss Strata neu gestartet werden.
 
 ## Ergebnisse des Tunings (UD-IQ4_XS)
 
@@ -48,8 +58,12 @@ Gemessen am 2026-10-08 (Details: [ANALYSE-Speicherhierarchie-XS.md](ANALYSE-Spei
 | Wechsel Haupt-Agent ↔ Sub-Agent | ~25 s Prefill | **~1,5 s** |
 | SSD-Reads im Prompt-Pfad | ja (1,1 TB) | keine |
 
-Die wichtigsten Flags: `--resident-experts`, `--conversation-cache-mib 6144 --conversation-cache-slots 3`,
+Die wichtigsten Flags: `--resident-experts`, `--conversation-cache-mib 10240 --conversation-cache-slots 12`,
 `--adapt-async 1`, `--kv-resident 32768` + `STRATA_KV_PREFETCH=1`, `--vram-reserve-mib 1000`, `--ple-io direct`.
+
+Parken: Bis zu 12 Konversationen (max. 10 GiB RAM, ~0,9 GB je Konversation bei kurzem Kontext) bleiben zwischen den
+Anfragen im RAM. Eine verdrängte Konversation wird nicht auf die SSD ausgelagert, sondern beim nächsten Mal neu
+eingelesen. Wer mehr Kontexte im Wechsel nutzt, hebt Slots und MiB an (RAM-Untergrenze 2,5 GB hält Strata frei).
 
 **Engpass ist der Windows-Commit, nicht das physische RAM.** 262K Kontext läuft ohne Tempoverlust, ist aber erst mit
 fester Auslagerungsdatei betriebssicher (siehe Einrichtung, Schritt 9).
@@ -60,7 +74,7 @@ Sackgassen (gemessen, nicht wiederholen): Batching (`parallel: 2` + `--batch-mtp
 ## Verzeichnis
 
 ```
-Start-*.bat, Stop-All.bat     Bedienung (Doppelklick)
+Start-*.bat, Stop-*.bat       Bedienung (Doppelklick)
 _start-model.cmd, _run-*.cmd  intern: startet Strata + Fassade (+ Dashboard)
 settings.cmd                  Ports, Bind-Adresse, genesis3-Modellname
 strata-configs/               Strata-Configs (Vorlagen, werden nach Strata\ kopiert)

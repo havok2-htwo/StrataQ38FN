@@ -60,6 +60,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fewer pipeline groups (2 instead of 4), 2 instances of 2 GPUs each, more than 16 slots, larger prefill chunks.
 - RAZOR-65B (50% of experts pruned) in vLLM: clearly worse quality (62.5% MMLU-Pro).
 
+## [0.4.0] – 2026-10-10
+
+### Hinzugefügt
+- `Start-Alles.bat` / `Stop-Alles.bat`: Strata + SearXNG + Open WebUI in einem Rutsch; laufende Dienste bleiben.
+- `cors_origins` (`http://localhost:3000`, `http://127.0.0.1:3000`) in allen drei Configs: Browser-Clients wie
+  Genesis dürfen `/v1/*` direkt aufrufen. Vorher fehlte `Access-Control-Allow-Origin`, der Browser verwarf die
+  Antworten („Could not connect … after 3 attempts“).
+
+### Geändert
+- UD-IQ4_XS: Parken von 3 Slots / 6 GiB auf `--conversation-cache-slots 12 --conversation-cache-mib 10240`,
+  damit ~10 abwechselnde Kontexte nicht jedes Mal neu eingelesen werden.
+- `LIESMICH.txt`, `settings.cmd`: Hinweise auf Start-/Stop-Alles und die Firewall-Freigabe.
+
 ## [0.3.0] – 2026-10-09
 
 ### Added
