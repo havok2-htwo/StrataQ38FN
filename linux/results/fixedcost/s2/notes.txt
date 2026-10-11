@@ -1,0 +1,15 @@
+fixedcost step S2: STRATA_SLOT_COPY_BATCHSYNC=1 (default off), commit on g3-142, engine/strata-g3-142fc
+- conversation_copy.hpp: private_stream(), copy_nonblocking(..., queued) (no per-copy cudaStreamSynchronize when queued),
+  order_after_queued(): thread_local per-device event recorded on the private stream, legacy stream waits for it.
+- conversation_checkpoint_copy / conversation_kv_copy take `queued` (default false = unchanged); kv_copy calls
+  order_after_queued() before refresh_residency when queued && to.kv_mode != 0.
+- direct_slot_copy (both directions: copy_to_slot and copy_from_slot's direct path) passes queued; the existing final
+  sync_all (cudaDeviceSynchronize per device, covers the non-blocking stream) is the one wait per device.
+Exactness (T16-142 exact flags; all earlier switches on + S2): bt16-on 16/16 slot==solo and == rebase142 bt16-sc.json
+(solo 16/16, batch 16/16); ov-on PASS (tokens + RESUME == step0 ov-off.json); il-on byte-identical to il-sc.out apart
+from the admissions timing line (stops at step 4 like the reference); edge kv_mode 1 (--kv-resident 20480, 4 slots, last
+prompt 21309 tokens > resident): kv-off vs kv-on solo 4/4, batch 4/4 identical, slot==solo 4/4 in both.
+Driver (24 admissions, all earlier switches, S2 off vs on): 45 requests identical (102,510 tokens).
+  slot copy 1.3 -> 0.5 ms (short and long); kv edge copy of 23-27 tokens 1.1 -> 0.7-0.8 ms, 21309 tokens 17.9 -> 17.6 ms.
+  send->BADM 195.3/603.0 -> 195.6/606.7 (noise: the batched read moved +0.5/+4.6 ms), R_eff 145.9/555.8 -> 143.9/554.2.
+Not run: STATE_HASH, edge s1_edge, env-off arms of bt16/ov/il (off path unchanged; driver off arm covers it).

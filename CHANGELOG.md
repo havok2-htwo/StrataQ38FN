@@ -21,6 +21,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.10.0] – 2026-10-12
+
+Linux (4× RTX 3090).
+
+### Added
+- Engine patch series 5 "fixed per-admission cost" (six opt-in switches, `linux/patches/v0.1.42/`), exact. New
+  default `configs/T16-142fc.json`: 16 users 493 tok/s short / 357 tok/s 1.2K (was 470 / 349), TTFT p95 −21 %.
+
 ## [0.9.0] – 2026-10-11
 
 Linux (4× RTX 3090).

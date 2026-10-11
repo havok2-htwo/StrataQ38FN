@@ -9,8 +9,8 @@ for sm_86), model **Unsloth UD-IQ4_XS** (target), for comparison UD-Q4_K_XL, vLL
 | | Strata UD-IQ4_XS | vLLM 0.31 Flash-Next W4A16 | vLLM 0.31 Qwen3.8-27B FP8 |
 |---|---|---|---|
 | Decode, 1 user | **~121 tok/s** (MTP) | 79 tok/s; with MTP 136 tok/s (then max. 8 users) | 64 tok/s |
-| Total, 1.2K prompts | ~342 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
-| Total, short prompts | ~467 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
+| Total, 1.2K prompts | ~357 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
+| Total, short prompts | ~493 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
 | Agent load, 16 users × 5 turns (11K→28K context): TTFT follow-up turn | **~4.5–5 s** | ~32 s | – |
 | Prefill | 1,250 (2K) → 2,240 tok/s (28K) | ~3,500 tok/s | up to ~3,100 tok/s |
 | Quality: MMLU-Pro (240) / GSM8K (150), thinking off | **77.9%** / 94.0% | 70.4% / 94.7% | 72.1% / 95.3% |
@@ -284,6 +284,18 @@ Exact (batch = solo, tokens equal to the 0.1.41 engines). The direct slot copy i
 More slots (#47): 24 slots raise throughput only ~2 %, but with more than 16 concurrent users they cut queueing
 (TTFT p95 21 → 7 s at 24 users) at a lower per-user decode speed (21 instead of 31 tok/s): `configs/T24-142.json`.
 `STRATA_ROUTE_TAIL_SKIP` (+12–13 % on the RTX 5090) does nothing here: it only skips experts missing from VRAM.
+
+## Fixed per-admission cost (engine patch series 5, default)
+
+Every admission stalled all slots for ~112 ms besides the prompt read (drain, header windows, turn checkpoint, first
+window, copies, refill). Six opt-in switches (`patches/v0.1.42/`, design `upstream/DESIGN-admission-fixed-cost.md`)
+cut ~25 ms of it, exactly: the last prompt tokens and the first token in one window (`STRATA_ADMIT_MERGE_FIRST`),
+checkpoint buffers recycled and saved on 4 per-card threads (`STRATA_CKPT_POOL`, `STRATA_CKPT_THREADS`, 17 → 7 ms),
+the turn checkpoint moved into the slot instead of copied (`STRATA_SLOT_CKPT_MOVE`), one sync per card for the slot
+copy (`STRATA_SLOT_COPY_BATCHSYNC`), and no drain for a late BYIELD (`STRATA_PIPE_BYIELD_NODRAIN`). Config
+`configs/T16-142fc.json` (engine `strata-g3-142fc`, default of `start-strata.sh`): 16 users **493 tok/s short, 357 tok/s
+1.2K** (0.1.42 without them: 470 / 349), TTFT p95 −21 % (TESTLOG #48–#49). Merging the first window saved less than
+planned (7 instead of 22 ms): every extra row in a window costs 2.4–4 ms.
 
 ## License notices
 

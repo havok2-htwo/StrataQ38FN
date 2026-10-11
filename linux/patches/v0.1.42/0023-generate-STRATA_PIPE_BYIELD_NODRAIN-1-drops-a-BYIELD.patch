@@ -1,0 +1,67 @@
+From 9c66d2326e9f1d870d78fbc1530614fd2d332004 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 22:16:12 +0200
+Subject: [PATCH 23/28] generate: STRATA_PIPE_BYIELD_NODRAIN=1 drops a BYIELD
+ without draining the pipelined groups
+
+A pipelined read never gives way (batch_read_piece returns 0 when piped), so a
+BYIELD that reaches the main loop is for a read that has ended and is dropped.
+The main loop still drained the groups for it first, as for a request, unless
+STRATA_PIPE_OVERLAP was set. With the switch the BYIELD is dropped as it comes.
+
+A BYIELD the server sends during the read is queued and taken right after BADM,
+before any group is restarted, so that drain costs nothing today (0 groups in
+flight, 0.0 ms). Only a BYIELD that arrives once the groups run again (the
+server reads the control lines late) paid for it: measured with one sent 60 ms
+after BADM, drain 26 ms with 4 groups in flight and the first rows 50 ms after
+it, a 23.5 ms gap in the slots' rows and about 14 rows lost (at 576 rows/s). With
+the switch the longest gap is 7.1 ms, as in plain decode.
+
+Off by default: the same path as before. Tokens: batch_overlap_test (a BYIELD
+during B's read) on vs off token- and RESUME-identical, batch_interleave_test
+output byte-identical, batch_test16 16/16, and 41 sampled requests of the
+admission driver (8 with a BYIELD while 4 groups were in flight) equal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 843e27de..7c987337 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -166,6 +166,16 @@ bool pipe_overlap_env() {
+     }();
+     return on;
+ }
++// STRATA_PIPE_BYIELD_NODRAIN=1 (read once; off by default): with the pipelined groups, a BYIELD that reaches the main
++// loop is dropped without draining the groups first.  A pipelined read never gives way (batch_read_piece), so the
++// BYIELD is for a read that has ended, and the drain (and the refill after it) did nothing for it
++bool pipe_byield_nodrain_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_PIPE_BYIELD_NODRAIN");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
+ // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+ // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+@@ -9779,9 +9789,10 @@ int main(int argc, char** argv) {
+                     }
+                     ov_dec_valid = false;
+                 }
+-                // a request reads its prompt through every stage: the groups in flight finish first (STRATA_PIPE_OVERLAP:
+-                // not for a BYIELD, which is dropped below)
+-                if (piped && line.rfind("BSTOP ", 0) != 0 && !(pipe_overlap_env() && line.rfind("BYIELD", 0) == 0)) {
++                // a request reads its prompt through every stage: the groups in flight finish first (STRATA_PIPE_OVERLAP,
++                // STRATA_PIPE_BYIELD_NODRAIN: not for a BYIELD, which is dropped below)
++                if (piped && line.rfind("BSTOP ", 0) != 0 &&
++                    !((pipe_overlap_env() || pipe_byield_nodrain_env()) && line.rfind("BYIELD", 0) == 0)) {
+                     const int in_flight = trace ? (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) {
+                                                       return G.inflight; }) : 0;
+                     const auto td = Clock::now();
+-- 
+2.43.0
+

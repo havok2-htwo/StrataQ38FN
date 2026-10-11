@@ -1,0 +1,27 @@
+=== bt16-on 23:41:48 env=[STRATA_SLOT_CKPT_MOVE=1 STRATA_CKPT_POOL=1 STRATA_CKPT_THREADS=1 STRATA_ADMIT_MERGE_FIRST=1 STRATA_SLOT_COPY_BATCHSYNC=1 STRATA_TRACE=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --batch 16 --n 16 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/fixedcost/s2/bt16-on.json]
+rc=0 23:42:33 (45 s)
+batch: 16 slots, 1024 tokens; admissions 2.5s; then 1.6s -> aggregate 248.6 tok/s overall, 467.7 tok/s from the first batch token
+identical slots: 16; admissions 16, watchdog/terminate 0
+=== ov-on 23:42:33 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/fixedcost/s2/ov-on.json --env STRATA_PIPE_OVERLAP=0 --env STRATA_SLOT_CKPT_MOVE=1 --env STRATA_CKPT_POOL=1 --env STRATA_CKPT_THREADS=1 --env STRATA_ADMIT_MERGE_FIRST=1 --env STRATA_SLOT_COPY_BATCHSYNC=1 --env STRATA_TRACE=1 --solo-json /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/fixedcost/s2/../step0-o1/ov-off.json]
+rc=0 23:43:14 (42 s)
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: False
+note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/fixedcost/s2/../step0-o1/ov-off.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/fixedcost/s2/../step0-o1/ov-off.json: RESUME identical
+RESULT: PASS
+identical slots: 9; admissions 23, watchdog/terminate 0
+=== il-on 23:43:15 env=[STRATA_SLOT_CKPT_MOVE=1 STRATA_CKPT_POOL=1 STRATA_CKPT_THREADS=1 STRATA_ADMIT_MERGE_FIRST=1 STRATA_SLOT_COPY_BATCHSYNC=1 STRATA_TRACE=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_interleave_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow]
+rc=1 23:43:57 (42 s)
+D gave way: None
+engine: ERR BGEN: no such free slot (--batch 3) or a bad max_new
+identical slots: 4; admissions 6, watchdog/terminate 0
+=== kv-off 23:44:02 env=[STRATA_SLOT_CKPT_MOVE=1 STRATA_CKPT_POOL=1 STRATA_CKPT_THREADS=1 STRATA_ADMIT_MERGE_FIRST=1 STRATA_TRACE=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --batch 4 --n 4 --max-new 64 --long-tokens 22000 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --kv-resident 20480 --dump /media/raid0/StrataQ38FN/linux/results/fixedcost/s2/kv-off.json]
+rc=0 23:44:50 (48 s)
+batch: 4 slots, 256 tokens; admissions 7.5s; then 0.9s -> aggregate 30.7 tok/s overall, 32.1 tok/s from the first batch token
+identical slots: 4; admissions 4, watchdog/terminate 0
+=== kv-on 23:44:50 env=[STRATA_SLOT_CKPT_MOVE=1 STRATA_CKPT_POOL=1 STRATA_CKPT_THREADS=1 STRATA_ADMIT_MERGE_FIRST=1 STRATA_SLOT_COPY_BATCHSYNC=1 STRATA_TRACE=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --batch 4 --n 4 --max-new 64 --long-tokens 22000 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --kv-resident 20480 --dump /media/raid0/StrataQ38FN/linux/results/fixedcost/s2/kv-on.json]
+rc=0 23:45:38 (48 s)
+batch: 4 slots, 256 tokens; admissions 7.4s; then 0.9s -> aggregate 30.8 tok/s overall, 32.3 tok/s from the first batch token
+identical slots: 4; admissions 4, watchdog/terminate 0
+DONE bt16-on ov-on il-on kv-off kv-on 23:45:38

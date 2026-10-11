@@ -1,0 +1,27 @@
+fixedcost step 0 (instrumentation) + O1 (STRATA_PIPE_BYIELD_NODRAIN), 2026-10-11 22:00-22:16
+engine/strata-g3-142fc = Strata-142 g3-142 9c66d232 (06633124 trace, 9c66d232 O1), build-142, sha256 cebf239842b7aa0a
+generate.cpp: env helper :172, drain block :9795, ReqTimes :8010, first-rows line :9689, BYIELD-dropped line :9822, admission line :12610
+
+Exactness (run.sh, T16-142, exact flags, STRATA_MMQ_DIRECT=1 STRATA_IQ_MT_MIN=1 STRATA_SLOT_COPY_DIRECT=1): summary.txt
+  ov-off (new binary, env off, STRATA_TRACE via the tool) vs rebase142 ov-on.json: token + RESUME identical, PASS
+  ov-o1 (STRATA_PIPE_BYIELD_NODRAIN=1) vs ov-off: token + RESUME identical, PASS (its BYIELD: 'dropped, 0 groups in flight')
+  il-o1 (env on + STRATA_TRACE): output byte-identical to rebase142 il-sc.out (stops at step 4 as the reference)
+  bt16-o1 (env on + STRATA_TRACE) vs rebase142 bt16-sc.json: solo 16/16, batch 16/16
+  edge case (BYIELD while 4 groups in flight, driver 'late'): drv-off vs drv-o1 41 sampled requests identical over
+  the common prefix (92176 tokens), 8 late BYIELDs each; drv-off vs drv-glibc 41 identical (91906 tokens)
+
+Driver (fc_driver.py = m0_driver + BYIELD none/read/late round robin, late = 60 ms after BADM; production args of
+T16-142, STRATA_TRACE=1, 24 measured admissions, 12 short ~130 / 12 long ~1196 tokens): drive.sh, fc_analyze.py
+  analyze-off-o1.txt, analyze-off-glibc.txt, drv-*/m0_phases.txt (m0_analyze R_eff)
+  phases (median ms, off; on/glibc within 0.4): drain 26.1/24.8 (short/long), read 132.6/541.6, header windows 23.4/24.0,
+  checkpoint 17.3 (sync 0.1 + save 17.2, evict 0), rest of prompt 0.9, first window 11.5, slot copy 1.3, slot freed 0.0,
+  checkpoint copy into slot 7.8 (60 on a slot's first fill), first rows after BADM 23.7/24.0
+  BYIELD during the read ('read', the server's normal case): drained with 0 groups in flight, 0.0 ms -> O1 saves 0
+  BYIELD 60 ms after BADM ('late'): off drain 26.1 ms with 4 groups in flight, first rows 50.1 ms after the drain start,
+  longest BT gap 23.5 ms, ~11 rows lost vs +1.5 s; on: dropped, longest gap 7.1 ms, -3.5 rows -> ~14.5 rows ~ 25 ms
+  of decode per late BYIELD. m0 R_eff 'late' median off 185.0/594.9 vs on 171.4/582.9 (n=4, noisy)
+  GLIBC_TUNABLES=glibc.malloc.mmap_threshold=33554432:glibc.malloc.trim_threshold=17179869184 (32 MiB is glibc's max
+  mmap_threshold): no effect - checkpoint save 17.2 vs 17.2, checkpoint copy 7.6 vs 7.8, first-fill copy 60.8 vs 60.0,
+  R_eff 176.1/587.8 vs 175.5/585.2. Page faults / trim are not in the steady-state cost; the save runs at ~6.5 GB/s
+  (112.5 MiB in 17.2 ms, 4 serial pageable D2H) - bandwidth-bound, so K2-lite (parallel per device) is the lever, K1's
+  zero-fill share looks small.

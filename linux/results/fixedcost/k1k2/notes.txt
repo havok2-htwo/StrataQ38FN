@@ -1,0 +1,15 @@
+fixedcost step K1 + K2-lite (STRATA_CKPT_POOL=1, STRATA_CKPT_THREADS=1), 2026-10-11 22:40-23:04
+engine/strata-g3-142fc = Strata-142 g3-142 b7350501 (on top of f5093737 AB), build-142, sha256 a962495703add8d6
+generate.cpp: env helpers ckpt_pool_env :196, ckpt_threads_env :206; class CheckpointPool :1541 (cap 2, give/take/erase_if);
+  class StageThreads :1584 (persistent workers, spread_current_thread :1617 leaves the host's single CPU);
+  ckpt_pool :7876, ckpt_threads :8172; checkpoint_at: take :8182, new branch :8193 (parts per stage, threads or serial),
+  tail erase :8290, eviction give :8321; prune at request start :10737; BSlot reset give :12845; slot copy into pooled :12874.
+Exactness (run.sh, summary.txt): edge-off vs edge-on/edge-final 12/12 (tokens+RESUME; root+turn checkpoints, slot-checkpoint
+  restore S2, root mount R, all into pooled vectors); ov-on PASS vs step0 ov-off.json; bt16-on 16/16 and == bt16-sc.json;
+  il-on == il-sc.out (minus timing); driver off/pool/on 47 requests identical; drv-off == ab/drv-off.
+Driver medians (analyze.txt, m0_phases.txt): checkpoint 17.2 -> 10.4 (pool) -> 5.6 ms (pool+threads); fills save 17.1 -> 6.0;
+  send->BADM short 222.9/215.0/210.4, long 634.4/623.8/619.0; R_eff short 176.1/161.5/158.2, long 587.0/566.9/566.6 (noisy).
+  Slot checkpoint copy unchanged 7.6 ms (first fill still ~59 ms: the pool is empty then).
+First build (first/): threads inherited the host thread's single CPU -> parts ran in turn (wall 10.4 = 4 x 2.6 ms); fixed by
+  spreading the worker threads.  Microbench (scratch d2h.cu): 4 x 28 MiB pageable D2H serial 10 ms, parallel 5.5 ms; pinned
+  staging (chunked) 14.5 / 7.5 ms -> pinned K2 not worth it here.

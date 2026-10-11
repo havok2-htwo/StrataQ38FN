@@ -1,0 +1,17 @@
+Step S1 (STRATA_SLOT_CKPT_MOVE=1), commit d42a987c on g3-142 (not pushed); engine/strata-g3-142fc sha256 874b7c97c79fe926.
+S1 also turns the checkpoint pool on (STRATA_CKPT_POOL behaviour): S1 alone without it (first/drv-s1, binary af1870931040c556)
+made every save fault in fresh pages: save 17.2 -> 38.5 short / 59.9 long, send->BADM 221.8 -> 239.9 / 631.1 -> 668.3.
+
+Exactness (T16-142 exact flags):
+  edge-on  (S1 alone, final binary) vs edge-off: 14/14 tokens identical; RESUME identical except D2 (0 -> 12, active-slot source, the duplicate fix)
+  edge-all (S1+POOL+THREADS+MERGE)  vs edge-off: same
+  ov-all  vs step0-o1/ov-off.json: tokens + RESUME identical, PASS
+  bt16-all: 16/16 slot==solo, dump == rebase142 bt16-sc.json
+  il-all: byte-identical to rebase142 il-sc.out except the admissions timing line; stops at step 4 as the reference
+  driver off vs s1 vs all: 45 requests identical over the common prefix (~102.7K tokens)
+
+Driver medians (24 admissions/arm), ms: see analyze.txt, medians.txt
+  ckpt_copy 7.7 -> 0.0 (moved); ckpt save 17.2 -> 10.4 (the implied pool); everything else within 0.5
+  send->BADM short 221.8 -> 208.1 (s1) -> 195.3 (all); long 631.1 -> 616.9 -> 605.1
+  vs k1k2 pool-only (215.0 / 623.8): S1's own share ~7 ms = the copy
+  fills: ckpt_copy 60 -> 0, save 17 -> 60 (s1: pool empty during fills) / 20.9 (all, threads)

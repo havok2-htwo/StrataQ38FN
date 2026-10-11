@@ -1,0 +1,8 @@
+fixedcost final check: engine/strata-g3-142fc = g3-142 c9bbd1fc (sha256 122dbbce3b43e64d, build-142 newer than every source; no rebuild)
+All new switches: STRATA_PIPE_BYIELD_NODRAIN=1 STRATA_ADMIT_MERGE_FIRST=1 STRATA_CKPT_POOL=1 STRATA_CKPT_THREADS=1 STRATA_SLOT_CKPT_MOVE=1 STRATA_SLOT_COPY_BATCHSYNC=1
+Exactness (T16-142, exact flags, run.sh; ref = engine/strata-g3-142 fresh with the same config):
+  batch_test16: ref/off/on each 16/16 slot==solo; dumps pairwise solo 16/16 + batch 16/16 identical (ref also == rebase142 bt16-sc.json); on: 16 merged windows
+  batch_overlap_test, STRATA_PIPE_OVERLAP=1: ref PASS vs rebase142 ov-on-sc.json; off and all-on PASS vs ov-ref (tokens + RESUME, A2 227, G2 198; 22 overlapped reads each; on: 23 merged windows)
+  batch_interleave_test: off and on byte-identical to the fresh ref (and ref == rebase142 il-sc.out) apart from the "admissions X s" line; all stop at step 4 rc=1 like the reference
+Driver (drive.sh, production args, 24 measured admissions, no BYIELD, off vs all-on): 45 requests identical (102,527 tokens)
+  see analyze.txt (engine trace phases) and medians.txt (m0 timing)

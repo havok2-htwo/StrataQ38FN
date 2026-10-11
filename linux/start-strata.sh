@@ -9,7 +9,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 STRATA=/media/raid0/StrataQ38FN/Strata
 SERVER_DIR=${SERVER_DIR:-/media/raid0/StrataQ38FN/Strata-142}   # server.py matching the engine (0.1.42)
-CONFIG=$(readlink -f "${CONFIG:-$HERE/configs/T16-142.json}")
+CONFIG=$(readlink -f "${CONFIG:-$HERE/configs/T16-142fc.json}")
 PORT=${PORT:-8090}
 EXTRA=()
 [ -n "${HOST:-}" ] && EXTRA+=(--host "$HOST")

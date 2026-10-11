@@ -1,0 +1,27 @@
+=== edge-off 22:23:34 env=[STRATA_TRACE=1] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/ab_edge.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/edge-off.json]
+rc=0 22:24:09 (35 s)
+identical slots: 0; engine log: merged windows 0 (T: ), 'admission of slot' 21, captures  4 capturing the 1-token window 4 capturing the 2-token window 4 capturing the 3-token window 4 capturing the 4-token window 4 capturing the 5-token window 4 capturing the 6-token window , watchdog/terminate 0
+=== edge-ab 22:24:16 env=[STRATA_ADMIT_MERGE_FIRST=1 STRATA_TRACE=1] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/ab_edge.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/edge-ab.json --compare /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/edge-off.json]
+rc=0 22:24:51 (35 s)
+compare with /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/edge-off.json: 24/24 requests identical
+identical slots: 0; engine log: merged windows 24 (T:  3 3 3 5 3 6 6 7 9 8 ), 'admission of slot' 21, captures  4 capturing the 1-token window 4 capturing the 2-token window 4 capturing the 3-token window 4 capturing the 5-token window 4 capturing the 6-token window 4 capturing the 7-token window 4 capturing the 8-token window , watchdog/terminate 0
+DONE edge-off edge-ab 22:24:51
+=== bt16-ab 22:25:00 env=[STRATA_ADMIT_MERGE_FIRST=1 STRATA_TRACE=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --batch 16 --n 16 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/bt16-ab.json]
+rc=0 22:25:45 (45 s)
+batch: 16 slots, 1024 tokens; admissions 3.5s; then 1.6s -> aggregate 199.8 tok/s overall, 454.1 tok/s from the first batch token
+identical slots: 16; engine log: merged windows 16 (T:  16 7 ), 'admission of slot' 16, captures  4 capturing the 1-token window 4 capturing the 2-token window 4 capturing the 3-token window 4 capturing the 4-token window 4 capturing the 6-token window 4 capturing the 7-token window , watchdog/terminate 0
+=== ov-ab 22:25:46 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/ov-ab.json --env STRATA_PIPE_OVERLAP=0 --env STRATA_ADMIT_MERGE_FIRST=1 --env STRATA_TRACE=1 --solo-json /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/../step0-o1/ov-off.json]
+rc=0 22:26:29 (43 s)
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: False
+note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/../step0-o1/ov-off.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/fixedcost/ab/../step0-o1/ov-off.json: RESUME identical
+RESULT: PASS
+identical slots: 9; engine log: merged windows 23 (T:  23 7 ), 'admission of slot' 23, captures  4 capturing the 5-token window 4 capturing the 6-token window 4 capturing the 7-token window , watchdog/terminate 0
+=== il-ab 22:26:29 env=[STRATA_ADMIT_MERGE_FIRST=1 STRATA_TRACE=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_interleave_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142fc --config /media/raid0/StrataQ38FN/linux/configs/T16-142.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow]
+rc=1 22:27:12 (43 s)
+D gave way: None
+engine: ERR BGEN: no such free slot (--batch 3) or a bad max_new
+identical slots: 4; engine log: merged windows 6 (T:  6 6 ), 'admission of slot' 6, captures  4 capturing the 1-token window 4 capturing the 2-token window 4 capturing the 3-token window 4 capturing the 4-token window 4 capturing the 6-token window , watchdog/terminate 0
+DONE bt16-ab ov-ab il-ab 22:27:12

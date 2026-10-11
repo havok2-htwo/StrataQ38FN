@@ -1,0 +1,12 @@
+Review fixes, commit c9bbd1fc on g3-142 (not pushed); engine/strata-g3-142fc sha256 122dbbce3b43e64d.
+F1 (S1 active-slot source, stale main drafter): active slot is a source only if !use_mtp || batch_mtp || admit_slot >= 0.
+   fix_edge.py = s1_edge + F (slot 6 refilled) + D3 (D's prompt as solo GEN while D/D1 decode):
+   edge-off vs edge-all (all switches): 16/16 identical, D3 RESUME 0 in both (the S1 build would take active slot 12: 12);
+   D2 (BGEN) still RESUME 12 (the duplicate fix stays for admissions).
+   Not covered (left as is): a BGEN that took an active slot leaves the main session live with stale drafter rows below
+   its start; a later solo GEN resuming from it drafts from them. Same class as upstream's idle slot sources (also no
+   drafter copy without --batch-mtp); greedy/exact tokens unaffected, only STRATA_SPEC_PROB=1 sampling.
+F2 (K2-lite workers back on host CPU after aux_cpus=0): widen first, then aux_cpus::pin_current_thread().
+   aux_check.py, --aux-cpus auto (host CPU 0, aux 64): workers on 64 after the first admission, 0-127 after aux_cpus=0. PASS.
+F3 (merged window in STRATA_DECODE_TIMING): dec_T += merged ? 1 : T.
+   bt16-all: 16 admission lines now "1 windows, avg T 1.00" (S1 build: avg T 7.00); dump == s1/bt16-all.json, == bt16-sc.json 16/16 + 16/16.

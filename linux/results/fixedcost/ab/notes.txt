@@ -1,0 +1,33 @@
+fixedcost step AB (STRATA_ADMIT_MERGE_FIRST=1), 2026-10-11 22:20-22:36
+engine/strata-g3-142fc = Strata-142 g3-142 f5093737 (AB, on top of 9c66d232), build-142, sha256 feff3c79f324a084
+generate.cpp: env helper admit_merge_first_env :179-189; gate merge_from + merge_at :11443-11464; read up to merge_at,
+  trace line + PP n-1 :11477-11498; first window: merge_T/p/x/WS/consumed :11541-11573, T/merged :12255, window rows
+  from ids :12290, spec_q !first_window :12328, dump row T-1 :12342, a = T-1 :12348, mtp.prefill of rows 0..T-2 :12369,
+  draft counters skipped + emit row T-1 only :12377-12383.  verify.hpp :88 Verifier::max_t().
+
+Exactness (run.sh, T16-142, exact flags, STRATA_MMQ_DIRECT=1 STRATA_IQ_MT_MIN=1 STRATA_SLOT_COPY_DIRECT=1): summary.txt
+  edge-off vs edge-ab (ab_edge.py: 8 prompts x greedy / seeded / seeded+penalties = 24 admissions, max_new 24, one at a
+    time): 24/24 requests identical; merged T: 3x3 (raw 3-token prompt, window at pos 0), 3x5, 6x6, 3x7, 9x8 (raw 9/40/64
+    tokens and the assistant-prefill header: windows [at, n-8) + merged 8); 3 admissions with EOS as first token (BADM 0)
+  bt16-ab (env on) vs rebase142 bt16-sc.json: batch == ref, solo == ref; slot == solo 16/16; 16 merged (T=7)
+  ov-ab (env on) vs step0-o1 ov-off.json: token- and RESUME-identical, PASS; 23 merged (T=7)
+  il-ab (env on): tokens byte-identical to rebase142 il-sc.out (only the 'admissions 2.3s' timing line differs), stops
+    at step 4 as the reference; 6 merged
+  driver off vs ab (seeded sampled, production args): 47 requests identical over the common prefix (106270 tokens)
+
+Driver (fc_driver.py --byield none, 24 measured admissions, 12 short ~131 / 12 long ~1195 tokens; analyze-off-ab.txt,
+drv-*/m0_phases.txt), median ms:
+                          off short  ab short | off long  ab long
+  header windows (T4+T2)     23.5       0.0   |   24.0      0.0
+  first window (T1 / T7)     11.5      27.6   |   11.5     28.2
+  sum                        35.0      27.6   |   35.5     28.2     -> -7.4 / -7.3 ms per admission
+  send -> BADM              222.3     215.5   |  632.3    624.7
+  send -> first BT          246.8     239.4   |  656.1    648.5
+  R_eff (m0, noisy)         173.2     163.4   |  583.9    573.2
+  all other phases within 0.5 ms (drain, read, checkpoint 17.2, slot copy 1.3, ckpt copy 7.6, refill after BADM 24)
+
+Window cost per T (first-window path, edge-ab, captures excluded): T1 11.4, T3 16.5, T5 21.7, T6 23.9, T7 28.6,
+T8 32.1 ms -> ~2.4 ms per extra row to T6, ~4 ms per row at T7/T8; not the plan's 0.15-1.45 ms.  read_windows
+(serial windows, async commit): 2 tok 14.4, 4 tok 19.0, 6 tok (T4+T2) 24.0, 24 tok (6xT4) ~98 ms.  So the merged
+window saves ~7 ms, not ~22 (35.5 -> ~13 assumed cheap extra rows), and step A (header windows at T=8 for other
+windowed reads) has ~no value: one T8 (32.1) vs two T4 (~30 with the async commit).
