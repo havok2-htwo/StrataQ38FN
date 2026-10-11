@@ -1,0 +1,16 @@
+M2 (gate + prepare, dry run), branch g3-overlap. Engine: engine/strata-g3-overlap (build-mmqtab, md5 79ffd46d25f54d61760035ff503130ec).
+run_m2.sh <arms>: tools/batch_test16.py, T16-mmqtab.json (split 12,24,36, 4 groups of 4), STRATA_MMQ_DIRECT=1,
+  --pcie-frac 0 --adapt-every 1000000 (+ --no-prefill-borrow unless the arm needs a loan); summary.txt has every arm.
+  ref (strata-g3-mmqtab), off, on, on-mtpprio: solo and batch dumps identical (ref.json == off.json == on.json ==
+  on-mtpprio.json == ../m1/ab/ref-ram.json); every slot equal to solo in every arm.
+  Refusal arms (8 slots, 32 tokens): r-plebatch, r-kvres, r-help, r-ownbuf, r-syncsub, r-noar each log their reason
+  once and pass batch==solo. r-idxchk: STRATA_IDX_FP16_CHECK=1 crashes the solo path on the split before any batch
+  admission (illegal address in qsa_decode_attn_batch) - the reference engine does the same (ref-idxchk): a
+  pre-existing bug of that check on a layer split, so its refusal cannot be reached here.
+run_il.sh: tools/batch_interleave_test.py (3 slots = 3 groups of 1): il-ref and il-on print the same lines (A, B, C
+  and A's next turn IDENTICAL to solo); both stop at step 4 (D never gives way: BYIELD is not read in piped mode,
+  ERR BGEN on the next admission) - the same in the reference.
+prod-on/: m0_driver.py (production flags, STRATA_TRACE=1, 12 admissions + 16 fill) with STRATA_PIPE_OVERLAP=1:
+  every batched read eligible (30 lines, no refusal), one capture of 16 full-width layouts (54 ms) at the first
+  admission beside slots; phases (prod-on/phases.txt) equal M0 run A: sp_run (incl. gate + prepare) short 199.8 vs
+  201.0 ms, long 609.2 vs 608.9 ms (medians).

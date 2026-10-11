@@ -1,0 +1,15 @@
+R1: review fixes on g3-overlap. Engine engine/strata-g3-overlap md5 063ce1b7a8540874fef6b51642a454c2.
+run_r1.sh <name> <exe> "<test args>" (batch_overlap_test.py, T16-mmqtab.json split 12,24,36, STRATA_MMQ_DIRECT=1,
+  --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow); run_bt16.sh bt16-off|bt16-on (batch_test16.py, as M2).
+New test case (G/H/G2): G (2 tokens) into slot 15, long H into slot 14; G ends during H's read; G2 (G's next turn)
+  must RESUME from slot 15 (198 = G's prompt 197 + 1 fed token) and match solo; --compare checks RESUME too.
+prefix-padup: the PRE-fix engine (ab93f570) with FORCE_PADUP=1: G2 RESUME 0 -> FAIL (finding 1 reproduced).
+Final engine (063ce1b7):
+  fault-d-cuda (new STRATA_PIPE_OVERLAP_TEST_FAULT=cuda, finding 2's path): PASS, 1 ERR, rc 1 4.3 s after it, the
+    "spin waits released" line logged, no watchdog/terminate.
+  smoke-on PASS (G2 RESUME 198, G ended during H's read), 0 pad-ups, 0 waits (was 123 pad-ups in M3; the narrower
+    widths of active groups are now captured in overlap_prepare: 32 extra layouts, 60 ms in all, once).
+  off PASS, token- and RESUME-identical to smoke-on.  padup PASS (211 pad-ups, 7 waits), wait2 PASS (24 waits): both
+    token- and RESUME-identical to off.  smoke-on's A..F/A2/bg tokens identical to m3/ref.json (strata-g3-mmqtab).
+  bt16-off: 16/16 IDENTICAL, dump identical to m2/off and m2/ref.  bt16-on: 16/16 IDENTICAL (1 overlapped read).
+superseded/: runs on intermediate binaries (469550d4 aborted; 19bbeb64: FORCE_PADUP waited at a group's full width).

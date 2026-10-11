@@ -1,0 +1,66 @@
+=== on 16:33:44 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1] extra=[--no-prefill-borrow] test=[--n 16 --max-new 64 --long-tokens 1200]
+rc=0 16:34:30
+batch: 16 slots, 1024 tokens; admissions 3.7s; then 1.6s -> aggregate 193.0 tok/s overall, 434.5 tok/s from the first batch token
+eligible lines: 1
+=== ref 16:34:30 exe=strata-g3-mmqtab env=[STRATA_MMQ_DIRECT=1 ] extra=[--no-prefill-borrow] test=[--n 16 --max-new 64 --long-tokens 1200]
+rc=0 16:35:16
+batch: 16 slots, 1024 tokens; admissions 3.7s; then 1.6s -> aggregate 194.4 tok/s overall, 440.2 tok/s from the first batch token
+eligible lines: 0
+=== off 16:35:16 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 ] extra=[--no-prefill-borrow] test=[--n 16 --max-new 64 --long-tokens 1200]
+rc=0 16:36:02
+batch: 16 slots, 1024 tokens; admissions 3.7s; then 1.6s -> aggregate 194.3 tok/s overall, 439.3 tok/s from the first batch token
+eligible lines: 0
+DONE on ref off 16:36:02
+=== r-plebatch 16:36:09 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1 STRATA_PLE_BATCH=0] extra=[--no-prefill-borrow] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=0 16:36:45
+batch: 8 slots, 256 tokens; admissions 2.2s; then 0.7s -> aggregate 89.4 tok/s overall, 97.4 tok/s from the first batch token
+eligible lines: 0
+strata batch: overlapped read off: CUDA0's prompt path runs the PLE block token by token (STRATA_PLE_BATCH=0, or no native postops or key)
+=== r-kvres 16:36:45 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1] extra=[--no-prefill-borrow --kv-resident 8192] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=0 16:37:29
+batch: 8 slots, 256 tokens; admissions 2.1s; then 0.7s -> aggregate 91.1 tok/s overall, 370.9 tok/s from the first batch token
+eligible lines: 0
+strata batch: overlapped read off: K/V streaming (--kv-resident)
+=== r-help 16:37:29 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1 STRATA_PREFILL_HELP=1] extra=[--no-prefill-borrow] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=0 16:38:05
+batch: 8 slots, 256 tokens; admissions 2.1s; then 0.7s -> aggregate 91.2 tok/s overall, 180.1 tok/s from the first batch token
+eligible lines: 0
+strata batch: overlapped read off: CUDA0's prompt path has a stage helper (STRATA_PREFILL_HELP)
+=== r-ownbuf 16:38:05 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1 STRATA_SPLIT_OWN_BUFFERS=0] extra=[] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=0 16:38:43
+batch: 8 slots, 256 tokens; admissions 2.7s; then 0.7s -> aggregate 75.8 tok/s overall, 129.7 tok/s from the first batch token
+eligible lines: 0
+strata batch: overlapped read off: CUDA0's prompt path borrows expert cache slots
+=== r-syncsub 16:38:43 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1] extra=[--no-prefill-borrow --ple-io direct --ple-sync-submit] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=0 16:39:18
+batch: 8 slots, 256 tokens; admissions 2.1s; then 0.7s -> aggregate 91.0 tok/s overall, 180.5 tok/s from the first batch token
+eligible lines: 0
+strata batch: overlapped read off: the PLE table reads on the caller's thread (--ple-sync-submit)
+=== r-idxchk 16:39:18 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1 STRATA_IDX_FP16_CHECK=1] extra=[--no-prefill-borrow] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=1 16:39:50
+eligible lines: 0
+=== r-noar 16:39:50 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1 STRATA_VERIFY_ALL_RESIDENT=0] extra=[--no-prefill-borrow] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=0 16:40:27
+batch: 8 slots, 256 tokens; admissions 2.2s; then 0.8s -> aggregate 87.5 tok/s overall, 173.7 tok/s from the first batch token
+eligible lines: 0
+strata batch: overlapped read off: stage 1 runs the doorbell graph (not every expert of its layers in VRAM, or STRATA_VERIFY_ALL_RESIDENT=0)
+=== on-noprio 16:40:27 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1 STRATA_PIPE_OVERLAP_PRIO=0] extra=[--no-prefill-borrow] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=0 16:41:03
+batch: 8 slots, 256 tokens; admissions 2.1s; then 0.7s -> aggregate 90.2 tok/s overall, 176.7 tok/s from the first batch token
+eligible lines: 1
+DONE r-plebatch r-kvres r-help r-ownbuf r-syncsub r-idxchk r-noar on-noprio 16:41:03
+=== ref-idxchk 16:41:17 exe=strata-g3-mmqtab env=[STRATA_MMQ_DIRECT=1 STRATA_IDX_FP16_CHECK=1] extra=[--no-prefill-borrow] test=[--n 8 --max-new 32 --long-tokens 1200]
+rc=1 16:41:50
+eligible lines: 0
+=== on-mtpprio 16:41:50 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1 STRATA_PIPE_OVERLAP_MTP_PRIO=1] extra=[--no-prefill-borrow] test=[--n 16 --max-new 64 --long-tokens 1200]
+rc=0 16:42:36
+batch: 16 slots, 1024 tokens; admissions 3.7s; then 1.6s -> aggregate 193.6 tok/s overall, 435.7 tok/s from the first batch token
+eligible lines: 1
+DONE ref-idxchk on-mtpprio 16:42:36
+=== il-on 16:42:48 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1]
+rc=1 16:43:32
+eligible lines: 1
+=== il-ref 16:43:32 exe=strata-g3-mmqtab env=[STRATA_MMQ_DIRECT=1]
+rc=1 16:44:16
+eligible lines: 0
+DONE il-on il-ref 16:44:16

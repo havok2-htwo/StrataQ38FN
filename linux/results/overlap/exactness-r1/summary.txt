@@ -1,0 +1,274 @@
+=== bt16-off 18:08:59 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 16 --n 16 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/bt16-off.json]
+rc=0 18:09:45
+batch: 16 slots, 1024 tokens; admissions 3.6s; then 1.6s -> aggregate 194.8 tok/s overall, 441.2 tok/s from the first batch token
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== bt32-off 18:09:45 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_test32.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 32 --n 32 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/bt32-off.json]
+rc=0 18:10:51
+batch: 32 slots, 2048 tokens; admissions 7.2s; then 2.9s -> aggregate 203.5 tok/s overall, 568.8 tok/s from the first batch token
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== bt32-ref 18:10:51 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_test32.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-mmqtab --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 32 --n 32 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/bt32-ref.json]
+rc=0 18:11:57
+batch: 32 slots, 2048 tokens; admissions 7.0s; then 2.9s -> aggregate 205.8 tok/s overall, 564.5 tok/s from the first batch token
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== il-off 18:11:57 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_interleave_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow]
+rc=1 18:12:40
+D gave way: None
+engine: ERR BGEN: no such free slot (--batch 3) or a bad max_new
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== il-ref 18:12:45 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_interleave_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-mmqtab --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow]
+rc=1 18:13:28
+D gave way: None
+engine: ERR BGEN: no such free slot (--batch 3) or a bad max_new
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+DONE bt16-off bt32-off bt32-ref il-off il-ref 18:13:28
+=== ov-on 18:13:33 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json --env STRATA_PIPE_OVERLAP=1]
+rc=0 18:15:20
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 44, 'eligible' 0, 'overlapped read' 51, 'not captured before' 0, ERR-ish 0
+=== ov-off 18:15:20 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json --env STRATA_PIPE_OVERLAP=0 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json]
+rc=0 18:16:05
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: False
+note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json: RESUME identical
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== ov-ref 18:16:05 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-mmqtab --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-ref.json --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json]
+rc=0 18:16:49
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: False
+note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json: RESUME identical
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== ov-padup 18:16:49 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-padup.json --env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_PADUP=1 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json]
+rc=0 18:17:36
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json: RESUME identical
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 44, 'eligible' 0, 'overlapped read' 52, 'not captured before' 0, ERR-ish 0
+=== ov-wait1 18:17:36 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-wait1.json --env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_WAIT=1 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json]
+rc=0 18:18:22
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json: RESUME identical
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 44, 'eligible' 0, 'overlapped read' 51, 'not captured before' 0, ERR-ish 0
+=== ov-wait2 18:18:22 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-wait2.json --env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_WAIT=2 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json]
+rc=0 18:19:09
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off.json: RESUME identical
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 44, 'eligible' 0, 'overlapped read' 48, 'not captured before' 0, ERR-ish 0
+=== ov-on-1325 18:19:09 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on-1325.json --split 13,25,37 --env STRATA_PIPE_OVERLAP=1]
+rc=0 18:20:56
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 44, 'eligible' 0, 'overlapped read' 53, 'not captured before' 0, ERR-ish 0
+=== ov-off-1325 18:20:56 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off-1325.json --split 13,25,37 --env STRATA_PIPE_OVERLAP=0 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on-1325.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on-1325.json]
+rc=0 18:21:40
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on-1325.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on-1325.json: RESUME identical
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== ov-padup-1325 18:21:40 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-padup-1325.json --split 13,25,37 --env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_PADUP=1 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on-1325.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off-1325.json]
+rc=0 18:22:26
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off-1325.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off-1325.json: RESUME identical
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 44, 'eligible' 0, 'overlapped read' 52, 'not captured before' 0, ERR-ish 0
+=== ov-wait1-1325 18:22:26 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-wait1-1325.json --split 13,25,37 --env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_WAIT=1 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-on-1325.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off-1325.json]
+rc=0 18:23:13
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off-1325.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/ov-off-1325.json: RESUME identical
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 44, 'eligible' 0, 'overlapped read' 50, 'not captured before' 0, ERR-ish 0
+DONE ov-on ov-off ov-ref ov-padup ov-wait1 ov-wait2 ov-on-1325 ov-off-1325 ov-padup-1325 ov-wait1-1325 18:23:13
+=== soak-on 18:23:13 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak-on.json --env STRATA_PIPE_OVERLAP=1]
+rc=0 18:25:40
+log: 63 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+0 requests differ from solo
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 126, 'eligible' 0, 'overlapped read' 127, 'not captured before' 0, ERR-ish 0
+=== soak-off 18:25:41 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak-off.json --env STRATA_PIPE_OVERLAP=0 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak-on.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak-on.json]
+rc=0 18:27:03
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak-on.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak-on.json: RESUME DIFFERS [('r08', 0, 736), ('r24', 0, 732)]
+0 requests differ from solo
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== fault-a 18:27:04 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --env STRATA_PIPE_OVERLAP=1 --expect-fault --bg 4 --bg-new 200 --env STRATA_PIPE_OVERLAP_TEST_FAULT=poll]
+rc=0 18:27:49
+fault: 1 ERR line(s): ['ERR test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=poll): a batch window failed']
+fault: the engine ended with rc 1 4.9 s after the first ERR; watchdog fired: False; std::terminate: False
+   log: strata batch: overlapped read: captured 16 group layouts in 31.9 ms
+   log: strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 1, 'eligible' 0, 'overlapped read' 2, 'not captured before' 0, ERR-ish 0
+=== fault-b 18:27:49 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --env STRATA_PIPE_OVERLAP=1 --expect-fault --bg 4 --bg-new 200 --env STRATA_PIPE_OVERLAP_TEST_FAULT=throw]
+rc=0 18:28:34
+fault: 1 ERR line(s): ["ERR the batch slots' loop beside an overlapped prompt read threw: test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=throw)"]
+fault: the engine ended with rc 1 4.9 s after the first ERR; watchdog fired: False; std::terminate: False
+   log: strata batch: overlapped read: captured 16 group layouts in 31.8 ms
+   log: strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 1, 'eligible' 0, 'overlapped read' 2, 'not captured before' 0, ERR-ish 0
+=== fault-c 18:28:34 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --env STRATA_PIPE_OVERLAP=1 --expect-fault --bg 4 --bg-new 200 --env STRATA_PIPE_OVERLAP_TEST_FAULT=stage]
+rc=0 18:29:19
+fault: 1 ERR line(s): ["ERR test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=stage): stage 2's chunk failed"]
+fault: the engine ended with rc 1 4.7 s after the first ERR; watchdog fired: False; std::terminate: False
+   log: strata batch: overlapped read: captured 16 group layouts in 31.8 ms
+   log: strata batch: overlapped read of 191 tokens in 120 ms (drain 6.0 ms); the slots decoded 8 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0
+   log: strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 2, 'eligible' 0, 'overlapped read' 3, 'not captured before' 0, ERR-ish 0
+=== fault-d 18:29:19 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --env STRATA_PIPE_OVERLAP=1 --expect-fault --bg 4 --bg-new 200 --env STRATA_PIPE_OVERLAP_TEST_FAULT=cuda]
+rc=0 18:30:04
+fault: 1 ERR line(s): ['ERR test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault']
+fault: the engine ended with rc 1 4.3 s after the first ERR; watchdog fired: False; std::terminate: False
+   log: strata batch: overlapped read: captured 16 group layouts in 31.2 ms
+   log: strata batch: overlapped read: a CUDA fault (test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault); the stages' spin waits released
+   log: strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 1, 'eligible' 0, 'overlapped read' 3, 'not captured before' 0, ERR-ish 0
+=== fault-e 18:30:04 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --env STRATA_PIPE_OVERLAP=1 --expect-fault --bg 4 --bg-new 200 --env STRATA_PIPE_OVERLAP_TEST_FAULT=stall --env STRATA_WATCHDOG_S=10 --env STRATA_PIPE_OVERLAP_JOIN_S=2]
+rc=0 18:31:03
+fault: 1 ERR line(s): ['ERR the overlapped prompt read made no progress for 10 s']
+fault: the engine ended with rc 1 6.4 s after the first ERR; watchdog fired: False; std::terminate: False
+   log: strata batch: the overlapped prompt read did not end in 2 s (STRATA_PIPE_OVERLAP_JOIN_S) - stopping the engine
+   log: strata serve: no prompt chunk finished for 10 s during an overlapped read (the slots went on decoding) - stopping the engine so the server starts it again (issue #29)
+   log: strata batch: overlapped read: captured 20 group layouts in 37.0 ms
+   log: strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 1, 'eligible' 0, 'overlapped read' 3, 'not captured before' 0, ERR-ish 0
+DONE fault-a fault-b fault-c fault-d fault-e 18:31:03
+=== bt16-off-1325 18:31:03 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/T16-mmqtab-1325.json --batch 16 --n 16 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/bt16-off-1325.json]
+rc=0 18:31:49
+batch: 16 slots, 1024 tokens; admissions 3.7s; then 1.6s -> aggregate 192.1 tok/s overall, 208.3 tok/s from the first batch token
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== il-off-1325 18:31:49 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_interleave_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/T16-mmqtab-1325.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow]
+rc=1 18:32:32
+D gave way: None
+engine: ERR BGEN: no such free slot (--batch 3) or a bad max_new
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== il-on 18:32:37 env=[STRATA_PIPE_OVERLAP=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata/tools/batch_interleave_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow]
+rc=1 18:33:19
+D gave way: None
+engine: ERR BGEN: no such free slot (--batch 3) or a bad max_new
+overlap lines in engine log: 'overlapped read of' 1, 'eligible' 0, 'overlapped read' 2, 'not captured before' 0, ERR-ish 0
+DONE bt16-off-1325 il-off-1325 il-on 18:33:19
+CHAINB-DONE
+=== soak2-on 18:33:24 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64b.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on.json --env STRATA_PIPE_OVERLAP=1]
+rc=2 18:36:56
+r16: 96 tokens (length), solo 96: DIFFERS at 54; next turn of r09, RESUME 846 in slot 4 (parent slot 4)
+r32: 96 tokens (length), solo 96: DIFFERS at 18; next turn of r25, RESUME 847 in slot 7 (parent slot 7)
+r48: 96 tokens (length), solo 96: DIFFERS at 30; next turn of r41, RESUME 803 in slot 7 (parent slot 7)
+log: 58 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+3 requests differ from solo
+RESULT: FAIL
+overlap lines in engine log: 'overlapped read of' 116, 'eligible' 0, 'overlapped read' 120, 'not captured before' 0, ERR-ish 0
+=== soak2-off 18:36:56 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64b.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-off.json --env STRATA_PIPE_OVERLAP=0 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on.json]
+rc=2 18:38:33
+r32: 96 tokens (length), solo 96: DIFFERS at 18; next turn of r25, RESUME 847 in slot 10 (parent slot 10)
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on.json: DIFFERS ['r16', 'r48']
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on.json: RESUME DIFFERS [('r16', 846, 0), ('r48', 803, 0)]
+1 requests differ from solo
+RESULT: FAIL
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+DONE soak2-on soak2-off 18:38:33
+=== e2e 18:38:33
+rc done 18:40:37
+{"status": "ok", "max_context": 32768, "model": "qwen3.8-flash-next-unsloth-ud-iq4_xs", "images": false, "api_key": false, "loaded": true, "service": "strata"}
+# ov-e2e: prompt~1000 tok, max_tokens 256, 2 request(s) per user, temperature 0.7
+users  ok/req    wall  agg out  dec p50  dec p5  TTFT p50  TTFT p95  TTFT max  e2e p50  e2e p95
+    4   8/8      12.2    168.4     56.1    55.1      0.94      3.08      3.41      5.4      7.6
+   16  32/32     36.3    225.5     25.5    21.5      4.19     19.99     21.47     14.1     29.8
+bench rc=0
+# ov-e2e-4k: prompt~4000 tok, max_tokens 128, 1 request(s) per user, temperature 0.7
+users  ok/req    wall  agg out  dec p50  dec p5  TTFT p50  TTFT p95  TTFT max  e2e p50  e2e p95
+   16  16/16     29.3     69.8     47.0    45.8     15.21     26.82     28.11     18.0     28.8
+bench4k rc=0
+/media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/e2e.engine.log: 'overlapped read of' 53, ERR 0, watchdog 0, terminate 0, 'not captured before' 0, 'overlapped read off' 0
+/media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/e2e.server.out: 'overlapped read of' 0, ERR 0, watchdog 0, terminate 0, 'not captured before' 0, 'overlapped read off' 0
+E2E-DONE
+CHAINC-DONE
+=== soak2-ref 18:40:45 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64b.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-mmqtab --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-ref.json --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on.json]
+rc=2 18:42:22
+r32: 96 tokens (length), solo 96: DIFFERS at 18; next turn of r25, RESUME 847 in slot 10 (parent slot 10)
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+1 requests differ from solo
+RESULT: FAIL
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== soak2-ref2 18:42:22 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64b.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-mmqtab --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-ref2.json --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on.json]
+rc=2 18:43:59
+r32: 96 tokens (length), solo 96: DIFFERS at 18; next turn of r25, RESUME 847 in slot 10 (parent slot 10)
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+1 requests differ from solo
+RESULT: FAIL
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== soak2-on2 18:43:59 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64b.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on2.json --env STRATA_PIPE_OVERLAP=1 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak2-on.json]
+rc=2 18:45:29
+r40: 96 tokens (length), solo 96: DIFFERS at 15; next turn of r33, RESUME 845 in slot 8 (parent slot 8)
+log: 60 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+1 requests differ from solo
+RESULT: FAIL
+overlap lines in engine log: 'overlapped read of' 120, 'eligible' 0, 'overlapped read' 122, 'not captured before' 0, ERR-ish 0
+DONE soak2-ref soak2-ref2 soak2-on2 18:45:29
+=== reuse-ref 18:46:01 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/reuse4.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-mmqtab --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/reuse-ref.json]
+rc=0 18:47:12
+r09: IDENTICAL to solo; r16: RESUME 846, DIFFERS at 54 to solo; equal to soak runs' r16 (equal, their RESUME): {'soak2-on': (True, 846), 'soak2-on2': (False, 0), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+r25: IDENTICAL to solo; r32: RESUME 847, DIFFERS at 18 to solo; equal to soak runs' r32 (equal, their RESUME): {'soak2-on': (True, 847), 'soak2-on2': (False, 0), 'soak2-off': (True, 847), 'soak2-ref': (True, 847)}
+r33: IDENTICAL to solo; r40: RESUME 845, DIFFERS at 15 to solo; equal to soak runs' r40 (equal, their RESUME): {'soak2-on': (False, 0), 'soak2-on2': (True, 845), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+r41: IDENTICAL to solo; r48: RESUME 803, DIFFERS at 30 to solo; equal to soak runs' r48 (equal, their RESUME): {'soak2-on': (True, 803), 'soak2-on2': (False, 0), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+RESULT: FAIL
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+=== reuse-on 18:47:12 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/reuse4.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/reuse-on.json --env STRATA_PIPE_OVERLAP=1]
+rc=0 18:48:24
+r09: IDENTICAL to solo; r16: RESUME 846, DIFFERS at 54 to solo; equal to soak runs' r16 (equal, their RESUME): {'soak2-on': (True, 846), 'soak2-on2': (False, 0), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+r25: IDENTICAL to solo; r32: RESUME 847, DIFFERS at 18 to solo; equal to soak runs' r32 (equal, their RESUME): {'soak2-on': (True, 847), 'soak2-on2': (False, 0), 'soak2-off': (True, 847), 'soak2-ref': (True, 847)}
+r33: IDENTICAL to solo; r40: RESUME 845, DIFFERS at 15 to solo; equal to soak runs' r40 (equal, their RESUME): {'soak2-on': (False, 0), 'soak2-on2': (True, 845), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+r41: IDENTICAL to solo; r48: RESUME 803, DIFFERS at 30 to solo; equal to soak runs' r48 (equal, their RESUME): {'soak2-on': (True, 803), 'soak2-on2': (False, 0), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+RESULT: FAIL
+overlap lines in engine log: 'overlapped read of' 20, 'eligible' 0, 'overlapped read' 23, 'not captured before' 0, ERR-ish 0
+=== reuse-off 18:48:25 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/reuse4.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/reuse-off.json --env STRATA_PIPE_OVERLAP=0]
+rc=0 18:49:36
+r09: IDENTICAL to solo; r16: RESUME 846, DIFFERS at 54 to solo; equal to soak runs' r16 (equal, their RESUME): {'soak2-on': (True, 846), 'soak2-on2': (False, 0), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+r25: IDENTICAL to solo; r32: RESUME 847, DIFFERS at 18 to solo; equal to soak runs' r32 (equal, their RESUME): {'soak2-on': (True, 847), 'soak2-on2': (False, 0), 'soak2-off': (True, 847), 'soak2-ref': (True, 847)}
+r33: IDENTICAL to solo; r40: RESUME 845, DIFFERS at 15 to solo; equal to soak runs' r40 (equal, their RESUME): {'soak2-on': (False, 0), 'soak2-on2': (True, 845), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+r41: IDENTICAL to solo; r48: RESUME 803, DIFFERS at 30 to solo; equal to soak runs' r48 (equal, their RESUME): {'soak2-on': (True, 803), 'soak2-on2': (False, 0), 'soak2-off': (False, 0), 'soak2-ref': (False, 0)}
+RESULT: FAIL
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+DONE reuse-ref reuse-on reuse-off 18:49:36
+=== soak3-on 18:50:09 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64c.py --long-new --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak3-on.json --env STRATA_PIPE_OVERLAP=1]
+rc=0 18:55:29
+log: 63 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+0 requests differ from solo
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 126, 'eligible' 0, 'overlapped read' 135, 'not captured before' 0, ERR-ish 0
+=== soak3-off 18:55:29 env=[] cmd=[python3 /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak64c.py --long-new --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak3-off.json --env STRATA_PIPE_OVERLAP=0 --solo-json /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak3-on.json --compare /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak3-on.json]
+rc=0 18:57:27
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak3-on.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/overlap/exactness-r1/soak3-on.json: RESUME identical
+0 requests differ from solo
+RESULT: PASS
+overlap lines in engine log: 'overlapped read of' 0, 'eligible' 0, 'overlapped read' 0, 'not captured before' 0, ERR-ish 0
+DONE soak3-on soak3-off 18:57:27

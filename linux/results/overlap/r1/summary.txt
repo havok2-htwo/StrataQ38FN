@@ -1,0 +1,314 @@
+=== prefix-padup 17:40:12 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_PADUP=1]
+rc=2 17:42:00
+bg0: stopped at 395 of 600: PREFIX OK
+bg1: 130 tokens (stop), solo 130: IDENTICAL
+bg2: stopped at 373 of 377: PREFIX OK
+bg3: 191 tokens (stop), solo 191: IDENTICAL
+bg4: stopped at 353 of 600: PREFIX OK
+bg5: stopped at 342 of 579: PREFIX OK
+bg6: 310 tokens (stop), solo 310: IDENTICAL
+bg7: stopped at 320 of 342: PREFIX OK
+bg8: stopped at 310 of 541: PREFIX OK
+bg9: stopped at 300 of 600: PREFIX OK
+bg10: stopped at 290 of 547: PREFIX OK
+bg11: stopped at 280 of 600: PREFIX OK
+bg12: stopped at 270 of 600: PREFIX OK
+bg13: stopped at 115 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 23 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+    strata batch: overlapped read of 5163 tokens in 1068 ms (drain 23.3 ms); the slots decoded 283 rows meanwhile, D_ref 536.9 rows/s, lost 564 ms of decode; 25 group starts padded up, 0 waited; stage-1 PLE gather 0.018 ms avg over 95 windows, ple hit n/a (cancelled)
+RESULT: FAIL
+=== smoke-on 17:51:50 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1]
+(aborted: binary 469550d4 superseded by the test-hook build)
+=== restart with 19bbeb64 17:53:44
+=== fault-d-cuda 17:53:44 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1 --expect-fault --bg 4 --bg-new 200 --env STRATA_PIPE_OVERLAP_TEST_FAULT=cuda]
+rc=0 17:54:29
+fault: 1 ERR line(s): ['ERR test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault']
+fault: the engine ended with rc 1 4.3 s after the first ERR; watchdog fired: False; std::terminate: False
+   log: strata batch: overlapped read: captured 16 group layouts in 32.0 ms
+   log: strata batch: overlapped read: a CUDA fault (test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault); the stages' spin waits released
+   log: strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+RESULT: PASS
+=== smoke-on 17:54:29 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1]
+rc=0 17:56:17
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+bg0: stopped at 413 of 600: PREFIX OK
+bg1: 130 tokens (stop), solo 130: IDENTICAL
+bg2: 377 tokens (stop), solo 377: IDENTICAL
+bg3: 191 tokens (stop), solo 191: IDENTICAL
+bg4: stopped at 360 of 600: PREFIX OK
+bg5: stopped at 349 of 579: PREFIX OK
+bg6: 310 tokens (stop), solo 310: IDENTICAL
+bg7: stopped at 327 of 342: PREFIX OK
+bg8: stopped at 317 of 541: PREFIX OK
+bg9: stopped at 306 of 600: PREFIX OK
+bg10: stopped at 295 of 547: PREFIX OK
+bg11: stopped at 285 of 600: PREFIX OK
+bg12: stopped at 275 of 600: PREFIX OK
+bg13: stopped at 110 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+    strata batch: overlapped read of 5163 tokens in 1068 ms (drain 17.5 ms); the slots decoded 287 rows meanwhile, D_ref 538.7 rows/s, lost 553 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.017 ms avg over 96 windows, ple hit n/a (cancelled)
+RESULT: PASS
+=== off 17:56:17 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=0 --solo-json smoke-on.json --compare smoke-on.json]
+rc=0 17:57:01
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: False
+note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised
+bg0: stopped at 129 of 600: PREFIX OK
+bg1: stopped at 128 of 130: PREFIX OK
+bg2: stopped at 127 of 377: PREFIX OK
+bg3: stopped at 126 of 191: PREFIX OK
+bg4: stopped at 126 of 600: PREFIX OK
+bg5: stopped at 126 of 579: PREFIX OK
+bg6: stopped at 125 of 310: PREFIX OK
+bg7: stopped at 125 of 342: PREFIX OK
+bg8: stopped at 125 of 541: PREFIX OK
+bg9: stopped at 124 of 600: PREFIX OK
+bg10: stopped at 124 of 547: PREFIX OK
+bg11: stopped at 124 of 600: PREFIX OK
+bg12: stopped at 124 of 600: PREFIX OK
+bg13: stopped at 76 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with smoke-on.json: token-identical
+compare with smoke-on.json: RESUME identical
+RESULT: PASS
+=== padup 17:57:01 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_PADUP=1 --solo-json smoke-on.json --compare off.json]
+rc=0 17:57:46
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: False
+note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised
+bg0: stopped at 166 of 600: PREFIX OK
+bg1: 130 tokens (stop), solo 130: IDENTICAL
+bg2: stopped at 143 of 377: PREFIX OK
+bg3: stopped at 132 of 191: PREFIX OK
+bg4: stopped at 155 of 600: PREFIX OK
+bg5: stopped at 144 of 579: PREFIX OK
+bg6: stopped at 134 of 310: PREFIX OK
+bg7: stopped at 125 of 342: PREFIX OK
+bg8: stopped at 152 of 541: PREFIX OK
+bg9: stopped at 142 of 600: PREFIX OK
+bg10: stopped at 132 of 547: PREFIX OK
+bg11: stopped at 123 of 600: PREFIX OK
+bg12: stopped at 236 of 600: PREFIX OK
+bg13: stopped at 97 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+    strata batch: overlapped read of 5163 tokens in 731 ms (drain 0.0 ms); the slots decoded 0 rows meanwhile, D_ref 577.0 rows/s, lost 731 ms of decode; 0 group starts padded up, 4 waited; stage-1 PLE gather 0.000 ms avg over 0 windows, ple hit n/a (cancelled)
+compare with off.json: token-identical
+compare with off.json: RESUME identical
+RESULT: PASS
+=== wait2 17:57:46 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_WAIT=2 --solo-json smoke-on.json --compare off.json]
+rc=0 17:58:32
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+bg0: stopped at 262 of 600: PREFIX OK
+bg1: 130 tokens (stop), solo 130: IDENTICAL
+bg2: stopped at 260 of 377: PREFIX OK
+bg3: 191 tokens (stop), solo 191: IDENTICAL
+bg4: stopped at 369 of 600: PREFIX OK
+bg5: stopped at 368 of 579: PREFIX OK
+bg6: 310 tokens (stop), solo 310: IDENTICAL
+bg7: 342 tokens (stop), solo 342: IDENTICAL
+bg8: stopped at 325 of 541: PREFIX OK
+bg9: stopped at 325 of 600: PREFIX OK
+bg10: stopped at 324 of 547: PREFIX OK
+bg11: stopped at 324 of 600: PREFIX OK
+bg12: stopped at 148 of 600: PREFIX OK
+bg13: stopped at 77 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+    strata batch: overlapped read of 5163 tokens in 939 ms (drain 16.3 ms); the slots decoded 216 rows meanwhile, D_ref 540.3 rows/s, lost 556 ms of decode; 0 group starts padded up, 2 waited; stage-1 PLE gather 0.021 ms avg over 54 windows, ple hit n/a (cancelled)
+compare with off.json: token-identical
+compare with off.json: RESUME identical
+RESULT: PASS
+=== bt16-off 17:58:32 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 ] extra=[--no-prefill-borrow] test=[--n 16 --max-new 64 --long-tokens 1200]
+(aborted: 19bbeb64 superseded - FORCE_PADUP waited at a group's full width; its runs in superseded/19bbeb64)
+=== restart with 063ce1b7 17:59:27
+=== fault-d-cuda 17:59:27 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1 --expect-fault --bg 4 --bg-new 200 --env STRATA_PIPE_OVERLAP_TEST_FAULT=cuda]
+rc=0 18:00:12
+fault: 1 ERR line(s): ['ERR test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault']
+fault: the engine ended with rc 1 4.3 s after the first ERR; watchdog fired: False; std::terminate: False
+   log: strata batch: overlapped read: captured 16 group layouts in 31.8 ms
+   log: strata batch: overlapped read: a CUDA fault (test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault); the stages' spin waits released
+   log: strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+RESULT: PASS
+=== smoke-on 18:00:12 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1]
+rc=0 18:02:00
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+bg0: stopped at 416 of 600: PREFIX OK
+bg1: 130 tokens (stop), solo 130: IDENTICAL
+bg2: 377 tokens (stop), solo 377: IDENTICAL
+bg3: 191 tokens (stop), solo 191: IDENTICAL
+bg4: stopped at 362 of 600: PREFIX OK
+bg5: stopped at 351 of 579: PREFIX OK
+bg6: 310 tokens (stop), solo 310: IDENTICAL
+bg7: stopped at 329 of 342: PREFIX OK
+bg8: stopped at 319 of 541: PREFIX OK
+bg9: stopped at 308 of 600: PREFIX OK
+bg10: stopped at 297 of 547: PREFIX OK
+bg11: stopped at 287 of 600: PREFIX OK
+bg12: stopped at 277 of 600: PREFIX OK
+bg13: stopped at 111 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+    strata batch: overlapped read of 5163 tokens in 1067 ms (drain 17.9 ms); the slots decoded 288 rows meanwhile, D_ref 538.7 rows/s, lost 551 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.017 ms avg over 97 windows, ple hit n/a (cancelled)
+RESULT: PASS
+=== off 18:02:00 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=0 --solo-json smoke-on.json --compare smoke-on.json]
+rc=0 18:02:44
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: False
+note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised
+bg0: stopped at 130 of 600: PREFIX OK
+bg1: stopped at 129 of 130: PREFIX OK
+bg2: stopped at 128 of 377: PREFIX OK
+bg3: stopped at 127 of 191: PREFIX OK
+bg4: stopped at 127 of 600: PREFIX OK
+bg5: stopped at 126 of 579: PREFIX OK
+bg6: stopped at 126 of 310: PREFIX OK
+bg7: stopped at 125 of 342: PREFIX OK
+bg8: stopped at 125 of 541: PREFIX OK
+bg9: stopped at 125 of 600: PREFIX OK
+bg10: stopped at 124 of 547: PREFIX OK
+bg11: stopped at 124 of 600: PREFIX OK
+bg12: stopped at 124 of 600: PREFIX OK
+bg13: stopped at 77 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with smoke-on.json: token-identical
+compare with smoke-on.json: RESUME identical
+RESULT: PASS
+=== padup 18:02:44 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_PADUP=1 --solo-json smoke-on.json --compare off.json]
+rc=0 18:03:31
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+bg0: stopped at 261 of 600: PREFIX OK
+bg1: 130 tokens (stop), solo 130: IDENTICAL
+bg2: stopped at 238 of 377: PREFIX OK
+bg3: 191 tokens (stop), solo 191: IDENTICAL
+bg4: stopped at 367 of 600: PREFIX OK
+bg5: stopped at 356 of 579: PREFIX OK
+bg6: 310 tokens (stop), solo 310: IDENTICAL
+bg7: stopped at 335 of 342: PREFIX OK
+bg8: stopped at 325 of 541: PREFIX OK
+bg9: stopped at 315 of 600: PREFIX OK
+bg10: stopped at 305 of 547: PREFIX OK
+bg11: stopped at 296 of 600: PREFIX OK
+bg12: stopped at 267 of 600: PREFIX OK
+bg13: stopped at 109 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+    strata batch: overlapped read of 5163 tokens in 1031 ms (drain 17.7 ms); the slots decoded 275 rows meanwhile, D_ref 538.4 rows/s, lost 538 ms of decode; 5 group starts padded up, 1 waited; stage-1 PLE gather 0.018 ms avg over 84 windows, ple hit n/a (cancelled)
+compare with off.json: token-identical
+compare with off.json: RESUME identical
+RESULT: PASS
+=== wait2 18:03:31 exe=strata-g3-overlap test=[--env STRATA_PIPE_OVERLAP=1 --env STRATA_PIPE_OVERLAP_FORCE_WAIT=2 --solo-json smoke-on.json --compare off.json]
+rc=0 18:04:17
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+bg0: stopped at 262 of 600: PREFIX OK
+bg1: 130 tokens (stop), solo 130: IDENTICAL
+bg2: stopped at 260 of 377: PREFIX OK
+bg3: 191 tokens (stop), solo 191: IDENTICAL
+bg4: stopped at 366 of 600: PREFIX OK
+bg5: stopped at 365 of 579: PREFIX OK
+bg6: 310 tokens (stop), solo 310: IDENTICAL
+bg7: 342 tokens (stop), solo 342: IDENTICAL
+bg8: stopped at 322 of 541: PREFIX OK
+bg9: stopped at 322 of 600: PREFIX OK
+bg10: stopped at 321 of 547: PREFIX OK
+bg11: stopped at 321 of 600: PREFIX OK
+bg12: stopped at 148 of 600: PREFIX OK
+bg13: stopped at 77 of 600: PREFIX OK
+A: 24 tokens (length), solo 24: IDENTICAL
+B: 24 tokens (length), solo 24: IDENTICAL
+C: 24 tokens (length), solo 24: IDENTICAL
+D: cancelled, 0 tokens, a prefix of solo
+E: 24 tokens (length), solo 24: IDENTICAL
+F: 24 tokens (length), solo 24: IDENTICAL
+G: 2 tokens (stop), solo 2: IDENTICAL
+H: 24 tokens (length), solo 24: IDENTICAL
+A2: 24 tokens (length), solo 24: IDENTICAL
+G2: 2 tokens (stop), solo 2: IDENTICAL
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+    strata batch: overlapped read of 5163 tokens in 933 ms (drain 21.4 ms); the slots decoded 216 rows meanwhile, D_ref 535.4 rows/s, lost 551 ms of decode; 0 group starts padded up, 2 waited; stage-1 PLE gather 0.021 ms avg over 54 windows, ple hit n/a (cancelled)
+compare with off.json: token-identical
+compare with off.json: RESUME identical
+RESULT: PASS
+=== bt16-off 18:04:17 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 ] extra=[--no-prefill-borrow] test=[--n 16 --max-new 64 --long-tokens 1200]
+rc=0 18:05:03
+batch: 16 slots, 1024 tokens; admissions 3.7s; then 1.6s -> aggregate 194.0 tok/s overall, 439.0 tok/s from the first batch token
+eligible lines: 0
+=== bt16-on 18:05:03 exe=strata-g3-overlap env=[STRATA_MMQ_DIRECT=1 STRATA_PIPE_OVERLAP=1] extra=[--no-prefill-borrow] test=[--n 16 --max-new 64 --long-tokens 1200]
+rc=0 18:05:49
+batch: 16 slots, 1024 tokens; admissions 4.0s; then 1.5s -> aggregate 183.4 tok/s overall, 387.4 tok/s from the first batch token
+eligible lines: 0
+DONE bt16-off bt16-on 18:05:49
+CHAIN1-DONE

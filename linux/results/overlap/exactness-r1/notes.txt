@@ -1,0 +1,17 @@
+exactness-r1 (engine/strata-g3-overlap md5 063ce1b7..., = build-mmqtab/strata at g3-overlap 28a74747; reference engine/strata-g3-mmqtab)
+All arms: STRATA_MMQ_DIRECT=1 STRATA_IQ_MT_MIN=1, --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow, T16-mmqtab config
+(split 12,24,36 unless -1325 = T16-mmqtab-1325.json / --split 13,25,37). Commands: run.sh <arm> (each arm's cmd line in summary.txt),
+chainB.sh, chainC.sh, e2e.sh. Per arm: <arm>.out (test output), <arm>.engine.log, <arm>.json (dump).
+Drivers written for this run (not in the repo): soak64.py (v1, short max_new), soak64b.py (v2: next turns into the
+parent's slot), soak64c.py --long-new (v3: 64 distinct requests, all 16 slots busy), reuse4.py (deterministic slot-reuse A/B).
+
+1 env off: bt16-off, bt32-off (= bt32-ref), il-off (= il-ref, stops at step 4 as the reference), bt16-off-1325, il-off-1325
+2 env on: ov-on, ov-off (cmp ov-on), ov-ref (reference engine, cmp ov-on), ov-on-1325, ov-off-1325
+3 forced: ov-padup, ov-wait1, ov-wait2, ov-padup-1325, ov-wait1-1325 (FORCE_WAIT=1 forces 0 waits now: every own-width
+  layout is captured by overlap_prepare since 28a74747; FORCE_WAIT=2 exercises the wait path)
+4 soak: soak3-on/off PASS (64 requests, slots 0-15, mean 11.7 decoding beside each admission); soak-on/off (v1) PASS;
+  soak2-* FAIL in every engine incl. the reference: a next turn continued from its parent's slot after a 160-token
+  batch reply is not equal to its fresh solo read (r16/r32/r40/r48); reuse-ref/-off/-on give the same tokens for all
+  four - pre-existing, not the overlap. Env on resumes from the slot more often (timing), so it hits it more often.
+5 faults: fault-a..fault-e PASS (one ERR, rc 1 in 4.3-6.4 s, no watchdog, no std::terminate)
+6 e2e: e2e.bench.out / e2e.engine.log - 56 requests ok, 53 overlapped reads, no ERR/watchdog/terminate

@@ -54,6 +54,9 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
 | 36 | Upper bound: skip the resident-expert gather (`STRATA_HACK_SKIP_GATHER=1`, wrong outputs, branch `g3-hack-skip-gather`) | prompt read ~162 tok: 397–413 → **240–292 ms** (−35–40%); ~1,228 tok: 900–908 → **609–619 ms** (−32%) | 🔬 B-tab worth building (est. +12–15% multi-user throughput, −30–40% TTFT, also single GPU) | engine log 2026-10-11 ~12:00, `configs/HK-*.json` |
 | 37 | **B-tab implemented** (branch `g3-mmq-tab`, build `-DSTRATA_MMQ_TAB=ON`, env `STRATA_MMQ_DIRECT=1`; patches `patches/mmq-tab/`) | unit test 874/874 bitwise; batch_test16 16/16 and interleave identical; old vs new: tokens **and** fp32 logits byte-identical (4 GPUs, 1 GPU, streamed experts); prompt read −20..−24% (~170 tok), −18..−20% (~1.2K); default build (option off) produces byte-identical device code | ✅ | workflow report, `upstream/DESIGN-mmq-direct.md` |
 | 38 | B-tab through the HTTP server, 16 users (same session reference in brackets) | short **443.6** (417), long **327.0** (295.5), 16 agents multi-turn **72.4 tok/s** (61.6), follow-up TTFT 4.57 s (5.05), single-user TTFT 1.2K 0.73 s (0.88) | ✅ new default (`configs/T16-mmqtab.json`, agent: `X16-agent-mmqtab.json`) | `results/series_mmqtab.out`, `strata-T16-mmqtab-*`, `multiturn.jsonl` |
+| 39 | **M0 baseline for overlapped admission** (engine level, reference engine, 15 slots decoding, `results/overlap/m0/`) | all-slot stall per admission **0.28 s short / 0.67 s 1.2K** (design assumed 0.44/0.94); prompt read (`sp.run`, the overlappable part) 201 / 609 ms = 64 % / 85 %; fixed rest ~112 ms (drain 27, header windows 24, ramp 24, checkpoint 17, first window 11.5, copy 7.8); D_ref 591 rows/s (16 slots). Gate holds in T16-mmqtab (no loans, 100 % resident, `--ple-io ram` = Mmap mode, no PleReader); X16 agent configs (`--kv-resident`) are refused | 🔬 model `D/(1+D·R/L)` predicts 446/333 vs measured 444/327 | `results/overlap/m0/` |
+| 40 | **Overlapped admission implemented** (branch `g3-overlap`, 5 commits, env `STRATA_PIPE_OVERLAP=1`, engine `strata-g3-overlap`): M1 PLE concurrency setters, M2 gate + pre-capture of all group layouts, M3 read on a worker thread while `pump` keeps the groups decoding; review found 2 real defects (pad-up over a parked slot cache; spin waits not released on a CUDA fault), both fixed | exactness matrix all green: env off = reference engine (batch_test16/32, interleave, both splits); env on: batch_overlap_test every slot/admission = solo, env 0 vs 1 token- and RESUME-identical, forced pad-up/wait arms identical, 64-request soak 64/64, BSTOP/STOP/BYIELD mid-read, fault cases (a)–(e) exactly one ERR + bounded exit; 1.2K read beside decoding 826 ms (609 drained), decode lost 420 ms → x ≈ 0.7 | ✅ exact; throughput → #41 | `results/overlap/{m2,m3,r1,exactness-r1}/` |
+| — | Found on the way (reference engine too, not the overlap): a next turn continued from its parent's slot after a reply decoded in the batch can differ from a fresh solo read (soak2: r16/r32/r40/r48 differ at token 15–54, RESUME ~845) | open, upstream behaviour? | 🔬 | `results/overlap/exactness-r1/soak2-ref*.out`, `reuse4.py` |
 
 ## Analyses (no GPU)
 
@@ -65,8 +68,8 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
 
 ## Open / next steps
 
-- Variant B (MMQ directly on padded cache slots): design in progress, then implementation + exactness check + measurement.
-- Safe overlapped admission (latency).
+- Overlapped admission: end-to-end benchmark (M5) and knob arms (M4: PRIO, SLEEP_US, MTP_PRIO), then docs (M6).
+- Slot-resume mismatch after a batch-decoded reply (see the row after #40).
 - Parked: dynamic switching pipeline ↔ expert parallel (see the memory/ideas note in the README section).
 
 ## Appendix: all measurement runs (generated automatically from the JSONL files)

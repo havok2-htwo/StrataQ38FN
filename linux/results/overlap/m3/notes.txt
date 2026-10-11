@@ -1,0 +1,16 @@
+M3 (the overlap itself), branch g3-overlap. Engine engine/strata-g3-overlap md5 ab93f570257e90a467e3166423e7156b.
+run_m3.sh <name> <exe> "<test args>": tools/batch_overlap_test.py on T16-mmqtab.json (split 12,24,36 unless --split,
+  4 groups of 4, STRATA_MMQ_DIRECT=1 from the config), --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow,
+  STRATA_IQ_MT_MIN=1 STRATA_TRACE=1 (set by the test). summary.txt has every arm.
+Exactness (14 background slots decoding, admissions A/A2/B/C/D/E/F into slots 14/15; every request == solo, the
+  background a prefix of solo; BSTOP of slot 13 and BYIELD during B's read; STOP during D's 5163-token read):
+  smoke-on (env on), off (env off), ref (strata-g3-mmqtab), padup (FORCE_PADUP=1), wait2 (FORCE_WAIT=2): all PASS and
+  token-identical to smoke-on. on-1325 / off-1325 (split 13,25,37): PASS, identical to each other.
+  final-on / final-off (final binary): PASS, identical to smoke-on.
+  Logs: 20 'overlapped read of' stats lines per env-on run (C's root checkpoint gives 2 segments; A2's 19-token
+  rest is read through windows after 'slot 15 gave back 227 tokens'), 0 'not captured', 0 captures inside a read.
+  Pad-up per run: smoke-on 123 group starts (natural layouts like 12,13,14 missing), padup 278, wait2 21 waits.
+Faults (4 background slots, --expect-fault): a poll, b throw, c stage, e stall (WATCHDOG_S=10, JOIN_S=2): exactly
+  one ERR each, engine rc 1 within 5-6.3 s, no watchdog, no std::terminate. (e) try1 (fault-e-stall.try1.*): the
+  global watchdog raced the bounded abort once the slots ended -> the abort now sets a progress_allow allowance.
+  (d) (a CUDA fault on the prompt side) has no injection hook: not tested.

@@ -1,0 +1,15 @@
+M1 (PLE concurrency), branch g3-overlap: 09ee0f19 (PLE layer + tests), 0b622c99 (generate env wiring). Engine: engine/strata-g3-overlap.
+
+Selftest, CMake build:  build-mmqtab/ple_reader_test --selftest --dir <dir on a disk with O_DIRECT, not tmpfs>   -> selftest-cmake.log
+Host-only g++ build (in the Strata clone):
+  g++ -std=c++20 -O2 -Wall -Wextra -Iinclude -Ithird_party/ggml src/ngram/ple_reader_test.cpp src/kernels/ngram.cpp \
+      src/ngram/ple_reader.cpp src/platform/direct_file.cpp src/platform/memory.cpp -o ple_reader_test_o2 -lpthread   -> selftest-o2.log
+TSAN (host-only; the kernel's ASLR entropy needs setarch -R):
+  g++ -std=c++20 -O1 -g -fsanitize=thread <same sources> -o ple_reader_test_tsan -lpthread
+  setarch $(uname -m) -R ./ple_reader_test_tsan --selftest --dir <dir>                                             -> selftest-tsan.log (0 reports)
+SYCL copies: the same two builds with sycl/src/ngram/ple_reader.cpp and sycl/src/platform/direct_file.cpp in place
+  of the src/ ones (still -Iinclude only)                                    -> selftest-sycl-copies.log, selftest-sycl-copies-tsan.log
+Mutations (scratch copies, not committed): urgent queueing and reserve removed -> the order checks fail;
+  bytes_read non-atomic under TSAN -> tsan-mutation-nonatomic.log (4 data-race reports, rc 66).
+Engine A/B: ab/run_ab.sh, ab/run_ab2.sh (tools/batch_test16.py dumps; ab/summary.txt; ab/*.engine.log)
+Build log: build.log
