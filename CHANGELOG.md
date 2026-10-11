@@ -9,6 +9,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.7.0] – 2026-10-11
+
+Windows (RTX 5090 + 64 GB).
+
+### Added
+- `Start-Alles.bat` / `Stop-Alles.bat`: Strata + SearXNG + Open WebUI in one go; services already running are left alone.
+- `cors_origins` (`http://localhost:3000`, `http://127.0.0.1:3000`) in all three configs: browser clients such as
+  Genesis may call `/v1/*` directly. Before, `Access-Control-Allow-Origin` was missing and the browser discarded
+  the responses ("Could not connect … after 3 attempts").
+
+### Changed
+- UD-IQ4_XS: parking raised from 3 slots / 6 GiB to `--conversation-cache-slots 12 --conversation-cache-mib 10240`,
+  so ~10 alternating contexts are not re-read every time.
+- `LIESMICH.txt`, `settings.cmd`: notes on Start-/Stop-Alles and the firewall rule.
+
 ## [0.6.0] – 2026-10-11
 
 ### Added
@@ -59,19 +74,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `STRATA_BATCH_DECODE_SHARE`: ineffective with layer split and pipeline groups (prompt is read in one piece).
 - Fewer pipeline groups (2 instead of 4), 2 instances of 2 GPUs each, more than 16 slots, larger prefill chunks.
 - RAZOR-65B (50% of experts pruned) in vLLM: clearly worse quality (62.5% MMLU-Pro).
-
-## [0.4.0] – 2026-10-10
-
-### Hinzugefügt
-- `Start-Alles.bat` / `Stop-Alles.bat`: Strata + SearXNG + Open WebUI in einem Rutsch; laufende Dienste bleiben.
-- `cors_origins` (`http://localhost:3000`, `http://127.0.0.1:3000`) in allen drei Configs: Browser-Clients wie
-  Genesis dürfen `/v1/*` direkt aufrufen. Vorher fehlte `Access-Control-Allow-Origin`, der Browser verwarf die
-  Antworten („Could not connect … after 3 attempts“).
-
-### Geändert
-- UD-IQ4_XS: Parken von 3 Slots / 6 GiB auf `--conversation-cache-slots 12 --conversation-cache-mib 10240`,
-  damit ~10 abwechselnde Kontexte nicht jedes Mal neu eingelesen werden.
-- `LIESMICH.txt`, `settings.cmd`: Hinweise auf Start-/Stop-Alles und die Firewall-Freigabe.
 
 ## [0.3.0] – 2026-10-09
 
