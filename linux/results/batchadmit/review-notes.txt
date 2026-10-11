@@ -1,0 +1,26 @@
+Adversarial check of the batched-admission design (2026-10-12), engine strata-g3-142fc (g3-142 c9bbd1fc), no code change.
+Three GPU runs (all exact-path, no engine edits; GPUs back < 300 MiB):
+
+qprobe/  T16-142fc through Strata-142 serve/server.py, engine behind a stdin/stdout timestamp proxy (strata-wrap) + STRATA_TRACE
+  tok/s with proxy = baseline (short 491.6, long 360.0; rounds 4: 502.0 / 359.4)
+  waiting=N at BGEN (64 BGEN, rounds 4): 0:10 1:4 2:4 3:34, 4..15 once each (round-1 burst). After round 1 the queue sits at 3:
+  all requests are max_tok 512, batch windows give every slot 1 token/window, so the 4 slots of a decode group hit BDONE in
+  the same window -> arrivals come in 4s. k=4 is a lockstep artifact of the benchmark, not a property of real traffic.
+  BADM -> next BGEN gap when a request waits: p50 0.2-0.5 ms, p90 <= 1.0 ms (not 10-40 ms).
+  "drain for BGEN": 1 group in flight in 44/46 admissions (pump(true) restarted one group before the BGEN landed), 18-22 ms.
+
+pipecheck/  scale_driver variant (pipe_driver.py), idle phase, 4 reps, read = "read N tokens (batched)" median ms
+  --prefill 144 (k chunks of 144 = proxy for Stage 3's k one-chunk jobs through the 4 stages):
+    k=1 148, 2 258, 3 358, 4 486, 8 953   -> +~110 ms per extra chunk (c ~ 3, not 1.65)
+  --prefill 144 + --aux-cpus 64-127:
+    k=1 145, 2 192, 3 228, 4 272, 8 432   -> +~40 ms per extra chunk (c ~ 1.1-1.2)
+  --prefill 512 + --aux-cpus 64-127 (vs plain scaling run):
+    150 149 (145), 300 232 (230), 600 351 (356), 1200 457 (529), 2400 673 (911)
+  Cause: the host thread is pinned to CPU 0 and every thread it creates inherits CPU 0 while aux-cpus is off (the
+  default: "off at start"), incl. each prefill stage's std::async thread and the PLE gather; 19 engine threads had
+  Cpus_allowed_list 0 in the qprobe engine. With --aux-cpus LIST they call pin_current_thread() onto the list.
+
+auxab/  ab_quick arms (16 users, rounds 2, greedy) T16-142fc + --aux-cpus 64-127
+  short 495.3 tok/s (base 491.6-493.1), TTFT p50/p95 1.03/3.52
+  long  377.6 tok/s (base 357.3-360.0, +5-6 %), TTFT p50/p95 2.65/7.98 (base 3.01-3.02/9.06-9.08)
+  exactness of the aux switch NOT yet checked (header claims no output depends on thread placement): run batch_test16.

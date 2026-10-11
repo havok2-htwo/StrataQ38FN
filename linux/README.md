@@ -9,7 +9,7 @@ for sm_86), model **Unsloth UD-IQ4_XS** (target), for comparison UD-Q4_K_XL, vLL
 | | Strata UD-IQ4_XS | vLLM 0.31 Flash-Next W4A16 | vLLM 0.31 Qwen3.8-27B FP8 |
 |---|---|---|---|
 | Decode, 1 user | **~121 tok/s** (MTP) | 79 tok/s; with MTP 136 tok/s (then max. 8 users) | 64 tok/s |
-| Total, 1.2K prompts | ~357 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
+| Total, 1.2K prompts | ~376 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
 | Total, short prompts | ~493 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
 | Agent load, 16 users × 5 turns (11K→28K context): TTFT follow-up turn | **~4.5–5 s** | ~32 s | – |
 | Prefill | 1,250 (2K) → 2,240 tok/s (28K) | ~3,500 tok/s | up to ~3,100 tok/s |
@@ -293,9 +293,18 @@ cut ~25 ms of it, exactly: the last prompt tokens and the first token in one win
 checkpoint buffers recycled and saved on 4 per-card threads (`STRATA_CKPT_POOL`, `STRATA_CKPT_THREADS`, 17 → 7 ms),
 the turn checkpoint moved into the slot instead of copied (`STRATA_SLOT_CKPT_MOVE`), one sync per card for the slot
 copy (`STRATA_SLOT_COPY_BATCHSYNC`), and no drain for a late BYIELD (`STRATA_PIPE_BYIELD_NODRAIN`). Config
-`configs/T16-142fc.json` (engine `strata-g3-142fc`, default of `start-strata.sh`): 16 users **493 tok/s short, 357 tok/s
+`configs/T16-142fc.json` (engine `strata-g3-142fc`): 16 users **493 tok/s short, 357 tok/s
 1.2K** (0.1.42 without them: 470 / 349), TTFT p95 −21 % (TESTLOG #48–#49). Merging the first window saved less than
 planned (7 instead of 22 ms): every extra row in a window costs 2.4–4 ms.
+
+## CPU placement of the prefill threads (`--aux-cpus`, default since 0.11.0)
+
+The engine pins its host thread to CPU 0, and every thread it creates inherits that CPU unless `--aux-cpus` is set -
+including the three prefill stage threads of the layer split. Once 3–4 cards read a long prompt at once, their host-side
+expert grouping queues on that one core (5 → 60–68 ms per card per 512-token chunk). `--aux-cpus 65-127` (the SMT
+siblings of the idle pool cores) moves them off: a 1.2K read takes 484 instead of 557 ms, 16 users with 1.2K prompts
+**376 instead of 357 tok/s**, short prompts unchanged, output identical (TESTLOG #52). Config `configs/T16-142fca.json`
+= `T16-142fc` + this flag; `start-strata.sh` uses it. `auto` only finds CPU 64 here and gains less.
 
 ## License notices
 

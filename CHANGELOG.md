@@ -21,6 +21,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.11.0] – 2026-10-12
+
+Linux (4× RTX 3090).
+
+### Changed
+- New default `configs/T16-142fca.json` = `T16-142fc` + `--aux-cpus 65-127`: the prefill stage threads no longer
+  share the host's CPU 0. 16 users with 1.2K prompts 357 → 376 tok/s, short unchanged (493), output identical.
+
+### Added
+- `upstream/DESIGN-batched-admission.md`: reading several queued admissions together - measured, mostly a lockstep
+  artifact of the benchmark (fixed `max_tok`); only a short admission hold is worth building.
+
 ## [0.10.0] – 2026-10-12
 
 Linux (4× RTX 3090).

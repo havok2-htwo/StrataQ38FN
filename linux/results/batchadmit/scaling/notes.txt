@@ -1,0 +1,41 @@
+Batch admission bound: prefill read time vs token count (2026-10-12, no code change)
+Engine strata-g3-142fc, T16-142fc args (--batch 16, split 12,24,36, prefill 512, MTP, kv int8, ple-io ram, 6 fixed-cost
+switches), STRATA_TRACE=1. Driver scale_driver.py over stdin; slot 15 measured; phase idle (0 slots decoding) and dec15
+(slots 0-14 decoding, drained by the BGEN as usual). Prompts: fresh (unique header), text = slices of the repo's Markdown
+corpus; "concat kxN" = k distinct chat prompts of N tokens in ONE token sequence (one read). 4 reps each, shuffled.
+Arms: plain (read times, plain.summary.txt) and timing (+STRATA_PREFILL_TIMING=1, +15-35 ms per read overhead,
+timing.summary.txt). Derived: derived.txt (derive.py). Read = 'read N tokens (batched)', N = n-7 (merged first window).
+
+Findings
+- idle == dec15 within noise (the read runs drained). concat kxN == single (k*N) within 1 % -> diverse text already
+  touches as many experts as k separate prompts; the single-N curve is a valid proxy for a combined read.
+- Single-chunk reads (dec15 plain): 68 tok 100 ms, 143 145, 293 230, 443 298 ms; marginal 0.60 -> 0.46 ms/tok (concave).
+  Multi-chunk: 593 356, 893 403, 1193 529, 2393 911, 3593 1318, 4793 1721 ms; steady 0.335 ms/tok (171 ms per 512 chunk).
+- Phase split (timing arm, sum of 4 stages, single chunk): routed experts (dequant+gate/up+down+combine) 74/114/161/196 ms
+  at 68/143/293/443 tok; linear part above saturation 0.233 ms/tok, per-chunk floor ~93 ms (raw expert bytes 59.5 GB /
+  4 cards / ~900 GB/s = ~66 ms of it). Rest (gdn 18-57, qsa 4-20, hc read 8-24, router+shared 4-9) ~28 ms + ~0.19 ms/tok.
+  => 143-tok read: expert-weight floor ~52 %, per-token expert compute ~20 %, rest ~28 %. 443 tok: 30 / 33 / 37 %.
+- Side finding: in multi-chunk reads stages slow from ~89 to ~145-165 ms per 512 chunk when 3-4 stages run at once;
+  the growth is all "host grouping" (5 -> 60-68 ms per stage-chunk). Pipeline steady state is host-bound, not GPU-bound.
+== idle
+k x N    solo read  k*solo  1 read  (1xkN) read save    % | solo stall  k*stall comb stall   save    % per adm
+2x75         101.4   202.9   144.2   148.0      58.7   29 |      135.7    271.4      186.3   85.0   31    42.5
+4x75         101.4   405.8   227.3   229.7     178.4   44 |      135.7    542.8      288.0  254.8   47    63.7
+2x150        148.0   296.0   227.7   229.7      68.3   23 |      182.7    365.3      271.0   94.3   26    47.2
+3x150        148.0   444.0   292.1   293.3     151.9   34 |      182.7    548.0      343.6  204.3   37    68.1
+4x150        148.0   592.0   353.4   353.6     238.6   40 |      182.7    730.6      413.9  316.8   43    79.2
+2x600        353.6   707.3   524.6   526.5     182.6   26 |      388.2    776.5      567.1  209.4   27   104.7
+2x1200       526.5  1052.9   905.8   908.7     147.1   14 |      562.2   1124.5      948.9  175.5   16    87.8
+3x1200       526.5  1579.4  1304.2  1305.6     275.2   17 |      562.2   1686.7     1356.2  330.5   20   110.2
+4x1200       526.5  2105.8  1713.8  1716.2     392.1   19 |      562.2   2249.0     1775.3  473.7   21   118.4
+== dec15
+k x N    solo read  k*solo  1 read  (1xkN) read save    % | solo stall  k*stall comb stall   save    % per adm
+2x75         100.4   200.8   146.2   144.9      54.6   27 |      183.9    367.9      237.0  130.9   36    65.4
+4x75         100.4   401.6   229.8   230.1     171.8   43 |      183.9    735.8      339.7  396.1   54    99.0
+2x150        144.9   289.9   229.7   230.1      60.2   21 |      228.4    456.9      320.8  136.1   30    68.0
+3x150        144.9   434.8   297.8   299.3     137.0   32 |      228.4    685.3      397.9  287.4   42    95.8
+4x150        144.9   579.8   357.5   355.9     222.3   38 |      228.4    913.8      466.6  447.2   49   111.8
+2x600        355.9   711.9   523.5   528.9     188.4   26 |      439.3    878.7      613.4  265.3   30   132.6
+2x1200       528.9  1057.8   901.2   911.1     156.6   15 |      612.7   1225.4      989.8  235.7   19   117.8
+3x1200       528.9  1586.7  1299.3  1317.8     287.4   18 |      612.7   1838.1     1395.9  442.2   24   147.4
+4x1200       528.9  2115.6  1717.2  1720.8     398.3   19 |      612.7   2450.8     1827.0  623.9   25   156.0
