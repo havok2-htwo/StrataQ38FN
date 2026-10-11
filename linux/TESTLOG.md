@@ -50,6 +50,8 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
 | 32 | Overlapped admission, prototype (`STRATA_PIPE_OVERLAP_SPIKE`) | 413/294 (no gain), **TTFT p50 2.03 → 0.57 s** | 🔬 latency lever only | `strata-S16-spike-*`, `patches/experimental/` |
 | 33 | Prefill timing of short prompts (`STRATA_PREFILL_TIMING`) | 154 tok.: 78–87 ms per card, 31% "dequant" = expert copy for MMQ | 🔬 | `prefill_timing.txt`, `upstream/ANALYSIS-short-prompt-moe.md` |
 | 34 | `STRATA_PF_FUSED=1` | no change (only kicks in from 1,024-token chunks) | ➖ | `prefill_timing_fused.txt` |
+| 35 | Design "MMQ direct on padded cache slots" (idea B) — code review | rejected: cache is profile-ordered (layers interleaved) and changing MMQ's channel count changes stream-k rounding → not bit-identical; exact alternative "B-tab" = own copy of MMQ's outer kernel with a per-expert pointer table | 🔬 design in `upstream/DESIGN-mmq-direct.md` | `upstream/DESIGN-mmq-direct.md` |
+| 36 | Upper bound: skip the resident-expert gather (`STRATA_HACK_SKIP_GATHER=1`, wrong outputs, branch `g3-hack-skip-gather`) | prompt read ~162 tok: 397–413 → **240–292 ms** (−35–40%); ~1,228 tok: 900–908 → **609–619 ms** (−32%) | 🔬 B-tab worth building (est. +12–15% multi-user throughput, −30–40% TTFT, also single GPU) | engine log 2026-10-11 ~12:00, `configs/HK-*.json` |
 
 ## Analyses (no GPU)
 
