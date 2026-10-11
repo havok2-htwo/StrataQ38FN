@@ -9,8 +9,8 @@ for sm_86), model **Unsloth UD-IQ4_XS** (target), for comparison UD-Q4_K_XL, vLL
 | | Strata UD-IQ4_XS | vLLM 0.31 Flash-Next W4A16 | vLLM 0.31 Qwen3.8-27B FP8 |
 |---|---|---|---|
 | Decode, 1 user | **~121 tok/s** (MTP) | 79 tok/s; with MTP 136 tok/s (then max. 8 users) | 64 tok/s |
-| Total, 1.2K prompts | ~327 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
-| Total, short prompts | ~444 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
+| Total, 1.2K prompts | ~342 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
+| Total, short prompts | ~467 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
 | Agent load, 16 users × 5 turns (11K→28K context): TTFT follow-up turn | **~4.5–5 s** | ~32 s | – |
 | Prefill | 1,250 (2K) → 2,240 tok/s (28K) | ~3,500 tok/s | up to ~3,100 tok/s |
 | Quality: MMLU-Pro (240) / GSM8K (150), thinking off | **77.9%** / 94.0% | 70.4% / 94.7% | 72.1% / 95.3% |
@@ -268,6 +268,22 @@ it falls back to the old drained read with one log line. `--kv-resident` configs
 - Why no throughput gain at 16 users: a read beside decoding takes longer (1.2K: 840 instead of 609 ms) and the decode
   rate drops meanwhile (418 ms of decode lost instead of 609), but the admitted slot itself idles for the longer read.
 - Use it for interactive use with up to 16 users; the default stays `T16-mmqtab` until the p95 tail is fixed.
+
+## Engine 0.1.42 (rebased patch series, current default)
+
+All patch series are rebased onto upstream Strata 0.1.42 (`patches/v0.1.42/`, worktree `Strata-142`, branch `g3-142`,
+engine `strata-g3-142`, server `Strata-142/serve/server.py`, config `configs/T16-142.json`; `start-strata.sh` uses it).
+Exact (batch = solo, tokens equal to the 0.1.41 engines). The direct slot copy is opt-in there
+(`STRATA_SLOT_COPY_DIRECT=1`, set in the config). Upstream's own changes give, at 16 users (3 repetitions, TESTLOG #46):
+
+| 16 users | 0.1.41 + B-tab | 0.1.42 | 0.1.42 + overlap |
+|---|---|---|---|
+| short prompts | 441 tok/s, TTFT p50 1.74 s | **467 tok/s**, 0.96 s | 462 tok/s, 0.43 s |
+| 1.2K prompts | 327 tok/s, 4.13 s | **342 tok/s**, 2.60 s | 347 tok/s, 0.90 s |
+
+More slots (#47): 24 slots raise throughput only ~2 %, but with more than 16 concurrent users they cut queueing
+(TTFT p95 21 → 7 s at 24 users) at a lower per-user decode speed (21 instead of 31 tok/s): `configs/T24-142.json`.
+`STRATA_ROUTE_TAIL_SKIP` (+12–13 % on the RTX 5090) does nothing here: it only skips experts missing from VRAM.
 
 ## License notices
 

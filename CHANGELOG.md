@@ -21,6 +21,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.9.0] – 2026-10-11
+
+Linux (4× RTX 3090).
+
+### Changed
+- Engine rebased onto upstream Strata 0.1.42 with all four patch series (`linux/patches/v0.1.42/`), exact. New
+  default `configs/T16-142.json` (`start-strata.sh`): 16 users 467 tok/s short / 342 tok/s 1.2K (was 441 / 327),
+  TTFT p50 0.96 / 2.60 s (was 1.74 / 4.13 s).
+- Test protocol: `linux/ab_quick.sh` (one run per arm, 16 users, greedy, ~5 min) instead of 3-repetition series.
+
+### Added
+- `configs/T24-142.json` for more than 16 concurrent users (TTFT p95 −68 % at 24 users).
+- `STRATA_PIPE_OVERLAP_MAX_QUEUE` and the server's `waiting=N` (measured, no gain, kept off).
+
 ## [0.8.0] – 2026-10-11
 
 Linux (4× RTX 3090).
