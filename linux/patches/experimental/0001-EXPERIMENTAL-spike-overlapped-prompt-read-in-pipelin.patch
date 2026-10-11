@@ -1,0 +1,103 @@
+From 7285036d5abc8686bbf3eeab4ab9729e7bab7012 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 11:10:25 +0200
+Subject: [PATCH] EXPERIMENTAL spike: overlapped prompt read in pipelined batch
+ mode (measurement only)
+
+STRATA_PIPE_OVERLAP_SPIKE=1: in pipelined batch mode the prompt read runs on a worker thread
+while the main thread keeps pumping the slot groups; adaptive swaps and the idle reset are held
+meanwhile. Not production-safe (no PLE/graph-capture guards; see linux/upstream/DESIGN-overlap.md
+for the full design). Measured on 4x RTX 3090: no throughput gain (decode drops to ~1/3 during a
+read, the read stretches 10-20%), but median TTFT -70%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 51 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1e92225..554b76b 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -8561,6 +8561,10 @@ int main(int argc, char** argv) {
+         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
+         const int n_pipe = (int) stages.size() + 1;
+         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
++        // g3 spike (measurement only, STRATA_PIPE_OVERLAP_SPIKE=1): the pipelined groups keep decoding while a prompt
++        // is read on a worker thread (see linux/upstream/DESIGN-overlap.md for the full, safe design)
++        bool ov_active = false;
++        static const bool ov_spike = [] { const char* v = std::getenv("STRATA_PIPE_OVERLAP_SPIKE"); return v && v[0] != '0'; }();
+         if (piped && batch_mtp)   // #1413: said, not silent
+             std::fprintf(stderr,
+                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
+@@ -8662,7 +8666,7 @@ int main(int argc, char** argv) {
+                     G.inflight = true;
+                     G.stage = 0;
+                     drive.d.failed = false;
+-                    apply_pending(false);
++                    if (!ov_active) apply_pending(false);
+                 }
+                 PGroup& G = pg[(size_t) pick];
+                 strata::core::progress().busy.store(true);
+@@ -8673,7 +8677,7 @@ int main(int argc, char** argv) {
+                 stage_group[(size_t) k] = pick;
+             }
+             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
+-            if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
++            if (!ov_active && !pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
+                 const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+                 std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
+                                      "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
+@@ -9763,6 +9767,49 @@ int main(int argc, char** argv) {
+             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
+             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
++                if (ov_spike && piped && batch_on() && !pipe_inflight()) {
++                    std::atomic<bool> done{false};
++                    bool wok = false;
++                    std::string we;
++                    const auto t0 = Clock::now();
++                    int64_t rows = 0, steps = 0;
++                    ov_active = true;
++                    std::thread reader([&] {
++                        try {
++                            const strata::core::OnDevice od(0);
++                            wok = sp.run(ids.data() + a0, b0 - a0, a0, we);
++                        } catch (...) { wok = false; we = "the overlapped read threw"; }
++                        done.store(true, std::memory_order_release);
++                    });
++                    bool pok = true;
++                    while (!done.load(std::memory_order_acquire)) {
++                        if (pok) {
++                            const int64_t r0 = bt_rows;
++                            pok = pump(true);
++                            if (bt_rows > r0) { rows += bt_rows - r0; ++steps; }
++                        }
++                        {   // a BSTOP that came meanwhile ends its slot at its next window
++                            std::lock_guard<std::mutex> lk(in_mu);
++                            for (auto it = in_lines.begin(); it != in_lines.end();) {
++                                if (it->rfind("BSTOP ", 0) == 0) {
++                                    const int b = std::atoi(it->c_str() + 6);
++                                    if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
++                                    it = in_lines.erase(it);
++                                } else ++it;
++                            }
++                        }
++                        std::this_thread::yield();
++                    }
++                    reader.join();
++                    const double ms_read = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
++                    const bool dok = pok && pipe_drain();
++                    ov_active = false;
++                    std::fprintf(stderr, "strata overlap: %lld tokens read in %.1f ms while %lld rows decoded (%.1f rows/s)\n",
++                                 (long long) (b0 - a0), ms_read, (long long) rows, 1000.0 * rows / std::max(ms_read, 1e-9));
++                    if (!dok) { e = "a batch window failed during an overlapped read"; batch_fatal = true; return false; }
++                    if (!wok) { e = we; return false; }
++                    return true;
++                }
+                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                 for (int64_t q = a0; q < b0;) {
+-- 
+2.43.0
+

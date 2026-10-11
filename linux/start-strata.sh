@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start Strata with the recommended 4x RTX 3090 config (UD-IQ4_XS, 16 batch slots, split 12/24/36 + trim, patched engine) in its own systemd scope.
+# Start Strata with the recommended 4x RTX 3090 config (UD-IQ4_XS, 16 batch slots, split 12/24/36 + trim, PLE table in RAM, patched engine) in its own systemd scope.
 #   ./start-strata.sh                      -> http://127.0.0.1:8090/v1
 #   PORT=8005 ./start-strata.sh
 #   HOST=0.0.0.0 API_KEY=<secret> ./start-strata.sh   (LAN only together with a key)
@@ -8,7 +8,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 STRATA=/media/raid0/StrataQ38FN/Strata
-CONFIG=$(readlink -f "${CONFIG:-$HERE/configs/T16-trim-split.json}")
+CONFIG=$(readlink -f "${CONFIG:-$HERE/configs/T16-direct-pleram.json}")
 PORT=${PORT:-8090}
 EXTRA=()
 [ -n "${HOST:-}" ] && EXTRA+=(--host "$HOST")

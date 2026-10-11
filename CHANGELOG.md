@@ -9,6 +9,22 @@ Format angelehnt an [Keep a Changelog](https://keepachangelog.com/de/1.1.0/).
   Prefill-Chunk 16K/32K, Drafting, gelerntes Expert-Profil, Server-Optionen.
 - Feste Auslagerungsdatei, danach `--max-context 262144` und `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.5.0] – 2026-10-11
+
+### Hinzugefügt
+- Linux: `--ple-io ram` in der empfohlenen Config (`linux/configs/T16-direct-pleram.json`, Standard von
+  `start-strata.sh`): ~417 tok/s (kurze Prompts) bzw. ~297 tok/s (1,2K-Prompts) bei 16 Nutzern.
+- Profiling der Batch-Fenster und des Prefills (`linux/results/prof_*`, `prefill_timing*.txt`) und eine
+  Kernel-Analyse für kurze Prompts: 31 % der Prefill-Zeit ist eine Experten-Kopie für llama.cpps MMQ, Lösungswege
+  im Bericht (`linux/README.md`, „Profiling und Kernel-Analyse").
+- Experimenteller Engine-Patch „überlappende Aufnahme" (`linux/patches/experimental/`, nur zur Messung) und das
+  vollständige, gegengeprüfte Design dafür (`linux/upstream/DESIGN-overlap.md`): kein Durchsatzgewinn auf Ampere,
+  aber −70 % Wartezeit bis zum ersten Token.
+
+### Verworfen (gemessen)
+- Layer-Split neu ausbalancieren (`12,24,37`, `13,25,37`): kein Gewinn.
+- `STRATA_PF_FUSED=1` für die UD-IQ4_XS: greift erst ab 1.024-Token-Chunks, kein Effekt bei `--prefill 512`.
+
 ## [0.4.0] – 2026-10-11
 
 ### Hinzugefügt
