@@ -72,6 +72,8 @@ series_*.sh                   die gefahrenen Messserien
 configs/, logs/, *.jsonl      Varianten, Engine-Logs und Ergebnisse der Messserien
 ANALYSE-*.md, HEBEL-*.md      Abschlussbericht und offene Hebel
 download_hf.py, download_q4kxl.py  wiederaufnehmbare Hugging-Face-Downloads
+linux/                        Linux-Betrieb auf 4x RTX 3090: Start-/Bench-Skripte, Configs, Messergebnisse,
+                              Engine-Patches (>8 Slots, direkte Slot-Kopie), vLLM-Vergleich, Qualitäts-Eval
 ```
 
 Nicht im Repo (per `.gitignore`): `Strata/` (Engine-Clone + venv), `Strata-data/` (Packs, MTP),
@@ -81,6 +83,11 @@ Nicht im Repo (per `.gitignore`): `Strata/` (Engine-Clone + venv), `Strata-data/
 
 Windows 11 Pro · AMD Ryzen 7 9800X3D · 64 GB RAM · NVIDIA RTX 5090 (Treiber 610.88) · Python 3.12.4 ·
 Strata-Commit `82f46a8` · Modelle auf NVMe (WD SN850X, `C:\StrataQ38FN-models`).
+
+Linux (siehe [linux/README.md](linux/README.md)): Ubuntu, Kernel 7.0 · AMD Threadripper 3990X · 128 GB RAM ·
+4× NVIDIA RTX 3090 (Treiber 580, CUDA 13.0) · Strata `fb58e0d` (v0.1.41) plus zwei eigene Patches ·
+Modelle auf RAID (`/media/raid0/Models/Strata-GGUF`). Ergebnis: ~121 tok/s für einen Nutzer, ~405 tok/s gesamt
+bei 16 parallelen Nutzern, Agentenlast mit 262K Kontext und ~5 s Wartezeit pro Folge-Turn bei 16 Agenten.
 
 ## Lizenz
 
