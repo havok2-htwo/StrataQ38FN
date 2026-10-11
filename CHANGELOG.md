@@ -4,6 +4,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Measured
+- Windows, engine 0.1.40.1 vs 0.1.42 on UD-IQ4_XS (series U, `series_u.sh`, `batch_bench.py --suite engine`, one
+  request at a time, reference run before and after): decode **+12% prose (127 → 142 tok/s), +13% code
+  (151 → 172 tok/s)**, all of it from `STRATA_ROUTE_TAIL_SKIP=7` (with the new defaults off, 0.1.42 equals 0.1.40.1).
+  The measured PCIe share settles at 0.55 again (no change); the CPU prompt share gives -4% time on ~500-token
+  prompts, nothing from 1K. `--prefill 512` on top: 1K prompts -9% time, 10K -1%, 3 GiB more commit free,
+  prose decode -3% (137 instead of 142); longer prompts (>10K) not measured yet. Engine in worktree `Strata-142`.
+
 ### Planned
 - Measurement series I (`series_i.sh`, see `HEBEL-Kandidaten-XS.md`): GPU kernel variants, CPU pool, PCIe copy mode,
   prefill chunk 16K/32K, drafting, learned expert profile, server options.

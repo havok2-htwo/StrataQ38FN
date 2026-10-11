@@ -78,6 +78,36 @@ def prefill_test(url, n, n_chars=32_000):
     return row
 
 
+CODE_TASKS = ["an LRU cache with O(1) get and put", "a thread-safe bounded queue with timeouts",
+              "a JSON tokenizer that reports line and column of errors"]
+
+
+def engine_suite(url):
+    """Versionsvergleich, nur ein Request gleichzeitig: Decode (Prosa, Code), kurze und lange Prompts."""
+    rows = []
+    for i in range(5):
+        if i < 3:
+            msgs = decode_prompt(i)
+            kind = "prose"
+        else:
+            msgs = [{"role": "user", "content": f"[{uuid.uuid4().hex[:8]}] Write a complete, commented Python "
+                                                f"implementation of {CODE_TASKS[i - 3]}, with unit tests."}]
+            kind = "code"
+        r = chat(url, msgs, 600)
+        rows.append({"test": "decode", "kind": kind, "decode_tps": r["decode_tps"], "out_tokens": r["out_tokens"],
+                     "ttft_s": r["ttft_s"]})
+        print(f"   decode {kind}: {r['decode_tps']} tok/s ({r['out_tokens']} Tok.)", flush=True)
+    for label, n_chars, reps in (("p512", 2_000, 3), ("p1k", 4_000, 3), ("p10k", 32_000, 2)):
+        for _ in range(reps):
+            r = chat(url, prefill_prompt(PREFILL_K[0], n_chars), 16)
+            PREFILL_K[0] += 1
+            tps = round(r["prompt_tokens"] / r["ttft_s"], 1) if r["prompt_tokens"] else None
+            rows.append({"test": "prompt", "kind": label, "prompt_tokens": r["prompt_tokens"], "ttft_s": r["ttft_s"],
+                         "prompt_tps": tps})
+            print(f"   prompt {label}: {r['prompt_tokens']} Tok. in {r['ttft_s']} s = {tps} tok/s", flush=True)
+    return rows
+
+
 def mixed_test(url, n_chars=64_000):
     """Ein Stream decodiert 1500 Tokens; nach 4 s kommt ein langer Prompt dazu."""
     res = {}
@@ -111,6 +141,8 @@ def main():
     ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--rounds", default="1,2,4")
+    ap.add_argument("--suite", default="batch", choices=["batch", "engine"],
+                    help="batch: 1/2/4 gleichzeitige Requests; engine: Versionsvergleich mit einem Request")
     ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
 
@@ -155,7 +187,7 @@ def main():
     time.sleep(10)
     mem_loaded, vram_loaded = mem_now(), vram_free_mib()
     for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
-        if any(k in line.lower() for k in ("batch", "expert cache", "warning", "error", "failed", "slot")) \
+        if any(k in line.lower() for k in ("batch", "expert cache", "warning", "error", "failed", "slot", "share", "tail", "commit")) \
                 and "verify:" not in line:
             print("   log:", line[:240], flush=True)
     print(f"[{a.name}] bereit nach {load_s} s, VRAM frei {vram_loaded} MiB", flush=True)
@@ -167,11 +199,14 @@ def main():
     try:
         chat(url, [{"role": "user", "content": "Write a short poem about the sea."}], 128)
         chat(url, decode_prompt(5), 200)
-        for n in rounds:
-            rows.append(decode_test(url, n))
-        for n in rounds:
-            rows.append(prefill_test(url, n))
-        rows.append(mixed_test(url))
+        if a.suite == "engine":
+            rows += engine_suite(url)
+        else:
+            for n in rounds:
+                rows.append(decode_test(url, n))
+            for n in rounds:
+                rows.append(prefill_test(url, n))
+            rows.append(mixed_test(url))
     except Exception as e:  # was bis dahin gemessen ist, bleibt
         err = repr(e)
         print("   FEHLER:", err, flush=True)
@@ -179,7 +214,7 @@ def main():
     time.sleep(2)
     alive = proc.poll() is None
     summary = {"name": a.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "engine": cfg["exe"],
-               "parallel": a.parallel, "add": a.add, "set": a.set, "drop": a.drop, "env": a.env, "error": err,
+               "suite": a.suite, "parallel": a.parallel, "add": a.add, "set": a.set, "drop": a.drop, "env": a.env, "error": err,
                "server_alive": alive, "load_s": load_s, "vram_free_loaded_mib": vram_loaded,
                "mem_before": mem_before, "mem_loaded": mem_loaded, "mem_during": sampler.summary(), "rows": rows}
     with open(HERE / "batch_results.jsonl", "a", encoding="utf-8") as f:
