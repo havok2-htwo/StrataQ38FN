@@ -232,6 +232,7 @@ Erwartung: kurze Prompts −25–33 % Einlesezeit, Durchsatz +5–10 %, wirkt au
 
 | Datei | Inhalt |
 |---|---|
+| `TESTLOG.md` | **chronologisches Protokoll aller Tests mit Urteil**: vor jedem neuen Test hier nachsehen |
 | `start-strata.sh` | empfohlene Konfiguration starten |
 | `run_strata_variant.sh` | eine Config-Variante starten, Benchmark fahren, stoppen |
 | `bench_concurrency.py` | Last-Benchmark (OpenAI-kompatibel, Streaming, TTFT/Decode/Gesamt) |
@@ -241,6 +242,6 @@ Erwartung: kurze Prompts −25–33 % Einlesezeit, Durchsatz +5–10 %, wirkt au
 | `patches/` | Strata-Engine-Patches: mehr als 8 Slots, direkte Slot-Kopie; `patches/experimental/`: Überlappungs-Prototyp (nur Messung) |
 | `bench_multiturn.py` | Agenten-/Multi-Turn-Benchmark |
 | `eval/` | Qualitäts-Set (MMLU-Pro + GSM8K) mit Antworten und Ergebnissen |
-| `upstream/` | Issue- und PR-Text für Niko1221/Strata (noch nicht gepostet), Design der überlappenden Aufnahme |
+| `upstream/` | Issue-/PR-Text für Niko1221/Strata (noch nicht gepostet), Design der überlappenden Aufnahme, detaillierte Code-Analysen (`ANALYSIS-*.md`) |
 | `quant-survey/` | Auswertung aller 910 Flash-Next-Repos auf Hugging Face |
 | `vllm/` | vLLM-Startskripte und PLE-FP8-Patches |
