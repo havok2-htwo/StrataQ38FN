@@ -13,7 +13,8 @@ import importlib.machinery
 import os
 import sys
 
-_SCALE = os.environ.get("QWEN4_PLE_FP8_SCALE")
+_SCALE = os.environ.get("QWEN4_PLE_FP8_SCALE")          # cast a bf16 table to FP8 (+ exact pinning)
+_AMPERE = os.environ.get("QWEN4_PLE_AMPERE_LOOKUP")     # only the byte-wise pinned lookup (table already FP8)
 _COMMON = "vllm.models.qwen4_exp.common.ngram_embedding"
 _PLE = "vllm.models.qwen4_exp.common.ple"
 _NVIDIA = "vllm.models.qwen4_exp.nvidia.ngram_embedding"
@@ -29,7 +30,8 @@ def _patch_common(mod):
     def from_quant_config(quant_config, prefix, embedding_dtype=None):
         return mod.Qwen4ExpPLEFp8EmbeddingMethod()
 
-    mod.Qwen4ExpPLEEmbeddingMethod.from_quant_config = staticmethod(from_quant_config)
+    if _SCALE:
+        mod.Qwen4ExpPLEEmbeddingMethod.from_quant_config = staticmethod(from_quant_config)
 
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         cpu = torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="cpu")
@@ -40,7 +42,8 @@ def _patch_common(mod):
         _say(f"PLE table pinned exactly: {nbytes / 2**30:.2f} GiB {dtype}")
         return cpu
 
-    mod.Qwen4ExpPLEPinnedHostEmbedding.allocate_embedding_weight = allocate_embedding_weight
+    if _SCALE:
+        mod.Qwen4ExpPLEPinnedHostEmbedding.allocate_embedding_weight = allocate_embedding_weight
 
     # The pinned lookup is a Triton row copy; Triton on sm_86 cannot load fp8e4nv.  It only moves bytes (masked
     # rows become 0, which is +0.0 in e4m3 too), so run it on uint8 views of the table and the output.
@@ -62,7 +65,7 @@ def _patch_common(mod):
         return output
 
     mod.Qwen4ExpPLEPinnedHostEmbedding._lookup = _lookup
-    _say("FP8 PLE method + exact host pinning + byte-wise pinned lookup")
+    _say(("FP8 PLE method + exact host pinning + " if _SCALE else "") + "byte-wise pinned lookup")
 
 
 def _patch_ple(mod):
@@ -105,7 +108,7 @@ def _patch_nvidia(mod):
     mod.Qwen4ExpNGramEmbedding.load_weights = load_weights
 
 
-_HOOKS = {_COMMON: _patch_common, _PLE: _patch_ple, _NVIDIA: _patch_nvidia}
+_HOOKS = {_COMMON: _patch_common, _PLE: _patch_ple, _NVIDIA: _patch_nvidia} if _SCALE else {_COMMON: _patch_common}
 
 
 class _Loader(importlib.abc.Loader):
@@ -131,5 +134,5 @@ class _Finder(importlib.abc.MetaPathFinder):
         return spec
 
 
-if _SCALE:
+if _SCALE or _AMPERE:
     sys.meta_path.insert(0, _Finder())

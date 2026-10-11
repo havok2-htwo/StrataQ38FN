@@ -57,7 +57,9 @@ def one_request(a, uid):
     hdr = {"Content-Type": "application/json"}
     if a.key:
         hdr["Authorization"] = "Bearer " + a.key
-    req = urllib.request.Request(a.url.rstrip("/") + "/v1/chat/completions", data=json.dumps(body).encode(), headers=hdr)
+    urls = a.url.split(",")          # several instances: round-robin by request id (data-parallel setups)
+    req = urllib.request.Request(urls[uid % len(urls)].rstrip("/") + "/v1/chat/completions",
+                                 data=json.dumps(body).encode(), headers=hdr)
     t0 = time.perf_counter()
     t_first = None
     chunks = 0

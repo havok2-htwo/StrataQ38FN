@@ -15,6 +15,7 @@ cd "$STRATA"
 systemd-run --user --scope --unit=strata-bench -p MemoryMax=${MEMMAX:-90G} -p MemorySwapMax=0 \
   "$STRATA/.venv/bin/python" "$STRATA/serve/server.py" --engine strata --config "$CFG" --port "$PORT" \
   > "$LOG" 2>&1 < /dev/null &
+sleep 5
 t0=$(date +%s)
 until curl -s -m 3 "http://127.0.0.1:$PORT/health" | grep -q '"loaded": *true'; do
   if ! systemctl --user is-active -q strata-bench.scope; then echo "[$LABEL] server died during start"; tail -30 "$LOG"; exit 1; fi

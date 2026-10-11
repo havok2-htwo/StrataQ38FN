@@ -1,0 +1,238 @@
+From 3adce8545b738fcc2742277e98cf83058031f1ae Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:30:57 +0200
+Subject: [PATCH 2/2] batch: device-to-device slot copy for admissions and slot
+ resumes
+
+The main sessions and the batch slot sessions of a stage live on the same device and are
+carved alike, so copy_to_slot / copy_from_slot (without a checkpoint) now copy the running
+state and the QSA K/V directly (conversation_checkpoint_copy, conversation_kv_copy:
+cudaMemcpyAsync on the legacy stream, one device sync before and after) instead of the
+checkpoint/K-V image round trip through host memory with a sync per layer. Same bytes into
+the same places in the same order; the residency refresh for streamed K/V is shared with
+conversation_kv_restore. STRATA_SLOT_COPY_DIRECT=0 restores the host path.
+
+4x RTX 3090, UD-IQ4_XS, --batch 16, split 12,24,36 + --trim-stage-weights: admission copy
+65.6 -> 34.0 ms average (pure copy ~8 ms); tools/batch_test16.py 16/16 and
+batch_interleave_test.py (incl. next turn from its slot) identical to solo.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/conversation_snapshot.hpp |  8 +++
+ src/core/conversation_snapshot.cpp            | 54 +++++++++++++++----
+ src/core/conversation_state.cpp               | 37 +++++++++++++
+ src/program/generate.cpp                      | 43 +++++++++++++++
+ 4 files changed, 131 insertions(+), 11 deletions(-)
+
+diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
+index 80b1de8..1853b9b 100644
+--- a/include/strata/core/conversation_snapshot.hpp
++++ b/include/strata/core/conversation_snapshot.hpp
+@@ -25,6 +25,10 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
+                               int64_t upto, bool include_index, std::string& error);
+ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                              int64_t upto, bool include_index, std::string& error);
++// conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout:
++// asynchronous on the legacy stream; the caller synchronizes before the target is read.
++bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
++                          int64_t upto, bool include_index, std::string& error);
+ // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
+ // workspace, compares authoritative bytes and resident draft-ring pages, and
+ // fingerprints the authoritative payload only. Never changes model state.
+@@ -60,6 +64,10 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
+                                   const ModelGeometry& g, std::string& error);
+ bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
+                                      const ModelGeometry& g, std::string& error);
++// conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
++// sessions carved alike on the same device; asynchronous, the caller synchronizes.
++bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
++                                  const ModelGeometry& g, std::string& error);
+ 
+ struct ConversationView {
+     const std::vector<int32_t>& ids;
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 0ae7362..5f6eb8a 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -200,17 +200,10 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
+     return true;
+ }
+ 
+-bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+-                             int64_t upto, bool index, std::string& error) {
+-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+-    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+-    const auto dst = pools(st);
+-    for (size_t i = 0; i < src.size(); ++i)
+-        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+-            })) return false;
+-    // VRAM slots still contain the outgoing conversation. Resolve must refill
+-    // them from the restored authoritative pools before any attention reads.
++namespace {
++// After the authoritative pools were rewritten: the VRAM slots of a streamed state still hold the outgoing
++// conversation, so resolve must refill them before any attention reads (shared by restore and direct copy).
++bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+     if (st.kv_mode == 2 && upto > 0) {
+         auto shapes = strata::kernels::qsa_real_shapes();
+@@ -224,6 +217,45 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
+     error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+     return false;
+ }
++} // namespace
++
++bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
++                          int64_t upto, bool index, std::string& error) {
++    Layout lf{}, lt{};
++    if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
++        !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
++    if (lf.format != lt.format || lf.cells != lt.cells || lf.page_size != lt.page_size ||
++        lf.pooled_rows != lt.pooled_rows || lf.data != lt.data || lf.value_data != lt.value_data ||
++        lf.scales != lt.scales || lf.value_scales != lt.value_scales || lf.pooled != lt.pooled) {
++        error = "conversation snapshot: direct K/V copy between different layouts";
++        return false;
++    }
++    // The same bytes conversation_kv_save + conversation_kv_restore move, without the host image: each part
++    // straight from the source's authoritative pool into the target's (device or mapped host memory), queued on
++    // the legacy stream so the residency refresh below and the caller's kernels run after it.
++    const auto src = pools(from);
++    const auto dst = pools(to);
++    const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
++    for (size_t i = 0; i < sizes.size(); ++i) {
++        if (!sizes[i]) continue;
++        if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
++        const cudaError_t e = cudaMemcpyAsync(dst[i], src[i], sizes[i], cudaMemcpyDefault, nullptr);
++        if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
++    }
++    return refresh_residency(to, g, upto, error);
++}
++
++bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
++                             int64_t upto, bool index, std::string& error) {
++    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
++    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
++    const auto dst = pools(st);
++    for (size_t i = 0; i < src.size(); ++i)
++        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
++                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
++            })) return false;
++    return refresh_residency(st, g, upto, error);
++}
+ 
+ bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                 std::array<uint64_t, 5>& sizes, std::string& error) {
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index ae40f3a..d4efdbd 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -192,6 +192,43 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
+     return sync(error);
+ }
+ 
++bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
++                                  const ModelGeometry& g, std::string& error) {
++    // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) without the host image, for two
++    // sessions carved alike on the same device (a stage's own session and its batch slots): the same bytes into
++    // the same places, queued on the legacy stream (asynchronous; the caller synchronizes once at the end).
++    ConversationStateSizes zf, zt;
++    if (!checkpoint_targets(from, g, ids.size(), zf, error) || !checkpoint_targets(to, g, ids.size(), zt, error))
++        return false;
++    if (zf.gdn != zt.gdn || zf.tail != zt.tail || zf.dead != zt.dead || zf.block_pos != zt.block_pos ||
++        owned_qsa(from) != owned_qsa(to) || (from.ple_hist != nullptr) != (to.ple_hist != nullptr))
++        return fail(error, "direct copy between differently carved sessions");
++    auto acopy = [&](void* dst, const void* src, size_t bytes) {
++        if (!bytes) return true;
++        if (!dst || !src) return fail(error, "missing running-state buffer");
++        const auto status = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, nullptr);
++        if (status == cudaSuccess) return true;
++        error = std::string("conversation snapshot direct running-state copy: ") + cudaGetErrorString(status);
++        return false;
++    };
++    if (!acopy(to.gdn_state, from.gdn_state, zf.gdn) ||
++        !acopy(to.ple_hist, from.ple_hist, from.ple_hist ? zf.ple : 0)) return false;
++    for (size_t j = 0; j < owned_qsa(from); ++j) {
++        const auto& a = owned(from, j);
++        const auto& b = owned(to, j);
++        if (!acopy(b.idx_tail, a.idx_tail, zf.tail) || !acopy(b.idx_dead, a.idx_dead, zf.dead) ||
++            !acopy(b.idx_block_pos, a.idx_block_pos, zf.block_pos)) return false;
++        if (!ids.empty()) {   // restore writes the saved `dead` row into the pooled row the next token fills
++            const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
++            if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
++        }
++    }
++    const size_t tokens = ids.size();
++    to.ple_prev[0] = tokens >= 2 ? ids[tokens - 2] : -1;
++    to.ple_prev[1] = tokens >= 1 ? ids[tokens - 1] : -1;
++    return true;
++}
++
+ bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
+                                  const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
+     bytes = 0;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 8e52fd6..1e92225 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -8309,8 +8309,48 @@ int main(int argc, char** argv) {
+             return true;
+         };
+         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
++        // g3: the main sessions and the slot sessions of a stage live on the same device and are carved alike, so
++        // a slot copy can go device to device (the same bytes into the same places as the checkpoint/K-V image
++        // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); every stage's
++        // copies are queued first and each device is synchronized once.  STRATA_SLOT_COPY_DIRECT=0: the host path.
++        static const bool slot_copy_direct = [] {
++            const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
++            return v == nullptr || v[0] != '0';
++        }();
++        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
++            const int64_t upto = (int64_t) ids.size();
++            auto sync_all = [&]() {
++                bool ok = true;
++                for (size_t k = 0; k < bslot_ss.size(); ++k) {
++                    const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
++                    ok = cudaDeviceSynchronize() == cudaSuccess && ok;
++                }
++                return ok;
++            };
++            // a copy that fails part-way leaves earlier ones queued on the legacy stream: drain them before the
++            // caller reuses the sessions (its zeroing runs on non-blocking streams, not ordered against these)
++            auto failed = [&]() { (void) sync_all(); return false; };
++            if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
++            for (size_t k = 0; k < bslot_ss.size(); ++k) {
++                strata::core::SessionState& main_ss = k == 0 ? ss : stages[k - 1]->ss;
++                strata::core::SessionState& slot_ss = *bslot_ss[k][(size_t) b];
++                strata::core::SessionState& from = into_slot ? main_ss : slot_ss;
++                strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
++                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
++                if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e)) return failed();
++                for (int64_t j = 0; j < from.qsa_alloc; ++j)
++                    if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
++                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
++                        return failed();
++            }
++            if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
++            return true;
++        };
+         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+             const int64_t upto = (int64_t) ids.size();
++            if (slot_copy_direct) {
++                if (!direct_slot_copy(true, b, ids, e)) return false;
++            } else
+             for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
+                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
+@@ -8350,6 +8390,9 @@ int main(int argc, char** argv) {
+         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
++            if (slot_copy_direct && at == nullptr) {
++                if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
++            } else
+             for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
+                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
+-- 
+2.43.0
+
