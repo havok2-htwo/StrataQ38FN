@@ -1,75 +1,75 @@
-# Testprotokoll (chronologisch)
+# Test log (chronological)
 
-Jeder Versuch steht hier **bevor** der nächste beginnt: Datum, was getestet wurde, Ergebnis, Urteil, Rohdaten. Vor einem
-neuen Test hier nachsehen, ob es ihn schon gab. Lastprofil, wenn nicht anders angegeben: `bench_concurrency.py`, je Nutzer
-2 Anfragen, 512 Ausgabe-Tokens, Temperatur 0.7, Thinking aus; „kurz" ≈ 120, „lang" ≈ 1.230 Prompt-Tokens. Zahlen =
-Gesamtdurchsatz in tok/s (Output) bzw. Decode pro Nutzer, TTFT in s. Alle Strata-Läufe: UD-IQ4_XS, 4× RTX 3090.
+Every attempt is recorded here **before** the next one starts: date, what was tested, result, verdict, raw data. Before a
+new test, check here whether it has already been run. Load profile unless stated otherwise: `bench_concurrency.py`, 2
+requests per user, 512 output tokens, temperature 0.7, thinking off; "short" ≈ 120, "long" ≈ 1,230 prompt tokens. Numbers =
+total throughput in tok/s (output) or decode per user, TTFT in s. All Strata runs: UD-IQ4_XS, 4× RTX 3090.
 
-Urteile: ✅ übernommen · ➖ kein messbarer Effekt · ❌ schlechter / verworfen · 🔬 nur Erkenntnis
+Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · 🔬 insight only
 
 ## 2026-10-10
 
-| # | Test | Ergebnis | Urteil | Rohdaten |
+| # | Test | Result | Verdict | Raw data |
 |---|---|---|---|---|
-| 1 | Strata Setup-Standard, solo (kein `parallel`), mit/ohne `--resident-experts` | 121 tok/s single, ~88 gesamt; ohne Resident-Modus 60 GB RAM → oomd-Kill | ✅ `--resident-experts` Pflicht | `strata-A-solo*` |
-| 2 | `parallel 8` (Upstream-Limit), Split auto | ~177 kurz/lang, 31 tok/s pro Nutzer | 🔬 Basis | `strata-B-batch8` |
-| 3 | Engine-Patch 1: 16/32 Slots (8 Zeilen pro Gruppe) | 16 Slots bit-identisch, Batch-Decode 603 tok/s; über HTTP nur ~195 | ✅ Patch (HTTP-Limit = Prefill) | `batch_test_16/32.txt`, `strata-C/D-*` |
-| 4 | Prefill-Chunks 256/512/768/1024 + Decode-Anteil 1/2 | 512 am besten (~246–250 lang); Decode-Anteil wirkungslos (s. #21) | ✅ `--prefill 512` | `strata-E*`, `strata-F*` |
-| 5 | Slots 12/16/20/24/28 (kurze Prompts) | Plateau ~330–361, 12 Slots beste Latenz | 🔬 | `strata-H*-short` |
-| 6 | Nutzer 24–40 bei 12 Slots | flach 346–358, Wartezeit steigt | 🔬 | `strata-U-b12-users` |
-| 7 | 3 GPUs (`--trim-stage-weights`, Split 16/32) | 117 single / 266 Batch | 🔬 4. Karte nur unter Last nützlich | `strata-T3-*` |
-| 8 | UD-Q4_K_XL | 97 % Experten im VRAM, 100 single / 241 Batch | 🔬 IQ4_XS bleibt Target | `strata-K-*` |
-| 9 | MTP aus (`--spec 4` ohne `--mtp`) | 81 statt 117 tok/s | ✅ MTP an (+45 %) | `strata-M-nomtp` |
-| 10 | Prefill über Länge 2K–28K: Chunks 512 / auto / auto:32768 | 512: 1.247→2.239 tok/s, bestes Gesamtbild | ✅ 512 | `strata-P-*` |
-| 11 | vLLM 0.29 Flash-Next W4A16 (EP, FP8-Tabelle per Patch), Prefix-Cache an/aus | 65–75 single, ~420–450 Plateau, max ~21 gleichzeitig | 🔬 | `vllm-w4a16-*` |
-| 12 | vLLM 0.31 Flash-Next, Prefix-Cache an | 79 single, ~400 lang / ~710 kurz, Cap ~22 | 🔬 | `vllm031-flashnext-pc-*` |
-| 13 | vLLM 0.31 Flash-Next mit MTP bei 64 bzw. 32 Seqs | OOM bzw. kein KV-Platz | ❌ | `vllm031_mtp*.log` |
-| 14 | vLLM 0.31 Prefill über Länge | ~3.500 tok/s konstant | 🔬 | `vllm031-P-*` |
-| 15 | vLLM 0.31 27B-FP8-Preset | 64 single, 409 lang / 838 kurz (64 Nutzer), ~100 GB RAM | 🔬 | `vllm031-27b-fp8-*` |
+| 1 | Strata setup default, solo (no `parallel`), with/without `--resident-experts` | 121 tok/s single, ~88 total; without resident mode 60 GB RAM → oomd kill | ✅ `--resident-experts` mandatory | `strata-A-solo*` |
+| 2 | `parallel 8` (upstream limit), split auto | ~177 short/long, 31 tok/s per user | 🔬 baseline | `strata-B-batch8` |
+| 3 | Engine patch 1: 16/32 slots (8 rows per group) | 16 slots bit-identical, batch decode 603 tok/s; over HTTP only ~195 | ✅ patch (HTTP limit = prefill) | `batch_test_16/32.txt`, `strata-C/D-*` |
+| 4 | Prefill chunks 256/512/768/1024 + decode share 1/2 | 512 best (~246–250 long); decode share has no effect (see #21) | ✅ `--prefill 512` | `strata-E*`, `strata-F*` |
+| 5 | Slots 12/16/20/24/28 (short prompts) | plateau ~330–361, 12 slots best latency | 🔬 | `strata-H*-short` |
+| 6 | Users 24–40 at 12 slots | flat 346–358, wait time rises | 🔬 | `strata-U-b12-users` |
+| 7 | 3 GPUs (`--trim-stage-weights`, split 16/32) | 117 single / 266 batch | 🔬 4th card only useful under load | `strata-T3-*` |
+| 8 | UD-Q4_K_XL | 97% of experts in VRAM, 100 single / 241 batch | 🔬 IQ4_XS remains the target | `strata-K-*` |
+| 9 | MTP off (`--spec 4` without `--mtp`) | 81 instead of 117 tok/s | ✅ MTP on (+45%) | `strata-M-nomtp` |
+| 10 | Prefill across length 2K–28K: chunks 512 / auto / auto:32768 | 512: 1,247→2,239 tok/s, best overall picture | ✅ 512 | `strata-P-*` |
+| 11 | vLLM 0.29 Flash-Next W4A16 (EP, FP8 table via patch), prefix cache on/off | 65–75 single, ~420–450 plateau, max ~21 concurrent | 🔬 | `vllm-w4a16-*` |
+| 12 | vLLM 0.31 Flash-Next, prefix cache on | 79 single, ~400 long / ~710 short, cap ~22 | 🔬 | `vllm031-flashnext-pc-*` |
+| 13 | vLLM 0.31 Flash-Next with MTP at 64 and 32 seqs | OOM and no KV space, respectively | ❌ | `vllm031_mtp*.log` |
+| 14 | vLLM 0.31 prefill across length | ~3,500 tok/s constant | 🔬 | `vllm031-P-*` |
+| 15 | vLLM 0.31 27B FP8 preset | 64 single, 409 long / 838 short (64 users), ~100 GB RAM | 🔬 | `vllm031-27b-fp8-*` |
 
 ## 2026-10-11
 
-| # | Test | Ergebnis | Urteil | Rohdaten |
+| # | Test | Result | Verdict | Raw data |
 |---|---|---|---|---|
-| 16 | vLLM 0.31 Flash-Next MTP mit 8 Seqs, 1.024 Batch-Tokens, 0.93 | **136 single**, 490 kurz (8 Nutzer), 65K KV | 🔬 MTP geht nur mit wenig Parallelität | `vllm031-flashnext-mtp2-s8-*` |
-| 17 | Qualitäts-Set (MMLU-Pro 240 / GSM8K 150) | Strata IQ4_XS 77,9/94,0 · 27B 72,1/95,3 · vLLM-W4A16 70,4/94,7 · RAZOR 62,5/92,7 | 🔬 | `eval/eval_results.jsonl` |
-| 18 | RAZOR-65B (50 % Experten gepruned, NVFP4) in vLLM | 111 single, ~412 lang; Qualität stark gefallen, Deutsch fehlerhaft | ❌ Modell gelöscht | `vllm031-razor65-*` |
-| 19 | Hub-Erhebung 910 Flash-Next-Repos | kein kleinerer vLLM-tauglicher Quant ohne Qualitätsverlust | 🔬 | `quant-survey/` |
-| 20 | 16 Slots in 2 Gruppen; 12 Slots in 2 Gruppen | 266–272 / 264–270 kurz, 200 lang | ❌ halbe Karten idle | `strata-Q2-*` |
-| 21 | Decode-Anteil 4.0 | 366–375 / 259 | ➖ im Pipeline-Modus wirkungslos (`generate.cpp:9706` upstream) | `strata-Q3-*` |
-| 22 | 2 Instanzen à 2 GPUs (Round-Robin) | 152–182 kurz, 100 lang, 90 single | ❌ | `strata-Q1-dp2-*` |
-| 23 | **Split `12,24,36` + `--trim-stage-weights`** | **405 kurz / 288 lang** (+14/+16 %), keine Puffer-Leihe | ✅ | `strata-T16-trim-*` |
-| 24 | dito 20 / 24 Slots | 409/288, 416/293 | ➖ Plateau | `strata-T20/T24-*` |
-| 25 | dito Chunks 1.024 / 2.048 | 406/281, 403/290 | ➖ | `strata-T16-pf*` |
-| 26 | Multi-Turn 8/16 Agenten, Trim-Config 32K vs. Agenten-Config (262K, `--kv-resident`, 24 GB Konv.-Cache) | TTFT Folge-Turn 7,1/10,4 s → **4,8/5,0 s**, 16 Agenten 43 → 73 tok/s | ✅ Agenten-Config | `multiturn.jsonl` |
-| 27 | Multi-Turn gegen vLLM 0.31 (+20 GB RAM-KV-Stufe) | 8: 89 tok/s, 6,4 s; 16: 77 tok/s, **32 s** | 🔬 Strata vorne bei Agentenlast | `multiturn.jsonl` |
-| 28 | Engine-Patch 2: direkte Slot-Kopie GPU→GPU | Kopie 65,6 → 34,0 ms, 405/294, Agenten-TTFT 4,5 s; bit-identisch | ✅ (klein) | `exact_direct_*`, `strata-T16-direct-*` |
-| 29 | Profiling Batch-Fenster (`STRATA_VERIFY_PROFILE`) | GPU 5,1–6,1 ms von ~6,95 ms pro Schritt; Karte 4 +0,73 ms Head | 🔬 Overhead klein | `prof_batch16*` |
+| 16 | vLLM 0.31 Flash-Next MTP with 8 seqs, 1,024 batch tokens, 0.93 | **136 single**, 490 short (8 users), 65K KV | 🔬 MTP only works with low parallelism | `vllm031-flashnext-mtp2-s8-*` |
+| 17 | Quality set (MMLU-Pro 240 / GSM8K 150) | Strata IQ4_XS 77.9/94.0 · 27B 72.1/95.3 · vLLM-W4A16 70.4/94.7 · RAZOR 62.5/92.7 | 🔬 | `eval/eval_results.jsonl` |
+| 18 | RAZOR-65B (50% of experts pruned, NVFP4) in vLLM | 111 single, ~412 long; quality dropped sharply, German output flawed | ❌ model deleted | `vllm031-razor65-*` |
+| 19 | Hub survey of 910 Flash-Next repos | no smaller vLLM-compatible quant without quality loss | 🔬 | `quant-survey/` |
+| 20 | 16 slots in 2 groups; 12 slots in 2 groups | 266–272 / 264–270 short, 200 long | ❌ half the cards idle | `strata-Q2-*` |
+| 21 | Decode share 4.0 | 366–375 / 259 | ➖ no effect in pipeline mode (`generate.cpp:9706` upstream) | `strata-Q3-*` |
+| 22 | 2 instances of 2 GPUs each (round-robin) | 152–182 short, 100 long, 90 single | ❌ | `strata-Q1-dp2-*` |
+| 23 | **Split `12,24,36` + `--trim-stage-weights`** | **405 short / 288 long** (+14/+16%), no buffer borrowing | ✅ | `strata-T16-trim-*` |
+| 24 | same, 20 / 24 slots | 409/288, 416/293 | ➖ plateau | `strata-T20/T24-*` |
+| 25 | same, chunks 1,024 / 2,048 | 406/281, 403/290 | ➖ | `strata-T16-pf*` |
+| 26 | Multi-turn 8/16 agents, trim config 32K vs. agent config (262K, `--kv-resident`, 24 GB conv. cache) | follow-up turn TTFT 7.1/10.4 s → **4.8/5.0 s**, 16 agents 43 → 73 tok/s | ✅ agent config | `multiturn.jsonl` |
+| 27 | Multi-turn against vLLM 0.31 (+20 GB RAM KV tier) | 8: 89 tok/s, 6.4 s; 16: 77 tok/s, **32 s** | 🔬 Strata ahead under agent load | `multiturn.jsonl` |
+| 28 | Engine patch 2: direct slot copy GPU→GPU | copy 65.6 → 34.0 ms, 405/294, agent TTFT 4.5 s; bit-identical | ✅ (small) | `exact_direct_*`, `strata-T16-direct-*` |
+| 29 | Profiling the batch window (`STRATA_VERIFY_PROFILE`) | GPU 5.1–6.1 ms of ~6.95 ms per step; card 4 +0.73 ms head | 🔬 overhead small | `prof_batch16*` |
 | 30 | Split `12,24,37` / `13,25,37` | 399/289, 397/282 | ➖ | `strata-T16-split*` |
-| 31 | `--ple-io ram` | **417 / 297**, 1,2K-Prompt 821 statt ~1.100 ms | ✅ | `strata-T16-pleram-*` |
-| 32 | Überlappende Aufnahme, Prototyp (`STRATA_PIPE_OVERLAP_SPIKE`) | 413/294 (kein Gewinn), **TTFT p50 2,03 → 0,57 s** | 🔬 nur Latenz-Hebel | `strata-S16-spike-*`, `patches/experimental/` |
-| 33 | Prefill-Timing kurzer Prompts (`STRATA_PREFILL_TIMING`) | 154 Tok.: 78–87 ms pro Karte, 31 % „dequant" = Experten-Kopie für MMQ | 🔬 | `prefill_timing.txt`, `upstream/ANALYSIS-short-prompt-moe.md` |
-| 34 | `STRATA_PF_FUSED=1` | keine Änderung (greift erst ab 1.024-Token-Chunks) | ➖ | `prefill_timing_fused.txt` |
+| 31 | `--ple-io ram` | **417 / 297**, 1.2K prompt 821 instead of ~1,100 ms | ✅ | `strata-T16-pleram-*` |
+| 32 | Overlapped admission, prototype (`STRATA_PIPE_OVERLAP_SPIKE`) | 413/294 (no gain), **TTFT p50 2.03 → 0.57 s** | 🔬 latency lever only | `strata-S16-spike-*`, `patches/experimental/` |
+| 33 | Prefill timing of short prompts (`STRATA_PREFILL_TIMING`) | 154 tok.: 78–87 ms per card, 31% "dequant" = expert copy for MMQ | 🔬 | `prefill_timing.txt`, `upstream/ANALYSIS-short-prompt-moe.md` |
+| 34 | `STRATA_PF_FUSED=1` | no change (only kicks in from 1,024-token chunks) | ➖ | `prefill_timing_fused.txt` |
 
-## Analysen (ohne GPU)
+## Analyses (no GPU)
 
-- `upstream/ANALYSIS-batching-levers.md`: 4 Engine-Hebel (überlappende Aufnahme, MTP im Batch, Fenster-Overhead,
-  Quick-Wins) mit Aufwand und Gegenprüfung.
-- `upstream/DESIGN-overlap.md`: vollständiges Design der überlappenden Aufnahme (6 Meilensteine).
-- `upstream/ANALYSIS-short-prompt-moe.md`: Kurz-Prompt-Prefill, Optionen A (Decode-Kernel für ≤ 8 Zeilen),
-  B (MMQ direkt auf den Cache-Slots), C (Fused-Kernels).
+- `upstream/ANALYSIS-batching-levers.md`: 4 engine levers (overlapped admission, MTP in the batch, window overhead,
+  quick wins) with effort estimates and cross-checks.
+- `upstream/DESIGN-overlap.md`: complete design of overlapped admission (6 milestones).
+- `upstream/ANALYSIS-short-prompt-moe.md`: short-prompt prefill, options A (decode kernel for ≤ 8 rows),
+  B (MMQ directly on the cache slots), C (fused kernels).
 
-## Offen / nächste Schritte
+## Open / next steps
 
-- Variante B (MMQ direkt auf gepaddeten Cache-Slots): Design läuft, danach Umsetzung + Exaktheit + Messung.
-- Sichere überlappende Aufnahme (Latenz).
-- Geparkt: dynamisches Umschalten Pipeline ↔ Expert-Parallel (siehe Gedächtnis-/Ideennotiz im README-Abschnitt).
+- Variant B (MMQ directly on padded cache slots): design in progress, then implementation + exactness check + measurement.
+- Safe overlapped admission (latency).
+- Parked: dynamic switching pipeline ↔ expert parallel (see the memory/ideas note in the README section).
 
-## Anhang: alle Messläufe (automatisch aus den JSONL-Dateien)
+## Appendix: all measurement runs (generated automatically from the JSONL files)
 
 ### `results/sweep.jsonl`
 
-| Label | Nutzer: Gesamt-tok/s (TTFT p50) |
+| Label | Users: total tok/s (TTFT p50) |
 |---|---|
 | `vllm-w4a16-ep4-nomtp` | 1: 72.2 (0.99 s), 2: 121.6 (0.57 s), 4: 210.3 (1.46 s), 1: 65.0 (1.34 s), 2: 115.1 (0.58 s), 4: 197.2 (1.45 s), 8: 269.3 (2.67 s), 16: 375.8 (2.42 s), 32: 384.2 (7.2 s), 48: 418.4 (29.54 s), 60: 400.1 (50.93 s), 96: 414.2 (87.52 s) |
 | `vllm-w4a16-ep4-nopc` | 1: 74.9 (0.37 s), 8: 255.9 (1.81 s), 16: 374.7 (2.26 s), 24: 419.8 (3.4 s), 32: 418.1 (6.62 s), 48: 452.2 (27.14 s), 64: 442.0 (48.21 s) |
@@ -161,7 +161,7 @@ Urteile: ✅ übernommen · ➖ kein messbarer Effekt · ❌ schlechter / verwor
 
 ### `results/multiturn.jsonl`
 
-| Label | Nutzer | tok/s | TTFT Folge-Turn p50 |
+| Label | Users | tok/s | Follow-up turn TTFT p50 |
 |---|---|---|---|
 | `strata-T16-trim-split-mt-u8` | 8 | 49.2 | 7.05 s |
 | `strata-T16-trim-split-mt-u16` | 16 | 42.8 | 10.4 s |
@@ -175,7 +175,7 @@ Urteile: ✅ übernommen · ➖ kein messbarer Effekt · ❌ schlechter / verwor
 
 | Label | MMLU-Pro | GSM8K |
 |---|---|---|
-| `vllm-full-w4a16-fp8ple` | 70.4 % | 94.7 % |
-| `strata-ud-iq4xs` | 77.9 % | 94.0 % |
-| `vllm-qwen3.8-27b-fp8` | 72.1 % | 95.3 % |
-| `vllm-razor65-nvfp4` | 62.5 % | 92.7 % |
+| `vllm-full-w4a16-fp8ple` | 70.4% | 94.7% |
+| `strata-ud-iq4xs` | 77.9% | 94.0% |
+| `vllm-qwen3.8-27b-fp8` | 72.1% | 95.3% |
+| `vllm-razor65-nvfp4` | 62.5% | 92.7% |

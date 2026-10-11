@@ -1,91 +1,91 @@
 # Changelog
 
-Format angelehnt an [Keep a Changelog](https://keepachangelog.com/de/1.1.0/).
+Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unveröffentlicht]
+## [Unreleased]
 
-### Geplant
-- Messserie I (`series_i.sh`, siehe `HEBEL-Kandidaten-XS.md`): GPU-Kernel-Varianten, CPU-Pool, PCIe-Kopiermodus,
-  Prefill-Chunk 16K/32K, Drafting, gelerntes Expert-Profil, Server-Optionen.
-- Feste Auslagerungsdatei, danach `--max-context 262144` und `--prompt-cache-every 8192 --prompt-cache 12`.
+### Planned
+- Measurement series I (`series_i.sh`, see `HEBEL-Kandidaten-XS.md`): GPU kernel variants, CPU pool, PCIe copy mode,
+  prefill chunk 16K/32K, drafting, learned expert profile, server options.
+- Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
 ## [0.5.0] – 2026-10-11
 
-### Hinzugefügt
-- Linux: `--ple-io ram` in der empfohlenen Config (`linux/configs/T16-direct-pleram.json`, Standard von
-  `start-strata.sh`): ~417 tok/s (kurze Prompts) bzw. ~297 tok/s (1,2K-Prompts) bei 16 Nutzern.
-- Profiling der Batch-Fenster und des Prefills (`linux/results/prof_*`, `prefill_timing*.txt`) und eine
-  Kernel-Analyse für kurze Prompts: 31 % der Prefill-Zeit ist eine Experten-Kopie für llama.cpps MMQ, Lösungswege
-  im Bericht (`linux/README.md`, „Profiling und Kernel-Analyse").
-- Experimenteller Engine-Patch „überlappende Aufnahme" (`linux/patches/experimental/`, nur zur Messung) und das
-  vollständige, gegengeprüfte Design dafür (`linux/upstream/DESIGN-overlap.md`): kein Durchsatzgewinn auf Ampere,
-  aber −70 % Wartezeit bis zum ersten Token.
+### Added
+- Linux: `--ple-io ram` in the recommended config (`linux/configs/T16-direct-pleram.json`, default of
+  `start-strata.sh`): ~417 tok/s (short prompts) or ~297 tok/s (1.2K prompts) with 16 users.
+- Profiling of the batch windows and of prefill (`linux/results/prof_*`, `prefill_timing*.txt`) and a
+  kernel analysis for short prompts: 31% of prefill time is an expert copy for llama.cpp's MMQ, possible fixes
+  in the report (`linux/README.md`, "Profiling and kernel analysis").
+- Experimental engine patch "overlapping admission" (`linux/patches/experimental/`, for measurement only) and the
+  complete, cross-checked design for it (`linux/upstream/DESIGN-overlap.md`): no throughput gain on Ampere,
+  but −70% time to first token.
 
-### Verworfen (gemessen)
-- Layer-Split neu ausbalancieren (`12,24,37`, `13,25,37`): kein Gewinn.
-- `STRATA_PF_FUSED=1` für die UD-IQ4_XS: greift erst ab 1.024-Token-Chunks, kein Effekt bei `--prefill 512`.
+### Rejected (measured)
+- Rebalancing the layer split (`12,24,37`, `13,25,37`): no gain.
+- `STRATA_PF_FUSED=1` for the UD-IQ4_XS: only kicks in from 1,024-token chunks, no effect with `--prefill 512`.
 
 ## [0.4.0] – 2026-10-11
 
-### Hinzugefügt
-- **Linux-Betrieb auf 4× RTX 3090** (`linux/`, Bericht `linux/README.md`): Setup per `Strata/setup.sh` mit
-  Layer-Split über alle 4 Karten, `start-strata.sh` (eigener systemd-Scope, Port 8090), Bench-Werkzeuge
-  `bench_concurrency.py` (Last mit vielen Nutzern) und `bench_multiturn.py` (Agentenlast), Runner
-  `run_strata_variant.sh`, alle gemessenen Configs und Ergebnisse.
-- **Engine-Patches** für Strata (`linux/patches/`, bit-identisch zu solo getestet):
-  mehr als 8 Batch-Slots bei Layer-Split (8 Zeilen pro Pipeline-Gruppe) und direkte Slot-Kopie GPU→GPU
-  (65,6 → 34,0 ms pro Aufnahme). Upstream-Texte in `linux/upstream/` (noch nicht eingereicht).
-- Empfohlene Linux-Config: Split `12,24,36` + `--trim-stage-weights`, 16 Slots, `--prefill 512`, MTP:
-  ~121 tok/s für einen Nutzer, ~405 tok/s gesamt (kurze Prompts) bzw. ~294 tok/s (1,2K-Prompts);
-  Agenten-Variante mit 262K Kontext, `--kv-resident 32768` und 24 GB Konversations-Cache.
-- Vergleich mit vLLM 0.31 (Flash-Next W4A16 mit FP8-N-Gram-Tabelle per Patch, mit/ohne MTP; Qwen3.8-27B-FP8),
-  Qualitäts-Set (`linux/eval/`: MMLU-Pro 240 + GSM8K 150): Strata UD-IQ4_XS 77,9 % MMLU-Pro vs. 27B-FP8 72,1 %
-  vs. vLLM-W4A16 70,4 %; Auswertung aller 910 Flash-Next-Repos auf Hugging Face (`linux/quant-survey/`).
+### Added
+- **Linux operation on 4× RTX 3090** (`linux/`, report `linux/README.md`): setup via `Strata/setup.sh` with
+  layer split across all 4 cards, `start-strata.sh` (own systemd scope, port 8090), bench tools
+  `bench_concurrency.py` (load with many users) and `bench_multiturn.py` (agent load), runner
+  `run_strata_variant.sh`, all measured configs and results.
+- **Engine patches** for Strata (`linux/patches/`, tested bit-identical to solo):
+  more than 8 batch slots with layer split (8 rows per pipeline group) and direct GPU→GPU slot copy
+  (65.6 → 34.0 ms per admission). Upstream texts in `linux/upstream/` (not yet submitted).
+- Recommended Linux config: split `12,24,36` + `--trim-stage-weights`, 16 slots, `--prefill 512`, MTP:
+  ~121 tok/s for a single user, ~405 tok/s total (short prompts) or ~294 tok/s (1.2K prompts);
+  agent variant with 262K context, `--kv-resident 32768` and 24 GB conversation cache.
+- Comparison with vLLM 0.31 (Flash-Next W4A16 with FP8 n-gram table via patch, with/without MTP; Qwen3.8-27B-FP8),
+  quality set (`linux/eval/`: MMLU-Pro 240 + GSM8K 150): Strata UD-IQ4_XS 77.9% MMLU-Pro vs. 27B-FP8 72.1%
+  vs. vLLM-W4A16 70.4%; evaluation of all 910 Flash-Next repos on Hugging Face (`linux/quant-survey/`).
 
-### Verworfen (gemessen)
-- `STRATA_BATCH_DECODE_SHARE`: bei Layer-Split mit Pipeline-Gruppen wirkungslos (Prompt wird am Stück gelesen).
-- Weniger Pipeline-Gruppen (2 statt 4), 2 Instanzen à 2 GPUs, mehr als 16 Slots, größere Prefill-Chunks.
-- RAZOR-65B (50 % Experten gepruned) in vLLM: deutlich schlechtere Qualität (62,5 % MMLU-Pro).
+### Rejected (measured)
+- `STRATA_BATCH_DECODE_SHARE`: ineffective with layer split and pipeline groups (prompt is read in one piece).
+- Fewer pipeline groups (2 instead of 4), 2 instances of 2 GPUs each, more than 16 slots, larger prefill chunks.
+- RAZOR-65B (50% of experts pruned) in vLLM: clearly worse quality (62.5% MMLU-Pro).
 
 ## [0.3.0] – 2026-10-09
 
-### Hinzugefügt
-- Git-Repo mit README, Changelog und Einrichtungsanleitung (`docs/EINRICHTUNG.md`).
-- `strata-configs/`: die drei Modell-Configs als Vorlagen (plus Setup-Original der IQ4_XS-Config zum Vergleich).
+### Added
+- Git repo with README, changelog and setup guide (`docs/EINRICHTUNG.md`).
+- `strata-configs/`: the three model configs as templates (plus the setup original of the IQ4_XS config for comparison).
 
 ## [0.2.0] – 2026-10-08
 
-### Hinzugefügt
-- Dashboard (`dashboard/`, `Start-Dashboard.bat`, Port 8082): Tempo, Caches, VRAM/RAM/Commit, SSD-Traffic,
-  geschätzte Leistung an der Steckdose, kWh, € und € pro 1M Tokens (Ein-/Ausgabe), Laufzeitanteile, 24-h-Hochrechnung,
-  Reset mit Archiv. Startet mit jedem Modell mit und überlebt Modellwechsel.
-- `agent_bench.py`: A/B-Runner mit agentischer Last (Workloads `agent`, `session`, `diverge`, `longctx`,
-  `parallel`), misst Commit und physisches RAM mit.
-- `trace_analyze.py` für Routing-Traces; Messserien E–H (`series_*.sh`, `configs/`, `logs/`, `agent_results.jsonl`).
-- Abschlussbericht `ANALYSE-Speicherhierarchie-XS.md` und Hebelliste `HEBEL-Kandidaten-XS.md`.
+### Added
+- Dashboard (`dashboard/`, `Start-Dashboard.bat`, port 8082): speed, caches, VRAM/RAM/commit, SSD traffic,
+  estimated power at the wall socket, kWh, € and € per 1M tokens (input/output), runtime shares, 24-h projection,
+  reset with archive. Starts along with every model and survives model switches.
+- `agent_bench.py`: A/B runner with agentic load (workloads `agent`, `session`, `diverge`, `longctx`,
+  `parallel`), also measures commit and physical RAM.
+- `trace_analyze.py` for routing traces; measurement series E–H (`series_*.sh`, `configs/`, `logs/`, `agent_results.jsonl`).
+- Final report `ANALYSE-Speicherhierarchie-XS.md` and lever list `HEBEL-Kandidaten-XS.md`.
 
-### Geändert
-- UD-IQ4_XS-Config getunt: `--resident-experts` (statt `--resident-budget-gib 40`), `--ple-row-cache 33554432`,
+### Changed
+- UD-IQ4_XS config tuned: `--resident-experts` (instead of `--resident-budget-gib 40`), `--ple-row-cache 33554432`,
   `--conversation-cache-mib 6144 --conversation-cache-slots 3`, `--adapt-async 1`, `--vram-reserve-mib 1000`,
-  `--kv-resident 32768`, `STRATA_KV_PREFETCH=1`. Decode ~125 → ~145 tok/s, Agenten-Wechsel ~25 s → ~1,5 s,
-  keine SSD-Reads mehr im Prompt-Pfad.
-- GGUF-Dateien von `X:` (Crucial P3) nach `C:\StrataQ38FN-models` (SN850X) verschoben, `--ple-io direct`.
+  `--kv-resident 32768`, `STRATA_KV_PREFETCH=1`. Decode ~125 → ~145 tok/s, agent switch ~25 s → ~1.5 s,
+  no more SSD reads in the prompt path.
+- Moved GGUF files from `X:` (Crucial P3) to `C:\StrataQ38FN-models` (SN850X), `--ple-io direct`.
 
-### Behoben
-- Engine-Hänger beim Prompt-Lesen („layer 1 of the prompt chunk", 9 Stück am 7./8.10.); seit dem Umzug keine mehr.
+### Fixed
+- Engine hangs while reading prompts ("layer 1 of the prompt chunk", 9 of them on Oct 7/8); none since the move.
 
-### Verworfen (gemessen)
-- Batching (`parallel: 2` + `--batch-mtp`): Absturz bei gleichzeitigen Anfragen (MTP-Bug), sonst −18 %.
-- `--vram-reserve-mib` < 800, `pcie_frac` > 0,7, `--spec` ≠ 4, `--spec-min-p` ≠ 0,5.
-- `STRATA_CACHE_MESSAGE_BOUNDARY=1`: ohne Wirkung.
+### Rejected (measured)
+- Batching (`parallel: 2` + `--batch-mtp`): crash on concurrent requests (MTP bug), otherwise −18%.
+- `--vram-reserve-mib` < 800, `pcie_frac` > 0.7, `--spec` ≠ 4, `--spec-min-p` ≠ 0.5.
+- `STRATA_CACHE_MESSAGE_BOUNDARY=1`: no effect.
 
 ## [0.1.0] – 2026-10-06
 
-### Hinzugefügt
-- Strata-Setup für drei Modelle: Unsloth UD-IQ4_XS, Unsloth UD-Q4_K_XL, ISTA Coder IQ1_M.
-- Start-Skripte (`Start-IQ4_XS.bat`, `Start-Q4_K_XL.bat`, `Start-Coder.bat`, `Stop-All.bat`), gemeinsame
-  Einstellungen in `settings.cmd`, API-Key aus `api_key.txt`, LAN-Betrieb auf 8080/8081.
-- vLLM-Fassade (`vllm_facade/`, Port 8081) für vLLM-Clients wie genesis3, mit Testsuite.
-- Benchmarks `bench_strata.py`, `run_variant.py`, `parallel_bench.py`, `stall_probe.py`; Messserien A–D.
-- Wiederaufnehmbare Downloads `download_hf.py`, `download_q4kxl.py`.
-- `LIESMICH.txt` als Kurzbedienung.
+### Added
+- Strata setup for three models: Unsloth UD-IQ4_XS, Unsloth UD-Q4_K_XL, ISTA Coder IQ1_M.
+- Start scripts (`Start-IQ4_XS.bat`, `Start-Q4_K_XL.bat`, `Start-Coder.bat`, `Stop-All.bat`), shared
+  settings in `settings.cmd`, API key from `api_key.txt`, LAN operation on 8080/8081.
+- vLLM facade (`vllm_facade/`, port 8081) for vLLM clients such as genesis3, with test suite.
+- Benchmarks `bench_strata.py`, `run_variant.py`, `parallel_bench.py`, `stall_probe.py`; measurement series A–D.
+- Resumable downloads `download_hf.py`, `download_q4kxl.py`.
+- `LIESMICH.txt` as quick-start guide.
