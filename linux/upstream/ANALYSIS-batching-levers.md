@@ -1,10 +1,10 @@
-# Code-Analyse: Batching-Hebel für Strata auf 4× RTX 3090 (2026-10-11)
+# Code analysis: batching levers for Strata on 4x RTX 3090 (2026-10-11)
 
-Vier Analysten haben je einen Hebel im Code untersucht, je ein Gegenprüfer hat jede Zeilenangabe nachgeprüft. 
-Zeilennummern beziehen sich auf Strata v0.1.41 plus die beiden lokalen Patches (Branch `g3-batch-over-8`). 
-Die Gegenprüfer-Spalte ist maßgeblich.
+Four analysts each examined one lever in the code; one skeptical reviewer per lever re-checked every file:line reference. 
+Line numbers refer to Strata v0.1.41 plus the two local patches (branch `g3-batch-over-8`). 
+The reviewer column is authoritative.
 
-| Hebel | Analyst (Tage) | Gegenprüfer (Tage) | Urteil |
+| Lever | Analyst (days) | Reviewer (days) | Verdict |
 |---|---|---|---|
 | A: interleaved / chunked prefill. The cheapest variant that removes most of the blocking i | 3–8 | 4–10 | optimistic |
 | B: MTP drafts inside pipelined batch windows with a layer split (--batch-mtp across 4 GPUs | 6–14 | 8–16 | optimistic |
@@ -13,12 +13,12 @@ Die Gegenprüfer-Spalte ist maßgeblich.
 
 ## B: MTP drafts inside pipelined batch windows with a layer split (--batch-mtp across 4 GPUs, one draft row per slot)
 
-### Mechanismus heute
+### Mechanism today
 
 ONE GPU (--batch-mtp): at startup (generate.cpp:4006-4018) every slot gets its own MtpDrafter. It shares the main drafter's weights (draft layer and draft head, MtpDrafter::load with `shared`, mtp.cpp:244-262), but its draft K/V and buffers are private. It is loaded against stage 0's slot session bslot_ss[0][b] and limited to set_max_drafts(1). In serve (6818-6845) the CUDA0 verifier is initialised with max_t=kVerifyMaxT=8 (verify_kernels.hpp:21) and set_batch_graph_limit(64), because slot rotation produces many row layouts and old graphs are evicted LRU. Each slot also gets a residual buffer and binds to `wt`/native_head. batch_step (8389-8510) gives every active slot two rows: [x at p, draft[0] at p+1]. A window therefore holds at most 4 slots, and with more slots `static next_slot` rotates them through 8-row windows (8402-8423). The window runs through run_slot_rows. That path chains through next_ for a split (verify.cpp:2624-2720). The window kernels already handle consecutive rows of one slot: GDN conv/recurrence per slot group (verify.cpp:993-1031), and an indexer-tail snapshot plus per-row attention over the slot's own K/V (1113-1119, 1224-1236). The host accepts the draft only if pick==draft, it is not EOS/stop, and the slot has room (8444-8450). commit_slot_prefixes(keep) then writes keep per slot into the mapped staging h_commitb_ and launches the commit graph. That graph applies the GDN state, the indexer append and the PLE history for only the kept prefix (verify.cpp:2728-2766, capture_commit_batch 2389-2468), and it chains to next_. Drafting runs per slot and serially: a cudaMemcpy of the 2 final_R rows, then MtpDrafter::draft, which ends in cudaStreamSynchronize (generate.cpp:8482-8493, mtp.cpp:1245-1372). Admission builds the first draft with draft_first(ver.final_R_all()) (10982-10990). copy_to_slot/copy_from_slot copy the draft K/V between the solo drafter and the slot drafter (8334-8344, 8378-8388).
 WHY IT IS REFUSED WITH A SPLIT: the option gate turns it off for any multi_gpu/split_same/stage setup (3871-3878). The #1413 warning at 8521-8525 says the pipelined path "builds one row per slot". In verify.cpp, stage_batch rejects duplicate-slot rows whenever next_ != nullptr ("grouped slot rows do not support a layer split yet", 2545-2548) and compares hbase+S to the slot count instead of the hand-off row count (2526). The structural reason is the pipeline itself. PGroup/pump (8527-8640) launches group g as rows base..base+S-1, one per slot, via Verifier::batch_launch (verify.cpp:2783-2804). That function launches the commit graph directly behind the window ("right behind it: every row is kept", 2790; header verify.hpp:173-177: "a batch window keeps every row, so the commit needs no host decision"), and it advances the PLE ple_prev on the host at launch time. With a split, the accept decision exists only after the last stage samples. Meanwhile stage k has started another group's window, and that window overwrites the window-row-indexed intermediates the commit needs: qkv_L_, h_L_, gate_L_, beta_L_, idx_raw_L_, hist_snap_ (allocated verify.cpp:528-554, read by the commit at +first*C, 2413-2447). It also overwrites the per-verifier "last window" fields last_rows_/last_t_/last_pos_b_/row_base_ (2606-2612). The draft layer and its head live on the last stage's GPU (mtp.load under OnDevice(last_st->dev), generate.cpp:3997-4004, bound to last_st->wt/head at 6820-6822). The per-slot drafters are still created against CUDA0 objects: bslot_ss[0], `wt`, native_head (not loaded with a split). Today's numbers: per the log, CUDA3 holds 6141 of 6144 experts and has only ~270 MiB free after the window captures. The draft layer takes 839 MiB plus the draft head 213 MiB on CUDA3.
 
-### Nötige Änderungen
+### Required changes
 
 - **src/program/generate.cpp:3867-3922 (batch_mtp gate, g3 pipe_cap block)** (small, ~25 lines): Allow batch_mtp with a pipelined split where each stage has its own GPU (keep refusing split_same and the helper GPU). Enforce 2*(batch/groups) <= kVerifyMaxT, i.e. at most 4 slots per group and 16 slots on 4 GPUs. Keep the existing kVerifyMaxT clamp consistent with the g3 patch.
 - **src/program/generate.cpp:4006-4018 (slot drafters) and 6829-6845 (slot_mtp_rows, bind)** (small, ~30 lines): Create the slot drafters under OnDevice(last_st->dev) and load them against bslot_ss.back()[b], so the draft K/V geometry and device are the last stage's. Use bslot_ss[0][b] as the PLE session. Allocate the residual rows on the last GPU. bind(last_st->wt, &last_st->head, r, err, &mtp), which also satisfies the shared-head check in mtp.cpp:620-629. Add OnDevice to the draft K/V copies in copy_to_slot/copy_from_slot (8334-8344, 8378-8388) and to draft_first at admission (10982).
@@ -32,7 +32,7 @@ WHY IT IS REFUSED WITH A SPLIT: the option gate turns it off for any multi_gpu/s
 - **serve/server.py:766,1103,1345 (BT parsing), 2198-2219 (PARALLEL_MAX)** (small, 0-10 lines): No protocol change. The server already accepts several BT lines per slot per window (single-GPU --batch-mtp). At most a log message about the 16-slot ceiling with MTP on 4 GPUs.
 - **docs/BATCHING.md 'Limits', docs/MULTI_GPU.md** (small): Document the split support, the 4-slots-per-group ceiling, and the VRAM on the last GPU.
 
-### Blocker und Invarianten
+### Blockers and invariants
 
 - The commit has to be deferred. Pipelined batch_launch commits all rows right behind the window (verify.cpp:2790; header verify.hpp:173-177). The keep decision exists only after the last stage samples, while stages 0-2 are already running other groups.
 - Intermediates are indexed by window row. qkv_L_/h_L_/gate_L_/beta_L_/idx_raw_L_/hist_snap_ (verify.cpp:528-554) are read by the commit at +first (2413-2447), and the next group's window on the same stage overwrites them. They need a per-group stash or row_base_ offsets. A mistake here does not crash: it silently corrupts GDN/indexer state while the text stays coherent, so only bit-exact batch-vs-solo tests catch it.
@@ -47,20 +47,20 @@ WHY IT IS REFUSED WITH A SPLIT: the option gate turns it off for any multi_gpu/s
 - Exactness invariants from BATCHING.md: STRATA_IQ_MT_MIN=1, --pcie-frac 0, --adapt-every 1e6. Sampled rows use Philox(seed, position) (sample_rows), and the draft is accepted only if it equals the sampled pick. This must stay bit-identical to solo for greedy and seeded sampling.
 - Single-user speed does not change: a request alone keeps the solo path with spec-4 MTP (121 tok/s); a slot left alone still returns to it.
 
-### Erwarteter Gewinn (Analyst)
+### Expected gain (analyst)
 
 Measured basis: 4 groups x 2 rows = 345 tok/s, so 5.8 ms per stage-step; 4 groups x 4 rows = 603 tok/s, so 6.6 ms. The marginal cost is ~0.4 ms per extra row and most of the stage time is fixed overhead. With MTP a group window carries 4 slots x (token + draft) = 8 rows, projected ~8.2 ms per stage-step (measurable without new code using 32 plain slots, 4 groups x 8 rows, batch_test32). First-draft acceptance alpha at temperature 0.7 is about 0.65-0.8: the solo log shows 295/453 = 65% over chains, BATCHING.md shows 140/172 = 81% greedy. That gives 1.65-1.8 tokens per slot-window. One draft per slot costs ~0.5-0.7 ms: it reads 111 MiB dense Q8, the 213 MiB draft head and the active experts, then synchronises.
 PURE ENGINE DECODE, 16 slots: (v1) synchronous per-slot drafts take about 4x0.6 ms per group-step and stall every stage: 16*1.72/(4*10.6 ms) = ~650 tok/s, +5-15%. (v2) drafts on the drafter stream, not blocking the host: CUDA3 gets ~1.4 ms more bandwidth per group-step and becomes the bottleneck: ~720 tok/s, +12-28%. (v3) batched multi-slot drafter plus a split with fewer layers on CUDA3: ~8.6 ms per step, ~800 tok/s, +25-40%. That matches the doc's +31-39% for 2-4 rows per window. At 8 users (2 active slots per group) the relative gain is larger: pure ~470-510 vs 345, +35-45%.
 THROUGH THE HTTP SERVER the admission stall dilutes it. A = 512/360 - 512/603 = ~0.57 s per short request (log: a ~100-token prompt read in ~330 ms, slot copy 48-86 ms, plus the pipeline drain). Throughput = 512/(A + 512/D). Short prompts: v1 ~377 (+5%), v2 ~391 (+9%), v3 ~410 (+14%) against 360. Long prompts (A = ~1.2 s): +3/+6/+10%, about 257-275 against 250. At 8 users (281 measured, A = ~0.34 s): ~350-380, +25-35%.
 Caveat: per window, a draft row is worth only alpha of a real row. With 32 users, 32 plain slots fill the same 8 rows and give more tokens (MTP-16 is about 0.83-0.9x plain-32), as long as the 32 slot sessions do not push experts out of VRAM; through the server, 32 slots measured worse (342 vs 365). So B is mainly a multiplier for 4-16 users. Alone it does not reach vLLM's 710. Only after lever A removes the admission and prefill stall (server approaching the 603 pure figure) does B lift it to ~720-800, i.e. to or slightly past vLLM.
 
-### Erster Prototyp-Schritt
+### First prototype step
 
 Under a day, without the pipeline: use the non-pipelined split path (--batch-groups 1). It already chains duplicate-slot rows and the keep[] commit through every stage (run_slot_rows forwards next_ at verify.cpp:2655/2714, commit_slot_prefixes at 2765, batch_step at generate.cpp:8389-8510). About 40-60 lines unlock it: (1) let batch_mtp through the gate at generate.cpp:3871-3878 for a split where each stage has its own GPU; (2) stage verifiers get max_t=kVerifyMaxT (6745/6757); (3) in verify.cpp, remove the split guard at 2545-2548 and check hbase+S against the hand-off rows instead of slots_.size() (2526); (4) create the slot drafters and their residual rows under OnDevice(last_st->dev), loaded against bslot_ss.back()[b] and bound to last_st->wt/&last_st->head (4006-4018, 6829-6845), with OnDevice around the draft K/V copies. Build it as a separate binary (strata-g3-mtp) and run tools/batch_test.py with --batch 4 --extra "--batch-groups 1 --batch-mtp --pcie-frac 0 --adapt-every 1000000" and STRATA_IQ_MT_MIN=1. 4 slots x 2 rows = 8 rows, one layout, no rotation. Results: (a) bit-exactness against solo across 4 stages; (b) the 'strata batch: ... ms/window = run + commit + emit' line, where run = the 8-row window over 4 stages, emit = ~the serial drafting cost of 4 slots, and avg rows gives alpha; (c) the per-slot drafter VRAM from the 'shared draft weights' log line. Alongside it, with no code change: tools/batch_test32.py (4 groups x 8 rows) for T_stage at 8 rows. Plug these into tok/s = 16*(1+alpha)/(4*T_stage8 + T_draft) before committing to the 6-14 day pipelined version.
 
 ## C: per-window overhead of the pipelined batch windows (pump / batch_launch / batch_poll / per-stage graphs)
 
-### Mechanismus heute
+### Mechanism today
 
 HOST LOOP: generate.cpp:8652-8660 is a pure busy loop: try_next_line (mutex), then pump(true). There are no sleeps anywhere on the hot path. The only sleep_for is in release_gpu_waits (verify.cpp:292), an error path. pump (generate.cpp:8545-8642) first polls every stage with batch_poll (8556). A finished group is marked for stage k+1, and on the last stage its BT lines are printed (8565-8592). It then launches waiting groups from the last stage down to stage 0 (8594-8632), calling batch_launch at 8626. With 4 groups on 4 stages this is a lockstep pipeline: every tick waits for the slowest stage, and stage 0 is launched last.
 
@@ -91,7 +91,7 @@ NUMBERS:
 - No STRATA_VERIFY_PROFILE run exists in the logs, so the split between GPU and host is not measured yet.
 - 32 slots is not comparable: the solo runs show about 40x more cache misses (2959 vs 69), so slot sessions pushed experts out of VRAM and onto the CPU.
 
-### Nötige Änderungen
+### Required changes
 
 - **no code: run tools/batch_test16.py with STRATA_VERIFY_PROFILE=1 (profile_report, verify.cpp:1631) plus ~40 lines of timers in pump (generate.cpp:8545-8642) and batch_launch/batch_poll** (small, ~40 lines of instrumentation): Measure per stage: GPU ms per window inside the verify graph, commit graph time, busy vs idle (completion seen to next launch), stage_batch time including the PLE gather, and sample_rows time. This shows which stage sets the tick and how much of 6.63 ms is graph work vs commit vs host/idle.
 - **verify.cpp:record_window (713, 994-1031, 1116, 918) + Verifier::batch_launch (2783-2804) + capture_batch/bkey (verify.hpp:286)** (medium, ~80-150 lines): Batch self-commit for the pipelined no-MTP path, where every row is kept. Set self_commit per batch row: gdn_conv_l2_multi(commit=true), and gdn_step_norm_multi with keep=one_ (the same kernel template the batch commit already uses for 1-row groups, 2420-2421). Skip the tail snapshot and the PLE history snapshot. Drop the commit_bm_ launch. Add a variant bit to the graph key. Keep the old commit graph for batch_step, --batch-mtp and commit_slot_prefixes.
@@ -101,7 +101,7 @@ NUMBERS:
 - **src/kernels/cuda/verify_kernels.cu (gdn_conv_l2_multi, gdn_step_norm_multi), kv_q8.cu (kv_append_q8_step), native_qsa_indexer.cu, qsa_select.cu (scores/topk), qsa_decode_attn.cu, plus the call sites at verify.cpp:994-1031, 1116, 1157-1193, 1225-1236 and the commit at 2401-2441** (large, ~600-1000 lines across 5-6 kernel files plus parity tests): Multi-slot kernel variants: one launch per layer over S rows with per-row device pointer tables (state, conv history, page table, pools, tail, idx buffers), filled at capture. Slot sessions are fixed allocations, so captured pointers stay valid. Each block keeps one row, so the arithmetic stays bitwise per-row. This cuts ~100-150 serialized tiny nodes per stage at 4 rows, ~2x that at 8 rows, and raises GDN-step occupancy from 48 to 48xS blocks. Needs parity tests in the existing *_parity style.
 - **(optional, low value) generate.cpp pump + verify.cpp stage_batch staging buffers** (medium-large, ~200-300 lines; not recommended before the items above): Device-side hand-off: pre-launch stage k+1's next graph behind a wait_flag_ge on a mapped ready-counter written by stage k's tail. Needs double-buffered h_step_/h_pos_/h_commitb_/h_tok_ per window parity, and must still work with the doorbell (ar_off) variant that needs host service per layer. Saves only ~30-80 us per stage per tick.
 
-### Blocker und Invarianten
+### Blockers and invariants
 
 - Exactness gate (batch = solo, token-identical): tools/batch_test16.py and batch_test32.py, batch_interleave_test.py and parking_test.py, run with STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 1000000. Every change above must keep the row arithmetic bitwise identical.
 - Self-commit is only valid when every row is kept. That holds for the pipelined path (batch_launch launches the commit 'right behind it: every row is kept', verify.cpp:2790). It does not hold for --batch-mtp/commit_slot_prefixes or for batch_step on one GPU, so both graph variants must coexist and the variant must be part of bkey (verify.hpp:286-289).
@@ -114,7 +114,7 @@ NUMBERS:
 - A single host thread serves 4 GPUs and stdin. Any new BGEN line drains the pipeline first (pipe_drain, generate.cpp:8647-8661). That is Lever A's territory and limits what Lever C can show at server level.
 - VRAM: new graph variants are small, but each capture syncs the stream (capture_batch at 2346-2376, only at first use of a layout). 32 slots already spills experts out of VRAM (solo misses 2959 vs 69), so per-row savings only pay off at 16-24 slots on this box.
 
-### Erwarteter Gewinn (Analyst)
+### Expected gain (analyst)
 
 Pure batch decode, 16 slots, 4x4: the tick is 6.63 ms (603 tok/s). The realistic floor for the slowest stage, from GGUF sizes and real kernel efficiency, is about 3.6-4.2 ms (dense ~0.94 GiB + experts ~1.04 GiB + GDN state 0.32 GiB per stage, plus the 0.49 GiB head on stage 3). The 2->4-row slope (+0.41 ms per row) shows row-proportional work is already near bandwidth, so all gains come from the ~5 ms of fixed cost per window.
 
@@ -128,7 +128,7 @@ Realistic tick 5.0-5.6 ms, so about 710-800 tok/s pure decode (+18-32%). At most
 
 Server level: decode is about 60% of wall time with short prompts (360/603) and about 41% with 1.2K prompts (250/603). That gives about +10-17% for short prompts (360 -> ~400-420 tok/s) and +6-10% for long ones (250 -> ~265-275). Lever C alone does not reach vLLM's 710/400. It multiplies with Lever A (prefill mixed into the windows), which attacks the 40-60% non-decode share. It also makes 8 rows per group (24-32 slots) worthwhile if VRAM allows.
 
-### Erster Prototyp-Schritt
+### First prototype step
 
 Under a day, once the GPUs are free:
 (1) Run tools/batch_test16.py exactly as for the 603 tok/s figure, with STRATA_VERIFY_PROFILE=1 and no code change. Read the 'strata batch GPU stages, stage k (ms/window)' lines to get GPU time per stage inside the verify graph vs the 6.63 ms tick. Add ~40 lines of steady_clock timers in pump/batch_launch/batch_poll: per stage, busy (launch to done) vs idle, stage_batch ms (stage 0 includes the PLE gather), and sample ms. This tells which stage is the max and how much is commit, host, or idle.
@@ -137,7 +137,7 @@ Under a day, once the GPUs are free:
 
 ## A: interleaved / chunked prefill. The cheapest variant that removes most of the blocking is an overlapped admission: the batched prompt read runs on a worker thread while the main thread keeps pumping the pipelined decode groups. Two fixed admission costs get cut alongside it: the host-bounced slot copy and the per-admission expert-cache loan on CUDA3. Real vLLM-style prompt rows inside the batch windows were investigated and rejected as the first step (8-15 days, structural blockers).
 
-### Mechanismus heute
+### Mechanism today
 
 WHAT HAPPENS TODAY WITH --batch 16 ON THE 4-GPU SPLIT (piped, groups auto)
 
@@ -174,7 +174,7 @@ Modelled with 16 slots, a 603 tok/s decode ceiling and 512 tokens per request: t
 - 1.2K prompts: 250 tok/s means R ≈ 1.2 s
 The log components above add up to the short-prompt figure, so the model is consistent.
 
-### Nötige Änderungen
+### Required changes
 
 - **src/program/generate.cpp: read_part lambda (9721-9795)** (medium, ~100-140 lines): New piped branch, gated (env STRATA_PIPE_OVERLAP=1, then default-on once validated): when piped && batch_on(), start sp.run(ids+a0, b0-a0, a0, e) on a worker thread (std::async). On the main thread, loop: pump(true); scan in_lines for BSTOP (copy of 9733-9745); sleep about 50 us. Then join and pipe_drain() before returning, so lend/refill, checkpoint_at, read_windows, the first-token window and copy_to_slot all still run with the pipeline drained. Gate it off when any pf_part lends (p.first>=0), when experts are not all resident or ar_on(), with kv_mode != 0 (--kv-resident), with images, and while adaptive swaps are pending.
 - **src/program/generate.cpp: pump (8545-8646)** (small, ~20 lines): Add an 'overlap' flag. While it is set: skip apply_pending(false) at group start (8622), so no adaptive swap rewrites cache slots the prefill reads; and do not reset progress().busy / the timing line when all groups go idle mid-read (8633-8644). Keep the BGEN drain at 8659 so the pre-read work (prompt cache, copy_from_slot, park_current, kvg_trim, lend) stays serial.
@@ -186,7 +186,7 @@ The log components above add up to the short-prompt figure, so the model is cons
 - **serve/server.py (1230-1320)** (small, ~10 lines): Optional only: stop sending BYIELD when slot_gs (pipelined groups), since the engine ignores it there. Optionally send the next BGEN without waiting for BADM; that is negligible. Admission serialization (ctl lock, 741) can stay.
 - **docs/BATCHING.md 'How the server uses the slots' / Limits** (small): Document that decode-between-chunks and BYIELD do not apply with --batch-groups, and describe the new overlap.
 
-### Blocker und Invarianten
+### Blockers and invariants
 
 - Decode-share experiment 3 is void as planned. In piped mode read_part returns a single sp.run (generate.cpp:9723), so STRATA_BATCH_DECODE_SHARE (9708-9711, 9780-9786) and BYIELD (9731-9779, discarded at 8670) never run. Q3-b12-share4.json uses auto groups and is therefore piped (3906). It can only differ from baseline by noise. Testing the share at all needs --batch-groups 1, which loses the pipeline.
 - Interleaving alone gives no throughput. Reading in pieces with decode in between serializes the same GPU work in a different order: only TTFT and fairness change. Only work running concurrently on idle or underused GPUs raises tok/s.
@@ -208,7 +208,7 @@ The log components above add up to the short-prompt figure, so the model is cons
 With only about 4 spare rows per group-step, a 150-token prompt would take ~38 group-steps (~1 s TTFT) and a 1.2K prompt ~8 s. Estimated 8-15 days, not the cheap path.
 - Concurrent admissions (two prompts read at once) would need a second main session plus a second prompt path per card (+0.39 GiB buffers and a session per card), a relaxed server ctl lock, and duplicated prompt-cache/checkpoint bookkeeping. Little gain over the overlap, because the GPU work is identical.
 
-### Erwarteter Gewinn (Analyst)
+### Expected gain (analyst)
 
 Model: throughput = 603 / (1 + 603·R/512), where R is the all-slot stall per admission. Measured: R ≈ 0.57 s (short prompts, 360 tok/s) and R ≈ 1.2 s (1.2K prompts, 250 tok/s).
 
@@ -224,7 +224,7 @@ The co-execution factor f is the main uncertainty. Grounds for optimism: both wo
 
 Hard ceiling for this lever: R → 0 gives 603 tok/s (today's pure batch decode). So lever A cannot reach vLLM's ~710 on short prompts by itself; that needs the decode ceiling (levers 5/6). On 1.2K prompts it can roughly close the gap to vLLM's ~400 only if f ≤ ~0.5; otherwise prefill efficiency is the next limit (Strata ≈ 2.1-2.5 ms of GPU time per prompt token summed over cards, against ≈ 1.1 for vLLM). Single-user speed is unchanged: the solo path is untouched and the overlap is gated on piped && batch_on().
 
-### Erster Prototyp-Schritt
+### First prototype step
 
 Under one day, env-gated, two measurements.
 
@@ -247,7 +247,7 @@ If f ≤ ~0.6, build the full version: stream priority, device-to-device copy, n
 
 ## D: quick wins without deep engine work (env/CLI knobs, --batch-groups, data-parallel instances, server.py scheduling)
 
-### Mechanismus heute
+### Mechanism today
 
 Measured logs confirm the cost model. In the pipelined batch path, every new request stops all slots for its whole prompt read.
 
@@ -272,7 +272,7 @@ Measured logs confirm the cost model. In the pipelined batch path, every new req
 - The server still sends BYIELD (server.py:1234, 1314). The engine ignores it but drains the pipeline for that line.
 - The CPU pool honours the inherited affinity (pool.cpp:232-234). Without taskset, two instances both pin 63 workers to logical CPUs 1-63.
 
-### Nötige Änderungen
+### Required changes
 
 - **linux/configs/G16-*.json (config only)** (small, 2 config lines): Set "layer_split": "12,24,36" (explicit, so CUDA0 is trimmed too) and add --trim-stage-weights. This frees about 2 GiB of foreign dense weights per card. All 4 stages should then keep their own prompt buffers (no loan, no refill of 0.7-1.8 GB from pageable mmap per admission), and CUDA3 should reach 6144/6144 with the zero-doorbell graph. Check the log for: 'loads the dense weights of layers 0-11 only', 4x 'keeps its own prompt buffers ... no loan', 4x '(100% VRAM resident: zero-doorbell graph)', and a per-request blob-read count that stays flat.
 - **linux/series_q.sh, configs Q3-*/G*-share*** (small): Drop STRATA_BATCH_DECODE_SHARE from piped experiments: generate.cpp:9723 bypasses it, so Q3-b12-share4 (12 slots, auto 4x3) will only reproduce H12 (~360 tok/s). Q2 (2x8) is already measured at -25%. Do not pursue fewer groups.
@@ -283,7 +283,7 @@ Measured logs confirm the cost model. In the pipelined batch path, every new req
 - **src/program/generate.cpp:copy_to_slot 8312-8348 / copy_from_slot 8350-8395 (optional)** (small-medium, ~60-100 lines): Replace the host round trip (conversation_checkpoint_save/restore + conversation_kv_save/restore into std::vector, 3 device syncs per stage) with same-device cudaMemcpyAsync D2D of GDN state/conv, PLE history, indexer tails and the QSA K/V prefix, issued on all 4 devices concurrently with one sync each. Byte-identical result.
 - **dp_launch.sh, configs Q1-dp2-inst*.json (only if DP2 is pursued)** (medium, 1-2 days): Give each instance its own CPUs: taskset -c 0-31,64-95 / 32-63,96-127 (pool.cpp:232-234 honours the mask). Replace --resident-experts with --mmap-experts (one shared page-cache copy) or cap it with --resident-budget-gib. --resident-experts pins a private copy of the experts each process cannot keep on its GPUs (~26-30 GB each), and --shared-expert-arena is refused together with mmap (generate.cpp:2034-2037). Raise or remove MemoryMax=90G: the 93.7 GB GGUF (PLE table + experts) page cache is charged to the scope. Use an explicit split of 24 plus --trim-stage-weights. Production also needs a sticky balancer: a small proxy hashing the system prompt and first user message, with a least-outstanding fallback (~150-250 lines), plus metrics aggregation for the G3 monitoring.
 
-### Blocker und Invarianten
+### Blockers and invariants
 
 - In piped mode (the default on a layer split) an admission always drains the pipeline (generate.cpp:8658-8659) and reads the whole prompt in one sp.run (9723), with all slots stalled. No config knob changes this. Real overlap (prefill on idle stages, or chunks mixed into windows) is lever 4 and needs engine code.
 - Time-slicing (STRATA_BATCH_DECODE_SHARE, BYIELD) cannot raise throughput even where it works. It only moves waiting time between users, because prefill and decode still run one after the other on the same GPUs.
@@ -295,7 +295,7 @@ Measured logs confirm the cost model. In the pipelined batch path, every new req
 - DP4 with --batch-mtp: about 0.9 GB per slot for drafters (generate.cpp:8521-8525 warning) plus 4.4 GiB of untrimmed dense weights per card leaves room for ~20% of the experts. RAM cannot hold 4 pinned copies of the experts the GPUs don't keep. Not viable.
 - Avoid STRATA_DF_BRANCH: on Linux it hung windows when NVML queries came in (#905, verify.cpp:614-620), and the G3 monitoring polls the GPUs.
 
-### Erwarteter Gewinn (Analyst)
+### Expected gain (analyst)
 
 Model fitted to the logs: throughput ~= L / (L/R + T_adm), with L = 512, R = 603 rows/s and T_adm = 0.57 s (162 tokens) or 1.17 s (1.2K tokens). It predicts 361 and 253 tok/s; measured 357-365 and 248-253.
 
@@ -311,7 +311,7 @@ Measured or predicted negatives:
 - DP2: expected 250-350 short / 170-240 long. Prompt reads with ~half the experts non-resident push T_adm to ~1-1.5 s short and ~2-3 s long. CPU misses lower R per instance, and single-user speed drops to roughly 70-90 tok/s. It could only win if prefill and decode on 2 GPUs stayed as fast as today, which the residency numbers rule out.
 - DP4 + --batch-mtp: not viable.
 
-### Erster Prototyp-Schritt
+### First prototype step
 
 Copy configs/G16-pf512-share2.json to D1-trim.json and change three things: set "layer_split": "12,24,36", add "--trim-stage-weights" to args, and remove the share env. Run the same G16-short and G16-long sweep (u=16, 24; --prompt-tok 100 / default 1.2K; max-tok 512).
 
@@ -326,7 +326,7 @@ Check the engine log for:
 
 Add one extra run with STRATA_VERIFY_PROFILE=1 to get per-stage ms/window and see whether CUDA3 is the slowest stage. If the 4 cards then have >= ~1.5 GiB spare, repeat with "parallel": 24 (and --max-context 16384 if needed), and once with "strata_checkpoint": false in the bench payload. About 1-2 h of GPU time; GPUs were not touched for this analysis.
 
-## Gegenprüfung: C: per-window overhead of the pipelined batch windows (pump / batch_launch / batch_poll / commit gra (optimistic, 5–14 Tage)
+## Review: C: per-window overhead of the pipelined batch windows (pump / batch_launch / batch_poll / commit gra (optimistic, 5–14 days)
 
 My estimates (no profile or nsys data exists yet):
 - Pipelined self-commit: removes about 100 nodes, ~108 MiB of re-read state and one graph launch per stage. Realistic saving 0.2-0.5 ms per tick, not 0.4-0.8.
@@ -342,11 +342,11 @@ At server level (Amdahl, decode about 60% / 41% of wall time):
 
 Lever C alone does not reach vLLM (710/400). The upside is larger only if the 1-row-per-group cross-check shows that most of the ~2.5 ms batch-vs-solo gap is path overhead rather than kernel scaling or memory throttling.
 
-**Nicht bestätigte Behauptungen:**
+**Claims not confirmed:**
 - Row-proportional work is already near bandwidth (0.41 ms per row), so all gains come from the roughly 5 ms fixed intercept. — The fit uses two points from separate runs (8 vs 16 slots), which is too little to separate the terms. The claim also contradicts the analysis's own -0.3 to -1.0 ms for multi-slot kernels: those kernels remove per-row nodes, and per-row nodes sit in the slope, not the intercept. If the slope really is at bandwidth, the multi-slot savings at 4 rows are capped at about 0.1-0.3 ms.
 - STRATA_VERIFY_PROFILE shows how much of the 6.63 ms is graph work vs commit vs host. — Each profiled section adds a 1-thread gpu_stamp kernel (verify_kernels.cu:1226-1244), roughly 300 extra serialized nodes per stage. Profiling also turns off the shared-expert side stream (verify.cpp:1280 and 1487, '!prof_on_') and does a synchronous cudaMemcpy per window in batch_poll (collect_profile, 1868-1871). It does not stamp the commit graph at all. It distorts exactly the latency-bound regime under study.
 
-**Übersehene Blocker:**
+**Missed blockers:**
 - HIP: one_token_self_commit() is hard-disabled under STRATA_USE_HIP (verify.cpp:173-182), and sh_stream is also off on HIP. Upstream's main pipelined-batch rig is 4x R9700 (BATCHING.md:40). A batch self-commit or new multi-slot kernels must therefore be CUDA-gated or validated on AMD, which cannot be done on this box. That lowers the PR's value and acceptance odds upstream.
 - The SYCL port keeps its own copy of the batch path (sycl/src/core/verify.cpp contains batch_launch/capture_commit_batch, plus sycl/src/kernels/cuda/verify_kernels.dp.cpp). Engine changes diverge from it and need re-migration per INTEL_ARC.md.
 - batch_step also runs inside the pipelined engine during prompt reads (decode share, generate.cpp:9784) through run_slot_rows + commit_slots on the same Verifiers. A STRATA_BATCH_SELF_COMMIT hack that is not keyed by caller or variant would run the self-committing graph and then commit_bm_ again: a double commit that corrupts conv/GDN state. batch_test16 (short prompts, no chunked reads) would not catch this; batch_interleave_test would.
@@ -375,11 +375,11 @@ Effort: about 2-4 days for instrumentation, self-commit (also applicable to non-
 
 Files: /media/raid0/StrataQ38FN/Strata/src/core/verify.cpp, /media/raid0/StrataQ38FN/Strata/src/program/generate.cpp, /media/raid0/StrataQ38FN/Strata/src/kernels/cuda/verify_kernels.cu, /media/raid0/StrataQ38FN/Strata/src/kernels/cuda/sampler.cu, /media/raid0/StrataQ38FN/Strata/src/kernels/ngram.cpp, /media/raid0/StrataQ38FN/Strata/include/strata/core/verify.hpp, /media/raid0/StrataQ38FN/Strata/docs/BATCHING.md, /media/raid0/StrataQ38FN/Strata/sycl/src/core/verify.cpp, /media/raid0/StrataQ38FN/linux/results/batch_test_16.txt, /media/raid0/StrataQ38FN/linux/bench_concurrency.py
 
-## Gegenprüfung: B: MTP drafts inside pipelined batch windows with a layer split (--batch-mtp across 4 GPUs, one draf (optimistic, 8–16 Tage)
+## Review: B: MTP drafts inside pipelined batch windows with a layer split (--batch-mtp across 4 GPUs, one draf (optimistic, 8–16 days)
 
 Engine-only decode with 16 slots: somewhere between -10% and +15% against today's 603 tok/s. The sign depends on the unmeasured 8-row stage time. If T8 ≈ 8.2 ms and alpha ≈ 0.65: v1 ≈ 620-650, v2 ≈ 650-690. v3 (batched drafter plus one layer moved off CUDA3) ≈ 700-760. If T8 ≥ 10 ms, B costs throughput unless v3 is done. Through the HTTP server at 16+ users, the admission stall (≈0.5 s per short prompt, never interleaved in the pipelined path) caps the gain at about 0-8% for short prompts (≈360 → 370-390) and 0-5% for 1.2K prompts. At 4-12 users with variable S (2 slots x 2 rows = 4-row windows), the gain is larger and less risky: about +20-30% engine-level (≈345 → 420-450 at 8 users), +15-25% through the server. Alone, B does not get to vLLM's 710/400. It only matters after lever A (interleaved prefill / no pipe_drain stall) has moved the server toward the 603 engine figure. Single-user speed is unaffected: the solo path keeps spec-4 MTP.
 
-**Nicht bestätigte Behauptungen:**
+**Claims not confirmed:**
 - Per-slot drafter VRAM is unknown (the #1413 warning says ~0.9 GB per slot). — It was measured on this model: /media/raid0/StrataQ38FN/logs/E-H10-batch2.txt and agent logs show 'strata mtp: shared draft weights, 164 MiB of private state and buffers' at 128K context, int8 K/V. At 32K that is about 60-70 MiB (the draft K/V is 2 heads x 256 x 2 bytes per cell), so 16 drafters take about 1-1.1 GiB on CUDA3, roughly 450 experts' worth. The 0.9 GB figure is too high.
 - T_stage at 8 rows is ~8.2 ms, measurable without new code with tools/batch_test32.py (32 plain slots, 4 groups x 8 rows). — That test was already run. /media/raid0/StrataQ38FN/linux/results/batch_test_32.txt gives 547.1 tok/s from the first batch token, i.e. 4800 tokens in ~8.8 s, about 14.7 ms per 8-row group-step, against 6.7 ms at 4 rows (batch_test_16.txt, 602.6). The run is confounded: 32 slot sessions x 0.15 GiB evict experts, so solo-run hit rates fall to 94.6% (98057/103680, ~3000 RAM reads per request) from 99.4%, and the stages lose their zero-doorbell graphs. The only existing 8-row data point therefore contradicts the linear 0.4 ms/row extrapolation, and repeating the same test proves nothing. It must be re-run with a smaller --max-context (e.g. 16384), so that 32 sessions take the VRAM that 16 take at 32K.
 - Acceptance alpha 0.65-0.8 ('BATCHING.md shows 140/172 = 81% greedy'). — docs/BATCHING.md:73: 140 of 172 is the acceptance of a request returned from a slot to the solo path, not a greedy first-draft figure for this model. Over the whole engine log on this box, acceptance is 35438/58996 = 60% (spec 4, min-p 0.5, mostly temperature 0.7); the analysis's own 295/453 = 65% is one request. For a single unconditional draft compared with a Philox-sampled pick, 0.6-0.72 is more realistic.
@@ -388,7 +388,7 @@ Engine-only decode with 16 slots: somewhere between -10% and +15% against today'
 - Admission costs ~330 ms for a ~100-token prompt read and 48-86 ms for the slot copy. — Engine log: ~100-199-token prompts are read in a median 458 ms (n=2185, 314-892), and 'copied in' has a median of 40.5 ms (35-154). A ≈ 0.5 s+ per admission still holds.
 - MTP in batch slots gives +31-39% (BATCHING.md). — That figure comes from one GPU on an RTX PRO 5000 / R9700 with another setup. On this model the only --batch-mtp runs (logs/E-H10-batch2.txt, E-H41, engine 0.1.40, RTX 5090) died at the first admission with 'mtp: unsupported native MMVQ GGML type'. Commit 569c094 in HEAD fixes that, but it has never been re-run here. Batch MTP has never produced a token on this model on this box.
 
-**Übersehene Blocker:**
+**Missed blockers:**
 - The 8-row cost is unknown, and the gain changes sign around it. Break-even is T8 + 4*t_draft < (1+alpha)*T4 ≈ 1.6-1.7 x 6.6 ≈ 10.6-11.2 ms. The only existing 8-row measurement (linux/results/batch_test_32.txt: 547 tok/s, ~14.7 ms per group-step) is above that, though confounded by VRAM eviction. Measure first: batch_test32.py with --max-context 16384, no code, ~15 min.
 - LRU eviction (evict_batch_graph, verify.cpp:2468-2496) destroys the window AND commit graph of a layout. With deferred commits it can delete the commit graph of a group whose commit is still pending. Pending keys must be pinned, or batch_commit_deferred must re-capture (capture_commit_batch) before launch.
 - Pad rows versus variable S: fixed S kills the 4-12 user gain. Variable S (as today) multiplies graph pairs on CUDA3, which has 267 MiB free, leading to eviction and recapture stalls (a capture synchronises the stage stream, verify.cpp:2371). Moving a layer off CUDA3 or adding --vram-reserve-mib is likely required, not optional.
@@ -424,7 +424,7 @@ Relevant to the user's current plan: experiment 3 (raising STRATA_BATCH_DECODE_S
 
 Key files: /media/raid0/StrataQ38FN/Strata/src/core/verify.cpp, /media/raid0/StrataQ38FN/Strata/src/program/generate.cpp, /media/raid0/StrataQ38FN/Strata/src/core/mtp.cpp, /media/raid0/StrataQ38FN/Strata/include/strata/core/verify.hpp, /media/raid0/StrataQ38FN/linux/results/batch_test_32.txt, /media/raid0/StrataQ38FN/logs/E-H10-batch2.txt, /media/raid0/StrataQ38FN/Strata/strata-unsloth-ud-iq4_xs.log.
 
-## Gegenprüfung: A: prefill-interleave. The batched prompt read (sp.run) runs on a worker thread while the main threa (optimistic, 4–10 Tage)
+## Review: A: prefill-interleave. The batched prompt read (sp.run) runs on a worker thread while the main threa (optimistic, 4–10 days)
 
 The mechanism analysis is accurate, and the most valuable finding holds: decode share and BYIELD are inert in piped mode, so experiment 3 measures noise. Previous share 1.0 vs 2.0 runs with auto groups (the 0.1.41 default) were noise too.
 
@@ -441,12 +441,12 @@ Single-user speed is unaffected when the overlap is gated on piped && batch_on()
 
 None of this applies to the 16-slot / 32K or the 262K agent configs until VRAM is rebalanced: CUDA0 and CUDA3 loans, CUDA3 at 6141/6144, and kv-resident.
 
-**Nicht bestätigte Behauptungen:**
+**Claims not confirmed:**
 - copy_to_slot is per stage, with cudaDeviceSynchronize and a host round trip via conversation_checkpoint/kv save+restore. 'copied in 86.9-88.6 ms' for every admission. — The mechanism holds: generate.cpp:8312-8346; transfer() is a synchronous cudaMemcpy(Default) at conversation_snapshot.cpp:112-120; checkpoint save/restore go through host vectors at conversation_state.cpp:154-198. The 'every admission' figure is wrong: the same log run also shows 'copied in 48.1 ms' and '36.2 ms'. The saving from a device-to-device copy is about 35-85 ms, not a flat 80.
 - CUDA0-2 keep their own prompt buffers, only CUDA3 borrows 166 slots, so each admission lends and refills on CUDA3 only. — That holds only for the 12-slot runs (log 32194-32197, 35429-35432). In both 16-slot server runs (log 34335, 35031-35032), CUDA0 ALSO borrows 170 slots and CUDA3 borrows 167 of only 6141 slots. CUDA3 holds 6141 of its 6144 experts ('expert cache 6141 slots', 'token graph hit path: 24573 resident experts'), so its verifier runs the doorbell graph (no '100% VRAM resident' suffix). CUDA3 had only 267 MiB free at capture time.
 - Test at 12 slots, where CUDA3 has more headroom, to satisfy the no-loan gate. — Every 12-slot run in the log still borrows on CUDA3 (log 32197, 35432, 35996, 36553), with about 880 MiB free at capture. Giving CUDA3 its own 0.39 GiB buffers means shrinking the cache below 6144 (losing all-resident) or freeing VRAM elsewhere (smaller --max-context or fewer slots). --no-prefill-borrow books the buffers out of the cache, so the stage also stops being 100% resident.
 
-**Übersehene Blocker:**
+**Missed blockers:**
 - The gate the analysis itself sets (no stage lends, every stage 100% resident) is NOT met by the 16-slot / 32K config the 360/250 tok/s numbers come from. CUDA0 lends 170 slots, and CUDA3 lends 167 and holds only 6141 of 6144 experts, so it runs the doorbell graph and serves the CPU pool on the main thread (log 34314/34335, 35010/35031-35032). The prototype as written would be gated off, or it would race the non-thread-safe ExpertSource. Fixing this costs VRAM on the tightest card (267 MiB free at capture), realistically a smaller --max-context, which changes the baseline and the product.
 - Admissions stay serialized (ctl lock, one main session), so throughput is also capped at about 512 / A_wall, where A_wall includes the read STRETCHED by co-running decode. For 1.2K prompts (about 1.05 s read, chunk-pipelined and compute-dense), a 30-50% stretch caps throughput at about 300-340 tok/s, whatever f is. The model 603/(1+603R/512) ignores this coupling between f (decode loss) and s (prefill stretch).
 - PleTable::gather_batch is not thread-safe (ngram.cpp:507ff: unguarded n_prefetch, prefetch slots, bytes_read). Today the stage-0 batch window (verify.cpp:2589, main thread) and the prefill's async PLE gather (prefill.cpp:2052, ple_next future) never run at the same time; with overlap they would. They also share one FIFO SSD reader queue (Direct mode is the default, generate.cpp:374). A 512-token chunk queues about 8K row reads, and the main thread blocks in stage_batch, so the whole pump stalls on stage 0. That needs a mutex, and it raises f.
@@ -486,16 +486,16 @@ Key paths:
 - /media/raid0/StrataQ38FN/Strata/strata-unsloth-ud-iq4_xs.log
 - /media/raid0/StrataQ38FN/linux/configs/Q3-b12-share4.json
 
-## Gegenprüfung: D: quick wins without deep engine work (trim plus an explicit split, slot count and groups, decode s (optimistic, 0.5–2.5 Tage)
+## Review: D: quick wins without deep engine work (trim plus an explicit split, slot count and groups, decode s (optimistic, 0.5–2.5 days)
 
 The core lever is sound and well grounded: an explicit split of 12,24,36 plus --trim-stage-weights, which is upstream's own documented batching recipe. Runs with 1, 2, 3 and 4 lending cards cost ~60-70 ms of prompt read per lending card (380/457/522/579 ms for a ~160-token prompt). With all 4 cards on own buffers, admission cost (T_adm) for short prompts falls from ~0.57 s to ~0.43 s. Plugged into the analysis's validated model L/(L/R + T_adm): ~360 -> ~395-410 tok/s short (+10-14%), and long ~250 -> ~275-290 tok/s (+10-15%; long prompts read ~2 GB per admission today). CUDA3 at 100% residency may add 0-8% to decode. ckpt=0 adds +3-5%, but only for the benchmark. The D2D slot copy saves ~30 ms per admission, +2-3%. The 24-slot step is unproven, 0 to +10%: H24 lost because residency collapsed, and pure decode at 32 slots was below 16. pick_slot and BYIELD changes are ~0 in these benchmarks. Realistic ceiling for lever D: ~400-440 tok/s short and ~280-300 long, about 55-62% of vLLM's 710 and 70-75% of its 400. The analysis's 430-470 short is the optimistic end. Reaching vLLM needs admissions that overlap decode (lever 4). Decode share and DP2 are confirmed losers.
 
-**Nicht bestätigte Behauptungen:**
+**Claims not confirmed:**
 - 24 slots in 4 groups of 6 lift pure decode from ~603 to ~700 and add ~8-10% through the server — Not supported by the data. H24 (4x6) measured 331 tok/s (334/330 rows/s), below 4x4 at 357-361. In that run CUDA0 held only 6033 slots and CUDA3 5612 (doorbell graph, CPU misses), and all 4 cards borrowed. Pure-decode batch_test with 32 slots (4x8) gave 547 tok/s, below 603 with 16 slots. The t = 2.8 + 0.95*S fit comes only from the 2-group Q2 run. The gain is possible only if trim restores 100% residency and own buffers at 24 slots, which is unmeasured.
 - pick_slot ignores held prefixes in piped mode (stale comment), and fixing it is a big win for multi-turn traffic — The first half holds: server.py:1430-1440. The 'big win' does not: the engine already searches every idle cached slot for the longest prefix, whichever slot BGEN targets (generate.cpp:9157-9171, restored via copy_from_slot at 9215-9250), and it also has the parked-conversation cache. The server change only decides which idle slot gets overwritten. Pad rows also clear cached on idle slots inside active groups (8617).
 - DP2: each 2-GPU instance holds ~49% of experts, CPU misses lower decode, single-user speed drops to 70-90 tok/s, so DP2 loses — The conclusion holds, the mechanism does not. strata-dp2-0.log: 15223 of 24576 pairs (62%, 98.6% of routed mass), decode hit rate 96-99%, so decode misses are not the problem. The ~164-token prompt read takes ~990 ms vs 457 ms on 4 GPUs. Measured: 1 user 74.4 tok/s aggregate (decode p50 89.5); 12 users 152.5 tok/s vs 361 for 4-GPU H12. Pinned RAM is 28.35 GiB per instance, matching the 26-30 GB claim.
 
-**Übersehene Blocker:**
+**Missed blockers:**
 - Expert residency collapses as slots grow, because each slot session takes 0.15 GiB per stage. At 20 slots 3 cards lend. At 24 slots CUDA0 holds 6033 and CUDA3 5612 slots. At 32 slots all four cards drop below 100%, CUDA3 to 5080. That, not the per-row cost model, explains H24 and G32. Holding 24 slots, 100% residency and own buffers on CUDA3 at once is borderline even with trim (~3 GiB freed): CUDA3 also carries the head, the 839 MiB MTP draft layer and the 213 MiB draft head, and had 247-271 MiB free at graph capture. Dropping to --max-context 16384 to make room conflicts with the X12/X16-agent-262k use case.
 - Batch CUDA graphs are keyed per layout (bkey(rows,S,hbase) in exec_bm_/commit_bm_): 16 per stage at 4x4, 24 at 4x6, 32 at 4x8. With 32 slots the LRU evicted and recaptured graphs 87 times (verify.cpp:2497-2515, 'no VRAM for a new window graph'). More rows per group needs VRAM headroom beyond the expert budget.
 - No measurement shows that more rows per group raises pure decode. The 32-slot batch_test (547 tok/s) is below 16 slots (603). Before claiming the 24-slot gain, prove pure decode at 24 slots with 100% residency on all 4 cards.
