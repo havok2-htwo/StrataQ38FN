@@ -1,0 +1,73 @@
+From 70dfe5cf0f882b1696dad01ae2a2ad8234250f00 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 16:24:39 +0200
+Subject: [PATCH 13/20] generate: STRATA_PIPE_OVERLAP=1 switches the PLE
+ setters on for pipelined batch slots
+
+The env (read once, Linux CUDA builds only: kPipeOverlapBuild) does nothing else yet: the overlapped read itself
+comes later. With a pipelined batch (--batch with --batch-groups > 1 on a layer split) it sets, once, before the
+first request:
+- ple_table.set_concurrent(true);
+- ple_table.set_urgent_reserve(STRATA_PIPE_OVERLAP_PLE_RESERVE, default 16 of --ple-inflight; Direct mode with
+  the I/O worker only, a no-op for --ple-io ram/mmap);
+- set_ple_urgent(true) on every stage verifier.
+Without the env none of these run.
+
+Checked with tools/batch_test16.py (--batch 16 --n 16 --max-new 64 --long-tokens 1200, T16-mmqtab.json: split
+12,24,36, 4 groups of 4, STRATA_MMQ_DIRECT=1, --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow): the
+reference engine (626a920), this build with the env off, and with STRATA_PIPE_OVERLAP=1, each with --ple-io ram
+and direct (9 runs). Every slot equals its solo tokens, and every run's solo and batch tokens are identical to
+the reference's. The admission reads, slot copies and the decode after the admissions (1.6 s) are the same;
+the "admissions included" batch line varies between runs of either build (2351-2957 ms for 252 group-steps:
+when a request line arrives relative to the next pump).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index b15985d1..57b8bce1 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -150,6 +150,14 @@ std::string vram_free_note() {
+     return buf;
+ }
+ 
++// STRATA_PIPE_OVERLAP: a batch admission's prompt read beside the pipelined slot windows, built only where it was
++// tested (Linux, CUDA); elsewhere the env does nothing.
++#if defined(__linux__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
++constexpr bool kPipeOverlapBuild = true;
++#else
++constexpr bool kPipeOverlapBuild = false;
++#endif
++
+ // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
+ // A file-backed arena on AMD (STRATA_ARENA_MMAP; the engine raises ROCclr's pin-in-place threshold, see main): an
+ // adaptive swap copies one expert straight from the mapped file.  Through ROCclr's staging that copy blocks the host
+@@ -9418,6 +9426,22 @@ int main(int argc, char** argv) {
+         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
+         std::vector<int> stage_group((size_t) n_pipe, -1);
+         int64_t pipe_tick = 0, rr = 0;
++        // STRATA_PIPE_OVERLAP=1: the PLE table is read by a prompt's chunks and the stage-0 windows at once. Switched on
++        // here and nowhere else (off: no lock, plain FIFO reads, as before): the table's lock, the windows' rows as
++        // urgent reads, and in Direct mode STRATA_PIPE_OVERLAP_PLE_RESERVE (default 16) read slots kept for them.
++        static const bool pipe_overlap_env = kPipeOverlapBuild && [] {
++            const char* v = std::getenv("STRATA_PIPE_OVERLAP");
++            return v && v[0] != '0';
++        }();
++        if (pipe_overlap_env && piped) {
++            static const int ple_reserve = [] {
++                const char* v = std::getenv("STRATA_PIPE_OVERLAP_PLE_RESERVE");
++                return v ? std::max(0, std::atoi(v)) : 16;
++            }();
++            ple_table.set_concurrent(true);
++            ple_table.set_urgent_reserve((uint32_t) ple_reserve);
++            for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_ple_urgent(true);
++        }
+         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
+         auto group_active = [&](int gi) {
+             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
+-- 
+2.43.0
+

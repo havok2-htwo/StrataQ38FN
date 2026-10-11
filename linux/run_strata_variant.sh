@@ -6,14 +6,15 @@ set -uo pipefail
 LABEL=$1; CFG=$(readlink -f "$2"); LEVELS=$3; shift 3
 HERE="$(cd "$(dirname "$0")" && pwd)"
 STRATA=/media/raid0/StrataQ38FN/Strata
+SERVER_DIR=${SERVER_DIR:-$STRATA}   # e.g. /media/raid0/StrataQ38FN/Strata-142 (its serve/server.py, same venv)
 PORT=${PORT:-8090}
 LOG="$HERE/results/server-$LABEL.out"
 mkdir -p "$HERE/results"
 systemctl --user stop strata-bench.scope 2>/dev/null
 systemctl --user reset-failed strata-bench.scope 2>/dev/null
-cd "$STRATA"
+cd "$SERVER_DIR"
 systemd-run --user --scope --unit=strata-bench -p MemoryMax=${MEMMAX:-90G} -p MemorySwapMax=0 \
-  "$STRATA/.venv/bin/python" "$STRATA/serve/server.py" --engine strata --config "$CFG" --port "$PORT" \
+  "$STRATA/.venv/bin/python" "$SERVER_DIR/serve/server.py" --engine strata --config "$CFG" --port "$PORT" \
   > "$LOG" 2>&1 < /dev/null &
 sleep 5
 t0=$(date +%s)

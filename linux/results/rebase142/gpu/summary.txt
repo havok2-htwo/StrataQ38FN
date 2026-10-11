@@ -1,0 +1,59 @@
+=== bt16 20:18:12 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 16 --n 16 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/bt16.json]
+rc=0 20:18:59 (47 s)
+batch: 16 slots, 1024 tokens; admissions 4.0s; then 1.6s -> aggregate 182.1 tok/s overall, 447.2 tok/s from the first batch token
+identical slots: 16; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== bt32 20:18:59 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test32.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 32 --n 32 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/bt32.json]
+rc=0 20:20:06 (67 s)
+batch: 32 slots, 2048 tokens; admissions 7.8s; then 2.9s -> aggregate 191.3 tok/s overall, 573.9 tok/s from the first batch token
+identical slots: 32; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== il 20:20:06 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_interleave_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow]
+rc=1 20:20:49 (43 s)
+D gave way: None
+engine: ERR BGEN: no such free slot (--batch 3) or a bad max_new
+identical slots: 4; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== ov-on 20:20:53 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json --env STRATA_PIPE_OVERLAP=1]
+rc=0 20:22:39 (106 s)
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+RESULT: PASS
+identical slots: 12; engine log: 'overlapped read of' 44, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== ov-off 20:22:39 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-off.json --env STRATA_PIPE_OVERLAP=0 --solo-json /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json]
+rc=0 20:23:23 (44 s)
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: False
+note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised
+log: 0 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json: RESUME identical
+RESULT: PASS
+identical slots: 9; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== ov-on-sc 20:23:23 env=[] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_overlap_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on-sc.json --env STRATA_PIPE_OVERLAP=1 --env STRATA_SLOT_COPY_DIRECT=1 --solo-json /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json --compare /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json]
+rc=0 20:24:08 (45 s)
+G2: RESUME 198 (G's prompt 197, its slot 198); G ended during H's read: True
+log: 22 overlapped reads, 0 'not captured' errors, 0 captures inside a read, 0 refusal reasons
+compare with /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json: token-identical
+compare with /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/ov-on.json: RESUME identical
+RESULT: PASS
+identical slots: 12; engine log: 'overlapped read of' 44, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== bt16-mmq0 20:24:08 env=[STRATA_MMQ_DIRECT=0] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 16 --n 16 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/bt16-mmq0.json]
+rc=0 20:24:55 (47 s)
+batch: 16 slots, 1024 tokens; admissions 4.2s; then 1.6s -> aggregate 177.6 tok/s overall, 384.9 tok/s from the first batch token
+identical slots: 16; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== bt32-mmq0 20:24:55 env=[STRATA_MMQ_DIRECT=0] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test32.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 32 --n 32 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/bt32-mmq0.json]
+rc=0 20:26:02 (67 s)
+batch: 32 slots, 2048 tokens; admissions 7.9s; then 2.9s -> aggregate 189.2 tok/s overall, 553.0 tok/s from the first batch token
+identical slots: 32; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== bt16-ts7 20:26:02 env=[STRATA_ROUTE_TAIL_SKIP=7] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 16 --n 16 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/bt16-ts7.json]
+rc=0 20:26:48 (46 s)
+batch: 16 slots, 1024 tokens; admissions 4.0s; then 1.6s -> aggregate 182.1 tok/s overall, 446.0 tok/s from the first batch token
+identical slots: 16; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+=== il-sc 20:26:48 env=[STRATA_SLOT_COPY_DIRECT=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_interleave_test.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow]
+rc=1 20:27:31 (43 s)
+D gave way: None
+engine: ERR BGEN: no such free slot (--batch 3) or a bad max_new
+identical slots: 4; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+DONE bt16 bt32 il ov-on ov-off ov-on-sc bt16-mmq0 bt32-mmq0 bt16-ts7 il-sc 20:27:31
+=== bt16-sc 20:28:42 env=[STRATA_SLOT_COPY_DIRECT=1] cmd=[python3 /media/raid0/StrataQ38FN/Strata-142/tools/batch_test16.py --exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-142 --config /media/raid0/StrataQ38FN/linux/configs/T16-mmqtab.json --batch 16 --n 16 --max-new 64 --long-tokens 1200 --extra --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --dump /media/raid0/StrataQ38FN/linux/results/rebase142/gpu/bt16-sc.json]
+rc=0 20:29:28 (46 s)
+batch: 16 slots, 1024 tokens; admissions 3.8s; then 1.6s -> aggregate 189.5 tok/s overall, 214.3 tok/s from the first batch token
+identical slots: 16; engine log: 'overlapped read of' 0, 'not captured before' 0, TAIL_SKIP lines 0, watchdog/terminate 0
+DONE bt16-sc 20:29:28

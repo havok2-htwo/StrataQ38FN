@@ -1,0 +1,6 @@
+Review fixes on g3-142 (2026-10-11):
+650001fb  slots_in_windows(): >8 slots held to <=8 rows/group, also after carving (findings 1+4), log/comments without g3 tags, pre-cap follows batch_groups::resolve (finding 2), hand-off rows per slot only for pipelined groups (finding 5), GS>8 guard before pump
+e20b3a18  TEST_FAULT=cuda: wcuda = -1 instead of cudaErrorIllegalAddress (HIP build, finding 3)
+Build log: build3.log. CPU tests batch_rows/batch_groups/batch_read pass. HIP build not checked (no hipcc here).
+Binary engine/strata-g3-142 sha256 3e5385428614710c0c70a9791dcb7110ad72b156a92603e9ab18c7827f279f6c
+Slot-count simulation (stages=3): default 32->32, 30->28, 27->24, 17->16; --batch-groups 4 30->28; groups 1 32->8; adapt-async default 16->8; no split 16->8; groups 3 32->24; groups 5 40->30

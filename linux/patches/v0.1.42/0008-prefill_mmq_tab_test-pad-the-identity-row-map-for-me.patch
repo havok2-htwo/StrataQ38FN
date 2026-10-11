@@ -1,0 +1,50 @@
+From 775d791325430335b7043555eea79ef840a11027 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:58:29 +0200
+Subject: [PATCH 08/20] prefill_mmq_tab_test: pad the identity row map for
+ memcheck
+
+MMQ loads a whole tile's ids, and its stream-k fixup one per column tile of max_rows, past an
+expert's last row (upstream behaviour on both paths; the values are not used). With the map
+padded, compute-sanitizer memcheck runs the whole test clean: 0 errors, 874/874 bitwise equal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/cuda/prefill_mmq_tab_test.cu | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/tests/cuda/prefill_mmq_tab_test.cu b/tests/cuda/prefill_mmq_tab_test.cu
+index d005de04..574fd135 100644
+--- a/tests/cuda/prefill_mmq_tab_test.cu
++++ b/tests/cuda/prefill_mmq_tab_test.cu
+@@ -38,6 +38,7 @@ namespace mmq = strata::prefill::mmq;
+ 
+ constexpr int G = mmq::kGatherGroupMax;
+ constexpr size_t TAIL = 4096;
++constexpr int64_t kIdsPad = 2048 + 128;   // > the largest max_rows of the sweep plus one tile
+ 
+ void ck(cudaError_t e, const char* what) {
+     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+@@ -97,7 +98,7 @@ struct Acts {
+     int64_t total;
+     Acts(ggml_type t, int64_t cols, const std::vector<int>& cnt, std::mt19937& rng, cudaStream_t s)
+         : x((size_t) std::max<int64_t>(1, sum(cnt)) * cols * 4), xq(mmq::q8_bytes(std::max<int64_t>(1, sum(cnt)), cols)),
+-          ids((size_t) std::max<int64_t>(1, sum(cnt)) * 4), bounds((cnt.size() + 1) * 4), total(sum(cnt)) {
++          ids((size_t) (sum(cnt) + kIdsPad) * 4), bounds((cnt.size() + 1) * 4), total(sum(cnt)) {
+         std::vector<float> hx((size_t) std::max<int64_t>(1, total) * cols);
+         std::normal_distribution<float> nd(0.0f, 1.0f);
+         for (auto& v : hx) v = nd(rng);
+@@ -105,7 +106,9 @@ struct Acts {
+         std::vector<int32_t> hb(cnt.size() + 1, 0);
+         for (size_t i = 0; i < cnt.size(); ++i) hb[i + 1] = hb[i] + cnt[i];
+         upload(bounds.p, hb.data(), hb.size() * 4, "bounds");
+-        mmq::iota((int32_t*) ids.p, std::max<int64_t>(1, total), s);
++        // MMQ loads a whole tile's J ids from an expert's first row, and its stream-k fixup does so for every column
++        // tile of max_rows, also past the last row (upstream behaviour, harmless values): padded for memcheck
++        mmq::iota((int32_t*) ids.p, total + kIdsPad, s);
+         if (total > 0) mmq::quantize((const float*) x.p, nullptr, xq.p, (int) t, cols, cols, total, s);
+         ck(cudaStreamSynchronize(s), "acts");
+     }
+-- 
+2.43.0
+

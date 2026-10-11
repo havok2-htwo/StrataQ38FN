@@ -1,0 +1,254 @@
+From db130fbe1a547dad96fdf13b80ed9cef092279a0 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:56:57 +0200
+Subject: [PATCH 10/20] expert cache: slot_guard() reports the guard applied; a
+ test for slot_tail on uniform and sized caches
+
+- ExpertCache::slot_guard() returns the guard open_sized applied (guard_, reset by close), not the request: 0 for
+  uniform slots, when closed, and on SYCL, whose open_sized applies none.
+- tests/core/expert_cache_slot_guard_test: slot_stride, slot_room and slot_tail on a uniform cache (empty off_,
+  including the last slot) and on sized caches with and without the 256 B guard; no guard gives today's offsets;
+  close and reopen.
+- generate: the "+256 B guard per sized slot" line only for a sized cache; a uniform one says it has no guard.
+- prefill: STRATA_MMQ_DIRECT_LOG=1 (with STRATA_MMQ_DIRECT=1) prints each stage's totals of experts read in place,
+  resident and streamed after every prompt, so an engine run can show which walk read what.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                              |   6 +
+ include/strata/core/expert_cache.hpp        |   6 +-
+ src/core/expert_cache.cpp                   |   2 +
+ src/prefill/prefill.cpp                     |  10 ++
+ src/program/generate.cpp                    |   9 +-
+ tests/core/expert_cache_slot_guard_test.cpp | 117 ++++++++++++++++++++
+ 6 files changed, 146 insertions(+), 4 deletions(-)
+ create mode 100644 tests/core/expert_cache_slot_guard_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fb615e72..9bd7a8eb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -565,6 +565,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(expert_cache_segmented_test PRIVATE strata_engine)
+     add_test(NAME expert_cache_segmented_test COMMAND expert_cache_segmented_test)
+     set_tests_properties(expert_cache_segmented_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
++    # STRATA_MMQ_DIRECT: slot_guard / slot_room / slot_tail on the uniform and the sized cache, and the default
++    # (no guard) sized layout unchanged
++    add_executable(expert_cache_slot_guard_test tests/core/expert_cache_slot_guard_test.cpp)
++    target_link_libraries(expert_cache_slot_guard_test PRIVATE strata_engine)
++    add_test(NAME expert_cache_slot_guard_test COMMAND expert_cache_slot_guard_test)
++    set_tests_properties(expert_cache_slot_guard_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+   endif()
+   if(STRATA_BUILD_CONVERSATION_TESTS)
+     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
+diff --git a/include/strata/core/expert_cache.hpp b/include/strata/core/expert_cache.hpp
+index 4ec789b7..5262ce5f 100644
+--- a/include/strata/core/expert_cache.hpp
++++ b/include/strata/core/expert_cache.hpp
+@@ -124,8 +124,9 @@ public:
+     /// `set_segment_bytes`; `close` keeps it.  0 (the default): no guard.  The uniform `open` ignores it, and so does
+     /// the SYCL engine's open_sized (its slots then have no guard, and `slot_tail` finds no room).
+     void set_slot_guard(int64_t g) { guard_req_ = g > 0 ? g : 0; }
+-    /// The guard the open slots have (0 for uniform slots).
+-    int64_t slot_guard() const { return off_.empty() ? 0 : guard_req_; }
++    /// The guard the open slots were laid out with: what `open_sized` applied (0 for uniform slots, when closed, and
++    /// on SYCL, whose open_sized applies none).
++    int64_t slot_guard() const { return guard_; }
+     /// A sized slot's arena bytes: the blob plus the guard, 256-byte aligned.
+     static int64_t slot_stride(int64_t blob, int64_t guard = 0) { return (blob + guard + 255) / 256 * 256; }
+     bool segmented() const { return !segs_.empty(); }
+@@ -239,6 +240,7 @@ private:
+     int64_t live_slots_ = 0;            ///< #533: slots() - all of them unless shrunk
+     int64_t seg_req_ = 0;               ///< #533: the segment size asked for (0: one cudaMalloc)
+     int64_t guard_req_ = 0;             ///< STRATA_MMQ_DIRECT: bytes kept after each sized slot's blob (set_slot_guard)
++    int64_t guard_ = 0;                 ///< ...the guard open_sized applied to the open slots (0: none)
+     int64_t seg_ = 0;                   ///< #533: the segment size used (a multiple of the driver's granularity)
+     uint64_t reserved_ = 0;             ///< #533: the reserved address range's size
+     std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)
+diff --git a/src/core/expert_cache.cpp b/src/core/expert_cache.cpp
+index 97ccb387..f51b2eca 100644
+--- a/src/core/expert_cache.cpp
++++ b/src/core/expert_cache.cpp
+@@ -575,6 +575,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
+     live_slots_ = slots_;
+     blob_ = mx;
+     off_ = std::move(off);
++    guard_ = guard_req_;
+ #if defined(STRATA_USE_HIP)
+     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
+         close();
+@@ -599,6 +600,7 @@ void ExpertCache::close() {
+     blocking_staging_bytes_ = 0;
+ #endif
+     off_.clear();
++    guard_ = 0;
+     if (!segs_.empty()) {
+         release_segmented();
+     } else if (vmm_) {
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index feded3a9..aa8e4a82 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -4232,6 +4232,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+         err = drain_err;
+         return false;
+     }
++    // STRATA_MMQ_DIRECT=1 with STRATA_MMQ_DIRECT_LOG=1 (a check, not a default): each stage's totals so far - how many
++    // resident experts its prompt MMQ read in their slots, of all its resident and streamed ones
++    if (mmq::direct_mode() == 1) {
++        static const bool log = [] { const char* v = std::getenv("STRATA_MMQ_DIRECT_LOG"); return v && std::atoi(v) != 0; }();
++        for (const Prefill* p = this; log && p != nullptr; p = p->next_)
++            std::fprintf(stderr, "strata prefill: layers %lld..%lld: %lld of %lld resident experts read in place, %lld "
++                                 "streamed (STRATA_MMQ_DIRECT, totals)\n", (long long) p->stage_lb_,
++                         (long long) p->stage_le_, (long long) p->stats_.experts_direct,
++                         (long long) p->stats_.experts_resident, (long long) p->stats_.experts_streamed);
++    }
+     return true;
+ }
+ 
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 521df74c..b15985d1 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4921,8 +4921,13 @@ int main(int argc, char** argv) {
+     }
+     // STRATA_MMQ_DIRECT: the guard after each sized slot (kept across the retry loop's close/open)
+     xcache.set_slot_guard(slot_guard);
+-    if (slot_guard > 0)
+-        std::fprintf(stderr, "strata generate: +%lld B guard per sized slot (STRATA_MMQ_DIRECT)\n", (long long) slot_guard);
++    if (slot_guard > 0 && o.expert_cache > 0) {
++        if (!sized_slots.empty())
++            std::fprintf(stderr, "strata generate: +%lld B guard per sized slot (STRATA_MMQ_DIRECT)\n", (long long) slot_guard);
++        else   // xcache.open below: every slot is the largest blob's size, and no guard is added
++            std::fprintf(stderr, "strata generate: uniform expert slots, no guard (STRATA_MMQ_DIRECT): an expert is read "
++                                 "in its slot where the slot's slack covers the over-read\n");
++    }
+     if (o.expert_cache > 0) {
+         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
+         auto shrink_to = [&](int64_t keep_bytes) -> bool {
+diff --git a/tests/core/expert_cache_slot_guard_test.cpp b/tests/core/expert_cache_slot_guard_test.cpp
+new file mode 100644
+index 00000000..d7b5ac40
+--- /dev/null
++++ b/tests/core/expert_cache_slot_guard_test.cpp
+@@ -0,0 +1,117 @@
++// STRATA_MMQ_DIRECT: the expert cache's slot guard (set_slot_guard), slot_room and slot_tail on the uniform cache
++// (open: off_ empty, the stride is the largest blob) and on the sized one (open_sized: off_ holds each slot's start).
++// No guard asked (the default) must give today's sized layout byte for byte.  Needs a CUDA device (exits 77 without).
++#include "strata/core/expert_cache.hpp"
++
++#include <cuda_runtime.h>
++
++#include <cstdio>
++#include <string>
++#include <vector>
++
++namespace {
++
++int g_fail = 0;
++
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++g_fail;
++    }
++}
++
++}  // namespace
++
++int main() {
++    int n = 0;
++    if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
++        std::puts("no CUDA device: skipped");
++        return 77;
++    }
++    using strata::core::ExpertCache;
++    std::string err;
++
++    // slot_stride: the blob plus the guard, 256-byte aligned; guard 0 is the old (b + 255) / 256 * 256
++    for (int64_t b : {1, 255, 256, 257, 1000, 2457600, 2949120, 3047424}) {
++        check(ExpertCache::slot_stride(b) == (b + 255) / 256 * 256, "slot_stride without a guard is today's stride");
++        check(ExpertCache::slot_stride(b, 256) == (b + 256 + 255) / 256 * 256, "slot_stride with a 256 B guard");
++        check(ExpertCache::slot_stride(b, 256) - b >= 256, "a guarded slot has at least the guard after its blob");
++    }
++
++    // 1. uniform: off_ is empty; the guard is asked for but not applied (every slot is the largest blob)
++    {
++        ExpertCache c;
++        c.set_slot_guard(256);
++        if (!c.open(6, 3, 4, 1024, err)) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
++        check(c.slot_guard() == 0, "uniform: no guard applied");
++        for (int32_t s = 0; s < 6; ++s) {
++            check(c.slot_room(s) == 1024, "uniform: slot_room is the blob size");
++            check(c.slot_offset(s) == (uint64_t) s * 1024, "uniform: slot_offset");
++        }
++        // the last slot reads slot_offset(slots) - the end - without indexing an empty off_
++        check(c.slot_tail(5, 1000, 24) == c.device_slot(5) + 1000, "uniform: the last slot's slack covers 24 B");
++        check(c.slot_tail(5, 1000, 25) == nullptr, "uniform: the last slot has no room for 25 B past 1000");
++        check(c.slot_tail(0, 1024, 0) == c.device_slot(0) + 1024, "uniform: need 0 at the slot's end");
++        check(c.slot_tail(0, 1024, 1) == nullptr, "uniform: a full slot has no room");
++        check(c.slot_tail(3, 512, 136) == c.device_slot(3) + 512, "uniform: a smaller blob's slack");
++        check(c.slot_tail(-1, 10, 10) == nullptr && c.slot_tail(6, 10, 10) == nullptr, "uniform: a bad slot is null");
++        c.close();
++        check(c.slot_guard() == 0 && c.slot_tail(0, 10, 10) == nullptr, "uniform: closed");
++    }
++
++    // 2. sized without a guard (the default): today's layout, and slot_tail sees only the 256-byte rounding
++    const std::vector<int64_t> blobs = {1000, 2457600, 700, 3047424, 256, 2949120};
++    std::vector<uint64_t> plain(blobs.size() + 1, 0);
++    for (size_t i = 0; i < blobs.size(); ++i) plain[i + 1] = plain[i] + ((uint64_t) blobs[i] + 255) / 256 * 256;
++    {
++        ExpertCache c;
++        if (!c.open_sized(blobs, 3, 4, err)) { std::fprintf(stderr, "open_sized: %s\n", err.c_str()); return 1; }
++        check(c.slot_guard() == 0, "sized, no guard: slot_guard 0");
++        for (size_t s = 0; s <= blobs.size(); ++s) check(c.slot_offset((int64_t) s) == plain[s], "sized, no guard: today's offsets");
++        check(c.slot_tail(0, 1000, 24) == c.device_slot(0) + 1000, "sized, no guard: the rounding's 24 B");
++        check(c.slot_tail(0, 1000, 25) == nullptr, "sized, no guard: no more than the rounding");
++        check(c.slot_tail(4, 256, 1) == nullptr, "sized, no guard: a blob of 256 has no room");
++        check(c.slot_tail(5, 2949120, 1) == nullptr, "sized, no guard: the last slot (offset of the end)");
++    }
++
++    // 3. sized with the 256 B guard: every slot has >= 256 B after its blob; close() drops the applied guard and a
++    //    reopen applies the kept request again
++    {
++        ExpertCache c;
++        c.set_slot_guard(256);
++        for (int round = 0; round < 2; ++round) {
++            if (!c.open_sized(blobs, 3, 4, err)) { std::fprintf(stderr, "open_sized: %s\n", err.c_str()); return 1; }
++            check(c.slot_guard() == 256, "sized, guard: slot_guard 256");
++            uint64_t off = 0;
++            for (size_t s = 0; s < blobs.size(); ++s) {
++                const int32_t si = (int32_t) s;
++                check(c.slot_offset(si) == off, "sized, guard: offsets");
++                off += (uint64_t) ExpertCache::slot_stride(blobs[s], 256);
++                check(c.slot_room(si) == (uint64_t) ExpertCache::slot_stride(blobs[s], 256), "sized, guard: slot_room");
++                check(c.device_slot(si) == c.device_slot(0) + c.slot_offset(si), "sized, guard: device_slot");
++                uint8_t* t = c.slot_tail(si, (uint64_t) blobs[s], 256);
++                check(t == c.device_slot(si) + blobs[s], "sized, guard: slot_tail at the blob's end");
++                check(c.slot_tail(si, (uint64_t) blobs[s], c.slot_room(si) - (uint64_t) blobs[s] + 1) == nullptr,
++                      "sized, guard: no room past the slot");
++            }
++            check(c.slot_offset((int64_t) blobs.size()) == off, "sized, guard: the end");
++            // the guard is writable device memory inside the arena (the prompt path zeroes it)
++            uint8_t* t = c.slot_tail((int32_t) blobs.size() - 1, (uint64_t) blobs.back(), 256);
++            check(t != nullptr && cudaMemset(t, 0, 256) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess,
++                  "sized, guard: the last slot's guard can be zeroed");
++            c.close();
++            check(c.slot_guard() == 0 && c.slot_tail(0, 10, 10) == nullptr, "sized, guard: closed");
++        }
++        // asked for 0 again: today's layout
++        c.set_slot_guard(0);
++        if (!c.open_sized(blobs, 3, 4, err)) { std::fprintf(stderr, "open_sized: %s\n", err.c_str()); return 1; }
++        check(c.slot_guard() == 0 && c.slot_offset((int64_t) blobs.size()) == plain.back(), "sized: guard reset to 0");
++    }
++
++    if (g_fail != 0) {
++        std::fprintf(stderr, "expert cache slot guard: %d checks failed\n", g_fail);
++        return 1;
++    }
++    std::puts("expert cache slot guard: uniform and sized caches, with and without the guard, passed");
++    return 0;
++}
+-- 
+2.43.0
+

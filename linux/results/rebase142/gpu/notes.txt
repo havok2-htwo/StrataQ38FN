@@ -1,0 +1,14 @@
+rebase142 GPU exactness (2026-10-11 20:16-20:33), engine/strata-g3-142 sha256 3e538542...279f6c (g3-142 e20b3a18).
+Started after series_ovq "SERIES OVQ DONE" and all 4 GPUs < 1000 MiB.
+All arms: STRATA_MMQ_DIRECT=1 STRATA_IQ_MT_MIN=1, --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow, configs/T16-mmqtab.json
+(split 12,24,36), tools from Strata-142/tools (identical to the main checkout's), MemoryMax=90G scope per engine.
+Commands: run.sh <arm> (each arm's command line in summary.txt); cmpdump.py a.json b.json compares two batch_test dumps.
+prefill_mmq_tab_test (build-142, GPU): 874 comparisons, 0 failed, rc 0, 101 s -> prefill_mmq_tab_test.out
+bt16 16/16, bt32 32/32 (4 groups of 8) identical to solo; bt16/bt32 tokens (solo+batch) also equal to exactness-r1 bt16-off/bt32-off/bt32-ref (old strata-g3-overlap / g3-mmqtab)
+il: rc 1 with "ERR BGEN: no such free slot (--batch 3)" at step 4, byte-identical output to exactness-r1/il-ref.out (pre-existing, reference engine stops the same way); il-sc byte-identical to il
+ov-on PASS (22 overlapped reads), ov-off PASS token- + RESUME-identical to ov-on, ov-on-sc (STRATA_SLOT_COPY_DIRECT=1) PASS token- + RESUME-identical to ov-on
+ov-on vs exactness-r1/ov-on.json: prompts/solo/resume equal; batch differs only in where the background slots were stopped (common prefixes identical)
+STRATA_MMQ_DIRECT=0 vs 1: bt16 16/16 and bt32 32/32 solo+batch token-identical
+STRATA_ROUTE_TAIL_SKIP: default -> off, no log line (100% experts resident and --batch); =7 explicit -> still no log line, no "route tail skip" counter, tokens 16/16 identical to off, decode 446.0 vs 447.2 tok/s from first batch token: does not engage (it only skips MISSED experts; none are missed)
+slot copy ("copied in" avg): default (host copy) bt16 85.7 / bt32 84.8 ms; STRATA_SLOT_COPY_DIRECT=1 bt16-sc 61.5 ms; old strata-g3-overlap (direct on by default) bt16-off 59.8 ms
+HTTP: ../http.sh, ../strata-142-{short,long}.txt, ../sweep.jsonl, ../http.engine.log

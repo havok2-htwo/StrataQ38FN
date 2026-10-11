@@ -1,0 +1,528 @@
+From 36aa90dcc068c6558fdafe02081e87b2248c4dfb Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:16:06 +0200
+Subject: [PATCH 01/20] batch: more than 8 slots with a layer split (8 rows per
+ pipeline group), hand-off sized per slot
+
+Measured on 4x RTX 3090 (UD-IQ4_XS): 16 and 32 slots decode bit-identical to solo
+(tools/batch_test16.py / batch_test32.py); 16 slots 603 tok/s batch decode vs 345 with 8.
+
+Rebased on 0.1.42: the stages' batch row check (batch_rows_error, upstream 48f2c47d) bounds
+hbase + S by the hand-off rows; set_handoff_rows passes the per-slot size there (only above 8 slots).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/verify.hpp |   4 +
+ src/core/verify.cpp            |   4 +-
+ src/program/generate.cpp       |  35 +++++--
+ tools/batch_test16.py          | 181 ++++++++++++++++++++++++++++++++
+ tools/batch_test32.py          | 183 +++++++++++++++++++++++++++++++++
+ 5 files changed, 397 insertions(+), 10 deletions(-)
+ create mode 100644 tools/batch_test16.py
+ create mode 100644 tools/batch_test32.py
+
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 519fd43b..797d6608 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -135,6 +135,9 @@ public:
+     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
+         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
+     }
++    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  More than --batch's 8 slots on a
++    /// layer split: the pipelined slot groups write their rows at hbase = group * rows-per-group, one row per slot.
++    void set_handoff_rows(int rows) { handoff_rows_ = rows; }
+     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
+     /// and `final_R` are the last stage's.
+     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+@@ -364,6 +367,7 @@ private:
+     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
+     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
+     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
++    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
+     const float* hand_in_ = nullptr;
+     float* hand_out_ = nullptr;
+     Verifier* next_ = nullptr;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 3e9ec069..684a15b5 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2589,9 +2589,9 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+                            std::string& err) {
+     using namespace strata::kernels;
+     // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
+-    // whose hand-off buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them)
++    // whose hand-off buffers hold kVerifyMaxT rows, or set_handoff_rows' (a stage that hands rows on or takes them)
+     if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), max_t_, hbase,
+-                                           next_ != nullptr || lb_ > 0, kVerifyMaxT)) {
++                                           next_ != nullptr || lb_ > 0, handoff_rows_ > 0 ? handoff_rows_ : kVerifyMaxT)) {
+         err = why;
+         return false;
+     }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ff3f2e1a..554514c0 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4238,9 +4238,17 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
+             o.batch = 0;
+         } else if (o.batch > cap && !batch_mtp) {
+-            std::fprintf(stderr, "strata generate: WARNING: --batch %d: a batch window holds at most %d rows, so %d "
+-                                 "slots\n", o.batch, cap, cap);
+-            o.batch = cap;
++            // g3: with a layer split the slots flow through the stages in groups, and a group's window holds
++            // batch / groups rows - so up to cap rows per group, one group per stage, i.e. cap * stages slots
++            const int pipe_cap = !stages.empty() && !(o.batch_groups_set && !o.batch_groups_auto && o.batch_groups == 1) ? cap * (int) (stages.size() + 1) : cap;
++            if (o.batch > pipe_cap) {
++                std::fprintf(stderr, "strata generate: WARNING: --batch %d: a batch window holds at most %d rows, so %d "
++                                     "slots\n", o.batch, cap, pipe_cap);
++                o.batch = pipe_cap;
++            }
++            if (o.batch > cap)
++                std::fprintf(stderr, "strata generate: --batch %d over %d stages (g3 patch: up to %d rows per group "
++                                     "window)\n", o.batch, (int) stages.size() + 1, cap);
+         }
+     }
+     // --batch-groups auto: the pipeline needs one group per GPU stage to keep every card busy (4 x R9700, 8 clients:
+@@ -4263,6 +4271,13 @@ int main(int argc, char** argv) {
+                          r.groups == 1 ? "" : "s", o.batch / r.groups, o.batch / r.groups == 1 ? "" : "s");
+     };
+     if (o.batch > 0) resolve_groups_auto();
++    if (o.batch > strata::kernels::kVerifyMaxT && !batch_mtp &&
++        (o.batch_groups < 2 || o.batch / std::max(o.batch_groups, 1) > strata::kernels::kVerifyMaxT)) {
++        const int g_ = std::max(o.batch_groups, 1), keep = strata::kernels::kVerifyMaxT * g_;
++        std::fprintf(stderr, "strata generate: WARNING: --batch %d in %d group%s exceeds %d rows per window: %d slots\n",
++                     o.batch, g_, g_ == 1 ? "" : "s", (int) strata::kernels::kVerifyMaxT, keep);
++        o.batch = keep;
++    }
+     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
+         std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
+                              "one group\n", o.batch_groups, o.batch);
+@@ -7307,8 +7322,10 @@ int main(int argc, char** argv) {
+                 }
+         }
+         if (n_stages > 1) {
+-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+-                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
++            // g3: pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
++            // kVerifyMaxT slots the hand-off must hold one row per slot
++            const int hrows = std::max<int>(strata::kernels::kVerifyMaxT, o.batch);
++            const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
+             for (float*& h : hand) {
+                 float* hh = nullptr;
+@@ -7324,6 +7341,7 @@ int main(int argc, char** argv) {
+             for (int st = 0; st < n_stages; ++st) {
+                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
+                                         st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
++                if (hrows > strata::kernels::kVerifyMaxT) stage_ver(st).set_handoff_rows(hrows);
+                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
+                 split_drive.cache_base[st] = drive.d.cache_base;
+                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
+@@ -7332,7 +7350,7 @@ int main(int argc, char** argv) {
+             for (int st = 1; st < n_stages; ++st) {
+                 bool ok_s = false;
+                 if (split_same) {
+-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err);
++                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
+                 } else {
+                     GpuStage& gs = *stages[(size_t) st - 1];
+                     const strata::core::OnDevice on(gs.dev);
+@@ -7348,7 +7366,8 @@ int main(int argc, char** argv) {
+                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
+                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
+                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
+-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
++                                       batch_mtp ? strata::kernels::kVerifyMaxT
++                                                 : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
+                     split_drive.cache_base[st] = gs.cache.device_slot(0);
+                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
+                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
+@@ -7418,7 +7437,7 @@ int main(int argc, char** argv) {
+         ver.set_remote_expert_opt(remote_opt.get());
+         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
++                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
+             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
+                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
+             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+diff --git a/tools/batch_test16.py b/tools/batch_test16.py
+new file mode 100644
+index 00000000..77686d5c
+--- /dev/null
++++ b/tools/batch_test16.py
+@@ -0,0 +1,181 @@
++#!/usr/bin/env python3
++"""Batching test: the same prompts decoded alone (GEN, the usual path with drafts) and together in the batch
++windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints the aggregate decode rate.
++
++  python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 4 --n 4 \
++      --extra "--layer-split 12,24,36 --trim-stage-weights --pcie-frac 0 --adapt-every 1000000"
++"""
++import argparse, json, os, subprocess, sys, tempfile, threading, time
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import strata_tokenizer as ST  # noqa: E402
++
++QUESTIONS = [
++    "Explique en detail le fonctionnement d'un B-tree.",
++    "Write a Python function that merges overlapping intervals, then explain it.",
++    "Compare TCP and QUIC: handshake, congestion control, multiplexing.",
++    "Raconte l'histoire du calcul de pi, d'Archimede a nos jours.",
++    "What are the main causes of the French Revolution?",
++    "Explain how a transformer's attention works, step by step.",
++    "Donne une recette de tarte aux pommes, etape par etape.",
++    "Describe the life cycle of a star like the Sun.",
++    "Erklaere ausfuehrlich, wie ein Dieselmotor funktioniert.",
++    "Write a Rust function that parses a CSV line with quoted fields, then explain it.",
++    "What were the main consequences of the invention of the printing press?",
++    "Explique le theoreme de Pythagore avec trois demonstrations differentes.",
++    "Describe how the immune system responds to a viral infection.",
++    "Explain the difference between processes and threads in an operating system.",
++    "Beschreibe die Geschichte des Roemischen Reiches in Grundzuegen.",
++    "How does public-key cryptography work? Give an example with RSA.",
++]
++
++
++def tokenizer(path):
++    t = Path(path)
++    vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
++    tokens = [None] * len(vocab)
++    for s, i in vocab.items():
++        tokens[i] = s
++    merges = (t / "merges.txt").read_text(encoding="utf-8").split("\n")
++    types = json.loads((t / "token_type.json").read_text())
++    return ST.Tokenizer(tokens, merges, types)
++
++
++class Engine:
++    def __init__(self, exe, cfg, batch, extra_env, extra_args):
++        args = list(cfg["args"])
++        if len(cfg.get("gpu") or []) > 1:
++            args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
++        if batch:
++            args += ["--batch", str(batch)]
++        args += extra_args
++        env = dict(os.environ, **extra_env)
++        env["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [env.get("LD_LIBRARY_PATH", "")])
++        if os.name == "nt":
++            env["PATH"] = os.pathsep.join(cfg.get("lib_dirs", []) + [env.get("PATH", "")])
++        self.log_path = os.environ.get("BATCH_TEST_LOG") or os.path.join(tempfile.gettempdir(), "batch_test_engine.log")
++        self.log = open(self.log_path, "w")
++        self.p = subprocess.Popen([exe, "--serve", *args], cwd=cfg.get("cwd"), stdin=subprocess.PIPE,
++                                  stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1, env=env)
++        for line in self.p.stdout:
++            if line.startswith("READY"):
++                return
++        raise SystemExit(f"the engine ended before READY - see {self.log_path}")
++
++    def send(self, line):
++        self.p.stdin.write(line + "\n")
++        self.p.stdin.flush()
++
++    def lines(self):
++        for line in self.p.stdout:
++            yield line.rstrip("\n")
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--exe", required=True)
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--batch", type=int, default=4)
++    ap.add_argument("--n", type=int, default=4, help="prompts (<= --batch)")
++    ap.add_argument("--max-new", type=int, default=64)
++    ap.add_argument("--skip-solo", action="store_true")
++    ap.add_argument("--keys", default="", help='sampling keys for every request, e.g. "temperature=0.7 top_k=20"')
++    ap.add_argument("--extra", default="", help='more engine arguments in one string, e.g. "--adapt-every 1000000"')
++    ap.add_argument("--dump", default="", help="write every slot's tokens (solo and batch) as JSON: an A/B of two engine builds")
++    ap.add_argument("--long-tokens", type=int, default=0,
++                    help="the LAST prompt is read from about this many tokens of filler text first: its chunks run "
++                         "beside the earlier slots' windows (the prompt path lends experts then)")
++    ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
++    a = ap.parse_args()
++    cfg = json.loads(Path(a.config).read_text())
++    tok = tokenizer(cfg["tokenizer"])
++    prompts = []
++    for q in QUESTIONS[: a.n]:
++        text = f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
++        if a.long_tokens and q is QUESTIONS[a.n - 1]:
++            para = ("The committee reviewed item %d of the long agenda, noting the budget, the schedule and the open "
++                    "risks, and asked the staff to report back next quarter. ")
++            per = max(1, len(tok.encode(para % 100)))
++            filler = "".join(para % i for i in range(a.long_tokens // per + 1))
++            text = f"<|im_start|>user\n{filler}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
++        prompts.append(tok.encode(text, parse_special=True))
++    env = {"STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
++    if a.mt_min:
++        env["STRATA_IQ_MT_MIN"] = a.mt_min
++    eng = Engine(a.exe, cfg, a.batch, env, a.extra.split())
++    out = eng.lines()
++
++    solo = []
++    if not a.skip_solo:
++        for i, ids in enumerate(prompts):
++            eng.send(" ".join(x for x in ("GEN", str(a.max_new), a.keys, ",".join(map(str, ids))) if x))
++            got, t0 = [], time.time()
++            for line in out:
++                if line.startswith("T "):
++                    got.append(int(line.split()[1]))
++                elif line.startswith("DONE") or line.startswith("ERR"):
++                    print(f"solo {i}: {len(got)} tokens in {time.time() - t0:.1f}s  {line[:60]}", flush=True)
++                    break
++            solo.append(got)
++
++    # batch: admit every prompt, then the slots decode together
++    got = {i: [] for i in range(len(prompts))}
++    done = {}
++    t_admit = time.time()
++    first_bt = None
++    for i, ids in enumerate(prompts):
++        eng.send(" ".join(x for x in ("BGEN", str(i), str(a.max_new), a.keys, ",".join(map(str, ids))) if x))
++        for line in out:
++            if line.startswith("T "):
++                got[i].append(int(line.split()[1]))
++            elif line.startswith("BT "):
++                _, s, y = line.split()
++                got[int(s)].append(int(y))
++                first_bt = first_bt or time.time()
++            elif line.startswith("BDONE "):
++                done[int(line.split()[1])] = line
++            elif line.startswith("ERR"):
++                print("batch:", line)
++                return 1
++            elif line.startswith("BADM "):
++                if line.split()[2] == "0":
++                    done[i] = line
++                break
++    t_admitted = time.time()
++    for line in out:
++        if line.startswith("BT "):
++            _, s, y = line.split()
++            got[int(s)].append(int(y))
++            first_bt = first_bt or time.time()
++        elif line.startswith("BDONE "):
++            done[int(line.split()[1])] = line
++            if len(done) == len(prompts):
++                break
++        elif line.startswith("ERR"):
++            print("batch:", line)
++            return 1
++    t_end = time.time()
++    total = sum(len(v) for v in got.values())
++    print(f"batch: {len(prompts)} slots, {total} tokens; admissions {t_admitted - t_admit:.1f}s; "
++          f"then {t_end - t_admitted:.1f}s -> aggregate {total / max(t_end - t_admit, 1e-9):.1f} tok/s overall, "
++          f"{sum(len(v) for v in got.values()) / max(t_end - (first_bt or t_admit), 1e-9):.1f} tok/s from the first batch token",
++          flush=True)
++    ok = True
++    for i in range(len(prompts)):
++        b = got[i]
++        if solo:
++            same = b == solo[i]
++            ok &= same
++            first_diff = next((k for k in range(min(len(b), len(solo[i]))) if b[k] != solo[i][k]), None)
++            print(f"slot {i}: {len(b)} tokens, solo {len(solo[i])}: {'IDENTICAL' if same else f'DIFFERS at {first_diff}'}")
++        print("   ", ascii(tok.decode(b)[:160]))
++    if a.dump:
++        Path(a.dump).write_text(json.dumps({"solo": solo, "batch": [got[i] for i in range(len(prompts))]}), encoding="utf-8")
++    eng.send("QUIT")
++    eng.p.wait(timeout=180)   # the next run needs the GPUs back
++    return 0 if ok else 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/batch_test32.py b/tools/batch_test32.py
+new file mode 100644
+index 00000000..fd60e26b
+--- /dev/null
++++ b/tools/batch_test32.py
+@@ -0,0 +1,183 @@
++#!/usr/bin/env python3
++"""Batching test: the same prompts decoded alone (GEN, the usual path with drafts) and together in the batch
++windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints the aggregate decode rate.
++
++  python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 4 --n 4 \
++      --extra "--layer-split 12,24,36 --trim-stage-weights --pcie-frac 0 --adapt-every 1000000"
++"""
++import argparse, json, os, subprocess, sys, tempfile, threading, time
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import strata_tokenizer as ST  # noqa: E402
++
++QUESTIONS = [
++    "Explique en detail le fonctionnement d'un B-tree.",
++    "Write a Python function that merges overlapping intervals, then explain it.",
++    "Compare TCP and QUIC: handshake, congestion control, multiplexing.",
++    "Raconte l'histoire du calcul de pi, d'Archimede a nos jours.",
++    "What are the main causes of the French Revolution?",
++    "Explain how a transformer's attention works, step by step.",
++    "Donne une recette de tarte aux pommes, etape par etape.",
++    "Describe the life cycle of a star like the Sun.",
++    "Erklaere ausfuehrlich, wie ein Dieselmotor funktioniert.",
++    "Write a Rust function that parses a CSV line with quoted fields, then explain it.",
++    "What were the main consequences of the invention of the printing press?",
++    "Explique le theoreme de Pythagore avec trois demonstrations differentes.",
++    "Describe how the immune system responds to a viral infection.",
++    "Explain the difference between processes and threads in an operating system.",
++    "Beschreibe die Geschichte des Roemischen Reiches in Grundzuegen.",
++    "How does public-key cryptography work? Give an example with RSA.",
++]
++
++QUESTIONS = QUESTIONS + [q + " Answer in German." for q in QUESTIONS]
++
++
++def tokenizer(path):
++    t = Path(path)
++    vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
++    tokens = [None] * len(vocab)
++    for s, i in vocab.items():
++        tokens[i] = s
++    merges = (t / "merges.txt").read_text(encoding="utf-8").split("\n")
++    types = json.loads((t / "token_type.json").read_text())
++    return ST.Tokenizer(tokens, merges, types)
++
++
++class Engine:
++    def __init__(self, exe, cfg, batch, extra_env, extra_args):
++        args = list(cfg["args"])
++        if len(cfg.get("gpu") or []) > 1:
++            args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
++        if batch:
++            args += ["--batch", str(batch)]
++        args += extra_args
++        env = dict(os.environ, **extra_env)
++        env["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [env.get("LD_LIBRARY_PATH", "")])
++        if os.name == "nt":
++            env["PATH"] = os.pathsep.join(cfg.get("lib_dirs", []) + [env.get("PATH", "")])
++        self.log_path = os.environ.get("BATCH_TEST_LOG") or os.path.join(tempfile.gettempdir(), "batch_test_engine.log")
++        self.log = open(self.log_path, "w")
++        self.p = subprocess.Popen([exe, "--serve", *args], cwd=cfg.get("cwd"), stdin=subprocess.PIPE,
++                                  stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1, env=env)
++        for line in self.p.stdout:
++            if line.startswith("READY"):
++                return
++        raise SystemExit(f"the engine ended before READY - see {self.log_path}")
++
++    def send(self, line):
++        self.p.stdin.write(line + "\n")
++        self.p.stdin.flush()
++
++    def lines(self):
++        for line in self.p.stdout:
++            yield line.rstrip("\n")
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--exe", required=True)
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--batch", type=int, default=4)
++    ap.add_argument("--n", type=int, default=4, help="prompts (<= --batch)")
++    ap.add_argument("--max-new", type=int, default=64)
++    ap.add_argument("--skip-solo", action="store_true")
++    ap.add_argument("--keys", default="", help='sampling keys for every request, e.g. "temperature=0.7 top_k=20"')
++    ap.add_argument("--extra", default="", help='more engine arguments in one string, e.g. "--adapt-every 1000000"')
++    ap.add_argument("--dump", default="", help="write every slot's tokens (solo and batch) as JSON: an A/B of two engine builds")
++    ap.add_argument("--long-tokens", type=int, default=0,
++                    help="the LAST prompt is read from about this many tokens of filler text first: its chunks run "
++                         "beside the earlier slots' windows (the prompt path lends experts then)")
++    ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
++    a = ap.parse_args()
++    cfg = json.loads(Path(a.config).read_text())
++    tok = tokenizer(cfg["tokenizer"])
++    prompts = []
++    for q in QUESTIONS[: a.n]:
++        text = f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
++        if a.long_tokens and q is QUESTIONS[a.n - 1]:
++            para = ("The committee reviewed item %d of the long agenda, noting the budget, the schedule and the open "
++                    "risks, and asked the staff to report back next quarter. ")
++            per = max(1, len(tok.encode(para % 100)))
++            filler = "".join(para % i for i in range(a.long_tokens // per + 1))
++            text = f"<|im_start|>user\n{filler}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
++        prompts.append(tok.encode(text, parse_special=True))
++    env = {"STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
++    if a.mt_min:
++        env["STRATA_IQ_MT_MIN"] = a.mt_min
++    eng = Engine(a.exe, cfg, a.batch, env, a.extra.split())
++    out = eng.lines()
++
++    solo = []
++    if not a.skip_solo:
++        for i, ids in enumerate(prompts):
++            eng.send(" ".join(x for x in ("GEN", str(a.max_new), a.keys, ",".join(map(str, ids))) if x))
++            got, t0 = [], time.time()
++            for line in out:
++                if line.startswith("T "):
++                    got.append(int(line.split()[1]))
++                elif line.startswith("DONE") or line.startswith("ERR"):
++                    print(f"solo {i}: {len(got)} tokens in {time.time() - t0:.1f}s  {line[:60]}", flush=True)
++                    break
++            solo.append(got)
++
++    # batch: admit every prompt, then the slots decode together
++    got = {i: [] for i in range(len(prompts))}
++    done = {}
++    t_admit = time.time()
++    first_bt = None
++    for i, ids in enumerate(prompts):
++        eng.send(" ".join(x for x in ("BGEN", str(i), str(a.max_new), a.keys, ",".join(map(str, ids))) if x))
++        for line in out:
++            if line.startswith("T "):
++                got[i].append(int(line.split()[1]))
++            elif line.startswith("BT "):
++                _, s, y = line.split()
++                got[int(s)].append(int(y))
++                first_bt = first_bt or time.time()
++            elif line.startswith("BDONE "):
++                done[int(line.split()[1])] = line
++            elif line.startswith("ERR"):
++                print("batch:", line)
++                return 1
++            elif line.startswith("BADM "):
++                if line.split()[2] == "0":
++                    done[i] = line
++                break
++    t_admitted = time.time()
++    for line in out:
++        if line.startswith("BT "):
++            _, s, y = line.split()
++            got[int(s)].append(int(y))
++            first_bt = first_bt or time.time()
++        elif line.startswith("BDONE "):
++            done[int(line.split()[1])] = line
++            if len(done) == len(prompts):
++                break
++        elif line.startswith("ERR"):
++            print("batch:", line)
++            return 1
++    t_end = time.time()
++    total = sum(len(v) for v in got.values())
++    print(f"batch: {len(prompts)} slots, {total} tokens; admissions {t_admitted - t_admit:.1f}s; "
++          f"then {t_end - t_admitted:.1f}s -> aggregate {total / max(t_end - t_admit, 1e-9):.1f} tok/s overall, "
++          f"{sum(len(v) for v in got.values()) / max(t_end - (first_bt or t_admit), 1e-9):.1f} tok/s from the first batch token",
++          flush=True)
++    ok = True
++    for i in range(len(prompts)):
++        b = got[i]
++        if solo:
++            same = b == solo[i]
++            ok &= same
++            first_diff = next((k for k in range(min(len(b), len(solo[i]))) if b[k] != solo[i][k]), None)
++            print(f"slot {i}: {len(b)} tokens, solo {len(solo[i])}: {'IDENTICAL' if same else f'DIFFERS at {first_diff}'}")
++        print("   ", ascii(tok.decode(b)[:160]))
++    if a.dump:
++        Path(a.dump).write_text(json.dumps({"solo": solo, "batch": [got[i] for i in range(len(prompts))]}), encoding="utf-8")
++    eng.send("QUIT")
++    eng.p.wait(timeout=180)   # the next run needs the GPUs back
++    return 0 if ok else 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+

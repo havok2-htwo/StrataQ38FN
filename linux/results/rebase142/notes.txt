@@ -1,0 +1,11 @@
+rebase of g3 series (fb58e0d..g3-overlap, 17 commits) onto origin/main 61b3fb5d (0.1.42) -> branch g3-142
+worktree /media/raid0/StrataQ38FN/Strata-142, build build-142 (CUDA 13.0, sm_86, Release, STRATA_MMQ_TAB=ON,
+STRATA_GGML_DIR=/media/raid0/StrataQ38FN/Strata/third_party/llama.cpp), binary engine/strata-g3-142
+sha256 6ebf1e272e4087c1d9b954627ecbe39b520e67aca44fcd8ad7ec527464f487d4
+llama.cpp pin unchanged (3cf03257 in CMakeLists FetchContent and setup.py LLAMA_CPP_COMMIT); MMQ_TAB mmq.cuh hash matched.
+adaptations: 3a695180 conflict (batch_mtp init) + set_handoff_rows for upstream 48f2c47d batch_rows_error;
+3adce854 STRATA_SLOT_COPY_DIRECT now opt-in (=1), copies via upstream a6346cdc copy_nonblocking;
+0b622c99 stage_verifier already defined upstream; 2257db30 prefill aux_cpus pin + cuda_err, read_part keeps
+upstream batch_read_piece (cec7e2b1); 42b318bc read thread calls aux_cpus::pin_current_thread.
+CPU tests (CUDA_VISIBLE_DEVICES=): ctest_cpu.log; GPU tests not run (benchmarks running).
+NOTE for benchmarks: the old strata-g3-overlap had the D2D slot copy on by default; set STRATA_SLOT_COPY_DIRECT=1 to match.

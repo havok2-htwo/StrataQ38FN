@@ -1,0 +1,1017 @@
+From 543c6b198cb3c084a2fe140e59910b2e27290181 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:22:57 +0200
+Subject: [PATCH 15/20] generate: STRATA_PIPE_OVERLAP=1 reads a batch
+ admission's prompt beside the pipelined slot groups
+
+With STRATA_PIPE_OVERLAP=1, a pipelined batch (a layer split, more than one slot group) now reads each batched prompt
+segment that passes the gate and overlap_prepare (2257db30) on a thread of its own (read_overlapped): sp.run over the
+same chunks as before, while the request thread keeps the groups decoding (pump) and applies BSTOPs. The groups in
+flight are drained before the read returns, so the checkpoint, header windows, first window and slot copy run as
+before. Env off: the same code path as before (pump's pick loop restructured, its all-idle block factored out as
+idle_report(true), one row counter; nothing else runs).
+
+- pump while a read runs (ov_active): no pending swap applied; the all-idle line waits for the read's end and leaves
+  the watchdog's busy flag alone (idle_report(false) after the drain); a group starts only on a layout every stage has
+  captured (ov_layout): its own width, else the full width captured by overlap_prepare (padded up: the extra rows are
+  pad rows, sl.cached cleared), else it waits until the read ends. No capture runs beside a read.
+- read_overlapped: an RAII guard ends the read thread on every way out (an exception included); on an abort it sets
+  stop_req, releases every stage's GPU waits (release_gpu_waits) and gives the read STRATA_PIPE_OVERLAP_JOIN_S
+  (default 30 s) to end, else _Exit(1). The read thread catches every exception and then joins the stage chain
+  (Prefill::join_chain: run() joins it only when it returns). A failed window keeps pump's ERR and text; the caller's
+  second ERR is skipped (ov_err_printed). A CUDA error the read's threads saw (their own error state, and
+  chain_cuda_error) skips the drain and leads to #224's exit (ov_cuda_fault). An exception out of the loop answers
+  one ERR and ends the request as a failed window does.
+- the read's own heartbeat: every stage's finished chunk beats; with none for STRATA_WATCHDOG_S during a read (the
+  windows' beats hide it from the watchdog) the engine reports the stall, answers ERR and aborts as above, with a
+  watchdog allowance for the bounded abort.
+- control lines during the read: BSTOP applied, BYIELD dropped (a pipelined read never gave way); the main loop no
+  longer drains the groups for a BYIELD (env on only).
+- the stats line per read: "strata batch: overlapped read of N tokens in X ms (drain Y ms); the slots decoded R rows
+  meanwhile, D_ref ... rows/s, lost Z ms of decode; P group starts padded up, W waited; stage-1 PLE gather ... ms avg
+  over K windows, ple hit ...". D_ref is the slots' rate between an admission and the next BGEN (an EMA); lost =
+  read+drain - rows / D_ref. The gather time is counted only with set_ple_urgent (Verifier::ms_ple_urgent); the hit
+  rate only in Direct mode (n/a with --ple-io ram). STRATA_TRACE=1 also logs each read's start.
+- knobs: STRATA_PIPE_OVERLAP_SLEEP_US (default 20, 0 = yield) between two turns of the loop; debug only (read when
+  the env is on): STRATA_PIPE_OVERLAP_FORCE_PADUP=1, STRATA_PIPE_OVERLAP_FORCE_WAIT=1|2 (2: a group narrower than the
+  full width waits too), STRATA_PIPE_OVERLAP_TEST_FAULT=poll|throw|stage|stall (fault paths a, b, c, e).
+- tools/batch_overlap_test.py: 14 background slots decode while prompts of ~200, ~1.3K and ~5K tokens (one with a
+  root checkpoint: two segments) are admitted, with a slot reuse, a BSTOP and a BYIELD during a read, and a STOP of
+  the admitted request during its read; every request must equal its solo tokens; --compare (another run's dump),
+  --split, --env, --expect-fault; the log must show the reads' stats lines and no capture inside a read.
+
+Checked (T16-mmqtab.json, STRATA_MMQ_DIRECT=1, --pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow,
+STRATA_IQ_MT_MIN=1): batch_overlap_test passes on split 12,24,36 with the env on, off, the reference engine
+(strata-g3-mmqtab), FORCE_PADUP=1 and FORCE_WAIT=2, all token-identical; on 13,25,37 env on and off, identical. Env on:
+20 overlapped reads per run, none refused, no 'not captured', no capture between a read's start and its stats line;
+123 group starts padded up in the plain run (natural layouts such as 12,13,14 not yet captured), 278 with FORCE_PADUP,
+21 waits with FORCE_WAIT=2. Faults poll, throw, stage and stall (WATCHDOG_S=10, JOIN_S=2): exactly one ERR, the
+engine ends by itself in 5-6 s, no watchdog, no std::terminate. A CUDA fault on the prompt side (fault d) has no
+injection hook and is not tested. First numbers (not M4's): a 1.27K-token read takes ~835 ms beside 14 slots (609 ms
+drained) and loses ~440 ms of decode; ~200-token reads 250-340 ms (200 ms).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/verify.hpp     |   2 +
+ include/strata/prefill/prefill.hpp |   4 +
+ src/core/verify.cpp                |   5 +
+ src/prefill/prefill.cpp            |  10 +
+ src/program/generate.cpp           | 374 ++++++++++++++++++++++++++---
+ tools/batch_overlap_test.py        | 372 ++++++++++++++++++++++++++++
+ 6 files changed, 739 insertions(+), 28 deletions(-)
+ create mode 100644 tools/batch_overlap_test.py
+
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 8a9d964f..911a1892 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -290,6 +290,8 @@ public:
+     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+ 
+     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
++    double ms_ple_urgent = 0;              ///< set_ple_urgent: the batch windows' PLE gathers (ms, how many)
++    int64_t n_ple_urgent = 0;
+     int64_t windows = 0;
+     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
+     /// window), as one line; empty when off.
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index a925980e..65bc6c28 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -205,6 +205,10 @@ public:
+     /// stage's chunks run on threads of their own, which take their error state with them; only a sticky fault
+     /// (an illegal address, a trap) outlives the error paths, which read and clear the error they report.
+     int chain_cuda_error() const;
++    /// After `run` threw (a thread that could not start, an allocation): wait for every later stage's chunk still
++    /// running, whatever it returns or throws, so nothing of this read runs on after it.  `run` itself joins them
++    /// only when it returns.  STRATA_PIPE_OVERLAP's read thread calls it; nothing else does.
++    void join_chain() noexcept;
+ 
+ private:
+     bool ple_on_() const;        ///< this stage holds layer 1, where the PLE block runs
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index f0bba57a..6c489e4f 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2651,7 +2651,12 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+             }
+             ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
+         }
++        const Clock::time_point tg = ple_urgent_ ? Clock::now() : Clock::time_point{};
+         if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err, ple_urgent_)) return false;
++        if (ple_urgent_) {   // STRATA_PIPE_OVERLAP's stats line: how long a window's rows took beside a prompt's
++            ms_ple_urgent += ms_since(tg);
++            ++n_ple_urgent;
++        }
+     }
+     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
+     // decoding may change the prefix length after comparing the draft with these picks.
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index a8871b67..cc8b5c49 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -4262,6 +4262,16 @@ bool Prefill::drain_pipeline(std::string& err) {
+     return ok;
+ }
+ 
++void Prefill::join_chain() noexcept {
++    for (Prefill* p = this; p != nullptr; p = p->next_)   // stage k's future is stage k+1's chunk (it may start k+2's)
++        if (p->next_run_.valid()) {
++            try {
++                (void) p->next_run_.get();
++            } catch (...) {
++            }
++        }
++}
++
+ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+     for (Prefill* p = this; p != nullptr; p = p->next_) p->cuda_err_.store(0);
+     const bool body_ok = run_impl(tokens, n, pos0, err);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 98d9a7f4..59f9cf53 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -119,6 +119,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <sstream>
++#include <stdexcept>
+ #include <string>
+ #include <set>
+ #include <vector>
+@@ -165,6 +166,32 @@ bool pipe_overlap_env() {
+     }();
+     return on;
+ }
++// STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
++// started during an overlapped read always runs its full width (its padded-up layout).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1:
++// never padded up, a group whose own layout is missing waits for the read's end; =2: also a group narrower than the
++// full width waits.  STRATA_PIPE_OVERLAP_TEST_FAULT (the fault paths, once per process, during an overlapped read):
++// poll (a window's poll fails), throw (the control-line scan throws), stage (stage 2's chunk fails), stall (the read
++// thread hangs after its read).
++enum class OvFault { none, poll, thrown, stage, stall };
++struct PipeOverlapDebug {
++    int force_padup = 0, force_wait = 0;
++    OvFault fault = OvFault::none;
++};
++const PipeOverlapDebug& pipe_overlap_debug() {
++    static const PipeOverlapDebug d = [] {
++        PipeOverlapDebug r;
++        if (!pipe_overlap_env()) return r;
++        if (const char* v = std::getenv("STRATA_PIPE_OVERLAP_FORCE_PADUP")) r.force_padup = std::atoi(v);
++        if (const char* v = std::getenv("STRATA_PIPE_OVERLAP_FORCE_WAIT")) r.force_wait = std::atoi(v);
++        if (const char* v = std::getenv("STRATA_PIPE_OVERLAP_TEST_FAULT")) {
++            const std::string f = v;
++            r.fault = f == "poll" ? OvFault::poll : f == "throw" ? OvFault::thrown : f == "stage" ? OvFault::stage
++                    : f == "stall" ? OvFault::stall : OvFault::none;
++        }
++        return r;
++    }();
++    return d;
++}
+ 
+ // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
+ // A file-backed arena on AMD (STRATA_ARENA_MMAP; the engine raises ROCclr's pin-in-place threshold, see main): an
+@@ -7931,6 +7958,10 @@ int main(int argc, char** argv) {
+         // failed): a request cancelled here keeps them as the live conversation instead of dropping what it restored
+         bool pp_exact = false;
+         Clock::time_point pp_t0 = Clock::now();
++        // STRATA_PIPE_OVERLAP: every stage's finished chunk beats here - an overlapped read's own heartbeat, since the
++        // slots' windows keep the watchdog's beating meanwhile; and whether such a read runs (the test faults)
++        std::atomic<int64_t> ov_read_beat{0};
++        std::atomic<bool> ov_reading{false};
+         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
+             std::vector<ImgKey> v;
+             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
+@@ -8097,6 +8128,15 @@ int main(int argc, char** argv) {
+                 strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
+                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
+                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
++                    if (pipe_overlap_env()) {
++                        ov_read_beat.fetch_add(1, std::memory_order_relaxed);
++                        const OvFault f = pipe_overlap_debug().fault;
++                        static std::atomic<bool> fired{false};
++                        if (f == OvFault::stage && i == 1 && ov_reading.load() && !fired.exchange(true)) {
++                            e = "test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=stage): stage 2's chunk failed";
++                            return false;
++                        }
++                    }
+                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
+                     part_next[i] = done + o.prompt_cache_every;
+                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
+@@ -9462,11 +9502,55 @@ int main(int argc, char** argv) {
+             for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_ple_urgent(true);
+         }
+         std::set<std::string> ov_refused_logged;   // STRATA_PIPE_OVERLAP: why a read was not overlapped, said once each
++        // STRATA_PIPE_OVERLAP: while a batched prompt segment is read on its own thread (read_overlapped), pump keeps the
++        // groups going, but applies no pending swap, keeps the all-idle line for after the read, and starts a group only
++        // on a layout every stage has captured (ov_layout)
++        bool ov_active = false;
++        bool ov_err_printed = false;   // the request's failure was already answered (pump's ERR)
++        bool ov_cuda_fault = false;    // the overlapped read ended on a CUDA fault: #224's exit, below
++        int64_t ov_rows = 0;           // every slot row the pipelined groups produced (D_ref, the rows during a read)
++        int64_t ov_padded = 0, ov_waited = 0;   // groups started padded up / start deferred during reads
++        std::vector<char> ov_wait_seen;         // ... (a group's deferral counted once per read)
++        double ov_dref = 0;                     // the slots' decode rate (rows/s) between an admission and the next
++        Clock::time_point ov_dec_t0 = Clock::now();
++        int64_t ov_dec_rows0 = 0;
++        bool ov_dec_valid = false;
+         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
+         auto group_active = [&](int gi) {
+             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
+             return false;
+         };
++        // During an overlapped read: the width group gi runs at if it starts now, or 0 (it waits). Its own width (up to
++        // its last active slot) when every stage holds that layout, else the full width when every stage holds that
++        // (overlap_prepare captured it: the extra rows are pad rows, as below its own width), else none - no capture
++        // runs beside the read.  Every stage's table is looked at first, as stage_batch does (the graph's key).
++        auto ov_layout = [&](int gi) -> int {
++            int S0 = 0;
++            for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) S0 = t + 1;
++            if (S0 == 0) return 0;
++            for (int k = 0; k < n_pipe; ++k) if (!stage_verifier(k).ar_live()) return 0;
++            auto held = [&](int S) {
++                for (int k = 0; k < n_pipe; ++k) if (!stage_verifier(k).has_batch_layout(gi * GS, S)) return false;
++                return true;
++            };
++            const PipeOverlapDebug& dbg = pipe_overlap_debug();
++            if (dbg.force_padup == 0 && !(dbg.force_wait >= 2 && S0 < GS) && held(S0)) return S0;
++            if (dbg.force_wait == 0 && held(GS)) return GS;
++            return 0;
++        };
++        // all idle: the timing line, as batch_step (reset_busy: the watchdog's busy flag too - not inside a request)
++        auto idle_report = [&](bool reset_busy) {
++            const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
++            std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
++                                 "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
++                         (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));
++            for (int k = 0; k < n_pipe; ++k) {
++                const std::string pr = stage_verifier(k).profile_report();
++                if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
++            }
++            bt_windows = bt_rows = 0;
++            if (reset_busy) strata::core::progress().busy.store(false);
++        };
+         // one turn: serve every running stage, hand finished groups on, start what can start
+         auto pump = [&](bool may_start) -> bool {
+             ++pipe_tick;
+@@ -9479,7 +9563,11 @@ int main(int argc, char** argv) {
+                 const int gi = stage_group[(size_t) k];
+                 if (gi < 0) continue;
+                 strata::core::Verifier& vk = stage_verifier(k);
+-                const int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
++                int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
++                if (r > 0 && ov_active && pipe_overlap_debug().fault == OvFault::poll && bt_windows >= 2) {
++                    static bool fired = false;   // STRATA_PIPE_OVERLAP_TEST_FAULT=poll: a window "fails" mid-read
++                    if (!fired) { fired = true; r = -1; err = "test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=poll): a batch window failed"; }
++                }
+                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
+                 if (r == 0) continue;
+                 stage_group[(size_t) k] = -1;
+@@ -9494,6 +9582,7 @@ int main(int argc, char** argv) {
+                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
+                     ++sl.produced;
+                     ++bt_rows;
++                    ++ov_rows;
+                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
+@@ -9527,15 +9616,25 @@ int main(int argc, char** argv) {
+                     if (pick < 0) continue;
+                 } else {
+                     if (!may_start) continue;
++                    int ov_S = 0;   // during an overlapped read: the width it starts at (ov_layout)
+                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
+                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
+-                        if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
++                        if (pg[(size_t) gi].inflight || !group_active(gi)) continue;
++                        if (ov_active && (ov_S = ov_layout(gi)) == 0) {   // no layout without a capture: after the read
++                            if (gi < (int) ov_wait_seen.size() && !ov_wait_seen[(size_t) gi]) { ov_wait_seen[(size_t) gi] = 1; ++ov_waited; }
++                            continue;
++                        }
++                        pick = gi;
+                     }
+                     if (pick < 0) continue;
+                     rr = pick + 1;
+                     PGroup& G = pg[(size_t) pick];
+                     G.S = 0;
+                     for (int t = 0; t < GS; ++t) if (bs[(size_t) (pick * GS + t)].active) G.S = t + 1;
++                    if (ov_active) {   // padded up: the rows past its own width are pad rows (below)
++                        if (ov_S > G.S) ++ov_padded;
++                        G.S = ov_S;
++                    }
+                     for (int t = 0; t < G.S; ++t) {
+                         BSlot& sl = bs[(size_t) (pick * GS + t)];
+                         G.tok[t] = sl.active ? sl.x : 0;
+@@ -9545,7 +9644,7 @@ int main(int argc, char** argv) {
+                     G.inflight = true;
+                     G.stage = 0;
+                     drive.d.failed = false;
+-                    apply_pending(false);
++                    if (!ov_active) apply_pending(false);   // an overlapped read: the expert tables stay as they are
+                 }
+                 PGroup& G = pg[(size_t) pick];
+                 strata::core::progress().busy.store(true);
+@@ -9556,18 +9655,8 @@ int main(int argc, char** argv) {
+                 stage_group[(size_t) k] = pick;
+             }
+             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
+-            if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
+-                const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+-                std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
+-                                     "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
+-                             (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));
+-                for (int k = 0; k < n_pipe; ++k) {
+-                    const std::string pr = stage_verifier(k).profile_report();
+-                    if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
+-                }
+-                bt_windows = bt_rows = 0;
+-                strata::core::progress().busy.store(false);
+-            }
++            // all idle: the timing line, as batch_step (an overlapped read: after it, inside its request)
++            if (!ov_active && !pipe_inflight() && !batch_on() && bt_windows > 0) idle_report(true);
+             return true;
+         };
+         auto pipe_drain = [&]() -> bool {
+@@ -9575,14 +9664,46 @@ int main(int argc, char** argv) {
+                 if (!pump(false)) return false;
+             return true;
+         };
++        // STRATA_PIPE_OVERLAP, while a prompt is read beside the groups: a BSTOP that came meanwhile ends its slot at its
++        // next window; a BYIELD is dropped (a pipelined read never gives way, as below)
++        auto scan_ctl_lines = [&] {
++            if (pipe_overlap_debug().fault == OvFault::thrown) {
++                static int scans = 0;   // STRATA_PIPE_OVERLAP_TEST_FAULT=throw: the scan throws mid-read, once
++                if (++scans == 200) throw std::runtime_error("test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=throw)");
++            }
++            std::lock_guard<std::mutex> lk(in_mu);
++            for (auto it = in_lines.begin(); it != in_lines.end();) {
++                if (it->rfind("BSTOP ", 0) == 0) {
++                    const int b = std::atoi(it->c_str() + 6);
++                    if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
++                    it = in_lines.erase(it);
++                } else if (it->rfind("BYIELD", 0) == 0) {
++                    it = in_lines.erase(it);
++                } else {
++                    ++it;
++                }
++            }
++        };
+         for (;;) {
+             if (batch_on() || (piped && pipe_inflight())) {
+                 if (!try_next_line(line)) {
+                     if (!(piped ? pump(true) : batch_step())) return 1;
+                     continue;
+                 }
+-                // a request reads its prompt through every stage: the groups in flight finish first
+-                if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
++                // STRATA_PIPE_OVERLAP: the slots' decode rate since the last admission (ov_dref, for the reads' stats)
++                if (pipe_overlap_env() && piped && line.rfind("BSTOP ", 0) != 0 && line.rfind("BYIELD", 0) != 0) {
++                    const double dt = std::chrono::duration<double>(Clock::now() - ov_dec_t0).count();
++                    if (ov_dec_valid && line.rfind("BGEN", 0) == 0 && dt >= 0.25 && ov_rows > ov_dec_rows0) {
++                        const double d = (double) (ov_rows - ov_dec_rows0) / dt;
++                        ov_dref = ov_dref > 0 ? 0.7 * ov_dref + 0.3 * d : d;
++                    }
++                    ov_dec_valid = false;
++                }
++                // a request reads its prompt through every stage: the groups in flight finish first (STRATA_PIPE_OVERLAP:
++                // not for a BYIELD, which is dropped below)
++                if (piped && line.rfind("BSTOP ", 0) != 0 && !(pipe_overlap_env() && line.rfind("BYIELD", 0) == 0) &&
++                    !pipe_drain())
++                    return 1;
+             } else if (!next_line(line)) {
+                 break;
+             }
+@@ -9644,6 +9765,7 @@ int main(int argc, char** argv) {
+             } busy_scope;
+             stop_req.store(false);   // a STOP that arrived between requests is stale
+             err.clear();
++            ov_err_printed = ov_cuda_fault = false;
+             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
+             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
+             // RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> for a refusal
+@@ -10761,17 +10883,205 @@ int main(int argc, char** argv) {
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                 return true;
+             };
++            // ... and the read itself, gate passed and prepared: [a0, b0) is read by sp.run - the same run over the same
++            // chunks as with the slots drained - on a thread of its own, while this thread keeps the groups going
++            // (pump, on captured layouts only) and applies BSTOPs.  The groups in flight are drained before it returns,
++            // so what follows (checkpoint, windows, the slot copy) runs as before.  `e` is `err`, which pump writes too:
++            // a failed window keeps pump's text and its ERR (ov_err_printed), the read's own goes to stderr.
++            auto read_overlapped = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
++                static const int sleep_us = [] {   // between two turns of the loop below (0: yield only)
++                    const char* v = std::getenv("STRATA_PIPE_OVERLAP_SLEEP_US");
++                    return v ? std::max(0, std::atoi(v)) : 20;
++                }();
++                static const int join_s = [] {   // how long an aborted read may take to end before the engine does
++                    const char* v = std::getenv("STRATA_PIPE_OVERLAP_JOIN_S");
++                    return v ? std::max(1, std::atoi(v)) : 30;
++                }();
++                static const int stall_s = [] {   // the watchdog's limit, on the read's own chunks (the windows beat)
++                    const char* v = std::getenv("STRATA_WATCHDOG_S");
++                    return v ? std::atoi(v) : 60;
++                }();
++                // The read thread ends before this returns, whichever way it returns (an exception included): on an
++                // abort the read is told to stop and every stage's spin waits are released (no stage-0 window waits on
++                // a flag nobody raises); then it gets join_s to end, or the engine ends (a running thread cannot be
++                // left behind).  `end`: the stages capture again, pump runs as before.
++                struct OvGuard {
++                    std::atomic<bool>& done;
++                    std::function<void()> stop, end;
++                    int join_s;
++                    std::thread w;
++                    bool stopped = false, ended = false;
++                    void abort() {
++                        if (!stopped) { stopped = true; stop(); }
++                    }
++                    void finish() {
++                        if (!w.joinable()) return;
++                        const auto t0 = Clock::now();
++                        while (!done.load(std::memory_order_acquire)) {
++                            if (Clock::now() - t0 > std::chrono::seconds(join_s)) {
++                                std::fprintf(stderr, "strata batch: the overlapped prompt read did not end in %d s "
++                                                     "(STRATA_PIPE_OVERLAP_JOIN_S) - stopping the engine\n", join_s);
++                                std::fflush(stdout);
++                                std::fflush(stderr);
++                                std::_Exit(1);
++                            }
++                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                        }
++                        w.join();
++                    }
++                    void end_now() {
++                        if (!ended) { ended = true; end(); }
++                    }
++                    ~OvGuard() {
++                        if (w.joinable() && !done.load()) abort();
++                        finish();
++                        end_now();
++                    }
++                };
++                std::atomic<bool> done{false};
++                bool wok = false;
++                std::string we;
++                int wcuda = 0;
++                OvGuard guard{done,
++                              [&] {
++                                  // the abort is bounded on its own (the releases, then join_s, then _Exit): the
++                                  // watchdog's explicit allowance for it, so the two do not race
++                                  strata::core::progress_allow(5 * n_pipe + join_s + 5);
++                                  stop_req.store(true);
++                                  for (int k = 0; k < n_pipe; ++k) (void) stage_verifier(k).release_gpu_waits(5000);
++                              },
++                              [&] {
++                                  for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_no_capture(false);
++                                  ov_active = false;
++                                  ov_reading.store(false);
++                              },
++                              join_s,
++                              std::thread{}};
++                const auto t0 = Clock::now();
++                const int64_t rows0 = ov_rows, padded0 = ov_padded, waited0 = ov_waited;
++                const double ple_ms0 = stage_verifier(0).ms_ple_urgent;
++                const int64_t ple_n0 = stage_verifier(0).n_ple_urgent;
++                const strata::kernels::PleTable::IoCounts io0 = ple_table.io_counts();
++                ov_wait_seen.assign(pg.size(), 0);
++                if (trace) std::fprintf(stderr, "strata trace: overlapped read of tokens %lld..%lld starts\n", (long long) a0,
++                                        (long long) b0);
++                ov_active = true;
++                ov_reading.store(true);
++                guard.w = std::thread([&] {
++                    strata::aux_cpus::pin_current_thread();   // --aux-cpus (off: nothing), as the prompt path's stage threads
++                    try {
++                        wok = sp.run(ids.data() + a0, b0 - a0, a0, we);
++                    } catch (const std::exception& x) {
++                        wok = false;
++                        we = std::string("the prompt read threw: ") + x.what();
++                        sp.join_chain();
++                    } catch (...) {
++                        wok = false;
++                        we = "the prompt read threw";
++                        sp.join_chain();
++                    }
++                    wcuda = (int) cudaPeekAtLastError();   // this thread's: a fault the read saw first
++                    if (pipe_overlap_debug().fault == OvFault::stall) {   // STRATA_PIPE_OVERLAP_TEST_FAULT=stall
++                        static std::atomic<bool> fired{false};
++                        if (!fired.exchange(true)) std::this_thread::sleep_for(std::chrono::seconds(stall_s + join_s + 60));
++                    }
++                    done.store(true, std::memory_order_release);
++                });
++                bool pump_ok = true, stalled = false;
++                int64_t beat_seen = ov_read_beat.load(std::memory_order_relaxed);
++                auto beat_at = Clock::now();
++                try {
++                    while (!done.load(std::memory_order_acquire)) {
++                        if (!pump(true)) { pump_ok = false; break; }   // pump answered ERR
++                        scan_ctl_lines();
++                        const int64_t b = ov_read_beat.load(std::memory_order_relaxed);
++                        if (b != beat_seen) {
++                            beat_seen = b;
++                            beat_at = Clock::now();
++                        } else if (stall_s > 0 && Clock::now() - beat_at > std::chrono::seconds(stall_s)) {
++                            stalled = true;
++                            break;
++                        }
++                        if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
++                        else std::this_thread::yield();
++                    }
++                } catch (const std::exception& x) {
++                    e = std::string("the batch slots' loop beside an overlapped prompt read threw: ") + x.what();
++                    std::printf("ERR %s\n", e.c_str());
++                    std::fflush(stdout);
++                    pump_ok = false;
++                }
++                if (stalled) {   // #29, for the read: the windows' beats hide it from the watchdog
++                    strata::core::progress_allow(5 * n_pipe + join_s + 10);   // (the report and the abort below)
++                    std::fprintf(stderr, "strata serve: no prompt chunk finished for %d s during an overlapped read (the "
++                                         "slots went on decoding) - stopping the engine so the server starts it again "
++                                         "(issue #29)\n", stall_s);
++                    stall_report(stderr, 0);
++                    e = "the overlapped prompt read made no progress for " + std::to_string(stall_s) + " s";
++                    std::printf("ERR %s\n", e.c_str());
++                    std::fflush(stdout);
++                    pump_ok = false;
++                }
++                if (!pump_ok) guard.abort();
++                guard.finish();
++                const bool fault = !wok && (wcuda != 0 || sp.chain_cuda_error() != 0);
++                if (!pump_ok) {   // ERR answered: the engine ends (#224's exit on a fault)
++                    ov_err_printed = true;
++                    ov_cuda_fault = fault;
++                    batch_fatal = true;
++                    if (!we.empty()) std::fprintf(stderr, "strata batch: overlapped read: %s\n", we.c_str());
++                    return false;
++                }
++                if (fault) {   // the context is poisoned: no drain, the caller leaves at once (#224)
++                    ov_cuda_fault = true;
++                    batch_fatal = true;
++                    e = we;
++                    return false;
++                }
++                const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
++                const auto td = Clock::now();
++                const bool drained = pipe_drain();   // (ov_active still set: no swap, no all-idle line inside)
++                const double drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
++                guard.end_now();
++                if (!drained) {
++                    ov_err_printed = true;
++                    batch_fatal = true;
++                    if (!we.empty()) std::fprintf(stderr, "strata batch: overlapped read: %s\n", we.c_str());
++                    return false;
++                }
++                if (!batch_on() && bt_windows > 0) idle_report(false);   // every slot ended meanwhile
++                // the stats: lost = the time the slots would have needed for the rows they did not make meanwhile, at
++                // their rate between admissions (D_ref; n/a before one was seen)
++                const int64_t rows = ov_rows - rows0;
++                const double span_ms = read_ms + drain_ms;
++                char lost[48] = "n/a";
++                if (ov_dref > 0) std::snprintf(lost, sizeof lost, "%.0f ms", span_ms - (double) rows * 1000.0 / ov_dref);
++                const int64_t gn = stage_verifier(0).n_ple_urgent - ple_n0;
++                const strata::kernels::PleTable::IoCounts io1 = ple_table.io_counts();
++                char hit[48] = "n/a";
++                if (io1.requests > io0.requests)
++                    std::snprintf(hit, sizeof hit, "%.1f%%", 100.0 * (double) (io1.cache_hits - io0.cache_hits) /
++                                                                 (double) (io1.requests - io0.requests));
++                std::fprintf(stderr, "strata batch: overlapped read of %lld tokens in %.0f ms (drain %.1f ms); the slots "
++                                     "decoded %lld rows meanwhile, D_ref %.1f rows/s, lost %s of decode; %lld group "
++                                     "starts padded up, %lld waited; stage-1 PLE gather %.3f ms avg over %lld windows, "
++                                     "ple hit %s%s\n",
++                             (long long) (b0 - a0), read_ms, drain_ms, (long long) rows, ov_dref, lost,
++                             (long long) (ov_padded - padded0), (long long) (ov_waited - waited0),
++                             gn > 0 ? (stage_verifier(0).ms_ple_urgent - ple_ms0) / (double) gn : 0.0, (long long) gn, hit,
++                             wok ? "" : (" (" + we + ")").c_str());
++                if (!wok) {
++                    e = we;
++                    return false;
++                }
++                return true;
++            };
+             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+                 if (pipe_overlap_env() && piped && batch_on()) {
+                     std::string why;
+-                    if (overlap_gate(a0, b0, why) && overlap_prepare(why)) {
+-                        // the read itself still runs with the slots drained (below): this only checks the gate
+-                        for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_no_capture(false);
+-                        std::fprintf(stderr, "strata batch: overlapped read eligible: tokens %lld..%lld (read drained "
+-                                             "for now)\n", (long long) a0, (long long) b0);
+-                    } else if (ov_refused_logged.insert(why).second) {
++                    if (overlap_gate(a0, b0, why) && overlap_prepare(why)) return read_overlapped(a0, b0, e);
++                    if (ov_refused_logged.insert(why).second)
+                         std::fprintf(stderr, "strata batch: overlapped read off: %s\n", why.c_str());
+-                    }
+                 }
+                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
+                 // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
+@@ -10993,11 +11303,14 @@ int main(int argc, char** argv) {
+                 }
+                 if (!sp_ok) {
+                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
+-                        std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+-                        std::printf("ERR %s\n", err.c_str());
++                        if (!ov_err_printed) {   // (an overlapped read's failed window: pump answered ERR already)
++                            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
++                            std::printf("ERR %s\n", err.c_str());
++                        }
+                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
+-                        // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
+-                        if (cudaPeekAtLastError() != cudaSuccess) {
++                        // unwinding the destructors on it could hang until the 60 s watchdog: leave at once (a fault
++                        // an overlapped read's threads saw: ov_cuda_fault)
++                        if (cudaPeekAtLastError() != cudaSuccess || ov_cuda_fault) {
+                             std::fflush(stdout);
+                             std::fflush(stderr);
+                             std::_Exit(1);
+@@ -12137,6 +12450,11 @@ int main(int argc, char** argv) {
+                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
+                 }
+                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
++                if (pipe_overlap_env() && piped) {   // the slots decode alone from here to the next admission (ov_dref)
++                    ov_dec_t0 = Clock::now();
++                    ov_dec_rows0 = ov_rows;
++                    ov_dec_valid = true;
++                }
+                 std::fflush(stdout);
+                 admit_slot = -1;
+             }
+diff --git a/tools/batch_overlap_test.py b/tools/batch_overlap_test.py
+new file mode 100644
+index 00000000..93a27044
+--- /dev/null
++++ b/tools/batch_overlap_test.py
+@@ -0,0 +1,372 @@
++#!/usr/bin/env python3
++"""STRATA_PIPE_OVERLAP: batch admissions read WHILE the pipelined slot groups decode (a layer split, --batch with
++more than one slot group).  Every slot and every admission must equal its solo tokens, greedy.
++
++  1. solo references (GEN) of every prompt: background prompts (~170 tokens), test prompts of ~170, ~1.2K and ~5K
++     tokens (the 5K one with a system prompt past --prompt-cache-root: a root checkpoint, two batched segments), and
++     the next turn of the first test prompt
++  2. the background fills slots 0 .. bg-1 (each admission after the first is read beside decoding slots)
++  3. admissions into the last two slots, one after the other, while the background decodes:
++       short A; A's next turn into A's slot (slot reuse: copy_from_slot before the read); long B with a BSTOP of a
++       background slot and a BYIELD sent during its read; huge C; huge D stopped (STOP) during its read (DONE
++       cancel); short E; long F
++  4. the background is stopped (BSTOP); every request's tokens must equal its solo tokens (a stopped one: a prefix)
++
++  python3 tools/batch_overlap_test.py --exe engine/strata-g3-overlap --config <T16 config> \\
++      --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow" --env STRATA_PIPE_OVERLAP=1 --dump on.json
++
++--split 13,25,37 overrides the config's layer split; --env K=V (repeatable) adds engine env (the forced arms:
++STRATA_PIPE_OVERLAP_FORCE_PADUP=1, STRATA_PIPE_OVERLAP_FORCE_WAIT=1|2); --compare A.json checks this run's tokens
++against another run's dump (env 0 against 1); --solo-json reuses solo references from an earlier dump (same
++prompts and lengths: the dump records them).  --expect-fault: an arm of STRATA_PIPE_OVERLAP_TEST_FAULT=poll|throw|
++stage|stall (with stall: STRATA_WATCHDOG_S=10 STRATA_PIPE_OVERLAP_JOIN_S=2), passed when the engine answers exactly
++one ERR and ends by itself (not by the watchdog, no std::terminate).  The engine log (BATCH_TEST_LOG) is checked too, with
++STRATA_TRACE=1 set here: with the env on, an "overlapped read of" line per overlapped read, no "not captured
++before an overlapped read", and no "captured the batch window" between a read's start and its stats line.
++"""
++import argparse, json, os, queue, sys, threading, time
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from batch_test import Engine, tokenizer  # noqa: E402
++
++QUESTIONS = [
++    "Explain how a B-tree keeps itself balanced.", "Compare TCP and QUIC in a few sentences.",
++    "What causes the seasons on Earth?", "Describe the water cycle briefly.",
++    "How does a hash map handle collisions?", "Summarize the plot of Hamlet.",
++    "Why is the sky blue?", "What is a closure in programming?", "How do vaccines train the immune system?",
++    "Explain the Monty Hall problem.", "What does a compiler's register allocator do?",
++    "Describe how a refrigerator works.", "What is entropy in information theory?",
++    "How does public-key cryptography work?", "Explain gradient descent.", "What is a Fourier transform?",
++    "How do bees communicate?", "Explain the CAP theorem.", "What is photosynthesis?", "Describe a red-black tree.",
++]
++PARA = ("The committee reviewed item %d of the long agenda, noting the budget, the schedule and the open risks, and "
++        "asked the staff to report back next quarter. ")
++SYSPARA = ("Rule %d: answer precisely, cite the relevant section of the handbook, keep the tone neutral and never "
++           "invent facts that the handbook does not state. ")
++
++
++def filler(tok, pattern, n_tokens, start):
++    per = max(1, len(tok.encode(pattern % 100)))
++    return "".join(pattern % (start + i) for i in range(n_tokens // per + 1))
++
++
++def chat(tok, q, fill=0, system=0, seed=0):
++    text = ""
++    if system:
++        text += f"<|im_start|>system\n{filler(tok, SYSPARA, system, seed)}<|im_end|>\n"
++    body = (filler(tok, PARA, fill, seed * 1000) + "\n\n" if fill else "") + q
++    text += f"<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
++    return tok.encode(text, parse_special=True)
++
++
++class EngineErr(Exception):
++    pass
++
++
++class Driver:
++    def __init__(self, eng):
++        self.eng = eng
++        self.q = queue.Queue()
++        self.slot_req = {}   # slot -> request name (decoding)
++        self.toks = {}       # request name -> tokens
++        self.fin = {}        # request name -> finish reason
++        self.events = []
++        threading.Thread(target=self._read, daemon=True).start()
++
++    def _read(self):
++        for line in self.eng.p.stdout:
++            self.q.put(line.rstrip("\n"))
++        self.q.put(None)
++
++    def get(self, timeout=600):
++        try:
++            line = self.q.get(timeout=timeout)
++        except queue.Empty:
++            raise SystemExit(f"no engine output for {timeout} s (see {self.eng.log_path})")
++        if line is None:
++            raise SystemExit(f"the engine ended (rc {self.eng.p.wait()}; see {self.eng.log_path})")
++        return line
++
++    def handle(self, line):
++        """BT/BDONE of decoding slots; ERR fails the test.  True if handled."""
++        if line.startswith("BT "):
++            _, s, y = line.split()
++            self.toks[self.slot_req[int(s)]].append(int(y))
++        elif line.startswith("BDONE "):
++            f = line.split()
++            name = self.slot_req.pop(int(f[1]))
++            self.fin[name] = f[3]
++            self.events.append(f"{name}: BDONE {f[3]} ({len(self.toks[name])} tokens)")
++        elif line.startswith("ERR"):
++            raise EngineErr(line)
++        else:
++            return False
++        return True
++
++    def solo(self, ids, max_new):
++        self.eng.send(f"GEN {max_new} " + ",".join(map(str, ids)))
++        got = []
++        while True:
++            line = self.get()
++            if line.startswith("T "):
++                got.append(int(line.split()[1]))
++            elif line.startswith("DONE"):
++                return got
++            elif line.startswith("ERR"):
++                raise SystemExit("engine: " + line)
++
++    def admit(self, slot, name, ids, max_new, during=()):
++        """BGEN into `slot`; `during`: (seconds after the BGEN, line) sent while its prompt is read."""
++        self.toks[name] = []
++        self.eng.send(f"BGEN {slot} {max_new} " + ",".join(map(str, ids)))
++        t0, sched = time.time(), sorted(during)
++        while True:
++            while sched and time.time() - t0 >= sched[0][0]:
++                self.eng.send(sched.pop(0)[1])
++            try:
++                line = self.q.get(timeout=0.005 if sched else 600)
++            except queue.Empty:
++                continue
++            if line is None:
++                raise SystemExit(f"the engine ended during {name} (see {self.eng.log_path})")
++            if line.startswith("T "):
++                self.toks[name].append(int(line.split()[1]))
++            elif line.startswith("DONE"):
++                self.fin[name] = line.split()[5]
++            elif line.startswith("ERR"):
++                raise EngineErr(line)
++            elif line.startswith("BADM "):
++                for _, l in sched:   # whatever was not sent yet goes now (a read shorter than planned)
++                    self.eng.send(l)
++                if line.split()[2] == "1":
++                    self.slot_req[slot] = name
++                    self.fin.pop(name, None)
++                self.events.append(f"{name}: admitted into slot {slot} ({len(ids)} tokens) in {time.time() - t0:.2f} s"
++                                   f"{'' if line.split()[2] == '1' else ' - ended: ' + self.fin.get(name, '?')}")
++                return
++            else:
++                self.handle(line)
++
++    def wait_done(self, name):
++        while name in self.slot_req.values():
++            self.handle(self.get())
++
++    def stop_all(self):
++        for s in list(self.slot_req):
++            self.eng.send(f"BSTOP {s}")
++        while self.slot_req:
++            self.handle(self.get())
++
++
++def check_log(path, env_on):
++    lines = Path(path).read_text(errors="replace").splitlines()
++    stats = [l for l in lines if "strata batch: overlapped read of" in l]
++    bad = [l for l in lines if "not captured before an overlapped read" in l]
++    inside, open_read = [], False
++    for l in lines:
++        if "strata trace: overlapped read of tokens" in l:
++            open_read = True
++        elif "strata batch: overlapped read of" in l:
++            open_read = False
++        elif open_read and "captured the batch window" in l:
++            inside.append(l)
++    refused = sorted({l for l in lines if "overlapped read off:" in l})
++    print(f"log: {len(stats)} overlapped reads, {len(bad)} 'not captured' errors, {len(inside)} captures inside a read, "
++          f"{len(refused)} refusal reasons")
++    for l in refused:
++        print("   ", l)
++    for l in stats[:3] + (["    ..."] if len(stats) > 6 else []) + stats[3:][-3:]:
++        print("   ", l)
++    for l in inside[:5]:
++        print("   capture inside a read:", l)
++    ok = not bad and not inside
++    if env_on:
++        ok &= len(stats) > 0
++    return ok
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--exe", required=True)
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--batch", type=int, default=16)
++    ap.add_argument("--bg", type=int, default=14, help="background slots decoding through the test (<= batch-2)")
++    ap.add_argument("--bg-new", type=int, default=600, help="background max_new (they are stopped at the end)")
++    ap.add_argument("--max-new", type=int, default=24, help="max_new of the test admissions")
++    ap.add_argument("--split", default="", help="layer split, e.g. 13,25,37 (default: the config's)")
++    ap.add_argument("--extra", default="")
++    ap.add_argument("--env", action="append", default=[], help="K=V engine env (repeatable)")
++    ap.add_argument("--dump", default="")
++    ap.add_argument("--compare", default="", help="a dump of another run: its tokens must equal this run's")
++    ap.add_argument("--solo-json", default="", help="reuse the solo references of an earlier dump")
++    ap.add_argument("--long", type=int, default=1200)
++    ap.add_argument("--huge", type=int, default=5000)
++    ap.add_argument("--expect-fault", action="store_true",
++                    help="a STRATA_PIPE_OVERLAP_TEST_FAULT arm: pass if the engine answers exactly one ERR and ends "
++                         "(not by the watchdog) within --fault-exit-s")
++    ap.add_argument("--fault-exit-s", type=float, default=60)
++    ap.add_argument("--stop-after", type=float, default=0.4, help="seconds after D's BGEN its STOP is sent")
++    a = ap.parse_args()
++    cfg = json.loads(Path(a.config).read_text())
++    if a.split:
++        cfg["layer_split"] = a.split
++    tok = tokenizer(cfg["tokenizer"])
++    assert a.bg <= a.batch - 2
++    s14, s15 = a.batch - 2, a.batch - 1
++
++    P = {}
++    for i in range(a.bg):
++        P[f"bg{i}"] = (chat(tok, QUESTIONS[i % len(QUESTIONS)], fill=150, seed=i), a.bg_new)
++    P["A"] = (chat(tok, "Name three prime numbers and say why they are prime.", fill=150, seed=50), a.max_new)
++    P["B"] = (chat(tok, "List the risks the committee noted.", fill=a.long, seed=51), a.max_new)
++    P["C"] = (chat(tok, "Which rule matters most, and why?", fill=a.long, system=max(a.huge - a.long, 2100), seed=52),
++              a.max_new)
++    P["D"] = (chat(tok, "Summarize the agenda in one line.", fill=a.huge, seed=53), a.max_new)
++    P["E"] = (chat(tok, "What is 17 times 23?", fill=150, seed=54), a.max_new)
++    P["F"] = (chat(tok, "Which item came last?", fill=a.long, seed=55), a.max_new)
++
++    env = {"STRATA_IQ_MT_MIN": "1", "STRATA_TRACE": "1", **(cfg.get("env") or {})}
++    for kv in a.env:
++        k, _, v = kv.partition("=")
++        env[k] = v
++    env_on = env.get("STRATA_PIPE_OVERLAP", "0") not in ("", "0")
++    eng = Engine(a.exe, cfg, a.batch, env, a.extra.split())
++    d = Driver(eng)
++    print(f"engine: {a.exe} split {cfg.get('layer_split')} env {' '.join(f'{k}={v}' for k, v in sorted(env.items()))}",
++          flush=True)
++
++    solo = {}
++    if a.solo_json:
++        old = json.loads(Path(a.solo_json).read_text())
++        if old.get("prompts") == {k: v[0] for k, v in P.items()} and old.get("max_new") == {k: v[1] for k, v in P.items()}:
++            solo = old["solo"]
++            print("solo references reused from", a.solo_json)
++        else:
++            print("solo references in", a.solo_json, "are for other prompts: computed again")
++    if not solo:
++        t0 = time.time()
++        for k, (ids, mn) in P.items():
++            solo[k] = d.solo(ids, mn)
++        print(f"solo: {len(P)} prompts in {time.time() - t0:.0f} s", flush=True)
++    # A's next turn: A, its solo reply, a new user turn - read from A's slot in the batch
++    a2 = P["A"][0] + solo["A"] + tok.encode("<|im_end|>\n<|im_start|>user\nAnd three more?<|im_end|>\n"
++                                            "<|im_start|>assistant\n<think>\n\n</think>\n\n", parse_special=True)
++    P["A2"] = (a2, a.max_new)
++    if "A2" not in solo:
++        solo["A2"] = d.solo(a2, a.max_new)
++    print("prompt tokens:", {k: len(v[0]) for k, v in P.items()}, flush=True)
++
++    try:
++        return batch_phase(a, d, eng, P, solo, s14, s15, env_on)
++    except EngineErr as x:
++        if not a.expect_fault:
++            raise SystemExit(f"engine: {x}")
++        return fault_end(a, d, eng, str(x))
++
++
++def fault_end(a, d, eng, first):
++    t0, errs, rest = time.time(), [first], []
++    while True:   # the rest of stdout until the engine ends
++        try:
++            line = d.q.get(timeout=max(1.0, a.fault_exit_s - (time.time() - t0)))
++        except queue.Empty:
++            break
++        if line is None:
++            break
++        (errs if line.startswith("ERR") else rest).append(line)
++    try:
++        rc = eng.p.wait(timeout=max(1.0, a.fault_exit_s - (time.time() - t0)))
++    except Exception:
++        rc = None
++    took = time.time() - t0
++    if rc is None:
++        eng.p.kill()
++        eng.p.wait()
++    eng.log.close()
++    log = Path(eng.log_path).read_text(errors="replace")
++    watchdog = "during a request (" in log and "issue #29" in log
++    terminate = "terminate called" in log
++    print(f"fault: {len(errs)} ERR line(s): {errs}")
++    print(f"fault: the engine ended {'with rc ' + str(rc) if rc is not None else 'NOT (killed)'} {took:.1f} s after "
++          f"the first ERR; watchdog fired: {watchdog}; std::terminate: {terminate}")
++    for key in ("did not end in", "no prompt chunk finished", "strata batch: overlapped read:", "test fault",
++                "strata serve: "):
++        for l in log.splitlines():
++            if key in l and ("strata serve: prompt" not in l):
++                print("   log:", l[:200])
++                break
++    ok = len(errs) == 1 and rc is not None and not watchdog and not terminate
++    print("RESULT:", "PASS" if ok else "FAIL")
++    return 0 if ok else 2
++
++
++def batch_phase(a, d, eng, P, solo, s14, s15, env_on):
++    t0 = time.time()
++    for i in range(a.bg):
++        d.admit(i, f"bg{i}", *P[f"bg{i}"])
++    print(f"background: {a.bg} slots admitted in {time.time() - t0:.1f} s", flush=True)
++    d.admit(s15, "A", *P["A"])
++    d.wait_done("A")
++    d.admit(s15, "A2", *P["A2"])   # slot 14 idle: A's slot is not a pad row meanwhile, so its state is reused
++    d.wait_done("A2")
++    d.admit(s14, "B", *P["B"], during=[(0.05, f"BSTOP {a.bg - 1}"), (0.10, f"BYIELD {s14}")])
++    d.admit(s15, "C", *P["C"])
++    d.wait_done("B")
++    d.admit(s14, "D", *P["D"], during=[(a.stop_after, "STOP")])
++    d.wait_done("C")
++    d.admit(s15, "E", *P["E"])
++    d.admit(s14, "F", *P["F"])
++    d.wait_done("E")
++    d.wait_done("F")
++    active = len(d.slot_req)
++    d.stop_all()
++    print(f"admissions done in {time.time() - t0:.1f} s ({active} slots still decoding at the end)", flush=True)
++    for e in d.events:
++        print("   ", e)
++
++    ok = True
++    for k in P:
++        b, s = d.toks.get(k, []), solo[k]
++        fin = d.fin.get(k, "?")
++        if k == "D":   # stopped while read: no tokens (or, if the read beat the STOP, a prefix)
++            same = b == s[: len(b)]
++            verdict = f"{'cancelled' if fin == 'cancel' else 'NOT cancelled (' + fin + ')'}, {len(b)} tokens, " \
++                      f"{'a prefix of solo' if same else 'DIFFERS'}"
++        elif fin == "cancel":   # stopped (BSTOP): a prefix
++            same = len(b) > 0 and b == s[: len(b)]
++            verdict = f"stopped at {len(b)} of {len(s)}: {'PREFIX OK' if same else 'DIFFERS'}"
++        else:
++            same = b == s
++            first = next((i for i in range(min(len(b), len(s))) if b[i] != s[i]), None)
++            verdict = f"{len(b)} tokens ({fin}), solo {len(s)}: " + ("IDENTICAL" if same else f"DIFFERS at {first}")
++        ok &= same
++        print(f"{k}: {verdict}")
++    if "cancel" != d.fin.get(bg := f"bg{a.bg - 1}") and d.toks.get(bg) is not None:
++        print(f"note: {bg} was not ended by the BSTOP sent during B's read ({d.fin.get(bg)})")
++    eng.send("QUIT")
++    try:
++        eng.p.wait(timeout=180)
++    except Exception:
++        eng.p.kill()
++    eng.log.close()
++    ok &= check_log(eng.log_path, env_on)
++    batch_toks = {k: d.toks.get(k, []) for k in P}
++    if a.dump:
++        Path(a.dump).write_text(json.dumps({"prompts": {k: v[0] for k, v in P.items() if k != "A2"},
++                                            "max_new": {k: v[1] for k, v in P.items() if k != "A2"},
++                                            "solo": solo, "batch": batch_toks}))
++    if a.compare:
++        other = json.loads(Path(a.compare).read_text())["batch"]
++        diff = [k for k in P if k in other and other[k] != batch_toks[k] and k[:2] != "bg"]
++        # background slots are stopped at a time that depends on the run: compare their common prefix
++        diff += [k for k in P if k[:2] == "bg" and k in other and
++                 other[k][: min(len(other[k]), len(batch_toks[k]))] != batch_toks[k][: min(len(other[k]), len(batch_toks[k]))]]
++        print(f"compare with {a.compare}: " + ("token-identical" if not diff else f"DIFFERS: {diff}"))
++        ok &= not diff
++    print("RESULT:", "PASS" if ok else "FAIL")
++    return 0 if ok else 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+
