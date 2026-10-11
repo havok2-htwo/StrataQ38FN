@@ -269,6 +269,12 @@ it falls back to the old drained read with one log line. `--kv-resident` configs
   rate drops meanwhile (418 ms of decode lost instead of 609), but the admitted slot itself idles for the longer read.
 - Use it for interactive use with up to 16 users; the default stays `T16-mmqtab` until the p95 tail is fixed.
 
+## License notices
+
+The engine patches contain Strata source (MIT) and, in the pointer-table MMQ series, code mirrored from
+llama.cpp/ggml (MIT); both notices are in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md). The rebased series
+(`patches/v0.1.42/`) also carries the ggml notice in the mirrored file itself.
+
 ## Files
 
 | File | Contents |

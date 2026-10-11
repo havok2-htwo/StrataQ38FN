@@ -4,6 +4,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `THIRD_PARTY_NOTICES.md`: MIT notices of Strata and llama.cpp/ggml (the engine patches contain their code), dataset
+  licenses of the eval set. The rebased patch series carries the ggml notice in `moe_mmq_tab.cuh` itself.
+
 ### Measured
 - Windows, engine 0.1.40.1 vs 0.1.42 on UD-IQ4_XS (series U, `series_u.sh`, `batch_bench.py --suite engine`, one
   request at a time, reference run before and after): decode **+12% prose (127 → 142 tok/s), +13% code
