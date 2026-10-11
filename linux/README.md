@@ -9,8 +9,8 @@ for sm_86), model **Unsloth UD-IQ4_XS** (target), for comparison UD-Q4_K_XL, vLL
 | | Strata UD-IQ4_XS | vLLM 0.31 Flash-Next W4A16 | vLLM 0.31 Qwen3.8-27B FP8 |
 |---|---|---|---|
 | Decode, 1 user | **~121 tok/s** (MTP) | 79 tok/s; with MTP 136 tok/s (then max. 8 users) | 64 tok/s |
-| Total, 1.2K prompts | ~297 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
-| Total, short prompts | ~417 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
+| Total, 1.2K prompts | ~327 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
+| Total, short prompts | ~444 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
 | Agent load, 16 users × 5 turns (11K→28K context): TTFT follow-up turn | **~4.5–5 s** | ~32 s | – |
 | Prefill | 1,250 (2K) → 2,240 tok/s (28K) | ~3,500 tok/s | up to ~3,100 tok/s |
 | Quality: MMLU-Pro (240) / GSM8K (150), thinking off | **77.9%** / 94.0% | 70.4% / 94.7% | 72.1% / 95.3% |
@@ -27,7 +27,7 @@ quality, short wait times with many conversations and almost no RAM. vLLM delive
 git clone git@github.com:havok2-htwo/StrataQ38FN.git /media/raid0/StrataQ38FN
 cd /media/raid0/StrataQ38FN
 git clone https://github.com/Niko1221/Strata.git Strata
-git -C Strata am ../linux/patches/*.patch            # >8 batch slots + direct slot copy (see below); rebuild the engine afterwards
+git -C Strata am ../linux/patches/*.patch ../linux/patches/mmq-tab/*.patch            # >8 batch slots + direct slot copy (see below); rebuild the engine afterwards
 cd Strata
 ./setup.sh --yes --family unsloth --model UD-IQ4_XS --gpus all \
   --models-dir /media/raid0/Models/Strata-GGUF --no-start --no-browser --vision no
@@ -227,6 +227,23 @@ cache, so every touched expert (2.33 MB) is copied per chunk and layer (~2 GB of
 `STRATA_PF_FUSED=1` only kicks in from 1,024-token chunks and does not cover Q8_0 downs on CUDA. Possible fixes (~2–3 days each):
 decode kernel `native_expert_grouped` for experts with ≤ 8 rows, or MMQ directly on the cache slots (pointer table).
 Expectation: short prompts −25–33% ingestion time, throughput +5–10%, also helps on a single GPU.
+
+## Pointer-table MMQ ("B-tab", engine patch series 3)
+
+For prompt chunks below 1,024 tokens Strata copied every routed, VRAM-resident expert (2.33 MB) into a contiguous group
+buffer before llama.cpp's MMQ could use it (~2 GB DRAM traffic per layer). The patch series in `patches/mmq-tab/` adds a
+Strata copy of MMQ's outer stream-k kernel that takes a per-expert pointer table (16 kernel parameters), so MMQ reads the
+experts in place; only the address changes, the launch geometry and arithmetic stay identical. Over-read bytes behind each
+slot are covered by a 256 B guard that is zeroed per group. Build with `-DSTRATA_MMQ_TAB=ON` (off by default: costs
+~36 MiB VRAM per GPU under eager module loading and ~70% of upstream MMQ compile time per architecture), enable at run
+time with `STRATA_MMQ_DIRECT=1`.
+
+- Exactness: unit test 874/874 bitwise, compute-sanitizer clean; engine A/B old vs new: tokens and fp32 logits
+  byte-identical (4-GPU split, 1 GPU, streamed experts); batch == solo.
+- Effect (16 users, HTTP): short 417 → **444 tok/s**, 1.2K prompts 296 → **327 tok/s**, 16 agents multi-turn
+  62 → **72 tok/s** with follow-up TTFT 5.05 → 4.57 s; single-user TTFT for a 1.2K prompt 0.88 → 0.73 s.
+- Applies to every VRAM-resident expert, so it also helps a single-GPU setup. Not built or tested here: HIP, SYCL,
+  Windows (MSVC).
 
 ## Files
 

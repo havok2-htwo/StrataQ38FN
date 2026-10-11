@@ -1,0 +1,117 @@
+From 80c8c414a8354d6d001c8721ed2e2a8e9fa1c7f1 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:23:37 +0200
+Subject: [PATCH 4/9] prefill mmq tab: the table as 16 restrict kernel
+ parameters, so the weights keep LDG.CONSTANT loads
+
+A pointer taken from a dynamically indexed array parameter (mmq_x_tab by value) made nvcc copy
+the table to local memory and read the weights through generic LD.E loads instead of
+upstream's LDG.E.*.CONSTANT: the products ran 1.2-2.5x slower than upstream's in the unit test
+(Q8_0 down 2.2-2.6x, IQ4_NL 1.7-2.1x, IQ3_S 1.2-1.35x), which ate most of the gather saving.
+The kernel now takes x0..x15 as `const char * __restrict__` parameters (like upstream's x)
+and picks an expert's with a select chain: same SASS load mix as upstream (no local memory),
+kernel time within 1% of upstream over every type and J in prefill_mmq_tab_test (69.7 vs
+69.3 ms in total), and still 874/874 comparisons bitwise identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/prefill/moe_mmq_tab.cuh | 37 +++++++++++++++++++++++++++++--------
+ 1 file changed, 29 insertions(+), 8 deletions(-)
+
+diff --git a/src/prefill/moe_mmq_tab.cuh b/src/prefill/moe_mmq_tab.cuh
+index 8909976..d348920 100644
+--- a/src/prefill/moe_mmq_tab.cuh
++++ b/src/prefill/moe_mmq_tab.cuh
+@@ -11,8 +11,10 @@
+ // fallback = false only (mul_mat_q_tab_case refuses rows % 128 != 0).  Everything else is the upstream text, and
+ // mul_mat_q_process_tile, the tile loaders, vec_dot, write_back and mul_mat_q_stream_k_fixup are upstream's own
+ // templates from the same mmq.cuh, compiled in the same target with the same flags.  Deliberate deviations:
+-//   1. at the three offset_x sites the expert's base is `tab.p[fastdiv(zt, channel_ratio)]` and the
+-//      fastdiv(zt, channel_ratio)*stride_channel_x term leaves offset_x (stride_channel_x is still passed, unused);
++//   1. upstream's `const char * __restrict__ x` parameter becomes 16 such parameters x0..x15 (the table, see
++//      STRATA_MMQ_TAB_PARAMS); at the three offset_x sites the expert's base is the one picked by
++//      fastdiv(zt, channel_ratio), and the fastdiv(zt, channel_ratio)*stride_channel_x term leaves offset_x
++//      (stride_channel_x is still passed, unused);
+ //   2. the launcher raises the shared-memory limit of mul_mat_q_tab<type, J> only - upstream's line for
+ //      mul_mat_q<type, J, true> is dropped, so no fallback=true kernel is instantiated.
+ // The launch geometry (J, tiles, the stream-k grid and k split, the fixup) is computed from the same mmq_args as
+@@ -40,11 +42,30 @@ static_assert(std::is_same<decltype(&mul_mat_q_stream_k_fixup<GGML_TYPE_Q8_0, 8,
+                                     uint3, int, uint3)>::value,
+               "mmq.cuh: mul_mat_q_stream_k_fixup changed - re-sync src/prefill/moe_mmq_tab.cuh");
+ 
++// The table reaches the kernel as 16 separate `const char * __restrict__` parameters, like upstream's `x`, and an
++// expert's entry is picked with a select chain: a pointer picked from read-only kernel parameters keeps upstream's
++// non-coherent global loads (LDG.CONSTANT) of the weights; a dynamically indexed array parameter would be copied to
++// local memory and its pointers read through generic loads (measured ~1.2-2.5x slower products).
++#define STRATA_MMQ_TAB_PARAMS                                                                                     \
++    const char * __restrict__ x0, const char * __restrict__ x1, const char * __restrict__ x2,                  \
++    const char * __restrict__ x3, const char * __restrict__ x4, const char * __restrict__ x5,                  \
++    const char * __restrict__ x6, const char * __restrict__ x7, const char * __restrict__ x8,                  \
++    const char * __restrict__ x9, const char * __restrict__ x10, const char * __restrict__ x11,                \
++    const char * __restrict__ x12, const char * __restrict__ x13, const char * __restrict__ x14,               \
++    const char * __restrict__ x15
++#define STRATA_MMQ_TAB_PICK(z)                                                                                    \
++    ((z) == 0 ? x0 : (z) == 1 ? x1 : (z) == 2 ? x2 : (z) == 3 ? x3 : (z) == 4 ? x4 : (z) == 5 ? x5 :            \
++     (z) == 6 ? x6 : (z) == 7 ? x7 : (z) == 8 ? x8 : (z) == 9 ? x9 : (z) == 10 ? x10 : (z) == 11 ? x11 :        \
++     (z) == 12 ? x12 : (z) == 13 ? x13 : (z) == 14 ? x14 : x15)
++#define STRATA_MMQ_TAB_ARGS(t)                                                                                    \
++    (t).p[0], (t).p[1], (t).p[2], (t).p[3], (t).p[4], (t).p[5], (t).p[6], (t).p[7], (t).p[8], (t).p[9],        \
++    (t).p[10], (t).p[11], (t).p[12], (t).p[13], (t).p[14], (t).p[15]
++
+ // ---- mirrored: mul_mat_q (fallback = false, per-expert base from `tab`) ----
+ template <ggml_type type, int J>
+ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false), ggml_cuda_mmq_get_occupancy(type, J, false))
+ static __global__ void mul_mat_q_tab(
+-        const mmq_x_tab tab, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
++        STRATA_MMQ_TAB_PARAMS, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+         const float * __restrict__ y_scale,
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+@@ -142,7 +163,7 @@ static __global__ void mul_mat_q_tab(
+         const int tile_x_max_i = nrows_x  - it*I - 1;
+         const int tile_y_max_j = col_diff - jt*J - 1;
+ 
+-        const char * xz = tab.p[fastdiv(zt, channel_ratio)];  // STRATA: per-expert base
++        const char * xz = STRATA_MMQ_TAB_PICK(fastdiv(zt, channel_ratio));  // STRATA: per-expert base
+         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
+ 
+         constexpr bool fixup = false;
+@@ -237,7 +258,7 @@ static __global__ void mul_mat_q_tab(
+         const int tile_x_max_i = nrows_x  - it*I - 1;
+         const int tile_y_max_j = col_diff - jt*J - 1;
+ 
+-        const char * xz = tab.p[fastdiv(zt, channel_ratio)];  // STRATA: per-expert base
++        const char * xz = STRATA_MMQ_TAB_PICK(fastdiv(zt, channel_ratio));  // STRATA: per-expert base
+         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
+ 
+         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+@@ -322,7 +343,7 @@ static __global__ void mul_mat_q_tab(
+     const int tile_x_max_i = nrows_x  - it*I - 1;
+     const int tile_y_max_j = col_diff - jt*J - 1;
+ 
+-    const char * xz = tab.p[fastdiv(zt, channel_ratio)];  // STRATA: per-expert base
++    const char * xz = STRATA_MMQ_TAB_PICK(fastdiv(zt, channel_ratio));  // STRATA: per-expert base
+     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
+ 
+     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
+@@ -369,7 +390,7 @@ static void launch_mul_mat_q_tab(ggml_backend_cuda_context & ctx, const mmq_args
+ 
+     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+         mul_mat_q_tab<type, J><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+-            (tab, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
++            (STRATA_MMQ_TAB_ARGS(tab), args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+@@ -398,7 +419,7 @@ static void launch_mul_mat_q_tab(ggml_backend_cuda_context & ctx, const mmq_args
+     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
+ 
+     mul_mat_q_tab<type, J><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+-        (tab, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
++        (STRATA_MMQ_TAB_ARGS(tab), args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
+          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-- 
+2.43.0
+

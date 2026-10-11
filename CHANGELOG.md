@@ -9,6 +9,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.6.0] – 2026-10-11
+
+### Added
+- Engine patch series 3 "pointer-table MMQ" (`linux/patches/mmq-tab/`, build `-DSTRATA_MMQ_TAB=ON`, env
+  `STRATA_MMQ_DIRECT=1`): MMQ reads VRAM-resident experts in place instead of copying them per prompt chunk.
+  Bit-identical (tokens and logits). 16 users: short prompts 417 → 444 tok/s, 1.2K prompts 296 → 327 tok/s,
+  16 agents 62 → 72 tok/s; single-user TTFT for a 1.2K prompt −17%.
+- `linux/TESTLOG.md` (chronological test log), `linux/upstream/ANALYSIS-*.md` and `DESIGN-mmq-direct.md`.
+- `start-strata.sh` now defaults to `configs/T16-mmqtab.json`.
+
+### Changed
+- All project documentation in `linux/` and this changelog are now in English.
+
 ## [0.5.0] – 2026-10-11
 
 ### Added
