@@ -48,7 +48,10 @@ def one_request(a, uid):
     prompt = (f"[request {uid} / {a.label} / {time.time_ns()}]\nBackground notes:\n{doc}\n\n"
               f"Task: write a long, thorough and well-structured technical explanation of {topic}. "
               f"Use several sections and concrete examples. Do not stop early.")
-    body = {"model": a.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": a.max_tok,
+    max_tok = a.max_tok
+    if a.max_tok_min and a.max_tok_min < a.max_tok:   # mixed reply lengths, the same per request id in every run
+        max_tok = a.max_tok_min + (uid * 2654435761) % (a.max_tok - a.max_tok_min + 1)
+    body = {"model": a.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tok,
             "stream": True, "temperature": a.temperature, "seed": uid, "reasoning_effort": "none",
             "stream_options": {"include_usage": True}}
     if a.vllm:
@@ -141,6 +144,9 @@ def main():
     ap.add_argument("--levels", default="1,2,4,8,16")
     ap.add_argument("--rounds", type=int, default=2, help="requests per user, sent back to back")
     ap.add_argument("--max-tok", type=int, default=512)
+    ap.add_argument("--max-tok-min", type=int, default=0,
+                    help="> 0: each request's max_tokens is spread over [max-tok-min, max-tok] (fixed per request id), "
+                         "so the slots do not finish in lockstep")
     ap.add_argument("--prompt-tok", type=int, default=1000)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--timeout", type=float, default=3600)
