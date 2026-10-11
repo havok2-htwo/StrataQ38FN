@@ -57,6 +57,7 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
 | 39 | **M0 baseline for overlapped admission** (engine level, reference engine, 15 slots decoding, `results/overlap/m0/`) | all-slot stall per admission **0.28 s short / 0.67 s 1.2K** (design assumed 0.44/0.94); prompt read (`sp.run`, the overlappable part) 201 / 609 ms = 64 % / 85 %; fixed rest ~112 ms (drain 27, header windows 24, ramp 24, checkpoint 17, first window 11.5, copy 7.8); D_ref 591 rows/s (16 slots). Gate holds in T16-mmqtab (no loans, 100 % resident, `--ple-io ram` = Mmap mode, no PleReader); X16 agent configs (`--kv-resident`) are refused | 🔬 model `D/(1+D·R/L)` predicts 446/333 vs measured 444/327 | `results/overlap/m0/` |
 | 40 | **Overlapped admission implemented** (branch `g3-overlap`, 5 commits, env `STRATA_PIPE_OVERLAP=1`, engine `strata-g3-overlap`): M1 PLE concurrency setters, M2 gate + pre-capture of all group layouts, M3 read on a worker thread while `pump` keeps the groups decoding; review found 2 real defects (pad-up over a parked slot cache; spin waits not released on a CUDA fault), both fixed | exactness matrix all green: env off = reference engine (batch_test16/32, interleave, both splits); env on: batch_overlap_test every slot/admission = solo, env 0 vs 1 token- and RESUME-identical, forced pad-up/wait arms identical, 64-request soak 64/64, BSTOP/STOP/BYIELD mid-read, fault cases (a)–(e) exactly one ERR + bounded exit; 1.2K read beside decoding 826 ms (609 drained), decode lost 420 ms → x ≈ 0.7 | ✅ exact; throughput → #41 | `results/overlap/{m2,m3,r1,exactness-r1}/` |
 | — | Found on the way (reference engine too, not the overlap): a next turn continued from its parent's slot after a reply decoded in the batch can differ from a fresh solo read (soak2: r16/r32/r40/r48 differ at token 15–54, RESUME ~845) | open, upstream behaviour? | 🔬 | `results/overlap/exactness-r1/soak2-ref*.out`, `reuse4.py` |
+| 41 | **Overlapped admission through the HTTP server (M5)**: `T16-overlap` vs `T16-overlap-off` (same binary), 3 repetitions each, means; TTFT p50/p95 in s | 16 users short: 440.8 → 436.8 tok/s (−1 %), TTFT p50 **1.74 → 0.47**, p95 5.25 → 6.36, e2e p50 18.5 → 17.0 · 16 long: 327.1 → 327.7 (0 %), TTFT p50 **4.13 → 1.00**, p95 10.96 → 13.72, e2e p50 25.0 → 21.0 · 24 short: 424.1 → 433.6 (+2 %), p50 3.09 → 3.87 · 24 long: 316.4 → 337.5 (+7 %), p50 6.83 → 9.32, p95 36.1 → 28.9 · 1 user unchanged. Engine stats: short read 305 ms beside decode (201 drained), decode lost 158 ms; 1.2K read 840 ms (609), lost 418 ms; 0 pad-ups, 0 waits | ✅ latency lever (opt-in): median TTFT −73/−76 % and e2e −8/−16 % at 16 users, throughput neutral; ❌ p95 +20–25 % (stretched reads queue up), p50 worse above 16 users. Why no throughput: the admitted slot itself idles during the longer read, which eats the decode the other slots win | `results/series_overlap.out`, `strata-T16-overlap*-r{1,2,3}.txt`, `engine-strata-T16-overlap-*-r3.log` |
 
 ## Analyses (no GPU)
 
@@ -68,7 +69,10 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
 
 ## Open / next steps
 
-- Overlapped admission: end-to-end benchmark (M5) and knob arms (M4: PRIO, SLEEP_US, MTP_PRIO), then docs (M6).
+- Overlapped admission: fix the p95 tail (overlap only when no other admission is queued; or read queued prompts
+  together), knob arms (M4: PRIO, SLEEP_US, MTP_PRIO), docs (M6).
+- Rebase onto upstream 0.1.42 (+235 commits); the Windows side measured `STRATA_ROUTE_TAIL_SKIP=7` +12-13 % decode
+  there (upstream keeps it off with every expert in VRAM and with `--batch`; it changes the output).
 - Slot-resume mismatch after a batch-decoded reply (see the row after #40).
 - Parked: dynamic switching pipeline ↔ expert parallel (see the memory/ideas note in the README section).
 

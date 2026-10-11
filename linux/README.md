@@ -245,6 +245,30 @@ time with `STRATA_MMQ_DIRECT=1`.
 - Applies to every VRAM-resident expert, so it also helps a single-GPU setup. Not built or tested here: HIP, SYCL,
   Windows (MSVC).
 
+## Overlapped admission (engine patch series 4, opt-in)
+
+Without it, every new request stops all 16 slots while its prompt is read (0.28 s for ~150 tokens, 0.67 s for 1.2K,
+measured per admission). With `STRATA_PIPE_OVERLAP=1` (branch `g3-overlap`, `patches/overlap/0001-0005`, engine
+`engine/strata-g3-overlap`, config `configs/T16-overlap.json`) the prompt is read on a worker thread while the slot
+groups keep decoding. Before the read, every group layout the read could need is captured, so no CUDA graph is captured
+or evicted during it; a gate checks live that every expert is resident, nothing is lent and no K/V streams, otherwise
+it falls back to the old drained read with one log line. `--kv-resident` configs (the X16 agent configs) are refused.
+
+- Exactness: env on = env off = reference engine, token- and resume-identical (batch_test16/32, interleave,
+  `tools/batch_overlap_test.py` incl. BSTOP/STOP/BYIELD mid-read and slot reuse, 64-request soak, both splits,
+  forced pad-up/wait arms); fault injection (a)-(e): exactly one ERR and a bounded exit.
+- Effect through the server (3 repetitions, means; TESTLOG #41):
+
+| 16 users | throughput | TTFT p50 | TTFT p95 | request time p50 |
+|---|---|---|---|---|
+| short prompts, off → on | 441 → 437 tok/s | **1.74 → 0.47 s** | 5.3 → 6.4 s | 18.5 → 17.0 s |
+| 1.2K prompts, off → on | 327 → 328 tok/s | **4.13 → 1.00 s** | 11.0 → 13.7 s | 25.0 → 21.0 s |
+
+  With 24 users (more users than slots) throughput rises by 2 % (short) and 7 % (1.2K), but the median TTFT gets worse.
+- Why no throughput gain at 16 users: a read beside decoding takes longer (1.2K: 840 instead of 609 ms) and the decode
+  rate drops meanwhile (418 ms of decode lost instead of 609), but the admitted slot itself idles for the longer read.
+- Use it for interactive use with up to 16 users; the default stays `T16-mmqtab` until the p95 tail is fixed.
+
 ## Files
 
 | File | Contents |

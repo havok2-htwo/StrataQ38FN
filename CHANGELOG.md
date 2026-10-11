@@ -17,6 +17,17 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.8.0] – 2026-10-11
+
+Linux (4× RTX 3090).
+
+### Added
+- Engine patch series 4 "overlapped admission" (`linux/patches/overlap/0001-0005`, env `STRATA_PIPE_OVERLAP=1`,
+  opt-in, config `linux/configs/T16-overlap.json`): a new request's prompt is read while the other slots keep
+  decoding. Exact (token- and resume-identical to the reference engine). 16 users: median TTFT 1.74 → 0.47 s (short)
+  and 4.13 → 1.00 s (1.2K), median request time −8/−16 %, throughput unchanged, TTFT p95 +20–25 %.
+- `linux/series_overlap.sh`, `linux/results/overlap/` (M0 baseline, exactness matrix, fault injection).
+
 ## [0.7.0] – 2026-10-11
 
 Windows (RTX 5090 + 64 GB).
