@@ -68,7 +68,7 @@ eingelesen. Wer mehr Kontexte im Wechsel nutzt, hebt Slots und MiB an (RAM-Unter
 **Engpass ist der Windows-Commit, nicht das physische RAM.** 262K Kontext läuft ohne Tempoverlust, ist aber erst mit
 fester Auslagerungsdatei betriebssicher (siehe Einrichtung, Schritt 9).
 
-Sackgassen (gemessen, nicht wiederholen): Batching (`parallel: 2` + `--batch-mtp`) stürzt ab bzw. kostet −18 %;
+Sackgassen (gemessen, nicht wiederholen): Batching (`parallel` + `--batch-mtp`) bringt mit UD-IQ4_XS keinen Durchsatz (Absturz war ein Engine-Bug, ab Strata v0.1.40.2 behoben; danach 2 Slots 122 statt 128 tok/s gesamt, weil ~60 % der Experten auf der CPU laufen; nur der Coder mit allen Experten im VRAM gewinnt +17 % bei 4 Slots, `batch_bench.py`, `batch_results.jsonl`);
 `--vram-reserve-mib` < 800 meldet LOW; `pcie_frac` > 0,7, `--spec` ≠ 4 und `--spec-min-p` ≠ 0,5 sind langsamer.
 
 ## Verzeichnis

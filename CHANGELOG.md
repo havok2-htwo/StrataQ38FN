@@ -18,6 +18,11 @@ Windows (RTX 5090 + 64 GB).
 - `cors_origins` (`http://localhost:3000`, `http://127.0.0.1:3000`) in all three configs: browser clients such as
   Genesis may call `/v1/*` directly. Before, `Access-Control-Allow-Origin` was missing and the browser discarded
   the responses ("Could not connect … after 3 attempts").
+- `batch_bench.py` (`batch_results.jsonl`, configs `BB*`/`CB*`): decode/prefill with 1/2/4 concurrent requests and
+  decode next to a long prompt, against a selectable Strata build (`--strata`). Measured 2026-10-10 with engine
+  v0.1.40.2 (worktree `Strata-1402`, fixes the `--batch-mtp` crash): UD-IQ4_XS without batching 116–131 tok/s total,
+  2 slots 122, 4 slots 119 (a single request drops to 85); Coder without batching 162, 2 slots 177, 4 slots 189.
+  With UD-IQ4_XS ~60% of experts run on the CPU, so batching does not pay off there.
 
 ### Changed
 - UD-IQ4_XS: parking raised from 3 slots / 6 GiB to `--conversation-cache-slots 12 --conversation-cache-mib 10240`,
