@@ -1,0 +1,31 @@
+From 8298b9352dd791bae81722e6bdfdeae66b6eacbf Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:56:22 +0200
+Subject: [PATCH 19/33] generate: STRATA_PIPE_OVERLAP_TEST_FAULT=cuda marks its
+ fault without naming cudaErrorIllegalAddress
+
+The HIP compat headers do not map that enum, and generate.cpp is built for the
+HIP targets too (the overlap is only switched off there by a constexpr), so
+STRATA_ENABLE_HIP / STRATA_HIP_GFX906 builds failed. Any nonzero wcuda is a fault.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 95ab86d6..d24c72b6 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -11302,7 +11302,7 @@ int main(int argc, char** argv) {
+                         if (!fired.exchange(true)) {
+                             wok = false;
+                             we = "test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault";
+-                            wcuda = (int) cudaErrorIllegalAddress;
++                            wcuda = -1;   // (any nonzero: a fault; no CUDA enum, generate.cpp builds for HIP too)
+                         }
+                     }
+                     if (pipe_overlap_debug().fault == OvFault::stall) {   // STRATA_PIPE_OVERLAP_TEST_FAULT=stall
+-- 
+2.43.0
+

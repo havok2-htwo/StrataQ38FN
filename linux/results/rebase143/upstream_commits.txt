@@ -1,0 +1,72 @@
+7695859a 2026-10-11 Canonical Q2_0 pack: the measured PCIe share is opt-in on Windows (STRATA_PCIE_AUTO_CANON=1); RTX 5070: code +2.5%, a short answer -3.3%, 5 pairs
+7c035d72 2026-10-11 STRATA_ADAPT_OVERLAP: opt-in on Windows (RTX 5070, Q2_0: story -2.6%, code -2.1% with it, 5 pairs; IQ3_XXS neutral); Linux CUDA keeps it on
+0d0f106d 2026-10-11 docs/MULTI_GPU.md: the default pipeline's tokens are the serial loop's up to CPU rounding (4x R9700, default flags: 10 of 10 prompts matched over 160 tokens)
+60abf63e 2026-10-11 HIP layer split: the route tail skip's default stays off from 60% of the experts cached (90% elsewhere); measured on 2x R9700: Q2_0 story -6.2% at 70%, -1.8% at 60%, IQ3_S about 0 at 60%
+003ea8c6 2026-10-11 Merge PR #1892 (lask3802): the --serve NaN guard (non-finite head logits drop the caches and re-read from token 0; STRATA_NAN_GUARD=0 off); bitwise identical otherwise, cost under 0.2%
+f332a855 2026-10-11 Non-finite logits (#879): a guard with self-healing
+248dbee5 2026-10-11 Merge PR #1737 (Ethan): route-resident swap one warp per token; bitwise equal to the scalar kernel, opt-in STRATA_ROUTE_RESIDENT decode +1.6-2.4% (R9700 32 GB) / +5.7-7.8% (16 GB-eq)
+115f62b0 2026-10-10 route-resident parity: the swap against a scalar reference
+33fd01b4 2026-10-09 route-resident: one warp per token in the swap kernel
+5ef500d4 2026-10-11 Merge f-1712: the prompt chunk's step records and token ids go up from a pinned buffer (#1712)
+46d22108 2026-10-11 HIP layer split: the route tail skip's default stays off from 70% of the experts cached (90% elsewhere); 2x R9700 16 GB-eq Q2_0 story -6.1% with it at 73%
+a5f82ab7 2026-10-11 Merge f-143-dense (via the trial merge 94f6d18d): CUDA sm_86 Q3_K interleaved kernel and one column; bitwise exact, A4000 decode +2.0-2.7%
+2eba7154 2026-10-11 Merge f-143-intel: B70 prompt and decode speed (copy engine, wide kv_append, no GEMM staging on bmg, lend mirror, fused dequant, lean verify graph, the xe expert ranking); same output tokens, B70 4K prompt 8.5 -> 3.3 s (128K config), decode +14-21% on prompts outside the ranking's corpus
+b97a36a4 2026-10-11 prefill: the chunk's step records and token ids go up from a pinned buffer, not pageable memory (#1712)
+4d4f8bd5 2026-10-11 docs/INTEL.md: server latency numbers
+94f6d18d 2026-10-11 Merge f-143-dense: CUDA sm_86 Q3_K on the interleaved path and one column (STRATA_MMVQ_IL_Q3K=0 / STRATA_MMVQ_IL_T1=0 off)
+3d5c16ef 2026-10-11 docs/INTEL.md: the 0.1.43 prompt and decode speed changes on the B70
+8cb26e60 2026-10-11 SYCL: data/expert-profile-sycl.bin, the experts' ranking for a card on xe, built with make_profile_mix.py from the routing of 45 varied prompts and eight document summaries; setup_intel writes it instead of the shipped profile there (i915 keeps the shipped one). B70: +5..64% decode (mean +21%) on 12 unseen prompts, the same tokens. The copy-engine queue is Battlemage-only by default (it hung the A750's prompt)
+ddd84269 2026-10-11 Merge f-143-amdmg: --pipeline-windows 2 by default on gfx12 layer splits of 3+ stages (exact; 4x R9700 code +7-12%, 4K +9-11%, 32K +8-19%); STRATA_PCIE_AUTO_SPLIT=1 opt-in
+b03304d9 2026-10-11 HIP: --pipeline-windows 2 is on by default for gfx12 layer splits of 3+ stages (STRATA_PIPELINE_AUTO=0 / --pipeline-windows 0 off); STRATA_PCIE_AUTO_SPLIT=1 (opt-in) refines a two-stage split's PCIe shares per stage
+218df142 2026-10-11 SYCL copy engine: one queue per device (a layer split asks once per card)
+9e3ba427 2026-10-11 tools: make_profile_mix.py (an expert profile from several routing traces, each trace counting the same, with weights), collect_profile_traces.py (the traces of bench/profile_corpus.json's 45 varied prompts through the engine)
+46a77907 2026-10-11 SYCL decode window: under STRATA_VERIFY_NO_HOST with the device plan the graph drops the nodes nobody answers (doorbell publish, three flag waits, the plan copy, the PCIe-share group and its staging); -2% decode on a B70, same tokens (STRATA_VERIFY_LEAN=0 turns it off)
+331b591b 2026-10-11 Merge f-143-amdk: gfx12 decode node cuts (HC norm from registers, host-flag wait folded into the copy, HC up kernel owning its q8_1 groups, hit counts in the combine); bitwise exact, +1.6-2.0% decode
+a9917a55 2026-10-11 gfx12 decode: the HC up kernel owns whole q8_1 groups and writes its consumer's image itself (STRATA_QFUSE_HC, no atomics), moe_hit_add folded into the combine (STRATA_FUSE_HITS); STRATA_FUSE_CONVAB (conv + a/b in one launch, opt-in, measured slower)
+beba872b 2026-10-11 SYCL: the experts in the prompt loan's slots (the cache's last 10%, at most 1,200) are mirrored in pinned memory too, so the lent slots are refilled by DMA, not by a single-threaded GGUF read: 930 slots 916 -> 84 ms (STRATA_LEND_MIRROR=0 turns it off)
+7a07f281 2026-10-11 SYCL prompt path: no GEMM operand staging on Battlemage (STRATA_SYCL_GEMM_STAGE=1 brings it back): the A770 oneMKL bug (operands past 4 GiB) did not show on a B70, first-token logits are byte-identical at 4K and 49K, and the 10 MB copy per expert was ~10% of a prompt
+5a0df898 2026-10-11 SYCL prompt path: kv_append writes the host KV copy and the staging pool 4 bytes a lane (STRATA_KV_WIDE_HOST=0: the 1-byte stores): with --kv-resident the 1-byte stores into pinned host memory ran at ~30 MB/s, 2 s of a 4K prompt on a B70
+cd566059 2026-10-11 SYCL copy engine: the stager's issued-flag is a copy, not a fill kernel (a copy-only command list runs no kernel: the driver aborted the lent-slot prompt of the 128K config)
+75109596 2026-10-11 SYCL prompt path: an expert's gate/up and down dequantized in one launch (iq_dequant_expert_f16, the same values; STRATA_PF_DQ_FUSED=0: two launches), -2% on a B70 4K prompt
+7fc02cb5 2026-10-11 gfx12 decode: the split HC norm from registers (-1.8 us a read), the host-flag waits folded into the copies that follow them (-2 nodes a layer); STRATA_VERIFY_NODES lists the window graph on HIP; the stage profile splits the FFN-side HC read; STRATA_DUMMY_NODES=k measures what an empty graph node costs
+bb519f5b 2026-10-11 bench: fused_gr_bench cold-weight mode with the norm/down/up split and an output hash; router_chain_bench (router GEMV, top-10 and doorbell per layer in a graph)
+01fe68dd 2026-10-11 SYCL: the prompt path's expert copies run on the GPU's copy engine (an immediate command list on the copy-only queue group, wrapped as a SYCL queue); the Level Zero v2 adapter ran them on the compute engine, ~13% of a B70 prompt. STRATA_COPY_ENGINE=0 turns it off
+70f9c417 2026-10-11 SYCL: the grouped XMX expert kernels on Battlemage (STRATA_PF_XMX=1/2, opt-in): sub-group 16, joint_matrix 8x16x16, built for AOT bmg and lnl (STRATA_XMX_SG16); Alchemist keeps 8x8x16
+50089624 2026-10-11 SYCL: STRATA_USAGE_DUMP=PATH counts every routed expert in the device plan (an atomic per entry) and writes the counts in --dump-routing format; a measurement of how much residency matters under STRATA_VERIFY_NO_HOST
+195d3791 2026-10-11 CUDA sm_86: Q3_K on the interleaved 2-4 column path and one column on the same kernel, sm_86 table (STRATA_MMVQ_IL_Q3K=0 / STRATA_MMVQ_IL_T1=0 turn them off)
+da3fe1f1 2026-10-11 mmvq_il_parity: the engine's real shapes, one column, Q3_K, MMVQ_IL_ONLY filter, table emit by worst ratio; fused_gr_bench: engine's staged read, L2-cold weights, GB/s
+7c3fc48e 2026-10-11 Merge f-143-q2pcie: measured PCIe share for the canonical Q2_0 pack on CUDA (conflict with the gfx12 PcieAuto default resolved: one pf_old, canonical pack CUDA only)
+ab97f174 2026-10-11 PcieAuto for the canonical pack: probe the link and refine the share from the CPU pool's speed (CUDA; start value stays 0.2; STRATA_PCIE_FRAC_DEFAULT=old and --pcie-frac keep it fixed)
+c69adca6 2026-10-11 Version 0.1.43: project version and the setup minimum engine; DETAILS lines for the gfx12 defaults
+f5a01267 2026-10-11 Merge f-143-amd: gfx12 decode defaults
+bf1e083f 2026-10-11 Merge f-143-amdpp: gfx12 chunk rule and PF_FUSED default
+4ad4a258 2026-10-11 Merge f-143-kernels: P100 sm_60 tables
+b5e040da 2026-10-11 Merge f-143-prefetch: adapt overlap default-on CUDA
+85d90002 2026-10-11 serve: a slot request that ends at its stop token reads its BDONE before it leaves, so its decode time and tokens are the slot leg's (#1869)
+7475df93 2026-10-11 HIP: the measured PCIe share (PcieAuto) is the default on gfx1200/gfx1201; STRATA_PCIE_FRAC_DEFAULT=old opts out; other AMD parts unchanged
+ad2aef76 2026-10-11 HIP: STRATA_ROUTE_TAIL_SKIP=7 is the default on gfx1200/gfx1201 under the CUDA rules (#1884 cached-share line included); other AMD parts unchanged
+606eb108 2026-10-11 generate: decode_defaults_arch_ok() (gfx1200/gfx1201 on HIP, always on CUDA) for the HIP decode defaults
+5f9bbf61 2026-10-11 serve: a request moved from the solo path to a batch slot keeps the solo leg's prompt figures, decode time and tokens (#1869, #1870)
+5a66924d 2026-10-11 gfx12: the fused int8 prompt experts are on by default for IQ3_S and IQ3_XXS packs; STRATA_PF_FUSED=0 turns them off
+cf09057a 2026-10-10 gfx12 (Linux): a bare --prefill auto may take 16384-token chunks; explicit --prefill N, auto:N and STRATA_PREFILL_AUTO_MAX are untouched; STRATA_GFX12_CHUNK=0 or STRATA_GFX12_DEFAULTS=0 keeps 8192
+0d761d99 2026-10-10 Resident RAM mode overlap: opt-in (STRATA_ADAPT_OVERLAP_RESIDENT=1); exact, +7.0% on an A4000, -2.6% on a RAM-bound 3060 box
+6ab541f6 2026-10-10 CUDA: the tail-skip default stays off when 90% or more of the experts are in the GPU cache (#1884); STRATA_TAIL_SKIP_MAX_CACHED moves the line
+2eaeda2e 2026-10-10 STRATA_ADAPT_OVERLAP in the resident RAM mode: soft_commit_exchanges makes a staged evicted expert look committed (pinned, device alias into its exchange buffer) while in's RAM place stays the copy source
+8c34c475 2026-10-10 STRATA_ADAPT_OVERLAP_SLOW_US: test hook that slows the adaptive copies so the windows wait for them
+0636c464 2026-10-10 serve: a request handed from a batch slot back to the solo path keeps the slot leg's decode time and tokens (#1869); timings.prompt_n is what the engine read, the rest is cache_n (#1870)
+cd785013 2026-10-10 strata_bench: skip the agent session when the context is below ~10K instead of sending a request that fails with HTTP 400
+f95f2eab 2026-10-10 STRATA_ADAPT_OVERLAP on by default for CUDA (=0 turns it off), docs; the h2d copy-engine microbenchmark
+e7558f8c 2026-10-10 CUDA sm_60: expert mode 8 (grid and activations in shared memory, SwiGLU fused) is the Tesla P100's default, STRATA_SM60_TABLE=0 or STRATA_EXP_MODE=0 turns it off
+9ef44842 2026-10-10 STRATA_ADAPT_OVERLAP=1 (opt-in): the adaptive tier's copies land while the next decode window runs, a layer waits for its own copies
+e5387d41 2026-10-10 CUDA sm_60: interleaved 2-4 column GEMV with a Pascal rows table (P100), STRATA_SM60_TABLE=0 turns it off
+86070e78 2026-10-10 STRATA_TRACE: VRAM marks after the context, the pack weights, the session and the head (the 0.1.43 VRAM audit)
+885f9f70 2026-10-10 Version 0.1.42.1: project version and the setup minimum engine
+00cc68e7 2026-10-10 Merge f-142d-bench into f-1421
+bccef1cf 2026-10-10 Merge f-142d-numa into f-1421
+02a4216f 2026-10-10 Merge f-142d-unmap into f-1421
+879096d6 2026-10-10 Benchmark: backend wording, run time text
+ed5536ea 2026-10-10 file_expert_source_test: fix the cache-hint test string
+6b8c2e74 2026-10-10 Benchmark: prompt sizes calibrated by slope, agent re-read counts only earlier turns, no doubled quant in the folder name
+dfaebd9d 2026-10-10 Benchmark mode: BENCH.bat / bench.sh and tools/strata_bench.py measure an install through the HTTP API and write a community report
+52a2dd10 2026-10-10 Windows GGUF-in-place: close every GGUF shard view once the file tier reads unbuffered (NTFS serializes unbuffered reads of a mapped file)
+8c80a3ba 2026-10-10 Start-up after another model: judge pinning by the emptiest NUMA node, say how much is file cache when RAM is short, opt-in STRATA_DROP_CACHE_ON_EXIT

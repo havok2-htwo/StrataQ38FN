@@ -1,0 +1,137 @@
+ 1:  36aa90dc =  1:  0e0839de batch: more than 8 slots with a layer split (8 rows per pipeline group), hand-off sized per slot
+ 2:  2564c1f2 =  2:  fca4cb5d batch: device-to-device slot copy for admissions and slot resumes
+ 3:  8746f0d5 =  3:  063ed769 prefill mmq: pointer-table MMQ (STRATA_MMQ_TAB), prep_group, the bitwise test
+ 4:  76ba9dc7 =  4:  5cf80418 expert cache: a slot guard for STRATA_MMQ_DIRECT (set_slot_guard), the sizing sites use slot_stride
+ 5:  34359cdc =  5:  13fe7cc8 prefill: STRATA_MMQ_DIRECT=1 reads resident experts in their cache slots (pointer-table MMQ)
+ 6:  56c4fa15 =  6:  7ad58ceb prefill mmq tab: the table as 16 restrict kernel parameters, so the weights keep LDG.CONSTANT loads
+ 7:  a2ad3781 !  7:  01a6576f docs: STRATA_MMQ_DIRECT (opt-in) and the STRATA_MMQ_TAB build option, with the measurements
+    @@ Commit message
+     
+      ## docs/DETAILS.md ##
+     @@ docs/DETAILS.md: the pairs in which the switched arm won). They are here so you can try them on y
+    -   -0.1% (5/6). Boxes that hold all experts in RAM never use the stage buffers.
+    - - **`STRATA_ADAPT_LAG=2`: the adaptive tier's copies are waited for one window later** (#764). Decode, 6 pairs: Tesla P100
+    -   (PCIe 3.0 x16) +3.5% (6/6 pairs faster), RTX 5070 +0.2% (4/6), RTX 3060 -1.3% (0/6), so it stays opt-in.
+    +   `STRATA_ADAPT_NOWAIT` or `STRATA_DMA_BATCH`; otherwise the log says why it is off. RTX A4000, 6 interleaved pairs each,
+    +   decode median tok/s: Q2_0 16 GB 62.5 -> 66.2 (+5.9%), Q2_0 as a 12 GB card 51.3 -> 54.2 (+5.7%), IQ3_XXS 16 GB 48.6 -> 52.6 (+8.3%),
+    +   IQ3_XXS as 12 GB 39.3 -> 41.5 (+5.5%), 6/6 pairs faster every time.
+     +- **`STRATA_MMQ_DIRECT=1`: the prompt's MMQ reads resident experts in their cache slots** (CUDA, native packs). The prompt
+     +  path multiplies its experts in groups of 16 with llama.cpp's MMQ, which wants a group's weights in one buffer at a fixed
+     +  stride, so every expert a chunk routes to is copied there first (2.3-3.1 MB each, per chunk and layer), resident ones
+ 8:  775d7913 =  8:  93e8dc9f prefill_mmq_tab_test: pad the identity row map for memcheck
+ 9:  ddd995e1 =  9:  d69a89cf prefill mmq tab: STRATA_MMQ_TAB off by default, the nine tested types only, not on gfx906
+10:  db130fbe = 10:  2568e85a expert cache: slot_guard() reports the guard applied; a test for slot_tail on uniform and sized caches
+11:  cf524780 ! 11:  9a3c4fae docs: STRATA_MMQ_DIRECT needs -DSTRATA_MMQ_TAB=ON; its VRAM and build cost; the hack is no bound; engine exactness
+    @@ Commit message
+     
+      ## docs/DETAILS.md ##
+     @@ docs/DETAILS.md: the pairs in which the switched arm won). They are here so you can try them on y
+    -   -0.1% (5/6). Boxes that hold all experts in RAM never use the stage buffers.
+    - - **`STRATA_ADAPT_LAG=2`: the adaptive tier's copies are waited for one window later** (#764). Decode, 6 pairs: Tesla P100
+    -   (PCIe 3.0 x16) +3.5% (6/6 pairs faster), RTX 5070 +0.2% (4/6), RTX 3060 -1.3% (0/6), so it stays opt-in.
+    +   `STRATA_ADAPT_NOWAIT` or `STRATA_DMA_BATCH`; otherwise the log says why it is off. RTX A4000, 6 interleaved pairs each,
+    +   decode median tok/s: Q2_0 16 GB 62.5 -> 66.2 (+5.9%), Q2_0 as a 12 GB card 51.3 -> 54.2 (+5.7%), IQ3_XXS 16 GB 48.6 -> 52.6 (+8.3%),
+    +   IQ3_XXS as 12 GB 39.3 -> 41.5 (+5.5%), 6/6 pairs faster every time.
+     -- **`STRATA_MMQ_DIRECT=1`: the prompt's MMQ reads resident experts in their cache slots** (CUDA, native packs). The prompt
+     -  path multiplies its experts in groups of 16 with llama.cpp's MMQ, which wants a group's weights in one buffer at a fixed
+     -  stride, so every expert a chunk routes to is copied there first (2.3-3.1 MB each, per chunk and layer), resident ones
+12:  01a72a5f = 12:  8227c7ba ple: a table two threads may read, urgent reads and a read-slot reserve (setters, off by default)
+13:  70dfe5cf = 13:  8d0ed809 generate: STRATA_PIPE_OVERLAP=1 switches the PLE setters on for pipelined batch slots
+14:  b41fbc11 = 14:  2e9b6803 generate: STRATA_PIPE_OVERLAP's gate and pre-read setup, checked per batched prompt segment (dry run)
+15:  543c6b19 ! 15:  16d656fa generate: STRATA_PIPE_OVERLAP=1 reads a batch admission's prompt beside the pipelined slot groups
+    @@ src/program/generate.cpp: bool pipe_overlap_env() {
+      // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
+      // A file-backed arena on AMD (STRATA_ARENA_MMAP; the engine raises ROCclr's pin-in-place threshold, see main): an
+     @@ src/program/generate.cpp: int main(int argc, char** argv) {
+    -         // failed): a request cancelled here keeps them as the live conversation instead of dropping what it restored
+    -         bool pp_exact = false;
+    -         Clock::time_point pp_t0 = Clock::now();
+    +             nan_flush = true;
+    +             return true;
+    +         };
+     +        // STRATA_PIPE_OVERLAP: every stage's finished chunk beats here - an overlapped read's own heartbeat, since the
+     +        // slots' windows keep the watchdog's beating meanwhile; and whether such a read runs (the test faults)
+     +        std::atomic<int64_t> ov_read_beat{0};
+16:  5507a2e9 = 16:  2a4c0973 generate: an overlapped read never pads a group up over a parked conversation; a read's CUDA fault releases the spin waits
+17:  65aa2993 = 17:  5f24cd5e generate: STRATA_PIPE_OVERLAP_MAX_QUEUE=n overlaps a read only while at most n admissions wait behind it
+18:  650001fb = 18:  48b0e0b6 generate: more than 8 batch slots are held to 8 rows per group window once the slot sessions that fit are known
+19:  e20b3a18 = 19:  8298b935 generate: STRATA_PIPE_OVERLAP_TEST_FAULT=cuda marks its fault without naming cudaErrorIllegalAddress
+20:  d72209a9 = 20:  737ad18a batch: the server passes waiting=N with BGEN, MAX_QUEUE counts it
+21:  0b1aaedb = 21:  1835e37b prefill mmq tab: moe_mmq_tab.cuh carries ggml's MIT notice
+22:  06633124 ! 22:  69c9bd57 generate: STRATA_TRACE times a batch admission's phases
+    @@ src/program/generate.cpp: int main(int argc, char** argv) {
+     +                                 win ? "windows" : "batched", ms);
+                          std::fflush(stderr);
+                      }
+    -                 if (!sp_ok) {
+    +                 if (!sp_ok && nf_hit) {   // #879: DONE nonfinite (the lent slots are refilled below)
+     @@ src/program/generate.cpp: int main(int argc, char** argv) {
+                          bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
+                          cont = false;
+23:  9c66d232 = 23:  7c7f1d29 generate: STRATA_PIPE_BYIELD_NODRAIN=1 drops a BYIELD without draining the pipelined groups
+24:  f5093737 ! 24:  a84d7ecc generate: STRATA_ADMIT_MERGE_FIRST=1 reads a batch admission's last prompt tokens and its first token in one window
+    @@ Commit message
+     
+      ## include/strata/core/verify.hpp ##
+     @@ include/strata/core/verify.hpp: public:
+    -     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
+    -     bool copy_logits(int t, float* host) const;
+    -     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+    +         return t >= 0 && t < 32 && ((nf_mask_ >> t) & 1u) != 0;
+    +     }
+    +     static bool nan_guard_on();
+     +    /// The most tokens one window holds (`init`'s `max_t`; 0 before it).
+     +    int max_t() const { return max_t_; }
+          /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
+    @@ src/program/generate.cpp: int main(int argc, char** argv) {
+     +                                     (long long) (n - merge_at));
+                          std::fflush(stderr);
+                      }
+    +                 if (!sp_ok && nf_hit) {   // #879: DONE nonfinite (the lent slots are refilled below)
+    +                     cancelled = true;
+    +                     break;
+    +                 }
+     +                if (sp_ok && merge_at >= 0) {   // the server's progress reaches the prompt's end, as after its last window
+     +                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+     +                    std::printf("PP %lld %lld %.0f %.1f\n", (long long) to, (long long) pp_total, ms,
+    @@ src/program/generate.cpp: int main(int argc, char** argv) {
+                      if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                      if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
+     @@ src/program/generate.cpp: int main(int argc, char** argv) {
+    -                     std::printf("ERR %s\n", err.c_str());
+    -                     return 1;
+    +                     finish = "nonfinite";
+    +                     break;
+                      }
+     +                // a merged window: the drafter's rows of the prompt tokens in it, as the prompt windows give them
+     +                if (merged && use_mtp && !mtp.prefill(ver.final_R_all(), window.data() + 1, T - 1, p, err)) {
+25:  b7350501 ! 25:  07a691ab generate: STRATA_CKPT_POOL=1 saves checkpoints into dropped ones' vectors, STRATA_CKPT_THREADS=1 saves a split's parts at once
+    @@ src/program/generate.cpp: bool checkpoint_restore(const ConvCheckpoint& c, strat
+      // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
+      // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
+     @@ src/program/generate.cpp: int main(int argc, char** argv) {
+    -         std::vector<ImgKey> live_imgs, req_imgs;
+    -         bool live_ok = false;
+    +         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
+    +         bool nan_flush = false;
+              std::vector<ConvCheckpoint> checks;
+     +        CheckpointPool ckpt_pool(ckpt_pool_env());   // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused
+              uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+26:  d42a987c ! 26:  30591bed generate: STRATA_SLOT_CKPT_MOVE=1 moves a batch admission's turn checkpoint into the slot
+    @@ src/program/generate.cpp: bool ckpt_threads_env() {
+      // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+      // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+     @@ src/program/generate.cpp: int main(int argc, char** argv) {
+    -         std::vector<ImgKey> live_imgs, req_imgs;
+    -         bool live_ok = false;
+    +         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
+    +         bool nan_flush = false;
+              std::vector<ConvCheckpoint> checks;
+     -        CheckpointPool ckpt_pool(ckpt_pool_env());   // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused
+     +        // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused.  STRATA_SLOT_CKPT_MOVE turns it on too: a moved
+27:  e3c39eeb = 27:  57677cf7 generate: STRATA_SLOT_COPY_BATCHSYNC=1 queues the direct slot copy and synchronizes each device once
+28:  c9bbd1fc = 28:  24648491 generate: review fixes for the admission switches
+29:  faddbb2e = 29:  a8807612 prefill: STRATA_MMQ_GROUP_SORT=1 sorts the full MMQ groups by row count, keeping the partial group
+30:  7e7e169e = 30:  c8e8e754 verify: STRATA_BATCH_SELF_COMMIT=1 lets a one-row-per-slot batch window keep its rows itself
+31:  00ff1fb2 = 31:  82270b29 prefill: decide STRATA_MMQ_GROUP_SORT per layer once, in the MMQ plan
+32:  14c16bf2 = 32:  be977f35 tools: batch_interleave_test runs on a pipelined batch (no give-way required there) and checks a turn checkpoint taken from a slot

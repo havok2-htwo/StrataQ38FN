@@ -1,0 +1,229 @@
+From 57677cf71dca48e416b0e4cbfbf53c7abd20d7f6 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 23:54:10 +0200
+Subject: [PATCH 27/33] generate: STRATA_SLOT_COPY_BATCHSYNC=1 queues the
+ direct slot copy and synchronizes each device once
+
+The direct slot copy (STRATA_SLOT_COPY_DIRECT) waited for each of its ~116 copies on the private copy
+stream.  With the switch, conversation_checkpoint_copy and conversation_kv_copy only queue them (new
+`queued` argument, default off), and the slot copy's closing sync_all is the one wait per device.  A
+streamed K/V state (kv_mode != 0) has its residency refresh on the legacy stream, which is not ordered
+after a non-blocking stream: conversation_detail::order_after_queued records an event on the private
+stream and makes the legacy stream wait for it first.  The copies stay on the private non-blocking stream.
+
+Same copies in the same order on one stream: tokens are identical.  Measured on 4x RTX 3090 (T16-142,
+24 admissions): the slot copy takes 0.5 ms instead of 1.3 ms; batch_test16 16/16, batch_overlap_test
+and batch_interleave_test token-identical to the references; a --kv-resident 20480 run with a 21K
+prompt is identical with the switch off and on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/conversation_snapshot.hpp |  7 +++-
+ src/core/conversation_copy.hpp                | 37 +++++++++++++++++--
+ src/core/conversation_snapshot.cpp            |  9 ++++-
+ src/core/conversation_state.cpp               | 11 +++---
+ src/program/generate.cpp                      | 17 ++++++++-
+ 5 files changed, 67 insertions(+), 14 deletions(-)
+
+diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
+index 5a97bff3..449fc831 100644
+--- a/include/strata/core/conversation_snapshot.hpp
++++ b/include/strata/core/conversation_snapshot.hpp
+@@ -27,8 +27,10 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
+                              int64_t upto, bool include_index, std::string& error);
+ // conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
+ // The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
++// `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,
++// and the caller synchronizes the device before it reads or writes either state.
+ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+-                          int64_t upto, bool include_index, std::string& error);
++                          int64_t upto, bool include_index, std::string& error, bool queued = false);
+ // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
+ // workspace, compares authoritative bytes and resident draft-ring pages, and
+ // fingerprints the authoritative payload only. Never changes model state.
+@@ -66,8 +68,9 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, S
+                                      const ModelGeometry& g, std::string& error);
+ // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
+ // sessions carved alike on the same device; the caller synchronizes the device before (as for the restore).
++// `queued`: the copies are only queued (the private copy stream), and the caller synchronizes the device after too.
+ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
+-                                  const ModelGeometry& g, std::string& error);
++                                  const ModelGeometry& g, std::string& error, bool queued = false);
+ 
+ struct ConversationView {
+     const std::vector<int32_t>& ids;
+diff --git a/src/core/conversation_copy.hpp b/src/core/conversation_copy.hpp
+index e15b1197..6a934d4e 100644
+--- a/src/core/conversation_copy.hpp
++++ b/src/core/conversation_copy.hpp
+@@ -12,7 +12,8 @@ namespace strata::core::conversation_detail {
+ /// device, and while another thread captures a graph on one (a drafter or a stage worker), HIP refuses it with
+ /// "operation would make the legacy stream depend on a capturing blocking stream".  The caller's contract is
+ /// unchanged: the device was synchronized before the copy (the copy itself is complete on return).
+-inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
++/// private_stream: this thread's stream on the current device, created on first use.
++inline cudaError_t private_stream(cudaStream_t& s) {
+     int dev = 0;
+     cudaError_t e = cudaGetDevice(&dev);
+     if (e != cudaSuccess) return e;
+@@ -23,10 +24,40 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
+         e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
+         if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
+     }
+-    cudaStream_t s = streams[(size_t) dev];
+-    e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
++    s = streams[(size_t) dev];
++    return cudaSuccess;
++}
++
++/// `queued`: the copy is only queued on the private stream, and the caller synchronizes the device (or orders a
++/// later launch after it with order_after_queued) before anything reads the target or writes the source.
++inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bool queued = false) {
++    cudaStream_t s = nullptr;
++    cudaError_t e = private_stream(s);
+     if (e != cudaSuccess) return e;
++    e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
++    if (e != cudaSuccess || queued) return e;
+     return cudaStreamSynchronize(s);
+ }
+ 
++/// Work queued on the legacy stream after this call starts after every copy this thread queued on the current
++/// device's private stream (an event the legacy stream waits for; no host wait).
++inline cudaError_t order_after_queued() {
++    cudaStream_t s = nullptr;
++    cudaError_t e = private_stream(s);
++    if (e != cudaSuccess) return e;
++    int dev = 0;
++    e = cudaGetDevice(&dev);
++    if (e != cudaSuccess) return e;
++    thread_local std::vector<cudaEvent_t> events;
++    if (dev < 0) dev = 0;
++    if ((size_t) dev >= events.size()) events.resize((size_t) dev + 1, nullptr);    // never destroyed: process lifetime
++    if (!events[(size_t) dev]) {
++        e = cudaEventCreateWithFlags(&events[(size_t) dev], cudaEventDisableTiming);
++        if (e != cudaSuccess) { events[(size_t) dev] = nullptr; return e; }
++    }
++    e = cudaEventRecord(events[(size_t) dev], s);
++    if (e != cudaSuccess) return e;
++    return cudaStreamWaitEvent(nullptr, events[(size_t) dev], 0);
++}
++
+ } // namespace strata::core::conversation_detail
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 852e42df..d0dd80a1 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -221,7 +221,7 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
+ } // namespace
+ 
+ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+-                          int64_t upto, bool index, std::string& error) {
++                          int64_t upto, bool index, std::string& error, bool queued) {
+     Layout lf{}, lt{};
+     if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
+         !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
+@@ -234,13 +234,18 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
+     // The same bytes conversation_kv_save + conversation_kv_restore move, without the host image: each part
+     // straight from the source's authoritative pool into the target's (device or mapped host memory), through the
+     // private non-blocking stream the other snapshot copies use (complete on return, before the residency refresh).
++    // `queued`: the copies are only queued, and a streamed state's refresh waits for them on the device (an event).
+     const auto src = pools(from);
+     const auto dst = pools(to);
+     const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
+     for (size_t i = 0; i < sizes.size(); ++i) {
+         if (!sizes[i]) continue;
+         if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+-        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i]);
++        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
++        if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
++    }
++    if (queued && to.kv_mode != 0) {
++        const cudaError_t e = conversation_detail::order_after_queued();
+         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+     }
+     return refresh_residency(to, g, upto, error);
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index a882281f..cb2125c4 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -30,10 +30,10 @@ bool sync(std::string& error) {
+     return false;
+ }
+ 
+-bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
++bool copy(void* dst, const void* src, size_t bytes, std::string& error, bool queued = false) {
+     if (!bytes) return true;
+     if (!dst || !src) return fail(error, "missing running-state buffer");
+-    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes);
++    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, queued);
+     if (status == cudaSuccess) return true;
+     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
+     return false;
+@@ -195,17 +195,18 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
+ }
+ 
+ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
+-                                  const ModelGeometry& g, std::string& error) {
++                                  const ModelGeometry& g, std::string& error, bool queued) {
+     // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) without the host image, for two
+     // sessions carved alike on the same device (a stage's own session and its batch slots): the same bytes into
+-    // the same places, through copy() like the restore (the private non-blocking stream, complete on return).
++    // the same places, through copy() like the restore (the private non-blocking stream, complete on return unless
++    // `queued`: then the caller synchronizes the device).
+     ConversationStateSizes zf, zt;
+     if (!checkpoint_targets(from, g, ids.size(), zf, error) || !checkpoint_targets(to, g, ids.size(), zt, error))
+         return false;
+     if (zf.gdn != zt.gdn || zf.tail != zt.tail || zf.dead != zt.dead || zf.block_pos != zt.block_pos ||
+         owned_qsa(from) != owned_qsa(to) || (from.ple_hist != nullptr) != (to.ple_hist != nullptr))
+         return fail(error, "direct copy between differently carved sessions");
+-    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error); };
++    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, queued); };
+     if (!acopy(to.gdn_state, from.gdn_state, zf.gdn) ||
+         !acopy(to.ple_hist, from.ple_hist, from.ple_hist ? zf.ple : 0)) return false;
+     for (size_t j = 0; j < owned_qsa(from); ++j) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index edd9823b..3b02a701 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -225,6 +225,17 @@ bool slot_ckpt_move_env() {
+     }();
+     return on;
+ }
++// STRATA_SLOT_COPY_BATCHSYNC=1 (read once; off by default): the direct slot copy (STRATA_SLOT_COPY_DIRECT) only queues
++// its copies on each device's private copy stream and synchronizes every device once at the end, instead of waiting
++// for each of its ~116 copies.  A streamed K/V state's residency refresh waits for its copies through an event.  The
++// same copies in the same order on one stream, so the slot holds the same bytes
++bool slot_copy_batchsync_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_SLOT_COPY_BATCHSYNC");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
+ // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+ // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+@@ -9663,16 +9674,18 @@ int main(int argc, char** argv) {
+             // before the caller reuses the sessions (its zeroing runs on non-blocking streams, not ordered against these)
+             auto failed = [&]() { (void) sync_all(); return false; };
+             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
++            // STRATA_SLOT_COPY_BATCHSYNC: every copy is only queued, and the sync_all below is the one wait per device
++            const bool queued = slot_copy_batchsync_env();
+             for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                 strata::core::SessionState& main_ss = k == 0 ? ss : stages[k - 1]->ss;
+                 strata::core::SessionState& slot_ss = *bslot_ss[k][(size_t) b];
+                 strata::core::SessionState& from = into_slot ? main_ss : slot_ss;
+                 strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
+                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+-                if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e)) return failed();
++                if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e, queued)) return failed();
+                 for (int64_t j = 0; j < from.qsa_alloc; ++j)
+                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+-                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
++                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
+                         return failed();
+             }
+             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
+-- 
+2.43.0
+

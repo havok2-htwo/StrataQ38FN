@@ -1,0 +1,84 @@
+From 9a3c4fae5f11da5fe846517da2ef6b5b1e232f63 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:56:58 +0200
+Subject: [PATCH 11/33] docs: STRATA_MMQ_DIRECT needs -DSTRATA_MMQ_TAB=ON; its
+ VRAM and build cost; the hack is no bound; engine exactness
+
+- The build option is off by default and why (36-38 MiB of VRAM per GPU under EAGER, ~70% of the upstream MMQ
+  instances' compile time per arch); the nine types with a pointer table.
+- The skip-gather hack's 225/577 ms are no bound: it changes the routing and does less work.
+- Engine exactness as measured: first-window logits (STRATA_DUMP_FIRST_LOGITS) and greedy tokens byte-identical,
+  2 vs 1 vs 0, on the 4-GPU split with --prefill 2048 (the streamed walk), with 9 GB less expert cache per GPU
+  (mixed in-place, copied and mid-group-flushed groups), and on one GPU with --expert-cache-per-layer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/DETAILS.md | 50 ++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 33 insertions(+), 17 deletions(-)
+
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index d59202f8..7a2cc4e7 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -1704,25 +1704,41 @@ the pairs in which the switched arm won). They are here so you can try them on y
+   `STRATA_ADAPT_NOWAIT` or `STRATA_DMA_BATCH`; otherwise the log says why it is off. RTX A4000, 6 interleaved pairs each,
+   decode median tok/s: Q2_0 16 GB 62.5 -> 66.2 (+5.9%), Q2_0 as a 12 GB card 51.3 -> 54.2 (+5.7%), IQ3_XXS 16 GB 48.6 -> 52.6 (+8.3%),
+   IQ3_XXS as 12 GB 39.3 -> 41.5 (+5.5%), 6/6 pairs faster every time.
+-- **`STRATA_MMQ_DIRECT=1`: the prompt's MMQ reads resident experts in their cache slots** (CUDA, native packs). The prompt
+-  path multiplies its experts in groups of 16 with llama.cpp's MMQ, which wants a group's weights in one buffer at a fixed
+-  stride, so every expert a chunk routes to is copied there first (2.3-3.1 MB each, per chunk and layer), resident ones
+-  too. With this on, a Strata-side copy of MMQ's outer scheduler (`src/prefill/moe_mmq_tab.cuh`) takes one pointer per
+-  expert instead, and a resident expert is read where it is; streamed, peer-GPU and other experts are still copied. The
+-  launch (tile size, stream-k split, fixup) is the one MMQ makes for the copied group and the tile code is llama.cpp's
+-  own, so the answers are the same bits (`prefill_mmq_tab_test`: 874 products bitwise equal to the copied path, every type
+-  and tile size). Each sized cache slot keeps 256 bytes after its expert, because MMQ reads up to 136 bytes past a
+-  640-wide down matrix; they are zeroed before each group. That is about 2.3 MiB over 9,300 slots (one slot fewer out of
+-  6,998 on one RTX 3090). `STRATA_MMQ_DIRECT=2` keeps that layout but copies as before (an A/B reference); 0 or unset is
+-  the default path, byte for byte. Under HIP, or when CMake turned the build option `STRATA_MMQ_TAB` off (it does so, with
+-  a message, when the llama.cpp tree's `mmq.cuh` differs from the one the copy mirrors), the variable is ignored.
++- **`STRATA_MMQ_DIRECT=1`: the prompt's MMQ reads resident experts in their cache slots** (CUDA, native packs; needs an
++  engine built with `-DSTRATA_MMQ_TAB=ON`, which is off by default). The prompt path multiplies its experts in groups of
++  16 with llama.cpp's MMQ, which wants a group's weights in one buffer at a fixed stride, so every expert a chunk routes
++  to is copied there first (2.3-3.1 MB each, per chunk and layer), resident ones too. With this on, a Strata-side copy of
++  MMQ's outer scheduler (`src/prefill/moe_mmq_tab.cuh`) takes one pointer per expert instead, and a resident expert is
++  read where it is; streamed, peer-GPU and other experts are still copied. The launch (tile size, stream-k split,
++  fixup) is the one MMQ makes for the copied group and the tile code is llama.cpp's own, so the answers are the same
++  bits (`prefill_mmq_tab_test`: 874 products bitwise equal to the copied path, all nine types - Q2_0, IQ2_XXS, IQ2_XS,
++  IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q8_0 - and every tile size; the optional Q5_0 and K-quant experts get no
++  pointer table and keep the copy). Each sized cache slot keeps 256 bytes after its expert, because MMQ reads up to
++  136 bytes past a 640-wide down matrix; they are zeroed before each group. That is about 2.3 MiB over 9,300 slots (one
++  slot fewer out of 6,998 on one RTX 3090). `STRATA_MMQ_DIRECT=2` keeps that layout but copies as before (an A/B
++  reference); 0 or unset is the default path, byte for byte. `STRATA_MMQ_DIRECT_LOG=1` adds each stage's count of experts
++  read in place to the log after every prompt. Under HIP, on a build without `STRATA_MMQ_TAB`, or when CMake turned
++  that option off (it does so, with a message, when the llama.cpp tree's `mmq.cuh` differs from the one the copy
++  mirrors), the variable is ignored.
++  **Why the build option is off:** the engine loads every kernel at start (`CUDA_MODULE_LOADING=EAGER`), and the nine
++  pointer-table instances (+15 MB of binary) take 36-38 MiB of VRAM on every GPU (sm_86), with the variable unset too -
++  expert slots every model would lose, as with `STRATA_MMQ_KQUANTS`. They also cost ~70% of the upstream MMQ instances'
++  compile time per CUDA arch (175 s of CPU at sm_86). Without the option the device code is byte for byte that of a
++  build without the feature.
+   Measured on 4x RTX 3090, UD-IQ4_XS, split `12,24,36` with `--trim-stage-weights` and `--batch 16` (every expert
+   resident), the engine driven directly, its "read in" time, medians of 8: a 170-token prompt 331 -> 251 ms (-24%) and
+-  369 -> 290 ms (-21%) in two series, a 1,217-token prompt 773 -> 634 ms (-18%) and 838 -> 675 ms (-19%). Skipping
+-  those copies altogether (wrong answers; the bound) gave 225 and 577 ms. On one RTX 3090 with 40 GiB of experts
+-  streamed from RAM the copies of streamed experts stay, and the prompt time moved by 0-1.5%. Greedy answers with it on
+-  were identical to off: `tools/batch_test16.py` (16 prompts, solo and batch), 20 prompts of 170 and 1,217 tokens, and
+-  on one GPU (resident and streamed experts in the same groups), with `STRATA_PREFILL_CPU_SHARE=0` and no adaptive swaps.
++  369 -> 290 ms (-21%) in two series, a 1,217-token prompt 773 -> 634 ms (-18%) and 838 -> 675 ms (-19%). A hack that
++  skipped the copies altogether ran 225 and 577 ms, but it is no bound for an exact implementation: it changes the
++  routing (12,003 expert-layer entries fell to 777 on one prompt) and so does less work. On one RTX 3090 with most
++  experts streamed from RAM the copies of streamed experts stay, and the prompt time did not move (within 1.5%).
++  Exactness, with `STRATA_PREFILL_CPU_SHARE=0` and no adaptive swaps: the first decode window's logits after the prompt
++  (`STRATA_DUMP_FIRST_LOGITS`, fp32) and 32 greedy tokens were byte-identical between 2 and 1 (and 0) for prompts of
++  180-2,619 tokens - on the 4-GPU split with `--prefill 2048` (chunks of 1,024 tokens and more: the streamed walk),
++  the same with 9 GB less expert cache per GPU (20-31% of the expert reads streamed, so groups mix in-place, copied and
++  mid-group flushed experts), and on one GPU with `--expert-cache-per-layer`; the 150 greedy tokens of each of
++  `tools/batch_test16.py`'s 16 prompts (solo and batch) were identical too, and to those of a build without the
++  option. The uniform cache (no profile) holds no resident expert when a native pack's prompt is read (serve needs the
++  profile, and a one-shot run fills the cache only while it decodes), so `expert_cache_slot_guard_test` covers it.
+ 
+ ## Thread placement: `--aux-cpus` (Linux, off by default)
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,244 @@
+From 13fe7cc804882a3c8f5417bef68fb4ece2010e96 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:06:40 +0200
+Subject: [PATCH 05/33] prefill: STRATA_MMQ_DIRECT=1 reads resident experts in
+ their cache slots (pointer-table MMQ)
+
+mmq_plan marks a native layer direct when the pointer-table MMQ covers both products, gate/up
+reads nothing past its matrix, the down over-read (72 B IQ4_NL, 136 B Q8_0) fits the 256 B
+guard, and the blob is exactly [gate | up | down] in MMQ's matrix sizes; it says once how many
+layers qualify.
+
+In the MoE walk (both the staged and the streamed walk) compute() takes the expert's cache slot:
+a resident expert whose slot has room for the over-read (slot_tail) and a 16-byte aligned blob
+is not gathered - the group's pointer tables point at its gate|up and down in the slot, and the
+guard goes into the group's GuardTab. Streamed, peer and unguarded experts are gathered as
+before, at compact positions c = 0..ns-1 (gather_native, or gather_native_group with its
+mid-group flushes unchanged); the end-of-group flush runs even when the last entry was direct.
+At the group end one prep_group launch zeroes the direct experts' guards and the tails after
+position ns, replacing the two memsets; both products run with the same n, bounds, ids,
+max_rows and buffers plus .tab. STRATA_MMQ_DIRECT=0 (default) and 2 run the existing body.
+
+PrefillStats::experts_direct, said on the generate summary when non-zero.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/prefill/prefill.hpp |  1 +
+ src/prefill/prefill.cpp            | 95 ++++++++++++++++++++++++++++--
+ src/program/generate.cpp           |  3 +
+ 3 files changed, 93 insertions(+), 6 deletions(-)
+
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 024be039..1928cc1f 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -35,6 +35,7 @@ struct PrefillStats {
+     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
+     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
+     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
++    int64_t experts_direct = 0;     ///< ...of which MMQ read in their cache slots, not gathered (STRATA_MMQ_DIRECT=1)
+     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
+     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
+     double ms_ple = 0;
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index b8f021e6..b4fd24eb 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -989,6 +989,10 @@ struct MmqPlan {
+     std::vector<char> fo;                      // per layer: no MMQ here but the native fused kernels cover its formats
+                                                // (gfx11: UD-Q4_K_XL's Q4_K / Q5_K and Q5_1 / Q8_0 experts, STRATA_PF_FUSED=1)
+     size_t gu_max = 0, d_max = 0;
++    // STRATA_MMQ_DIRECT=1: per layer, whether resident experts are read in their cache slots (pointer-table MMQ),
++    // and the bytes the down product reads past its matrix there (zeroed in the slot's guard before each group)
++    std::vector<char> direct;
++    std::vector<uint32_t> d_over;
+ };
+ const MmqPlan& mmq_plan() {
+     static const MmqPlan plan = [] {
+@@ -1014,6 +1018,28 @@ const MmqPlan& mmq_plan() {
+             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
+             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
+         }
++        // STRATA_MMQ_DIRECT=1: a native layer's resident experts are read in place when the pointer-table MMQ covers
++        // both products, gate/up reads nothing past its matrix, the down over-read fits the slot guard, and the blob
++        // is exactly [gate | up | down] in MMQ's matrix sizes (the bytes a gather would copy)
++        p.direct.assign(p.layer.size(), 0);
++        p.d_over.assign(p.layer.size(), 0);
++        if (on && lay.native && mmq::direct_mode() == 1) {
++            int64_t nd = 0;
++            for (int64_t l = 0; l < layers; ++l) {
++                if (!p.layer[(size_t) l]) continue;
++                const auto& f = lay.fmt[(size_t) l];
++                const int gt = f.gu_type, dt = f.d_type;
++                if (!mmq::tab_fits(gt, 1280) || !mmq::tab_fits(dt, N)) continue;
++                if (mmq::overread_bytes(gt, N) != 0 || mmq::overread_bytes(dt, 640) > mmq::kSlotGuard) continue;
++                if (f.up_off != mmq::matrix_bytes(gt, 1280, N) / 2 || f.down_off != 2 * f.up_off) continue;
++                if (mmq::matrix_bytes(dt, N, 640) != f.bytes - f.down_off) continue;
++                p.direct[(size_t) l] = 1;
++                p.d_over[(size_t) l] = (uint32_t) mmq::overread_bytes(dt, 640);
++                ++nd;
++            }
++            std::fprintf(stderr, "strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): %lld of %lld "
++                                 "layers\n", (long long) nd, (long long) layers);
++        }
+         return p;
+     }();
+     return plan;
+@@ -3711,6 +3737,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         mmq::GatherGroup gg;
+                         int gg_slots[MMQ_GROUP];
+                         int gg_nslots = 0;   // ring slots gathered by the next flush
++                        // STRATA_MMQ_DIRECT=1: a resident expert with guard room in its slot is not gathered - the
++                        // group's pointer tables give MMQ each expert's own address (group position q), the others are
++                        // gathered at compact positions c = 0..ns-1 of the group buffers, as before (same bytes)
++                        const bool direct = use_mmq && lay.native && m.cache && mmq_plan().direct[(size_t) l];
++                        mmq::WeightTab tgu, td;
++                        mmq::GuardTab gd;
++                        int ns = 0;
+                         auto flush = [&]() {
+                             if (gg.n <= gg.first) return;
+                             const auto& f = lay.fmt[(size_t) l];
+@@ -3736,13 +3769,45 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             gg.first = gg.n;
+                         };
+                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
+-                        // expert) is released once the blob is read
+-                        auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
++                        // expert) is released once the blob is read; `cslot`: the expert-cache slot the blob is in (-1:
++                        // a ring slot or the peer's), which STRATA_MMQ_DIRECT reads in place
++                        auto compute = [&](size_t j, const uint8_t* blob_dev, int slot, int32_t cslot) -> bool {
+                             const int32_t e = order[j];
+                             pt.mark(kPfDequant, cs);
+                             if (use_mmq) {
+                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
+                                 const size_t q = j % MMQ_GROUP;
++                                if (direct) {
++                                    const auto& f = lay.fmt[(size_t) l];
++                                    uint8_t* gp = cslot >= 0 && ((uintptr_t) blob_dev | (uintptr_t) f.down_off) % 16 == 0
++                                                      ? m.cache->slot_tail(cslot, f.bytes, mmq_plan().d_over[(size_t) l])
++                                                      : nullptr;
++                                    if (gp) {   // read in its slot: the guard after the blob is zeroed at the group end
++                                        tgu.p[q] = blob_dev;
++                                        td.p[q] = blob_dev + f.down_off;
++                                        gd.p[gd.n++] = gp;
++                                        ++stats_.experts_direct;
++                                    } else {
++                                        const int c = ns++;
++                                        tgu.p[q] = m.grp_gu + (size_t) c * mmq_gub;
++                                        td.p[q] = m.grp_d + (size_t) c * mmq_db;
++                                        if (group_gather) {
++                                            gg.blob[c] = blob_dev;
++                                            gg.n = c + 1;
++                                            if (slot >= 0) gg_slots[gg_nslots++] = slot;
++                                        } else {
++                                            mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
++                                                               mmq_db, m.grp_gu + (size_t) c * mmq_gub,
++                                                               m.grp_d + (size_t) c * mmq_db, m.cs);
++                                        }
++                                    }
++                                    if (slot >= 0 && !group_gather) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
++                                    if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
++                                    if (group_gather) {   // also when the last entry was direct (a no-op without gathers)
++                                        flush();
++                                        gg = mmq::GatherGroup{};
++                                    }
++                                } else {
+                                 if (group_gather) {
+                                     gg.blob[q] = blob_dev;
+                                     gg.n = (int) q + 1;
+@@ -3759,6 +3824,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 }
+                                 if (slot >= 0 && !group_gather) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
++                                }
+                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
+                                 const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                                 const int ngx = (int) (q + 1);
+@@ -3766,13 +3832,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 int64_t maxr = 0;
+                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                                 pt.mark(kPfGemmGU, cs);
++                                if (direct) {
++                                    // one launch: the direct experts' guards (their down over-read) and the zeroed tail
++                                    // after the last gathered expert (see MMQ_TAIL)
++                                    mmq::prep_group(gd, mmq_plan().d_over[(size_t) l],
++                                                    ns ? m.grp_gu + (size_t) ns * mmq_gub : nullptr,
++                                                    ns ? m.grp_d + (size_t) ns * mmq_db : nullptr, MMQ_TAIL, m.cs);
++                                } else {
+                                 // the zeroed tail after the group's last expert (see MMQ_TAIL)
+                                 cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                                 cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
++                                }
+                                 mmq::Product gu;
+                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
+                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
++                                if (direct) gu.tab = &tgu;
+                                 m.mmq_ctx->run(gu, m.cs);
+                                 mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                                 pt.mark(kPfGemmD, cs);
+@@ -3782,7 +3857,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
+                                 dn.ld_dst = N;
++                                if (direct) dn.tab = &td;
+                                 m.mmq_ctx->run(dn, m.cs);
++                                if (direct) {
++                                    tgu = mmq::WeightTab{};
++                                    td = mmq::WeightTab{};
++                                    gd = mmq::GuardTab{};
++                                    ns = 0;
++                                }
+                                 return true;
+                             }
+                             const int q = (int) (j % DQ);
+@@ -3820,11 +3902,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 const int32_t e = order[j];
+                                 if (stage_of[j] < 0) {
+                                     ++stats_.experts_resident;
+-                                    if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
++                                    if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1,
++                                                 m.host_res[(size_t) l * m.g->n_expert + e])) return false;
+                                 } else {
+                                     pt.mark(kPfWaitCopy, cs);
+                                     cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+-                                    if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
++                                    if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j], -1)) return false;
+                                     --pending;   // compute recorded the slot's release event before any reuse
+                                 }
+                             }
+@@ -3853,7 +3936,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                         pt.mark(kPfWaitCopy, cs);
+                                         cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
+                                     }
+-                                    if (!compute(j, m.stage_dev[sl], sl)) return false;
++                                    if (!compute(j, m.stage_dev[sl], sl, -1)) return false;
+                                     consumed = ++k;
+                                     if (!group_gather || gg_nslots == 0) give_back(consumed);   // its group was gathered
+                                 } else {
+@@ -3862,7 +3945,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                                            : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr);   // over the cap: P2P
+                                     if (bp == nullptr) { err = "prefill: an expert is neither resident, streamed nor on the peer"; return false; }
+                                     ++stats_.experts_resident;
+-                                    if (!compute(j, bp, -1)) return false;
++                                    if (!compute(j, bp, -1, r0 ? m.host_res[(size_t) l * m.g->n_expert + e] : -1)) return false;
+                                     if (group_gather && gg_nslots == 0) give_back(consumed);
+                                 }
+                             }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1307efc1..b16ee355 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12603,6 +12603,9 @@ int main(int argc, char** argv) {
+                      ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
+                      (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident,
+                      (long long) ps.experts_cpu, ps.cpu_share, ps.ms_ple);
++        if (ps.experts_direct > 0)
++            std::fprintf(stderr, "strata generate: prompt MMQ read %lld of the %lld resident experts in their slots "
++                                 "(STRATA_MMQ_DIRECT)\n", (long long) ps.experts_direct, (long long) ps.experts_resident);
+     }
+ 
+     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
+-- 
+2.43.0
+

@@ -1,0 +1,35 @@
+rebase g3-142 (61b3fb5d + 32) -> g3-143 on origin/main 7695859a (v0.1.43, +72 upstream commits), 2026-10-12
+worktree /media/raid0/StrataQ38FN/Strata-143, branch g3-143 (HEAD be977f35), not pushed
+32/32 kept, 0 dropped (no upstream duplicate). range-diff: range-diff.txt
+conflicts: a2ad3781 + cf524780 docs/DETAILS.md (kept upstream ADAPT_OVERLAP entry + ours);
+           543c6b19 generate.cpp (NaN-guard lambda + ov_read_beat atomics, both kept, 8282-8299);
+           f5093737 verify.hpp (nan guard API + max_t(), both) and generate.cpp 12065 (nf_hit break, then merged PP line),
+                    12963-12977 (nonfinite_hit before the merged window's mtp.prefill)
+llama.cpp pin unchanged (3cf03257), third_party untouched; cmake: STRATA_MMQ_TAB on (hash match)
+build: CUDA 13.0 Release sm_86 OK -> engine/strata-g3-143 sha256 43b31b48...
+ctest host-only (CUDA_VISIBLE_DEVICES=): 60 pass, 8 skip (need GPU), 57 GPU parity fail with no device (ctest_host.log)
+ctest GPU subset on GPU1: 13/13 pass incl. prefill_mmq_tab_test, slot_guard, verify_batch_parity, mmvq_il_parity (ctest_gpu_subset.log)
+serve python tests: 706 OK, 8 skipped (serve_tests.log)
+no engine/server A/B run yet
+
+review fix 2026-10-12: STRATA_SLOT_CKPT_MOVE vs #879 flush (commit 42740f84 on g3-143)
+  finding confirmed: flush only tainted running slots; active_source + lent_slot still used their pre-flush checkpoints
+  fix: flush drops running slots' checks (only with SLOT_CKPT_MOVE, back to the pool); active_source + lent_slot skip tainted
+  test nanflush/ (T16-142gsc + STRATA_NAN_INJECT=600, next turns of chats still running in slots, client.py/run.sh):
+    pre-fix binary (43b31b48): after "reading this prompt from token 0" the 2 late requests resumed 1628 tok from slots 0/8
+    fixed binary: both late requests read 1661 tok from 0; pre-flush control still resumes 1628 from its running slot
+  engine/strata-g3-143 now sha256 b251abe6... (cfg-old.json's exe was a temp copy of the pre-fix binary, deleted)
+
+== GPU exactness of strata-g3-143 (b251abe6, g3-143 @42740f84), 2026-10-12 05:25-05:34, exact/ (run.sh, arm.sh, cmp.py)
+config exact/T16-143gsc.json = T16-142gsc with exe -> strata-g3-143; env = config env + STRATA_MMQ_DIRECT=1 STRATA_IQ_MT_MIN=1
+(NaN guard at its default = on); extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow --aux-cpus 65-127 --layer-split 12,24,37"
+  bt16: 16/16 IDENTICAL, bt16.json byte-identical to levers/self-commit/bt16-sc.json
+  bt32: 32/32 IDENTICAL, bt32.json byte-identical to levers/self-commit/bt32-sc.json
+  interleave: all 11 checks IDENTICAL, il.json byte-identical to gaps/interleave/il-final-cand.json
+  overlap =1: PASS (22 overlapped reads, G2 RESUME 198); =0 --compare ov1.json: token-identical, RESUME identical, PASS
+    vs 0.1.42 ov-sc.json: prompts, solo, resume and all admissions identical; only the stopped background slots end at
+    other lengths (each one a prefix of the other - same as ov-off vs ov-sc within 0.1.42)
+  T=0.7 top_k=20 seed=1234: 16/16 IDENTICAL, t07.json byte-identical to gaps/sampling/bt16-t07-cand.json
+  prefill_mmq_tab_test (GPU 0): 890 comparisons, 0 failed; output byte-identical to levers/mmq-sort/prefill_mmq_tab_test.txt
+  logs (all 6 engine arms): 100% experts resident, prompt MMQ in place 48/48, group sort 48/48, "one-row windows keep
+    their rows" on all 4 stages, no loans (prompt path own buffers), no non-finite; only warning = PLE mlock (also in 0.1.42 logs)

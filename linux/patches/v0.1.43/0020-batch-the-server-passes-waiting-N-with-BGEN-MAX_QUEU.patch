@@ -1,0 +1,79 @@
+From 737ad18ac154a7b7dae2b5ffa133f694a1a537f0 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 20:17:30 +0200
+Subject: [PATCH 20/33] batch: the server passes waiting=N with BGEN, MAX_QUEUE
+ counts it
+
+The server takes admissions one at a time (the control lines), so a burst of
+requests queues in the server, not in the engine's input lines, and
+STRATA_PIPE_OVERLAP_MAX_QUEUE never saw it. BGEN now carries waiting=N, the
+requests waiting for the control lines behind it; the engine takes the larger
+of that and its own queued BGEN lines. Older engines skip the unknown key.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py          |  5 ++++-
+ src/program/generate.cpp | 10 ++++++++--
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index cb5543ee..abfab9f4 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1423,7 +1423,10 @@ class StrataEngine:
+                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
+                     while not self.slot_q[slot].empty():
+                         self.slot_q[slot].get_nowait()
+-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
++                    with self.slot_cv:                      # the requests waiting behind this admission (the engine
++                        waiting = f" waiting={len(self.wait_lens)}"   # reads a long queue drained: faster per read)
++                    head = (f"BGENI {slot} {left}{keys}{waiting} {embeddings}" if embeddings
++                            else f"BGEN {slot} {left}{keys}{waiting}")
+                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
+                             "started": time.time(), "first_token": None}
+                     self.slot_live[slot] = live
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index d24c72b6..46c2f8ad 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -10303,6 +10303,9 @@ int main(int argc, char** argv) {
+             // the missed experts and the draft-probability floor, for this request only
+             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
++            // waiting=N (a batch admission): N further requests wait in the server for their own admission
++            // (STRATA_PIPE_OVERLAP_MAX_QUEUE); absent = unknown
++            int req_waiting = -1;
+             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
+                                      // embedding file path is the first token without an =
+                 for (;;) {
+@@ -10331,6 +10334,7 @@ int main(int argc, char** argv) {
+                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
+                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
++                    else if (key == "waiting") req_waiting = std::atoi(tok.c_str() + eq + 1);
+                     // unknown keys are skipped: the ids start at the first token without '='
+                 }
+             }
+@@ -11407,8 +11411,9 @@ int main(int argc, char** argv) {
+             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+                 if (pipe_overlap_env() && piped && batch_on()) {
+                     // STRATA_PIPE_OVERLAP_MAX_QUEUE=n: overlap a read only while at most n further admissions wait
+-                    // behind it (a read beside the groups takes longer, and admissions queue behind each other); unset
+-                    // or negative: always
++                    // behind it (a read beside the groups takes longer, and admissions queue behind each other): the
++                    // BGEN lines queued here, or the server's count (waiting=N; it sends one admission at a time);
++                    // unset or negative: always
+                     static const int max_queue = [] {
+                         const char* v = std::getenv("STRATA_PIPE_OVERLAP_MAX_QUEUE");
+                         return v && *v ? std::atoi(v) : -1;
+@@ -11418,6 +11423,7 @@ int main(int argc, char** argv) {
+                         std::lock_guard<std::mutex> lk(in_mu);
+                         for (const std::string& l : in_lines)
+                             if (l.rfind("BGEN ", 0) == 0 || l.rfind("BGENI ", 0) == 0) ++queued;
++                        queued = std::max(queued, req_waiting);
+                     }
+                     std::string why;
+                     if (max_queue >= 0 && queued > max_queue) {
+-- 
+2.43.0
+

@@ -1,0 +1,174 @@
+From c8e8e754ae068115b27ff9ffc20225afa9e69470 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 03:49:00 +0200
+Subject: [PATCH 30/33] verify: STRATA_BATCH_SELF_COMMIT=1 lets a
+ one-row-per-slot batch window keep its rows itself
+
+A pipelined batch window is followed on its stage's stream by the layout's commit graph, and the stage counts
+as done only after both. When every row of the window is another slot's one token, that commit is
+unconditional (each slot keeps its one row; commit_slot_prefixes allows nothing else), and most of the
+graph only repeats what the window wrote: it puts each indexer tail back from its snapshot and appends the
+same row again, and copies each PLE history back from the window's own snapshot of it. What it adds is the
+GDN conv history and recurrence state, which the window ran without writing.
+
+With the switch, such a window advances the GDN conv history (gdn_conv_l2_multi with commit) and state
+(gdn_step_norm_multi with n_keep = 1, the kernel the commit graph runs for a one-row group) itself, as a
+one-token solo window does, and takes no tail or history snapshots. No commit graph is captured for the
+layout; batch_launch and commit_slot_prefixes launch none, layout_captured and ensure_batch_layouts do not
+ask for one. Layouts with proposal rows (--batch-mtp) keep the commit graph. With the switch off every path
+is unchanged.
+
+Measured on 4x RTX 3090, UD-IQ4_XS, T16-142fcb (split 12,24,37), decode of 16 / 32 slots, 30 s each,
+reference and new build back to back: 653.7 -> 686.0 rows/s (+4.9 %) and 714.1 -> 752.6 rows/s (+5.4 %);
+the group step period 24.5 -> 23.3 ms and 44.85 -> 42.6 ms. STRATA_VERIFY_PROFILE: the window's GDN
+recurrence takes 0.09 ms (16) / 0.18 ms (32) longer per stage-window with the state written in it.
+
+batch_test16 (16 slots, a 1,200-token prompt) is token-identical to the reference dump; batch_test32
+32/32 identical and its dump equal to the switch-off run; batch_overlap_test (STRATA_PIPE_OVERLAP=1) passes
+and is token- and RESUME-identical to the switch-off run; batch_interleave_test parts 1-3 identical (its
+part 4 fails at the same point with the reference build).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/verify.cpp | 48 +++++++++++++++++++++++++++++++++------------
+ 1 file changed, 36 insertions(+), 12 deletions(-)
+
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 7fd47515..0d9f6111 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -180,6 +180,21 @@ const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
+ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
+ const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
+ const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
++// STRATA_BATCH_SELF_COMMIT=1 (opt-in): a batch window whose rows are each another slot's one token keeps them itself,
++// as a one-token window does (record_window): the GDN conv histories and states advance inside the window graph, and
++// no commit graph runs after it.  Such a window's commit is unconditional (each slot keeps its one row), and the rest
++// of the commit graph only repeats what the window wrote: the indexer tails are put back and appended again from the
++// same rows, the PLE histories are put back to the window's own snapshot.
++const bool g_batch_self_commit = env_on("STRATA_BATCH_SELF_COMMIT");
++
++// every row of a batch window is another slot's (no slot has proposal rows)
++bool one_row_per_slot(const int* rows, int S) {
++    for (int i = 0; i < S; ++i)
++        for (int j = i + 1; j < S; ++j)
++            if (rows[i] == rows[j]) return false;
++    return S >= 1;
++}
++bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && one_row_per_slot(rows, S); }
+ 
+ // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
+ // overlap pays off on CUDA, where it was added (cfd3b72).  On HIP a cross-stream event dependency costs more than the
+@@ -894,6 +909,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+     // a batch window: row t is slot t, whose state lives in its own session
+     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
+     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
++    // STRATA_BATCH_SELF_COMMIT: the window keeps its rows (no commit graph, nothing to snapshot for one)
++    const bool keep_rows = batch_rec_ && batch_self_commits(brow_, T);
+ 
+     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
+     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
+@@ -1059,7 +1076,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     err = std::string("verify PLE: ") + e.what();
+                     return false;
+                 }
+-                copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
++                if (!keep_rows) copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
+             }
+             pending = false;
+         }
+@@ -1147,7 +1164,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                         const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
+                                           (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                         gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
+-                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0);
++                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0,
++                                          keep_rows);
+                     }
+                 } else
+                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)
+@@ -1182,7 +1200,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                         gdn_step_norm_multi(stx, hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
+                                             beta + (size_t) first * HV, z_ + (size_t) first * ZV,
+                                             (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
+-                                            (int) HK, (int) HV, t - first, nullptr, cs, 0);
++                                            (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0);
+                     }
+                 } else
+                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+@@ -1267,7 +1285,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 }
+                 stamp(l, 8, grp);
+                 if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
+-                    for (int t = tb; t < te; ++t)
++                    for (int t = tb; t < te && !keep_rows; ++t)
+                         if (t == tb || brow_[t] != brow_[t - 1])
+                             copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
+                                              slot_ss(t).qsa_states[qi].idx_tail, TS, cs);
+@@ -2587,8 +2605,8 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string&
+     tail_snap_b_ = (float*) ((uint8_t*) d + a);
+     slots_ = slots;
+     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
+-    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
+-                 (long long) lb_, (long long) le_);
++    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
++                 (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
+     return true;
+ }
+ 
+@@ -2625,6 +2643,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
+ }
+ 
+ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
++    if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
+     cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
+     if (cex != nullptr) return true;
+     using namespace strata::kernels;
+@@ -2994,10 +3013,12 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
+             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
+     }
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+-    const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
+-    if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+-    const cudaError_t se = cudaStreamSynchronize(cs_);
+-    if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
++    if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
++        const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
++        if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
++        const cudaError_t se = cudaStreamSynchronize(cs_);
++        if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
++    }
+     if (ple_stage())
+         for (int t = 0; t < S;) {
+             const int first = t;
+@@ -3037,6 +3058,8 @@ bool Verifier::has_batch_layout(int base, int S) const {
+ bool Verifier::layout_captured(const std::vector<int>& key) const {
+     const auto e = exec_bm_.find(key);   // (find: a failed capture leaves a null entry)
+     const auto c = commit_bm_.find(key);
++    if (key.size() >= 3 && batch_self_commits(key.data() + 1, (int) key.size() - 2))   // [hbase, rows.., ar_off_]
++        return e != exec_bm_.end() && e->second != nullptr;   // the window keeps its rows: no commit graph
+     return e != exec_bm_.end() && e->second != nullptr && c != commit_bm_.end() && c->second != nullptr;
+ }
+ 
+@@ -3074,7 +3097,7 @@ bool Verifier::ensure_batch_layouts(int GS, int groups, int& captured, std::stri
+             return false;
+         bm_used_[key] = ++bm_tick_;
+         if (!capture_batch(rows, S, base, err) || !capture_commit_batch(rows, S, base, err)) return false;
+-        cudaGraphUpload(commit_bm_[key], cs_);
++        if (!batch_self_commits(rows, S)) cudaGraphUpload(commit_bm_[key], cs_);
+         ++captured;
+     }
+     if (captured > 0 && cudaStreamSynchronize(cs_) != cudaSuccess) {
+@@ -3097,7 +3120,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
+     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
+-    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
++    if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
++        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+-- 
+2.43.0
+

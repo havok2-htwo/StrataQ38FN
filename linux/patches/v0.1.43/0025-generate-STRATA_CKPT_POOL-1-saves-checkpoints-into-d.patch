@@ -1,0 +1,354 @@
+From 07a691ab939d1e4d76000b020cf776332e2fe150 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 23:04:09 +0200
+Subject: [PATCH 25/33] generate: STRATA_CKPT_POOL=1 saves checkpoints into
+ dropped ones' vectors, STRATA_CKPT_THREADS=1 saves a split's parts at once
+
+STRATA_CKPT_POOL=1 (off by default): the serve loop keeps the running-state
+vectors of the checkpoints it drops (LRU eviction, the tail one, the prune at
+a new request, a batch slot's old one), at most two, and the next checkpoint
+or slot copy goes into them.  A save then resizes nothing: no zero-fill of
+~118 MB of fresh vectors.  Every byte is overwritten by the copy.
+
+STRATA_CKPT_THREADS=1 (off by default): a layer split's checkpoint saves the
+first stage's part on the calling thread and every later stage's on a
+persistent thread of its own (the copies' private streams are per thread, so
+short-lived threads would leak them).  The threads leave the host thread's one
+CPU first (to the aux CPUs with --aux-cpus, else to every CPU the process may
+use): on it the copies only took turns.
+
+Measured on a 4-stage split (T16, 24 batch admissions per arm): a turn
+checkpoint takes 17.2 ms today, 10.4 ms with the pool and 5.6 ms with both;
+the batch tests, the overlap and interleave tests and a driver run give the
+same tokens with the switches on as off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 234 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 226 insertions(+), 8 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 457890f3..13f45144 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -121,6 +121,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <sstream>
++#include <exception>
+ #include <stdexcept>
+ #include <string>
+ #include <set>
+@@ -190,6 +191,27 @@ bool admit_merge_first_env() {
+     }();
+     return on;
+ }
++// STRATA_CKPT_POOL=1 (read once; off by default): the serve loop keeps the running-state vectors of the conversation
++// checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
++// resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
++// overwritten by the copy, so the checkpoints are the same
++bool ckpt_pool_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_CKPT_POOL");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
++// STRATA_CKPT_THREADS=1 (read once; off by default): a layer split's checkpoint saves every stage's part at once, the
++// first on the calling thread and each later stage's on a thread of its own device (kept for the process: the copies'
++// private streams are per thread), instead of one stage after the other.  Each part is the same copy of the same state
++bool ckpt_threads_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_CKPT_THREADS");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
+ // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+ // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+@@ -1539,6 +1561,122 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
+     return false;
+ }
+ 
++/// STRATA_CKPT_POOL: the storage of dropped checkpoints, for the next save or slot copy to reuse.  `give` keeps a
++/// checkpoint's vectors (its tokens, pictures and marks cleared), `take` hands one back (an empty checkpoint when none
++/// is kept).  At most `cap` are kept (a batch admission drops and takes about two), the rest are freed as before.
++class CheckpointPool {
++public:
++    explicit CheckpointPool(bool on, size_t cap = 2) : on_(on), cap_(cap) {}
++    bool on() const { return on_; }
++    void give(ConvCheckpoint&& c) {
++        if (!on_ || c.gdn.empty()) return;
++        clear_marks(c);
++        std::lock_guard<std::mutex> lk(mu_);
++        if (free_.size() < cap_) free_.push_back(std::move(c));
++    }
++    ConvCheckpoint take() {
++        std::lock_guard<std::mutex> lk(mu_);
++        if (!on_ || free_.empty()) return ConvCheckpoint{};
++        ConvCheckpoint c = std::move(free_.back());
++        free_.pop_back();
++        return c;
++    }
++    /// v.erase(remove_if(v, drop)) with the dropped ones given to the pool (the kept ones keep their order)
++    template <class Drop> void erase_if(std::vector<ConvCheckpoint>& v, Drop drop) {
++        size_t w = 0;
++        for (size_t i = 0; i < v.size(); ++i) {
++            if (drop(static_cast<const ConvCheckpoint&>(v[i]))) { give(std::move(v[i])); continue; }
++            if (w != i) v[w] = std::move(v[i]);
++            ++w;
++        }
++        v.erase(v.begin() + (std::ptrdiff_t) w, v.end());
++    }
++private:
++    static void clear_marks(ConvCheckpoint& c) {
++        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false;
++        for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
++    }
++    bool on_;
++    size_t cap_;
++    std::mutex mu_;
++    std::vector<ConvCheckpoint> free_;
++};
++
++/// STRATA_CKPT_THREADS: runs job(0) on the calling thread and job(k), k = 1..n-1, on persistent thread k at the same
++/// time, and returns when all have.  The threads live as long as this object: a short-lived thread would leave its
++/// private copy stream behind on every device it used (conversation_detail::copy_nonblocking).  A thread inherits the
++/// host thread's one CPU (aux_cpus.hpp), where the copies would only take turns, so each first goes to the aux CPUs
++/// (--aux-cpus) or else to every CPU the process may use.  One caller at a time; a job does not throw.
++class StageThreads {
++public:
++    StageThreads() = default;
++    StageThreads(const StageThreads&) = delete;
++    StageThreads& operator=(const StageThreads&) = delete;
++    ~StageThreads() {
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            stop_ = true;
++        }
++        go_.notify_all();
++        for (std::thread& t : threads_) t.join();
++    }
++    void run(size_t n, const std::function<void(size_t)>& job) {
++        if (n == 0) return;
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            while (threads_.size() + 1 < n) {
++                const size_t k = threads_.size() + 1;
++                threads_.emplace_back([this, k] { loop(k); });
++            }
++            job_ = &job;
++            n_ = n;
++            pending_ = n - 1;
++            ++round_;
++        }
++        go_.notify_all();
++        job(0);
++        std::unique_lock<std::mutex> lk(mu_);
++        done_.wait(lk, [&] { return pending_ == 0; });
++        job_ = nullptr;
++    }
++private:
++    static void spread_current_thread() {
++#if defined(__linux__)
++        if (strata::aux_cpus::enabled()) {
++            strata::aux_cpus::pin_current_thread();
++            return;
++        }
++        cpu_set_t all;
++        CPU_ZERO(&all);
++        for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
++        (void) sched_setaffinity(0, sizeof all, &all);   // the kernel keeps the CPUs the process may use
++#endif
++    }
++    void loop(size_t k) {
++        spread_current_thread();
++        uint64_t seen = 0;
++        std::unique_lock<std::mutex> lk(mu_);
++        for (;;) {
++            go_.wait(lk, [&] { return stop_ || round_ != seen; });
++            if (stop_) return;
++            seen = round_;
++            if (k >= n_) continue;   // a round with fewer jobs than threads
++            const std::function<void(size_t)>* job = job_;
++            lk.unlock();
++            (*job)(k);
++            lk.lock();
++            if (--pending_ == 0) done_.notify_all();
++        }
++    }
++    std::mutex mu_;
++    std::condition_variable go_, done_;
++    std::vector<std::thread> threads_;
++    const std::function<void(size_t)>* job_ = nullptr;
++    size_t n_ = 0, pending_ = 0;
++    uint64_t round_ = 0;
++    bool stop_ = false;
++};
++
+ // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
+ // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
+ // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
+@@ -7856,6 +7994,7 @@ int main(int argc, char** argv) {
+         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
+         bool nan_flush = false;
+         std::vector<ConvCheckpoint> checks;
++        CheckpointPool ckpt_pool(ckpt_pool_env());   // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused
+         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+@@ -8165,6 +8304,7 @@ int main(int argc, char** argv) {
+                        ") - a GPU hang; on Windows the driver is then reset";
+             return false;
+         };
++        StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
+         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+             ckpt_why.clear();
+             if (o.prompt_cache <= 0 || L < 1) return true;
+@@ -8174,7 +8314,7 @@ int main(int argc, char** argv) {
+                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
+                     return true;
+                 }
+-            ConvCheckpoint c;
++            ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
+             c.ids.assign(cur.begin(), cur.begin() + L);
+             c.imgs = imgs_below(req_imgs, L);
+             if (parts != nullptr) {
+@@ -8185,6 +8325,67 @@ int main(int argc, char** argv) {
+                 c.dead = std::move((*parts)[0].dead);
+                 c.block_pos = std::move((*parts)[0].block_pos);
+                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
++            } else if (ckpt_pool.on() || ckpt_threads_env()) {
++                // STRATA_CKPT_POOL / STRATA_CKPT_THREADS: the parts go into the vectors a pooled checkpoint already has
++                // (none resized), with the threads all at once; part k is stage k's session, synchronized first
++                const size_t n = stages.size() + 1;
++                const bool reused = !c.gdn.empty();   // (a pooled one)
++                c.stage_parts.resize(stages.size());
++                for (ConvCheckpoint& part : c.stage_parts) part.ids = c.ids;
++                std::vector<char> synced(n, 0), saved(n, 0);
++                std::vector<std::string> why(n);
++                std::vector<double> sync_part(n, 0.0), part_ms(n, 0.0);
++                std::vector<std::exception_ptr> thrown(n);   // (a failed allocation: thrown here, as without the threads)
++                const std::function<void(size_t)> save_part = [&](size_t k) {
++                    try {
++                        const Clock::time_point p0 = Clock::now();
++                        const strata::core::OnDevice on(k == 0 ? -1 : stages[k - 1]->dev);
++                        const cudaError_t e = cudaDeviceSynchronize();
++                        if (e != cudaSuccess) {
++                            why[k] = std::string(": the GPU stopped responding before it (") + cudaGetErrorString(e) +
++                                     ") - a GPU hang; on Windows the driver is then reset";
++                            return;
++                        }
++                        synced[k] = 1;
++                        const Clock::time_point p1 = Clock::now();
++                        saved[k] = checkpoint_save(k == 0 ? c : c.stage_parts[k - 1], k == 0 ? ss : stages[k - 1]->ss, g);
++                        sync_part[k] = std::chrono::duration<double, std::milli>(p1 - p0).count();
++                        part_ms[k] = std::chrono::duration<double, std::milli>(Clock::now() - p0).count();
++                    } catch (...) {
++                        thrown[k] = std::current_exception();
++                    }
++                };
++                const Clock::time_point t0 = Clock::now();
++                if (ckpt_threads_env()) {
++                    ckpt_threads.run(n, save_part);
++                } else {
++                    for (size_t k = 0; k < n; ++k) {
++                        save_part(k);
++                        if (!synced[k] || !saved[k]) break;
++                    }
++                }
++                for (size_t k = 0; k < n; ++k)
++                    if (thrown[k]) std::rethrow_exception(thrown[k]);
++                for (size_t k = 0; k < n; ++k) {
++                    if (!synced[k]) { ckpt_why = why[k]; return false; }
++                    if (!saved[k]) return false;
++                }
++                if (ckpt_trace) {   // sync: the first stage's (the others' are in their parts' times)
++                    const double wall = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
++                    std::string each;
++                    for (size_t k = 0; k < n; ++k) {
++                        char b[32];
++                        std::snprintf(b, sizeof b, " %.1f", part_ms[k]);
++                        each += b;
++                    }
++                    ++req_times.ckpts;
++                    req_times.sync_ms += sync_part[0];
++                    req_times.save_ms += wall - sync_part[0];
++                    std::fprintf(stderr, "strata trace: checkpoint at %lld: sync %.1f ms, save %.1f ms (%zu stage(s)%s, "
++                                         "each%s ms, %s)\n", (long long) L, sync_part[0], wall - sync_part[0], n,
++                                 ckpt_threads_env() ? " at once" : "", each.c_str(),
++                                 reused ? "into a dropped checkpoint's vectors" : "new vectors");
++                }
+             } else {
+                 Clock::time_point t0 = Clock::now();
+                 auto lap = [&](double& acc) {   // (STRATA_TRACE only)
+@@ -8219,9 +8420,11 @@ int main(int argc, char** argv) {
+             c.used = ++check_clock;
+             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
+                 const int64_t old_tail = tail_ckpt_len;
+-                checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
+-                                 return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
+-                             }), checks.end());
++                auto old = [&](const ConvCheckpoint& k) { return old_tail >= 0 && (int64_t) k.ids.size() == old_tail; };
++                if (ckpt_pool.on())
++                    ckpt_pool.erase_if(checks, old);
++                else
++                    checks.erase(std::remove_if(checks.begin(), checks.end(), old), checks.end());
+                 tail_ckpt_len = L;
+             } else if (L == tail_ckpt_len) {
+                 tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
+@@ -8250,6 +8453,7 @@ int main(int argc, char** argv) {
+                     }
+                 const size_t victim = strata::program::conv_cache::eviction_victim(
+                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
++                ckpt_pool.give(std::move(checks[victim]));   // (STRATA_CKPT_POOL; else nothing)
+                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+             }
+             if (ckpt_trace && checks.size() < before_evict) {
+@@ -10801,9 +11005,13 @@ int main(int argc, char** argv) {
+             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
+             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+-            checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+-                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+-                         }), checks.end());
++            auto off_path = [&](const ConvCheckpoint& c) {
++                return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
++            };
++            if (ckpt_pool.on())   // STRATA_CKPT_POOL: their storage is the next checkpoint's
++                ckpt_pool.erase_if(checks, off_path);
++            else
++                checks.erase(std::remove_if(checks.begin(), checks.end(), off_path), checks.end());
+             live_ok = false;   // until this request has finished, the session is in between
+             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
+             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
+@@ -12960,6 +13168,8 @@ int main(int argc, char** argv) {
+                 if (cont) {
+                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
+                     BSlot& sl = bs[(size_t) admit_slot];
++                    if (ckpt_pool.on())
++                        for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                     sl = BSlot{};
+                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
+                     sl.active = true;
+@@ -12986,7 +13196,15 @@ int main(int argc, char** argv) {
+                             std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                             best = &c;
+                     const auto tc3 = Clock::now();
+-                    if (best != nullptr && !sl.img) sl.checks.push_back(*best);
++                    if (best != nullptr && !sl.img) {
++                        if (ckpt_pool.on()) {   // a copy into a dropped checkpoint's vectors (their pages are in)
++                            ConvCheckpoint c = ckpt_pool.take();
++                            c = *best;
++                            sl.checks.push_back(std::move(c));
++                        } else {
++                            sl.checks.push_back(*best);
++                        }
++                    }
+                     const auto tc4 = Clock::now();
+                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
+                                  (long long) live.size(), std::chrono::duration<double, std::milli>(tc4 - tc0).count());
+-- 
+2.43.0
+
