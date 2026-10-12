@@ -106,6 +106,11 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
 
 ## Open / next steps
 
+- **Paused 2026-10-12 14:55 for the RAM upgrade (128 → 192 GB)**: KV tiering stage 2a was in progress - uncommitted work saved
+  as `git -C Strata-143 stash list` → "kvtier stage 2a WIP (paused for RAM upgrade 2026-10-12)"; resume = pop the stash
+  and rerun the stage 2a/3 workflow (plan `upstream/DESIGN-kv-tiering.md`). After the upgrade: check `free -g` and dmesg
+  for "Bad page state", then raise `--conversation-cache-mib` / the scope MemoryMax for the RAM tier.
+
 - KV tiering (user design 2026-10-12, plan `upstream/DESIGN-kv-tiering.md`): stage 1 async parking done (#68); next: keep
   conversations in their slots across turns (slot affinity, no pad-row wipe), SSD tier on /media/raid0 only as emergency overflow (min. context size,
   write-once, daily write budget shown in the dashboard). RAM budget config-driven (128 GB now, 192 GB after the upgrade).
