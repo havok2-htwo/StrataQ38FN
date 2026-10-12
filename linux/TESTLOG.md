@@ -112,6 +112,10 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
 
 ## Open / next steps
 
+- Kernel efficiency (read-only analysis 2026-10-12, `upstream/ANALYSIS-kernel-efficiency.md`): decode at ~53–56 % of peak
+  bandwidth; exact levers: QSA slots under KV streaming (production +5.5–7 %), HC read (`STRATA_GR_FAST` + prefetch,
+  +8.5–10.5 %), zero-code arms (`MMVF_ROWS`, `ATTN_LANECELL`), launch fusions; then batch-MTP for 2–8 users.
+
 - RAM upgraded to **256 GB** on 2026-10-12 (replacement DIMM; 3-pass 208 GiB userspace pattern test passed, no Bad page
   state); scope limits raised to 200G (`start-strata.sh`, `run_strata_variant.sh`, `kvaudit_run.sh`); KV tiering stages 1, 2a, 3 done (#68, #70, #72); open: server slot affinity (2b, low priority), delta files for grown conversations.
 
