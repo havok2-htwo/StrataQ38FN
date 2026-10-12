@@ -27,6 +27,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.17.0] – 2026-10-12
+
+Linux (4× RTX 3090, now 256 GB RAM).
+
+### Added
+- KV tiering stage 2a: slot parking (`STRATA_SLOT_PARK=1`, exact, verifiable byte by byte): follow-up turns continue
+  after the decoded reply. New default `configs/T16-143-64khocas.json`: multi-turn +2.6–2.9 %, one-shot TTFT −30–40 %.
+- 256 GB RAM: Strata scopes may use 200 GB; `configs/T16-143-64khocas128.json` with a 128 GiB conversation cache.
+
 ## [0.16.0] – 2026-10-12
 
 Linux (4× RTX 3090).

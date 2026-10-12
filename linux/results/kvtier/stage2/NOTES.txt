@@ -1,0 +1,74 @@
+KV tiering stage 2a: slot parking (STRATA_SLOT_PARK=1) + prefix supersede rule (STRATA_SUPERSEDE_PREFIX=1), 2026-10-12
+Code: Strata-143 g3-143 97941564 (on ff1b3b04 = stage 1), build-143, engine/strata-g3-143k3.
+Configs: linux/configs/T16-143-64khocas.json (= 64khoca + STRATA_SLOT_PARK=1, exe 143k3), T16-143-64khocas128.json
+(the same on the 128 GiB / 128-slot cache).  Reference: 64khoca / 64khoca128 on engine/strata-g3-143kt.
+
+Order from the critique
+- A2 (chain rule drops every conversation sharing the system prompt root under STRATA_SLOT_CKPT_MOVE): stage 1 does
+  NOT cover it (it never touches drop_superseded).  Fixed by STRATA_SUPERSEDE_PREFIX=1 (implied by SLOT_PARK): an entry
+  is superseded when its live tokens start the outgoing ones, or when its deepest checkpoint does and is deeper than the
+  outgoing chain's shallowest; pinned entries never.  Unit-tested only (no runtime test with a shared >= 2048-token
+  system prompt was run; the kvaudit bench has 0 supersede events in both arms - every follow-up takes its image out).
+- A1 (stale retained K/V after a slot give-back): stage 1 covers it with PARK_ASYNC; SLOT_PARK now drops it there too.
+- The previous agent's WIP (stash) had: the prefix rule + its unit tests, the env stubs, StageQueueThreads and an
+  unused BSlot::parks.  Kept and built on; the stub comments were rewritten for the final design.
+
+What 2a does (generate.cpp)
+- BDONE of a pipelined slot (pump): if it may be cached, its capture starts on StageQueueThreads (one thread per stage
+  device, own 2 x 16 MiB pinned staging per device = 128 MiB), live = slot ids, running state + K/V [0,len), no draft
+  layer, device_sync=false (each stage's batch_poll saw the window's streams idle).  RAM admission without evicting.
+- Group start: a group whose window (own width, or the overlap's padded width) would pad-row an idle slot whose capture
+  is still running is skipped; other groups go first.  Measured: 24x4: 62 waits, 0.83 s of one group's time / 156 s.
+- Put into the cache (lazy checkpoint attach): when the slot is overwritten (BADM, before copy_to_slot) or, after a pad
+  row wrote it, at the next request start (before best(), so that request can restore it).  Only then the slot's own
+  checkpoints (the turn checkpoint, marked slot_turn) and the chain copies go into the image (split per stage).  While
+  the slot still holds it, the slot is the source; a give-back from it (or a lent checkpoint mount) drops the image and
+  the chain comes back into the main chain.
+- The main sessions' copy of an admission's prompt is not parked ("N tokens not parked here: slot b parks them"); the
+  chain it was read with (complete checkpoints of `checks`, not slot_turn ones) is copied for the slot on the park
+  threads after BADM (AsyncPark with slot >= 0, host memory only), or synchronously at the next request when that could
+  not run.  slot_turn keeps old turn checkpoints from riding along into every later image.
+- Restore: draftless images are validated/restored with draft = nullptr; STRATA_SNAPSHOT_VERIFY skips the draft check.
+- STRATA_SLOT_PARK_VERIFY=1: every slot capture compared with a plain capture of the same slot before anything writes it.
+  STRATA_SLOT_PARK_TEST_RESTORE=1 (tests): every idle slot's image goes to the cache at the next request, so later
+  turns are restored from slot images instead of the slot's give-back.
+- Off (no env): byte-identical outputs (bt16-off, il-off == stage-1 reference dumps).
+
+Exactness (run_exact.sh / gc.sh in this dir; reference dumps = stage1/*-ref.json, engine 143ho == 143kt)
+- unit: conversation_cache_test 4265 checks (prefix rule, slot_turn copy/compare); all 7 conversation ctests pass.
+- bt16:onv (SLOT_PARK + SLOT_PARK_VERIFY + PARK_ASYNC_VERIFY), t07:onv (T=0.7 seed 1234), il:onv: bytes IDENTICAL.
+- ov1:onv (STRATA_PIPE_OVERLAP): PASS, token- and RESUME-identical to levers/handoff/ov1.json (background slots stopped
+  at other lengths, timing - as in stage 1).
+- il:off, bt16:off (k3, switch off): IDENTICAL.
+- Slot-image restore path: il:ont (TEST_RESTORE) IDENTICAL to il-ref; batch_groups_cache_test gc-ont (5 restores of
+  slot images) vs gc-off (5 slot give-backs): answers IDENTICAL.  (The tool's own PASS/FAIL count check fails on the
+  reference too: the #857 handovers add requests it does not expect.)
+- VERIFY: every compared slot capture byte-identical (il 6, ov1 7, gc 6, il-ont 9 compares).
+- Multi-turn reply hashes: turn 1 identical (24/24, 48/48); later turns differ from the reference because the follow-up
+  now resumes after the decoded reply instead of re-reading it (TESTLOG #59 path dependence, the same as a slot
+  give-back).  The slot-park arm is deterministic run to run (s24 vs s24b vs s24c: 96/96); the reference arm is not
+  (ref24 vs ref24b: 91/96, timing-dependent sources).
+
+Multi-turn (kvaudit_mt.sh, 128 GiB cache configs, single runs unless noted)
+  24x4 ref (64khoca128):  181.0, 182.7 tok/s  (mean 181.9); follow-up TTFT p50 4.23 / 6.87 s
+  24x4 slot (64khocas128): 188.8, 185.6, 185.3 tok/s (mean 186.6, +2.6 %); follow-up TTFT p50 4.32 / 6.26 / 4.95 s
+     cached per turn (mean prompt tokens reused) t2/t3/t4: ref 11203-11220 / 15708-15723 / 20249-20271,
+     slot 11530 / 16012 / 20487 (+~300 / +~290 / +~220 = most of the 400-token reply)
+     81 slot parks (15 slots still held at the end), capture 44 ms mean on the threads, put 1 ms, wait 0 ms;
+     restores 66/67 vs 69/68/67; 0 superseded, 0 evictions, 0 skips; cgroup at the end 22.8 GB (ref) vs 20.9 GB
+  48x4 ref 187.4 tok/s, follow-up TTFT p50 22.94 s; slot 192.8 tok/s (+2.9 %), TTFT p50 20.55 s
+     cached t2/t3/t4: 11279 / 15817 / 20361 -> 11602 / 16117 / 20623; 180 slot parks; cgroup 35.0 vs 36.6 GB
+One-shot (ab_quick, 16 users greedy, khoca vs khocas)
+  REPS=1 (ab-kt2): short -2.28 %, long -3.24 % - an outlier: REPS=3 (ab-kt2r, ABABAB):
+  short 570.8 -> 567.3 (-0.60 %; pairs -1.22 +0.18 -0.77), TTFT p50 1.44 -> 0.88 s
+  long  449.1 -> 445.8 (-0.72 %; pairs -1.41 +0.95 -1.71), TTFT p50 3.03 -> 2.11 s
+  replies identical 32/32 in every pair.  The skipped main-session park (stage 1 joined a 13-19 ms capture at every
+  burst admission) is why TTFT drops; the remaining cost is the slot captures beside the decode (D2H + host copies,
+  one-shot slot image 263 MB incl. the 118 MB turn checkpoint vs 137 MB main image) and short group waits.
+
+Open / next
+- Capture is host-bound (fresh zero-filled pages, critique A3): ~44 ms per 367 MB slot capture, ~22 ms per 122 MB.
+  A segment pool / no zero-fill / MADV_HUGEPAGE would shrink both stage 1 and 2a captures and the group waits.
+- Prefix rule, conservative miss: an outgoing image whose only checkpoint is a deep turn checkpoint does not drop the
+  same conversation's earlier copy when that copy's live tokens do not match (thinking-stripping clients) - left to LRU.
+- A2 at runtime (shared system prompt >= 2048 tokens) not measured.  2b (server slot affinity) and 3a (SSD) not started.

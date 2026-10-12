@@ -465,7 +465,10 @@ parks finished conversations in a **48 GiB RAM conversation cache**, plus the pi
 exact, no VRAM): multi-turn **176.8 tok/s, follow-up TTFT 5.6 s (1.9×)**. Parking cost ~6 % in one-shot traffic until
 stage 1 of the KV tiering (TESTLOG #68): `STRATA_PARK_ASYNC=1` captures the parked state on one thread per GPU while
 the slots decode, so the default `configs/T16-143-64khoca.json` (engine `strata-g3-143kt`, used by `start-strata.sh`)
-reaches 573 / 451 tok/s one-shot (no cache: 575 / 454) and 182.7 tok/s multi-turn. 80K per slot no longer fits
+reaches 573 / 451 tok/s one-shot (no cache: 575 / 454) and 182.7 tok/s multi-turn. Stage 2a (#70,
+`STRATA_SLOT_PARK=1`) parks a finished slot's conversation with its reply, so the next turn continues after the
+reply instead of re-reading it: multi-turn +2.6–2.9 %, one-shot TTFT p50 −30–40 %; default `configs/T16-143-64khocas.json`
+(engine `strata-g3-143k3`; `-64khocas128` with a 128 GiB cache for the 256 GB RAM). 80K per slot no longer fits
 without expert loans (−8 %); `--kv-resident` streaming costs −30 % decode.
 
 ## License notices
