@@ -21,6 +21,17 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.12.0] – 2026-10-12
+
+Linux (4× RTX 3090).
+
+### Changed
+- New default `configs/T16-142fcb.json`: layer split 12,24,37 (GPU3 was the decode bottleneck) and
+  `STRATA_SPLIT_MTP_BATCH=1`. 16 users 522 tok/s short / 405 tok/s 1.2K (was 491 / 378), output identical.
+
+### Added
+- `upstream/PROFILE-next-levers.md`: GPU profile of prefill and batch decode, ranked next levers.
+
 ## [0.11.0] – 2026-10-12
 
 Linux (4× RTX 3090).

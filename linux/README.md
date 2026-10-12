@@ -8,9 +8,9 @@ for sm_86), model **Unsloth UD-IQ4_XS** (target), for comparison UD-Q4_K_XL, vLL
 
 | | Strata UD-IQ4_XS | vLLM 0.31 Flash-Next W4A16 | vLLM 0.31 Qwen3.8-27B FP8 |
 |---|---|---|---|
-| Decode, 1 user | **~121 tok/s** (MTP) | 79 tok/s; with MTP 136 tok/s (then max. 8 users) | 64 tok/s |
-| Total, 1.2K prompts | ~376 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
-| Total, short prompts | ~493 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
+| Decode, 1 user | **~121–131 tok/s** (MTP) | 79 tok/s; with MTP 136 tok/s (then max. 8 users) | 64 tok/s |
+| Total, 1.2K prompts | ~405 tok/s (16 slots, plateau) | ~400 tok/s | 409 tok/s (64 users) |
+| Total, short prompts | ~522 tok/s (16 slots) | ~710 tok/s | 838 tok/s (64 users) |
 | Agent load, 16 users × 5 turns (11K→28K context): TTFT follow-up turn | **~4.5–5 s** | ~32 s | – |
 | Prefill | 1,250 (2K) → 2,240 tok/s (28K) | ~3,500 tok/s | up to ~3,100 tok/s |
 | Quality: MMLU-Pro (240) / GSM8K (150), thinking off | **77.9%** / 94.0% | 70.4% / 94.7% | 72.1% / 95.3% |
@@ -305,6 +305,14 @@ expert grouping queues on that one core (5 → 60–68 ms per card per 512-token
 siblings of the idle pool cores) moves them off: a 1.2K read takes 484 instead of 557 ms, 16 users with 1.2K prompts
 **376 instead of 357 tok/s**, short prompts unchanged, output identical (TESTLOG #52). Config `configs/T16-142fca.json`
 = `T16-142fc` + this flag; `start-strata.sh` uses it. `auto` only finds CPU 64 here and gains less.
+
+## Split 12,24,37 and batched draft-layer prompt K/V (default since 0.12.0)
+
+The GPU profile (`upstream/PROFILE-next-levers.md`, TESTLOG #55) shows GPU3 at 98 % in batch decode: it holds the last
+12 layers plus the head and the sampling, while GPU1/2 idle ~1.25 ms per 6.5 ms window period. Moving one layer to GPU2
+(`layer_split 12,24,37`) and letting the draft layer read its prompt K/V batched (`STRATA_SPLIT_MTP_BATCH=1`, upstream
+switch; tokens unchanged) gives, back to back (#57): 16 users **522 tok/s short (+6.5 %), 405 tok/s 1.2K (+7.3 %)**,
+single user unchanged (~131 tok/s decode), output identical. Config `configs/T16-142fcb.json`, used by `start-strata.sh`.
 
 ## License notices
 

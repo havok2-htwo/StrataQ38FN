@@ -1,0 +1,27 @@
+Profile of the default T16-142fca (2026-10-12, engine strata-g3-142fc, no code change). Driver prof_driver.py (from
+batchadmit/scaling/scale_driver.py), run.sh arms; analysis pf_reads.py, pf_stages.py, vprof.py, dec_rows.py, nsys_an.py
+(node-level kernels), nsys_graph.py (graph-level). nsys 2025.3.2 via `nsys launch` + start/stop around the event.
+sqlite exports deleted to keep the folder small: nsys export --type=sqlite -o X.sqlite X.nsys-rep
+
+PREFILL (slot 15, 15 slots decoding or idle; reads run drained: 0 decode kernels on GPU0-2 during a read)
+- read time plain (6 reps): 143 tok 147-149 ms, 1193 tok 457-458 ms (idle = dec15). +STRATA_PREFILL_TIMING: 172 / 501 ms.
+- 143 tok = one chunk -> 4 stages strictly serial: GPU0 1.7-39.7, GPU1 40.6-75.9, GPU2 76.9-112.6, GPU3 113.7-149.8 ms
+  (nsys). Each card busy ~36 ms of ~150 (24 %). Per stage: MMQ experts 19-21, cuBLAS dense 7.2, dequant q8_0 2.7 (fixed),
+  GDN 1.2, HC 1.2, attn 0.3, gaps 1.8 ms.
+- 1193 tok = 512+512+169: per stage-chunk 78-81 ms (512) / 39-42 ms (169), GPU 95-98 % busy inside a chunk.
+  Critical path (idle nsys): c0 through GPU0-2 (81+79+78 compute, 3 hops x ~4 ms) -> GPU3 starts c0 at 251 ms; GPU3 then
+  c0 79 + draft layer 15.8 + hop 2.7 + c1 79 + draft 15.5 + hop 0.8 + c2 40 -> 484 ms (+ draft 4.9). Compute on the
+  critical path 436 ms (90 %), MTP draft layer on GPU3 31 ms (6.5 %), hand-off hops ~16 ms (3.5 %).
+  Each card busy ~198 ms of 484 (41 %). GPU2 idles 329.8->347.1 waiting for GPU3's c0 + draft (successor rule).
+- hand-off: 21 MB per 512-token chunk (fp32 HC streams), D2H 1.6 ms + H2D 1.6 ms (~13 GB/s) + ~1.3 ms host per hop.
+- host grouping is 0.6-0.8 ms per stage-chunk now (was 5-68 ms before --aux-cpus).
+
+BATCH DECODE (no admissions, sampled t=0.7)
+- 16 slots: 616.6 rows/s, stage-window period 6.48 ms (4 rows); 32 slots: 670.1 rows/s, 11.95 ms (8 rows).
+- graph-level nsys (612 / 668 rows/s, ~no overhead): GPU busy 16: 88.5 / 80.8 / 80.9 / 97.7 %; 32: 84.7 / 76.5 / 76.9 /
+  97.9 %. Last stage (head + sampling) is the bottleneck; its idle is 0.15 ms per period (0.25 at 32).
+  window graph span 5.33/4.85/4.86/5.77 ms + commit graph 0.44 ms (16); 9.28/8.32/8.38/10.53 + 0.87 (32).
+  host: one thread, 10 % of time in CUDA calls (cudaGraphLaunch ~95-105 us/window at 16, 155-190 at 32; sampling
+  cudaStreamSynchronize 148 / 287 us per group step). Hand-off latency prev stage end -> launch 0.46 ms (16) / 0.9 (32).
+- marginal cost per extra row per stage-window: bottleneck stage +1.34 ms, middle stages +0.98 ms; intercept ~1.0-1.4 ms.
+  VERIFY_PROFILE (5 % overhead) per category in vprof_table.txt.

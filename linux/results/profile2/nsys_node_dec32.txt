@@ -1,0 +1,18 @@
+== nsys_dec32/nsys_dec_b32.sqlite: capture 1081.1 ms
+GPU0: 85 windows, period 12.84 ms, window span 9.50 ms, busy 81.5 % of capture (81.7 % between first and last window); idle per period (window start to next start) 2.35 ms; window end to next window start 3.22 ms (median 3.20); launch->first kernel median 0.89 ms; cudaGraphLaunch call median 887 us; second (commit) graph per window: 84, span 0.92 ms
+GPU1: 85 windows, period 12.84 ms, window span 8.47 ms, busy 73.4 % of capture (73.4 % between first and last window); idle per period (window start to next start) 3.41 ms; window end to next window start 4.27 ms (median 4.21); launch->first kernel median 0.78 ms; cudaGraphLaunch call median 777 us; second (commit) graph per window: 85, span 0.89 ms
+GPU2: 84 windows, period 12.85 ms, window span 8.49 ms, busy 72.6 % of capture (73.5 % between first and last window); idle per period (window start to next start) 3.40 ms; window end to next window start 4.26 ms (median 4.18); launch->first kernel median 0.79 ms; cudaGraphLaunch call median 788 us; second (commit) graph per window: 84, span 0.88 ms
+GPU3: 85 windows, period 12.84 ms, window span 10.60 ms, busy 92.8 % of capture (92.9 % between first and last window); idle per period (window start to next start) 0.91 ms; window end to next window start 2.12 ms (median 2.08); launch->first kernel median 0.78 ms; cudaGraphLaunch call median 776 us; second (commit) graph per window: 85, span 0.90 ms
+category (ms/window)      GPU0    GPU1    GPU2    GPU3
+MoE experts              2.885   2.540   2.610   2.738
+router+plan              0.133   0.130   0.129   0.134
+dense GEMV/GEMM          2.422   2.360   2.313   4.173
+GDN                      1.617   1.605   1.594   1.624
+QSA attention            1.332   1.308   1.295   1.341
+HC read/write            1.651   1.618   1.591   1.714
+head+sampling            0.002   0.000   0.000   0.357
+PLE/embed (st.0)         0.584   0.000   0.000   0.000
+hand-off/flags           0.190   0.193   0.205   0.127
+sum                     10.816   9.753   9.738  12.208
+host CUDA API (all threads), per stage-window: cudaGraphLaunch 2.01x 1050 us, cudaStreamSynchronize 0.25x 71 us, cudaLaunchKernel 4.01x 17 us, cudaStreamIsCapturing 2.01x 1 us, cuKernelGetName 4.01x 1 us, cudaStreamQuery 0.78x 0 us
+memcpy: GPU0 kind8: 680 x, 27.9 MB, 0.71 ms
