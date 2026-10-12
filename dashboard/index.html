@@ -256,7 +256,9 @@ th { color: var(--muted); font-weight: 600; } th:first-child, td:first-child { t
           <div class="bar"><span id="kvBar" style="background:var(--s1);width:0"></span></div></div>
         <div class="meter"><div class="row"><span>Geparkte Konversationen (RAM)</span><span id="parkTxt">–</span></div>
           <div class="bar"><span id="parkBar" style="background:var(--s1);width:0"></span></div></div>
-        <div class="kv" style="margin-top:10px"><dt>KV-Format · im VRAM</dt><dd id="kvFmt">–</dd><dt>Session-Dateien (SSD)</dt><dd id="sess">–</dd></div>
+        <div class="kv" style="margin-top:10px"><dt>KV-Format · im VRAM</dt><dd id="kvFmt">–</dd><dt>Session-Dateien (SSD)</dt><dd id="sess">–</dd>
+          <dt title="STRATA_CONV_TIER_DIR: aus dem RAM verdrängte lange Konversationen auf der SSD (Notfall-Stufe)">SSD-Stufe (Konversationen)</dt><dd id="tierTxt">–</dd>
+          <dt title="heute geschrieben / Tagesbudget · Restores von der SSD · Fehlschläge · verworfen wegen Budget">SSD-Stufe Budget · Restores</dt><dd id="tierIo">–</dd></div>
       </div>
     </div>
   </section>
@@ -475,6 +477,11 @@ function render(s) {
   const cc = s.conversation_cache || {};
   if (cc.enabled) { $('parkTxt').textContent = `${cc.parked}/${cc.slots} · ${bytes(cc.bytes)} von ${fmt(cc.budget_mib / 1024, 1)} GiB`; setBar($('parkBar'), cc.bytes / (cc.budget_mib * 2 ** 20)); }
   else { $('parkTxt').textContent = 'aus'; setBar($('parkBar'), 0); }
+  const ct = cc.tier;
+  if (ct) {
+    $('tierTxt').textContent = `${ct.files} Konv. · ${bytes(ct.disk_bytes)} · ${ct.spills} geschrieben` + (ct.pending ? ` · ${ct.pending} wartend` : '');
+    $('tierIo').textContent = `${bytes(ct.written_today)} / ${bytes(ct.budget)} heute (frei ${bytes(ct.budget_left)}) · ${ct.restores} Restores · ${ct.misses} Fehlschläge · ${ct.drops_budget} Budget-Drops`;
+  } else { $('tierTxt').textContent = 'aus'; $('tierIo').textContent = '–'; }
   $('kvFmt').textContent = `${e.kv || '–'} · ${e.kv_resident ? fmt(e.kv_resident) + ' Zellen (Streaming)' : 'komplett'}`;
   $('sess').textContent = s.sessions ? `${s.sessions.files} Dateien · ${bytes(s.sessions.bytes)}` : '–';
 
