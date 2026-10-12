@@ -36,4 +36,5 @@ sleep 10
 echo "g3 models: $(curl -s -m 5 http://127.0.0.1:8000/v1/models | head -c 300)"
 echo "webui:     HTTP $(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)"
 echo "dashboard: HTTP $(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/)"
+echo "gpu power:  $(nvidia-smi --query-gpu=power.limit --format=csv,noheader | tr '\n' ' ') (G3 power manager: day 380 W, night 280 W 22:00-07:00)"
 echo "boot without login: $(loginctl show-user "$USER" -p Linger) (needs: sudo loginctl enable-linger $USER)"

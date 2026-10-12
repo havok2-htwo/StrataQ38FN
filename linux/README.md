@@ -480,7 +480,9 @@ read in 33 s, TESTLOG #73; previously `T16-143-64khocast`: 64K per slot, on `/me
 `strata-g3-143k4`). `linux/systemd/` has user services for Strata (8090), G3 (8000, proxy with Strata as an external
 backend "Qwen3.8-Flash-Next"), Open WebUI (8080) and the LAN dashboard (8082); `linux/cutover.sh` switches from G3/vLLM
 to Strata and checks every service, `linux/rollback.sh` goes back. Boot without login needs
-`sudo loginctl enable-linger <user>` once.
+`sudo loginctl enable-linger <user>` once. GPU power limits come from G3's power manager (it runs as the proxy):
+day 380 W, night mode 280 W from 22:00 to 07:00 (`G3_VLLM/logs/genesis_power_settings.json`, NOPASSWD sudo rule
+for `nvidia-smi -pl`).
 
 ## License notices
 
