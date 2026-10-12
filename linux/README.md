@@ -473,8 +473,10 @@ without expert loans (−8 %); `--kv-resident` streaming costs −30 % decode.
 
 ## Production setup (since 0.18.0)
 
-`linux/configs/production.json` (symlink, now `T16-143-64khocast`: 64K per slot, 48 GiB conversation cache, async and
-slot parking, SSD emergency tier on `/media/raid0/strata-kvspill` with a 200 GB/day write budget, engine
+`linux/configs/production.json` (symlink, now `T16-143-prod262`: up to **262K context per conversation** with 32K
+cells per slot in VRAM and the rest streamed from pinned RAM, split 12,25,37 (no expert loans), 48 GiB conversation
+cache, async and slot parking, SSD emergency tier; −5 % vs the 64K mode `T16-143-64khocast`, a 170K-token prompt is
+read in 33 s, TESTLOG #73; previously `T16-143-64khocast`: 64K per slot, on `/media/raid0/strata-kvspill` with a 200 GB/day write budget, engine
 `strata-g3-143k4`). `linux/systemd/` has user services for Strata (8090), G3 (8000, proxy with Strata as an external
 backend "Qwen3.8-Flash-Next"), Open WebUI (8080) and the LAN dashboard (8082); `linux/cutover.sh` switches from G3/vLLM
 to Strata and checks every service, `linux/rollback.sh` goes back. Boot without login needs
