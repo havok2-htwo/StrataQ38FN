@@ -27,6 +27,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.16.0] – 2026-10-12
+
+Linux (4× RTX 3090).
+
+### Added
+- KV tiering stage 1: asynchronous parking (`STRATA_PARK_ASYNC=1`, exact, every park verifiable byte by byte with
+  `STRATA_PARK_ASYNC_VERIFY=1`). New default `configs/T16-143-64khoca.json`: the 48 GiB conversation cache no longer
+  costs one-shot speed (573 / 451 tok/s vs 535 / 426 before, no cache 575 / 454); multi-turn 182.7 tok/s.
+- `linux/upstream/DESIGN-kv-tiering.md`: staged plan VRAM slots → RAM conversation cache → SSD emergency tier.
+
 ## [0.15.0] – 2026-10-12
 
 Linux (4× RTX 3090).

@@ -462,9 +462,10 @@ conversation cache was off, so every follow-up turn was read again from the star
 follow-up TTFT p50 11.3 s); in the old agent config 52.6 GiB of pinned streamed K/V left the conversation cache no
 room inside the 90 GiB scope. The default now gives every slot **64K context in VRAM** (2× before, free in speed) and
 parks finished conversations in a **48 GiB RAM conversation cache**, plus the pipelined stage hand-off (`STRATA_HANDOFF_PIPE=8`,
-exact, no VRAM): multi-turn **176.8 tok/s, follow-up TTFT 5.6 s (1.9×)**. Parking costs ~6 % in one-shot traffic
-(536 / 427 tok/s); for pure one-shot load use `configs/T16-143-64kho.json` (575 / 454 tok/s). Config
-`configs/T16-143-64khoc.json` (engine `strata-g3-143ho`), used by `start-strata.sh`. 80K per slot no longer fits
+exact, no VRAM): multi-turn **176.8 tok/s, follow-up TTFT 5.6 s (1.9×)**. Parking cost ~6 % in one-shot traffic until
+stage 1 of the KV tiering (TESTLOG #68): `STRATA_PARK_ASYNC=1` captures the parked state on one thread per GPU while
+the slots decode, so the default `configs/T16-143-64khoca.json` (engine `strata-g3-143kt`, used by `start-strata.sh`)
+reaches 573 / 451 tok/s one-shot (no cache: 575 / 454) and 182.7 tok/s multi-turn. 80K per slot no longer fits
 without expert loans (−8 %); `--kv-resident` streaming costs −30 % decode.
 
 ## License notices

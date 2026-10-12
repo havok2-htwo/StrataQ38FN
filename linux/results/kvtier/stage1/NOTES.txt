@@ -1,0 +1,44 @@
+KV tiering stage 1: asynchronous parking (STRATA_PARK_ASYNC=1), 2026-10-12
+Code: Strata-143 g3-143 ff1b3b04 (on 1797c0fb), build-143, engine/strata-g3-143kt.  Config with the switch:
+linux/configs/T16-143-64khoca.json (= T16-143-64khoc + STRATA_PARK_ASYNC=1, exe 143kt).
+
+What it does
+- After a request (DONE/BADM) the main sessions' conversation is captured on 4 persistent threads (one per stage
+  device) while the slots decode: devices synchronized once at start (no group running yet), then only private-stream
+  copies through 2 x 16 MiB pinned staging blocks per device (128 MiB pinned), stoppable between blocks.  Checkpoints:
+  each stage's split list, copied (conversation_checkpoints_stage_copy).  RAM admission at start never evicts.
+- Next request: park decision as before.  Due -> join, superseded drop, make_room, RAM floor (evicting), put.
+  Not due -> cancel; a complete capture's K/V pages kept as retained pages (like after a restore).
+- Dropped at #879 flush, VRAM, SAVE/RESTORE; elastic K/V (kvg) and groups running past a request keep the sync park.
+- Fallback sync park uses STRATA_PARK_THREADS (stages in parallel).  With the switch, retained K/V is dropped before a
+  slot give-back (critique A1).  STRATA_PARK_ASYNC_VERIFY=1: sync capture at every park, must be byte-identical.
+
+Exactness (run_exact.sh; ref = strata-g3-143ho on the same 64khoc config; extra args as in the handoff runs)
+- bt16 on / off / thr(STRATA_PARK_THREADS) : bytes IDENTICAL to bt16-ref (ref itself = levers/handoff/bt16.json)
+- t07 (T=0.7 seed 1234) on : IDENTICAL;  il on : IDENTICAL;  il onv (VERIFY): IDENTICAL, every park verified
+- ov1 (STRATA_PIPE_OVERLAP): with the cache on the tool's own solo phase parks its prompts and the batch phase then
+  fails (ERR BGEN no free slot) on the REFERENCE engine too -> run with --solo-json levers/handoff/ov1.json:
+  ref and on both PASS, token- and RESUME-identical to the handoff dump (only background slots stopped at other lengths)
+- unit: conversation_snapshot_test (staged / stoppable / cancelled / retained-page capture == plain capture, all 4 KV
+  formats x 3 modes), conversation_cache_test (stage copy == split, deep compare, restore_reuse), all conversation ctests
+- multi-turn 24x4 with VERIFY (mt-onv): 96/96 parks byte-identical to the synchronous capture
+
+One-shot (ab-kta.out, ab_quick REPS=3 ABAB.., 16 users greedy; replies identical in every pair, 32/32)
+  short: 64khoc 534.8 | 64khoca 573.0 (+7.16 %; +6.50/+7.31/+7.66) | 64kho (no cache) 574.5 (+7.44 %)
+  long : 64khoc 425.5 | 64khoca 451.3 (+6.06 %; +5.83/+6.25/+6.11) | 64kho (no cache) 454.4 (+6.80 %)
+  -> recovered 96 % (short) / 89 % (long) of the cache's cost.  Park on the critical path 68-71 ms -> 20-21 ms:
+  the bench admits in bursts (next BGEN right after BADM), so the capture cannot overlap there; it is only faster
+  (4 threads + pinned staging).  wait == capture in those parks.
+
+Multi-turn 24 x 4 (kvaudit_mt.sh, single runs)
+  ref 64khoc: 177.7 tok/s, follow-up TTFT p50 6.5 s, 72 restores, parks 96 total 8.7 s (mean 90.5 ms)
+  on 64khoca: 182.7 tok/s (+2.8 %), TTFT p50 7.01 s, 69 restores, parks 96 total 0.4 s (mean 4.0 ms; most wait 0)
+  onv (VERIFY on, extra sync capture per park): 160.9 tok/s
+  Reply hashes: ref = earlier kvaudit run of 64khoc 96/96; on vs ref 95/96 ((19,4)); onv vs ref 93/96 ((18,2..4)).
+  Both differences are requests that took another (pre-existing, timing-dependent) source: ref restored the parked
+  prompt image (11344 / 20626 tokens), the async run got the slot give-back with the reply's decode state (11743 /
+  20932).  TESTLOG #59 (4): reply decoded in windows != the same tokens read as prompt numerically.  Replaying uid 19
+  alone (replay_user.py, reference engine) already differs at turn 3 from both batch runs: multi-turn hashes are
+  path dependent with the reference engine too.  Every async park was verified byte-identical (onv).
+Open: capture speed is host-bound (fresh pages, zero-fill): ~21 ms per ~120-240 MB image.  A segment recycle pool /
+  no-zero-fill / MADV_HUGEPAGE (critique A3) would shrink the remaining burst cost.  TTFT p50 single runs are noisy.
