@@ -455,6 +455,18 @@ Through the server (2 ABBA pairs, #64): 16 users **578 tok/s short, 456 tok/s 1.
 identical. Config `configs/T16-143l5.json` (engine `strata-g3-143l5`, server `Strata-143/serve/server.py`), used by
 `start-strata.sh`; agent load `configs/X16-agent-143l5.json`.
 
+## KV first: 64K per slot and the conversation cache (default since 0.15.0)
+
+A KV audit (TESTLOG #65) found a re-prefill cascade with more conversations than slots: in the old default the
+conversation cache was off, so every follow-up turn was read again from the start (24 agents × 4 turns: 91.5 tok/s,
+follow-up TTFT p50 11.3 s); in the old agent config 52.6 GiB of pinned streamed K/V left the conversation cache no
+room inside the 90 GiB scope. The default now gives every slot **64K context in VRAM** (2× before, free in speed) and
+parks finished conversations in a **48 GiB RAM conversation cache**, plus the pipelined stage hand-off (`STRATA_HANDOFF_PIPE=8`,
+exact, no VRAM): multi-turn **176.8 tok/s, follow-up TTFT 5.6 s (1.9×)**. Parking costs ~6 % in one-shot traffic
+(536 / 427 tok/s); for pure one-shot load use `configs/T16-143-64kho.json` (575 / 454 tok/s). Config
+`configs/T16-143-64khoc.json` (engine `strata-g3-143ho`), used by `start-strata.sh`. 80K per slot no longer fits
+without expert loans (−8 %); `--kv-resident` streaming costs −30 % decode.
+
 ## License notices
 
 The engine patches contain Strata source (MIT) and, in the pointer-table MMQ series, code mirrored from

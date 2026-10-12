@@ -1,0 +1,271 @@
+From 1797c0fb4e7bf00c21ce20a741e40bd6c52e673a Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 12:46:01 +0200
+Subject: [PATCH 36/36] prefill: STRATA_HANDOFF_PIPE=P hands a layer split's
+ chunk on in P pieces, gated by events, on a persistent thread
+
+A layer split hands each prompt chunk's rows (21 MB per 512 tokens) to the next card through a pinned
+host buffer: one D2H, a host stream sync, a new std::async thread, then one H2D before the next stage's
+first kernel.  The 3090s here have no P2P (topo: CNS) and cudaMemcpyPeerAsync is driver-staged and
+slower (3.4 ms vs 3.2 ms for D2H + H2D), so the copy stays on the host route; nsys showed 3.8-4.0 ms per
+512-row hop, of which ~1-1.4 ms was the thread start alone.
+
+With STRATA_HANDOFF_PIPE=P (2..16, opt-in; unset = unchanged):
+- the sending stage records an event when its chunk's work is done and one after each of P row-piece
+  downloads into the same pinned buffer, and waits on the host only for the first (on_stage_chunk's
+  checkpoint parts and the error check need the state, not the copy);
+- the next stage waits on the GPU for each piece's event (cross-device cudaStreamWaitEvent) before that
+  piece's upload, so its uploads overlap the remaining downloads (separate PCIe links); a smaller
+  receiving chunk waits for every piece, then copies as before;
+- the next stage's chunks run on one worker thread per sending stage, started and pinned once, whose
+  packaged_task futures carry the same results and exceptions as std::async's (it clears the CUDA error
+  state after each job, as a thread's end did).  STRATA_HANDOFF_PIPE_WORKER=0 keeps std::async (A/B).
+
+Same bytes in the same rows before the next stage's first kernel: exact.  No device memory (events only,
+the existing two pinned buffers per stage).  Measured (T16-143l5, P=8): 512-row hops 3.8-4.0 -> 1.85-1.89
+ms, 143-row hops 1.6 -> 1.0 ms; reads 1.2K about -1.5 %, 150 about -1 %, 9K (agent, --kv-resident) -3 %;
+decode rows/s unchanged.  batch_test16/32 (greedy and temperature 0.7), batch_interleave_test and
+batch_overlap_test (+ the stage fault arm) byte-/token-identical to the reference dumps; an agent-config
+run with checkpoint parts byte-identical to the reference binary.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/prefill/prefill.hpp |   4 +
+ src/prefill/prefill.cpp            | 149 ++++++++++++++++++++++++++++-
+ 2 files changed, 150 insertions(+), 3 deletions(-)
+
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 65bc6c28..1db4b074 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -228,6 +228,10 @@ private:
+     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
+     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
+     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
++    /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
++    /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
++    const void* hand_ev_ = nullptr;
++    int hand_pieces_ = 0;
+ 
+     std::string next_err_;
+     std::future<bool> next_run_;
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 34663976..98af90d3 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -45,6 +45,7 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <deque>
+ #include <map>
+ #include <string>
+ #include <atomic>
+@@ -319,6 +320,77 @@ inline int bf16x2_mode(bool f16_io) {
+     return f16_io ? 0 : v;
+ }
+ inline bool bf16x2(bool f16_io) { return bf16x2_mode(f16_io) != 0; }
++// STRATA_HANDOFF_PIPE=P (opt-in, 2..16; unset/0/1 = the one copy): a layer split hands a chunk's rows on in P row pieces.
++// The stage records an event when its chunk's work is done and one after each piece's copy into the pinned hand-off
++// buffer, waits on the host only for the first (what on_stage_chunk's checkpoint parts and the error check need), and
++// starts the next stage at once: that stage's upload of piece i waits on piece i's event on the GPU, so its uploads
++// overlap the remaining downloads (separate PCIe links; the 3090s here have no P2P) and the thread start is hidden
++// behind them.  The same bytes land in the same rows before the next stage's first kernel: exact.  No device memory;
++// the events and the existing two pinned buffers per stage only.
++static constexpr int kHandPiecesMax = 16;
++static int handoff_pipe_pieces() {
++    static const int v = [] {
++        const char* e = std::getenv("STRATA_HANDOFF_PIPE");
++        const int p = e ? std::atoi(e) : 0;
++        return p >= 2 ? std::min(p, kHandPiecesMax) : 0;
++    }();
++    return v;
++}
++// rows [r0, r0 + nr) of piece i of a T-row chunk in P pieces (the same split on both sides of a hand-off)
++static void handoff_piece(int64_t T, int P, int i, int64_t& r0, int64_t& nr) {
++    const int64_t per = (T + P - 1) / P;
++    r0 = std::min<int64_t>(T, (int64_t) i * per);
++    nr = std::min<int64_t>(T, r0 + per) - r0;
++}
++// STRATA_HANDOFF_PIPE: the next stage's chunks run on one thread of the stage's own, started once and pinned once
++// (std::async started a thread per chunk: ~1 ms from the hand-off to the next stage's first call, measured with nsys).
++// The futures are the same (run_impl's result, or what it threw), so the chain's waits do not change.
++// (STRATA_HANDOFF_PIPE_WORKER=0: a thread per chunk again, for an A/B of the two halves.)
++static bool handoff_pipe_worker() {
++    static const bool v = [] { const char* e = std::getenv("STRATA_HANDOFF_PIPE_WORKER"); return !e || std::atoi(e) != 0; }();
++    return handoff_pipe_pieces() > 0 && v;
++}
++struct HandWorker {
++    std::mutex mu;
++    std::condition_variable cv;
++    std::deque<std::packaged_task<bool()>> jobs;
++    bool stop = false;
++    std::thread th;
++    HandWorker() {
++        th = std::thread([this] {
++            strata::aux_cpus::pin_current_thread();
++            for (;;) {
++                std::packaged_task<bool()> job;
++                {
++                    std::unique_lock<std::mutex> lk(mu);
++                    cv.wait(lk, [this] { return stop || !jobs.empty(); });
++                    if (jobs.empty()) return;   // stopped, and every job taken has run (no broken promise)
++                    job = std::move(jobs.front());
++                    jobs.pop_front();
++                }
++                job();
++            }
++        });
++    }
++    std::future<bool> submit(std::packaged_task<bool()> job) {
++        std::future<bool> f = job.get_future();
++        {
++            std::lock_guard<std::mutex> lk(mu);
++            jobs.push_back(std::move(job));
++        }
++        cv.notify_one();
++        return f;
++    }
++    ~HandWorker() {
++        {
++            std::lock_guard<std::mutex> lk(mu);
++            stop = true;
++        }
++        cv.notify_one();
++        if (th.joinable()) th.join();
++    }
++};
++
+ // S23 (opt-in STRATA_HC_UPMIX=1): the hyper-connection read's up projection and gr_mix_r as one kernel (gr_upmix, gfx11);
+ // STRATA_HC_UPMIX_CHECK=N also runs the default pair on the first N reads and reports the difference of `mixed`
+ static int64_t pf_switch_min_t() {   // S23: STRATA_PF_SWITCH_MIN_T=N - the rounding-level prompt switches only on chunks of
+@@ -859,6 +931,11 @@ struct Prefill::Impl {
+     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
+     int device = -1;
+     float* hand[2] = {};
++    // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
++    int hand_pieces = 0;
++    cudaEvent_t hand_done[2] = {};
++    cudaEvent_t hand_ev[2][kHandPiecesMax] = {};
++    std::unique_ptr<HandWorker> hand_worker;   // STRATA_HANDOFF_PIPE: the next stage's chunks' thread (lazily)
+     // C-4: the chunk's token ids on the device, for one batched embedding gather
+     int32_t* tok_dev = nullptr;
+     std::vector<int32_t> tok_host;
+@@ -921,6 +998,7 @@ void Prefill::reset() {
+ 
+ void Prefill::release() {
+     if (!impl_) return;
++    impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
+     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
+     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
+     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
+@@ -930,6 +1008,9 @@ void Prefill::release() {
+     }
+     for (int b = 0; b < 2; ++b) {
+         if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
++        if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
++        for (cudaEvent_t& e : impl_->hand_ev[b])
++            if (e) cudaEventDestroy(e);
+         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
+         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
+     }
+@@ -1123,6 +1204,16 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
+             err = "prefill: the layer split's hand-off buffers";
+             return false;
+         }
++    if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
++        bool ok = true;
++        auto make = [](cudaEvent_t& e) { return e != nullptr || cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess; };
++        for (int b = 0; b < 2; ++b) {   // (a retry after a failed init keeps the events it made)
++            ok = ok && make(m.hand_done[b]);
++            for (int i = 0; ok && i < handoff_pipe_pieces(); ++i) ok = make(m.hand_ev[b][i]);
++        }
++        if (!ok) { err = "prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)"; return false; }
++        m.hand_pieces = handoff_pipe_pieces();
++    }
+     if (m.tok_dev == nullptr) {
+         if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)); e != cudaSuccess) {
+             err = std::string("prefill: the token id buffer (") + cudaGetErrorString(e) + ")";
+@@ -2228,7 +2319,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+         const auto tsetup = Clock::now();
+         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
+         // previous stage handed on
+-        if (hand_in_ != nullptr) {
++        if (hand_in_ != nullptr && hand_ev_ != nullptr) {
++            // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
++            // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
++            // chunk here) every piece is waited for before the one copy.
++            const auto* ev = static_cast<const cudaEvent_t*>(hand_ev_);
++            const bool whole = c0 == 0 && T == n;
++            bool ok = true;
++            for (int i = 0; ok && i < hand_pieces_; ++i) {
++                int64_t r0 = 0, nr = 0;
++                handoff_piece(n, hand_pieces_, i, r0, nr);
++                ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
++                if (ok && whole && nr > 0)
++                    ok = cudaMemcpyAsync(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
++                                         cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
++            }
++            if (ok && !whole)
++                ok = cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice,
++                                     m.cs) == cudaSuccess;
++            if (!ok) {
++                err = std::string("prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ") +
++                      cudaGetErrorString(cudaGetLastError());
++                return false;
++            }
++        } else if (hand_in_ != nullptr) {
+             if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
+                 cudaSuccess) {
+                 err = "prefill: the layer split's hand-off upload failed";
+@@ -4153,8 +4267,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+         if (next_ != nullptr) {
+             // The current hand-off slot was used two chunks ago.
+             float* h = m.hand[hand_buf_];
+-            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+-                cudaStreamSynchronize(m.cs) != cudaSuccess) {
++            const int hp = m.hand_pieces;
++            if (hp > 0) {
++                // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
++                // state on_stage_chunk saves, the error check), the next stage's uploads wait on the pieces' events
++                bool ok = cudaEventRecord(m.hand_done[hand_buf_], m.cs) == cudaSuccess;
++                for (int i = 0; ok && i < hp; ++i) {
++                    int64_t r0 = 0, nr = 0;
++                    handoff_piece(T, hp, i, r0, nr);
++                    if (nr > 0)
++                        ok = cudaMemcpyAsync(h + (size_t) r0 * D, m.R + (size_t) r0 * D, (size_t) nr * D * 4,
++                                             cudaMemcpyDeviceToHost, m.cs) == cudaSuccess;
++                    ok = ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.cs) == cudaSuccess;
++                }
++                if (!ok || cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
++                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
++                    return false;
++                }
++            } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
++                       cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+@@ -4164,7 +4295,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+             next_err_.clear();
+             next_->hand_in_ = h;
++            next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
++            next_->hand_pieces_ = hp;
+             next_->single_chunk_ = single_chunk;
++            if (handoff_pipe_worker()) {
++                if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
++                next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
++                    const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
++                    int none = 0;   // keep the first fault for chain_cuda_error, then clear what a thread's end cleared
++                    if (const int e = (int) cudaPeekAtLastError(); e != 0) next_->cuda_err_.compare_exchange_strong(none, e);
++                    (void) cudaGetLastError();
++                    return r;
++                }));
++            } else
+             next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                 strata::aux_cpus::pin_current_thread();
+                 const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
+-- 
+2.43.0
+

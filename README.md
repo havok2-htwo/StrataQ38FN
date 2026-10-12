@@ -14,17 +14,19 @@ to a test.
 |---|---|---|---|
 | **4× RTX 3090 + RAM**, 16 concurrent users, short prompts | ~88 tok/s (setup default) · ~175 tok/s (Strata's own batching, max. 8 slots) | **~578 tok/s** | **6.6×** · **3.3×** |
 | **4× RTX 3090 + RAM**, 16 concurrent users, 1.2K-token prompts | ~88 tok/s · ~175 tok/s | **~456 tok/s** | **5.2×** · **2.6×** |
+| **4× RTX 3090 + RAM**, 24 agents × 4 turns (growing context, more agents than slots) | our previous default without conversation cache: 91.5 tok/s, 11.3 s wait per follow-up turn (re-reads everything) | **176.8 tok/s, 5.6 s** | **1.9×** |
 | **4× RTX 3090**, single user (decode) | ~121 tok/s | ~131 tok/s | +8 % |
 | **RTX 5090 + 64 GB RAM**, single user (decode) | ~125 tok/s (setup default) | **~145 tok/s** | +16 % |
 | **RTX 5090 + 64 GB RAM**, switch between main agent and sub-agent | ~25 s prompt re-read | **~1.5 s** | 16× |
 
-4× RTX 3090: Strata 0.1.43 + our patch series, greedy, 512 output tokens per request (TESTLOG #57–#64 in
+4× RTX 3090: Strata 0.1.43 + our patch series, greedy, 512 output tokens per request; the one-shot rows use the
+throughput config, the default adds a 48 GiB conversation cache for multi-turn load (−6 % one-shot, TESTLOG #57–#67 in
 [linux/TESTLOG.md](linux/TESTLOG.md)). For comparison, vLLM 0.31 on the same box reaches 622 / 386 tok/s at 16
 users, with a measurably lower quality checkpoint ([linux/README.md](linux/README.md)).
 
 **Is this a fork?** In substance, yes: a downstream fork. It is not a GitHub fork of the engine repository. This
 repository holds the deployment (configs, start scripts, a vLLM-compatible facade, a dashboard) and the engine patch
-series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.43/`, 35
+series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.43/`, 36
 patches). The patches are kept upstream-ready (opt-in switches, default path unchanged), so they can be offered back
 to Strata.
 

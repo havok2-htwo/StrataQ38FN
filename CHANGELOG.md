@@ -27,6 +27,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.15.0] – 2026-10-12
+
+Linux (4× RTX 3090).
+
+### Changed
+- KV-first default `configs/T16-143-64khoc.json`: 64K context per slot (2×), 48 GiB conversation cache, pipelined stage
+  hand-off (`STRATA_HANDOFF_PIPE=8`, exact, no VRAM). Multi-turn (24 agents × 4 turns): 176.8 tok/s and 5.6 s
+  follow-up TTFT instead of 91.5 tok/s / 11.3 s; one-shot −6 % (parking). Throughput config without the cache:
+  `configs/T16-143-64kho.json` (575 / 454 tok/s).
+
+### Added
+- KV-cache audit (`linux/results/kvaudit/`): VRAM per card, what each patch costs, where the re-prefill cascade came
+  from.
+
 ## [0.14.0] – 2026-10-12
 
 Linux (4× RTX 3090).
