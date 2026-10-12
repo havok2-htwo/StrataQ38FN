@@ -1,0 +1,576 @@
+[strata] 2026-10-11 18:38:33 engine started: /media/raid0/StrataQ38FN/Strata/engine/strata-g3-overlap --serve --pack /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs --native /media/raid0/Models/Strata-GGUF/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf --expert-profile /media/raid0/StrataQ38FN/Strata/data/expert-profile.bin --expert-cache auto --prefill 512 --spec 4 --spec-min-p 0.5 --mtp /media/raid0/StrataQ38FN/Strata-data/mtp/rt --max-context 32768 --kv int8 --resident-experts --trim-stage-weights --ple-io ram --layer-split 12,24,36 --batch 16
+strata generate: layer split across 4 GPUs: CUDA0, then CUDA1,2,3 (split 12,24,36)
+strata generate: PCIe probe: 13.1 GB/s host->device (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs experts (largest blob 3.48 MB), token embedding Q8_0 in mapped host memory (644 MiB, 0.6 s)
+strata generate: layer split: CUDA0 loads the dense weights of layers 0-11 only
+strata generate: 463 MiB of weights loaded from /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs in 0.1 s (843 canonical tensors skipped: served natively)
+strata generate: 76 native projection matrices, 763.67 MiB of weights, in 0.2 s
+strata: PLE table mlock failed (Cannot allocate memory; raise `ulimit -l`): its pages stay faulted in but may be reclaimed
+strata generate: PLE table loaded (not locked) (--ple-io ram) in 0.1 s
+strata generate: layer split: CUDA1 loads the dense weights of layers 12-23 only
+strata generate: layer split: CUDA1 PCIe probe 13.1 GB/s (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36
+strata generate: layer split: CUDA1 holds its weights; 22.08 GiB free (its session follows the split search)
+strata generate: layer split: CUDA2 loads the dense weights of layers 24-35 only
+strata generate: layer split: CUDA2 PCIe probe 13.5 GB/s (best of 13.5 13.5 13.5 13.5) -> pcie_frac 0.37
+strata generate: layer split: CUDA2 holds its weights; 22.08 GiB free (its session follows the split search)
+strata generate: layer split: CUDA3 loads the dense weights of layers 36-47 only
+strata generate: layer split: CUDA3 PCIe probe 13.5 GB/s (best of 13.5 13.5 13.5 13.5) -> pcie_frac 0.37
+strata generate: layer split: CUDA3 holds its weights; 22.08 GiB free (its session follows the split search)
+strata generate: profile /media/raid0/StrataQ38FN/Strata/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: PLE on, table 320001536 rows of /media/raid0/Models/Strata-GGUF/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf
+strata generate: layer split: CUDA1 holds its weights, session [12, 24); 21.92 GiB free
+strata generate: layer split: CUDA2 holds its weights, session [24, 36); 21.92 GiB free
+strata generate: layer split: CUDA3 holds its weights, session [36, 48) and the head; 21.44 GiB free
+strata generate: --batch 16 over 4 stages (g3 patch: up to 8 rows per group window)
+strata generate: --batch-groups auto: 4 groups of 4 slots
+strata generate: --batch: 16 slot sessions on CUDA0 (0.15 GiB each); 19.11 GiB free
+strata generate: --batch: 16 slot sessions on CUDA1 (0.15 GiB each); 19.45 GiB free
+strata generate: --batch: 16 slot sessions on CUDA2 (0.15 GiB each); 19.45 GiB free
+strata generate: --batch: 16 slot sessions on CUDA3 (0.15 GiB each); 18.97 GiB free
+strata generate: --batch-groups auto: 4 groups of 4 slots
+strata generate: --batch 16: the slot sessions take 2.44 GiB of VRAM on CUDA0 that the expert cache would otherwise hold
+strata mtp: draft layer loaded, 839 MiB of VRAM (experts 675, dense 111), files read in 0.31 s (2532 MiB/s)
+strata generate: GPU 0: NVIDIA GeForce RTX 3090, compute capability 8.6
+strata generate: experts via mmap (--mmap-experts; the GGUF shards in place, no experts.bin)
+strata generate: CPU pool tasks/phase: 192 (automatic), participating threads: 64
+strata generate: 63 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63, the host thread on 0 (draining too) (--host-core first)
+strata generate: expert cache auto: 19.11 GiB free, 700 MiB reserved (+0 MiB for the draft head) -> 5681 slots
+strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): 48 of 48 layers
+strata generate: +256 B guard per sized slot (STRATA_MMQ_DIRECT)
+strata generate: expert cache 6144 slots, 14.27 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: the profile fill asks for 256 pairs ahead (STRATA_FILL_AHEAD)
+strata generate: pre-filled 6144 of 6144 slots from the profile in 4.2 s (3668 MB/s); slot 0 verified
+strata generate: layer split, CUDA1: 19.45 GiB free of 23.56, room for experts 18.68 GiB
+strata generate: layer split: CUDA1 runs layers 12-23, expert cache 6144 slots (13.33 GiB), 6144 of its 6144 profiled pairs; slot 0 verified
+strata generate: layer split, CUDA2: 19.45 GiB free of 23.56, room for experts 18.68 GiB
+strata generate: layer split: CUDA2 runs layers 24-35, expert cache 6144 slots (13.72 GiB), 6144 of its 6144 profiled pairs; slot 0 verified
+strata generate: layer split, CUDA3: 18.14 GiB free of 23.56, room for experts 17.37 GiB
+strata generate: layer split: CUDA3 runs layers 36-47, expert cache 6144 slots (14.11 GiB), 6144 of its 6144 profiled pairs; slot 0 verified
+strata generate: layer split: CUDA0 runs layers 0-11
+strata generate: routing-aware prefetch on (the next layer's router, file tier)
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 63 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.41)
+strata generate: token graph hit path: 24576 resident experts, decided on the device
+FileExpertSource: copied cache complement through layer 8/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 16/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 24/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 32/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 40/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 48/48 (0.00 GiB, 0 s)
+FileExpertSource: locked resident cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s
+FileExpertSource: 18432 verified additional-GPU experts remain on the mmap fallback
+strata generate: resident RAM mode: 0.00 GiB of experts in RAM (pageable), 6144 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+strata serve:   CUDA0 keeps its own prompt buffers (0.39 GiB of 4.83 GiB free): no loan
+strata serve:   CUDA1 keeps its own prompt buffers (0.39 GiB of 6.12 GiB free): no loan
+strata serve:   CUDA2 keeps its own prompt buffers (0.39 GiB of 5.73 GiB free): no loan
+strata serve:   CUDA3 keeps its own prompt buffers (0.39 GiB of 4.03 GiB free): no loan
+strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+strata hc: CUDA1: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: CUDA1's window stream at priority -5 (the greatest)
+strata verify: window up to 8 tokens, 98.3 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA2: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: CUDA2's window stream at priority -5 (the greatest)
+strata verify: window up to 8 tokens, 98.3 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA3: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: CUDA3's window stream at priority -5 (the greatest)
+strata verify: window up to 8 tokens, 98.3 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata serve: layer split: layers 0-11 (CUDA0), 12-23 (CUDA1), 24-35 (CUDA2), 36-47 (CUDA3), one hand-off per window
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: CUDA0's window stream at priority -5 (the greatest)
+strata verify: window up to 8 tokens, 98.3 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata verify: batch windows of up to 16 sequences (layers [0, 12))
+strata verify: batch windows of up to 16 sequences (layers [12, 24))
+strata verify: batch windows of up to 16 sequences (layers [24, 36))
+strata verify: batch windows of up to 16 sequences (layers [36, 48))
+strata serve: 4277 MiB of VRAM free with everything loaded
+strata verify: capturing the 6-token window (4229 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (5545 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (5147 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (3183 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (4223 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (5539 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (5141 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (3179 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (4219 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (5535 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (5137 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (3173 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (4213 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (5529 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (5131 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (3167 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (4207 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (5523 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (5125 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (3161 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata serve: prompt 1226 tokens = 0 reused + 1226 read in 944 ms (1299.1 tok/s), 256 generated in 2307 ms (111.0 tok/s), drafts accepted 125 of 229, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 59529.9 MB of expert reads
+strata serve: prompt 1228 tokens = 0 reused + 1228 read in 725 ms (1692.8 tok/s), 1 generated in 13 ms (79.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: slot 0 takes 1229 tokens (copied in 59.7 ms)
+strata serve: prompt 1229 tokens = 1228 reused + 1 read in 0 ms (101729.4 tok/s), 1 generated in 11 ms (87.9 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata batch: overlapped read: captured 16 group layouts in 31.8 ms
+strata batch: overlapped read of 1218 tokens in 634 ms (drain 11.5 ms); the slots decoded 37 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 37 windows, ple hit n/a
+strata batch: slot 4 takes 1225 tokens (copied in 60.6 ms)
+strata serve: prompt 1225 tokens = 0 reused + 1225 read in 741 ms (1653.8 tok/s), 1 generated in 12 ms (86.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata batch: overlapped read of 1216 tokens in 718 ms (drain 10.9 ms); the slots decoded 81 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 81 windows, ple hit n/a
+strata batch: slot 8 takes 1223 tokens (copied in 60.6 ms)
+strata serve: prompt 1223 tokens = 0 reused + 1223 read in 781 ms (1565.2 tok/s), 1 generated in 12 ms (86.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata batch: overlapped read: captured 4 group layouts in 6.8 ms
+strata batch: overlapped read of 1218 tokens in 791 ms (drain 9.4 ms); the slots decoded 119 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 119 windows, ple hit n/a
+strata batch: slot 12 takes 1225 tokens (copied in 60.5 ms)
+strata serve: prompt 1225 tokens = 0 reused + 1225 read in 850 ms (1441.7 tok/s), 1 generated in 12 ms (86.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata batch: overlapped read of 1220 tokens in 787 ms (drain 9.4 ms); the slots decoded 116 rows meanwhile, D_ref 279.6 rows/s, lost 381 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 116 windows, ple hit n/a
+strata batch: slot 0 takes 1227 tokens (copied in 8.1 ms)
+strata serve: prompt 1227 tokens = 0 reused + 1227 read in 838 ms (1463.9 tok/s), 1 generated in 12 ms (86.7 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1217 tokens in 787 ms (drain 9.2 ms); the slots decoded 118 rows meanwhile, D_ref 279.6 rows/s, lost 374 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 118 windows, ple hit n/a
+strata batch: slot 4 takes 1224 tokens (copied in 7.9 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 838 ms (1460.1 tok/s), 1 generated in 11 ms (87.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1217 tokens in 793 ms (drain 11.4 ms); the slots decoded 120 rows meanwhile, D_ref 279.6 rows/s, lost 375 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 120 windows, ple hit n/a
+strata batch: slot 8 takes 1224 tokens (copied in 8.2 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 846 ms (1446.3 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1220 tokens in 796 ms (drain 10.3 ms); the slots decoded 120 rows meanwhile, D_ref 279.6 rows/s, lost 377 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 120 windows, ple hit n/a
+strata batch: slot 12 takes 1227 tokens (copied in 55.2 ms)
+strata serve: prompt 1227 tokens = 0 reused + 1227 read in 848 ms (1446.7 tok/s), 1 generated in 12 ms (86.7 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch (pipelined, 4 groups of 4): 2000 group-steps, 2000 rows in 10935 ms = 182.9 rows/s (admissions included)
+strata batch: slot 12 gave back 1443 tokens of this conversation (all it holds) in 0.6 ms
+strata serve: prompt 1444 tokens = 1443 reused + 1 read in 1 ms (1669.1 tok/s), 39 generated in 372 ms (104.9 tok/s), drafts accepted 17 of 39, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: prompt 1228 tokens = 0 reused + 1228 read in 663 ms (1853.0 tok/s), 1 generated in 13 ms (79.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: slot 0 takes 1229 tokens (copied in 7.9 ms)
+strata serve: prompt 1229 tokens = 1228 reused + 1 read in 0 ms (101214.6 tok/s), 1 generated in 11 ms (87.8 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1217 tokens in 627 ms (drain 5.5 ms); the slots decoded 36 rows meanwhile, D_ref 279.6 rows/s, lost 504 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 36 windows, ple hit n/a
+strata batch: slot 4 takes 1224 tokens (copied in 7.9 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 674 ms (1815.2 tok/s), 1 generated in 11 ms (87.4 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1219 tokens in 706 ms (drain 8.7 ms); the slots decoded 80 rows meanwhile, D_ref 279.6 rows/s, lost 429 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 80 windows, ple hit n/a
+strata batch: slot 8 takes 1226 tokens (copied in 8.2 ms)
+strata serve: prompt 1226 tokens = 0 reused + 1226 read in 757 ms (1620.6 tok/s), 1 generated in 11 ms (87.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1218 tokens in 797 ms (drain 11.3 ms); the slots decoded 120 rows meanwhile, D_ref 279.6 rows/s, lost 379 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 120 windows, ple hit n/a
+strata batch: slot 12 takes 1225 tokens (copied in 56.3 ms)
+strata serve: prompt 1225 tokens = 0 reused + 1225 read in 850 ms (1441.6 tok/s), 1 generated in 11 ms (87.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1218 tokens in 810 ms (drain 12.1 ms); the slots decoded 129 rows meanwhile, D_ref 279.6 rows/s, lost 361 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 129 windows, ple hit n/a
+strata batch: slot 1 takes 1225 tokens (copied in 60.5 ms)
+strata serve: prompt 1225 tokens = 0 reused + 1225 read in 864 ms (1417.4 tok/s), 1 generated in 11 ms (87.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata batch: overlapped read: captured 4 group layouts in 6.9 ms
+strata batch: overlapped read of 1221 tokens in 813 ms (drain 12.7 ms); the slots decoded 146 rows meanwhile, D_ref 279.6 rows/s, lost 303 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.007 ms avg over 117 windows, ple hit n/a
+strata batch: slot 5 takes 1228 tokens (copied in 60.4 ms)
+strata serve: prompt 1228 tokens = 0 reused + 1228 read in 886 ms (1386.6 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata batch: overlapped read: captured 4 group layouts in 7.4 ms
+strata batch: overlapped read of 1217 tokens in 817 ms (drain 15.2 ms); the slots decoded 164 rows meanwhile, D_ref 279.6 rows/s, lost 245 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.008 ms avg over 109 windows, ple hit n/a
+strata batch: slot 9 takes 1224 tokens (copied in 60.7 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 881 ms (1388.6 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 8,9
+strata verify: captured the batch window over slots 8,9
+strata verify: captured the batch window over slots 8,9
+strata verify: captured the batch window over slots 8,9
+strata batch: overlapped read: captured 4 group layouts in 6.8 ms
+strata batch: overlapped read of 1217 tokens in 831 ms (drain 17.5 ms); the slots decoded 187 rows meanwhile, D_ref 279.6 rows/s, lost 179 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.010 ms avg over 107 windows, ple hit n/a
+strata batch: slot 13 takes 1224 tokens (copied in 59.9 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 908 ms (1348.1 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 12,13
+strata verify: captured the batch window over slots 12,13
+strata verify: captured the batch window over slots 12,13
+strata verify: captured the batch window over slots 12,13
+strata batch: overlapped read: captured 4 group layouts in 8.7 ms
+strata batch: overlapped read of 1219 tokens in 810 ms (drain 18.7 ms); the slots decoded 185 rows meanwhile, D_ref 279.6 rows/s, lost 167 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.011 ms avg over 94 windows, ple hit n/a
+strata batch: slot 2 takes 1226 tokens (copied in 60.3 ms)
+strata serve: prompt 1226 tokens = 0 reused + 1226 read in 880 ms (1393.8 tok/s), 1 generated in 11 ms (87.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 0,1,2
+strata verify: captured the batch window over slots 0,1,2
+strata verify: captured the batch window over slots 0,1,2
+strata verify: captured the batch window over slots 0,1,2
+strata batch: overlapped read of 1218 tokens in 823 ms (drain 16.3 ms); the slots decoded 186 rows meanwhile, D_ref 279.6 rows/s, lost 174 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.011 ms avg over 93 windows, ple hit n/a
+strata batch: slot 0 takes 1225 tokens (copied in 7.9 ms)
+strata serve: prompt 1225 tokens = 0 reused + 1225 read in 881 ms (1390.5 tok/s), 1 generated in 11 ms (87.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1216 tokens in 825 ms (drain 18.7 ms); the slots decoded 196 rows meanwhile, D_ref 279.6 rows/s, lost 143 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.012 ms avg over 93 windows, ple hit n/a
+strata batch: slot 6 takes 1223 tokens (copied in 61.0 ms)
+strata serve: prompt 1223 tokens = 0 reused + 1223 read in 885 ms (1381.2 tok/s), 1 generated in 11 ms (87.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 4,5,6
+strata verify: captured the batch window over slots 4,5,6
+strata verify: captured the batch window over slots 4,5,6
+strata verify: captured the batch window over slots 4,5,6
+strata batch: overlapped read: captured 4 group layouts in 8.2 ms
+strata batch: overlapped read of 1216 tokens in 825 ms (drain 17.1 ms); the slots decoded 202 rows meanwhile, D_ref 279.6 rows/s, lost 120 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.013 ms avg over 90 windows, ple hit n/a
+strata batch: slot 4 takes 1223 tokens (copied in 8.0 ms)
+strata serve: prompt 1223 tokens = 0 reused + 1223 read in 905 ms (1352.1 tok/s), 1 generated in 11 ms (87.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1216 tokens in 833 ms (drain 15.4 ms); the slots decoded 205 rows meanwhile, D_ref 279.6 rows/s, lost 116 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.013 ms avg over 89 windows, ple hit n/a
+strata batch: slot 10 takes 1223 tokens (copied in 60.0 ms)
+strata serve: prompt 1223 tokens = 0 reused + 1223 read in 891 ms (1373.0 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 8,9,10
+strata verify: captured the batch window over slots 8,9,10
+strata verify: captured the batch window over slots 8,9,10
+strata verify: captured the batch window over slots 8,9,10
+strata batch: overlapped read: captured 4 group layouts in 7.5 ms
+strata batch: overlapped read of 1217 tokens in 832 ms (drain 18.4 ms); the slots decoded 214 rows meanwhile, D_ref 279.6 rows/s, lost 85 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.053 ms avg over 86 windows, ple hit n/a
+strata batch: slot 8 takes 1224 tokens (copied in 8.1 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 900 ms (1359.7 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1220 tokens in 825 ms (drain 17.7 ms); the slots decoded 213 rows meanwhile, D_ref 279.6 rows/s, lost 81 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.014 ms avg over 85 windows, ple hit n/a
+strata batch: slot 12 takes 1227 tokens (copied in 8.1 ms)
+strata serve: prompt 1227 tokens = 0 reused + 1227 read in 885 ms (1386.0 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1217 tokens in 837 ms (drain 17.3 ms); the slots decoded 226 rows meanwhile, D_ref 279.6 rows/s, lost 46 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.014 ms avg over 86 windows, ple hit n/a
+strata batch: slot 14 takes 1224 tokens (copied in 60.3 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 896 ms (1365.6 tok/s), 1 generated in 11 ms (87.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata verify: captured the batch window over slots 12,13,14
+strata verify: captured the batch window over slots 12,13,14
+strata verify: captured the batch window over slots 12,13,14
+strata verify: captured the batch window over slots 12,13,14
+strata batch: overlapped read: captured 4 group layouts in 8.2 ms
+strata batch: overlapped read of 1217 tokens in 842 ms (drain 22.0 ms); the slots decoded 229 rows meanwhile, D_ref 279.6 rows/s, lost 44 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.015 ms avg over 84 windows, ple hit n/a
+strata batch: slot 1 takes 1224 tokens (copied in 8.1 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 925 ms (1323.9 tok/s), 1 generated in 12 ms (86.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1220 tokens in 835 ms (drain 21.5 ms); the slots decoded 231 rows meanwhile, D_ref 279.6 rows/s, lost 30 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.015 ms avg over 84 windows, ple hit n/a
+strata batch: slot 5 takes 1227 tokens (copied in 8.1 ms)
+strata serve: prompt 1227 tokens = 0 reused + 1227 read in 899 ms (1365.2 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1219 tokens in 836 ms (drain 18.2 ms); the slots decoded 232 rows meanwhile, D_ref 279.6 rows/s, lost 24 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.015 ms avg over 83 windows, ple hit n/a
+strata batch: slot 3 takes 1226 tokens (copied in 60.5 ms)
+strata serve: prompt 1226 tokens = 0 reused + 1226 read in 896 ms (1368.1 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1223 tokens in 837 ms (drain 19.9 ms); the slots decoded 228 rows meanwhile, D_ref 279.6 rows/s, lost 42 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.016 ms avg over 79 windows, ple hit n/a
+strata batch: slot 9 takes 1230 tokens (copied in 8.0 ms)
+strata serve: prompt 1230 tokens = 0 reused + 1230 read in 899 ms (1367.4 tok/s), 1 generated in 11 ms (87.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1216 tokens in 839 ms (drain 21.6 ms); the slots decoded 229 rows meanwhile, D_ref 279.6 rows/s, lost 41 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.016 ms avg over 78 windows, ple hit n/a
+strata batch: slot 13 takes 1223 tokens (copied in 7.9 ms)
+strata serve: prompt 1223 tokens = 0 reused + 1223 read in 902 ms (1355.2 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1218 tokens in 854 ms (drain 19.9 ms); the slots decoded 241 rows meanwhile, D_ref 279.6 rows/s, lost 11 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.017 ms avg over 81 windows, ple hit n/a
+strata batch: slot 2 takes 1225 tokens (copied in 7.9 ms)
+strata serve: prompt 1225 tokens = 0 reused + 1225 read in 916 ms (1337.8 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1217 tokens in 847 ms (drain 22.3 ms); the slots decoded 246 rows meanwhile, D_ref 279.6 rows/s, lost -11 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.016 ms avg over 82 windows, ple hit n/a
+strata batch: slot 0 takes 1224 tokens (copied in 7.9 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 911 ms (1342.9 tok/s), 1 generated in 11 ms (87.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1217 tokens in 825 ms (drain 22.5 ms); the slots decoded 240 rows meanwhile, D_ref 279.6 rows/s, lost -11 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.059 ms avg over 80 windows, ple hit n/a
+strata batch: slot 6 takes 1224 tokens (copied in 8.0 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 890 ms (1376.0 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1217 tokens in 831 ms (drain 21.3 ms); the slots decoded 239 rows meanwhile, D_ref 279.6 rows/s, lost -2 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.017 ms avg over 79 windows, ple hit n/a
+strata batch: slot 7 takes 1224 tokens (copied in 61.2 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 895 ms (1368.1 tok/s), 1 generated in 11 ms (87.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1216 tokens in 827 ms (drain 23.6 ms); the slots decoded 233 rows meanwhile, D_ref 279.6 rows/s, lost 17 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.017 ms avg over 76 windows, ple hit n/a
+strata batch: slot 4 takes 1223 tokens (copied in 7.9 ms)
+strata serve: prompt 1223 tokens = 0 reused + 1223 read in 893 ms (1369.9 tok/s), 1 generated in 11 ms (87.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1220 tokens in 831 ms (drain 21.1 ms); the slots decoded 237 rows meanwhile, D_ref 279.6 rows/s, lost 5 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.017 ms avg over 77 windows, ple hit n/a
+strata batch: slot 10 takes 1227 tokens (copied in 7.9 ms)
+strata serve: prompt 1227 tokens = 0 reused + 1227 read in 895 ms (1371.3 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1219 tokens in 848 ms (drain 20.5 ms); the slots decoded 237 rows meanwhile, D_ref 279.6 rows/s, lost 20 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.017 ms avg over 76 windows, ple hit n/a
+strata batch: slot 8 takes 1226 tokens (copied in 8.2 ms)
+strata serve: prompt 1226 tokens = 0 reused + 1226 read in 910 ms (1347.0 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1216 tokens in 842 ms (drain 21.8 ms); the slots decoded 247 rows meanwhile, D_ref 279.6 rows/s, lost -19 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.017 ms avg over 78 windows, ple hit n/a
+strata batch: slot 12 takes 1223 tokens (copied in 8.1 ms)
+strata serve: prompt 1223 tokens = 0 reused + 1223 read in 907 ms (1348.3 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1217 tokens in 834 ms (drain 20.9 ms); the slots decoded 173 rows meanwhile, D_ref 335.5 rows/s, lost 339 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.012 ms avg over 87 windows, ple hit n/a
+strata batch: slot 1 takes 1224 tokens (copied in 8.3 ms)
+strata serve: prompt 1224 tokens = 0 reused + 1224 read in 897 ms (1364.9 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1220 tokens in 825 ms (drain 19.5 ms); the slots decoded 172 rows meanwhile, D_ref 335.5 rows/s, lost 332 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.012 ms avg over 87 windows, ple hit n/a
+strata batch: slot 5 takes 1227 tokens (copied in 8.1 ms)
+strata serve: prompt 1227 tokens = 0 reused + 1227 read in 886 ms (1384.2 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 1223 tokens in 826 ms (drain 20.1 ms); the slots decoded 170 rows meanwhile, D_ref 335.5 rows/s, lost 339 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.011 ms avg over 87 windows, ple hit n/a
+strata batch: slot 0 takes 1230 tokens (copied in 7.9 ms)
+strata serve: prompt 1230 tokens = 0 reused + 1230 read in 888 ms (1384.8 tok/s), 1 generated in 11 ms (87.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch (pipelined, 4 groups of 4): 3781 group-steps, 8159 rows in 35483 ms = 229.9 rows/s (admissions included)
+strata serve: prompt 4779 tokens = 0 reused + 4779 read in 1820 ms (2626.4 tok/s), 128 generated in 1035 ms (123.7 tok/s), drafts accepted 71 of 115, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: prompt 4778 tokens = 0 reused + 4778 read in 1821 ms (2623.7 tok/s), 1 generated in 13 ms (76.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: slot 0 takes 4779 tokens (copied in 8.0 ms)
+strata serve: prompt 4779 tokens = 4778 reused + 1 read in 0 ms (71372.5 tok/s), 1 generated in 12 ms (85.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4772 tokens in 1540 ms (drain 1.4 ms); the slots decoded 75 rows meanwhile, D_ref 335.5 rows/s, lost 1318 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 75 windows, ple hit n/a
+strata batch: slot 4 takes 4779 tokens (copied in 8.0 ms)
+strata serve: prompt 4779 tokens = 0 reused + 4779 read in 1584 ms (3017.4 tok/s), 1 generated in 12 ms (84.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4770 tokens in 1645 ms (drain 4.0 ms); the slots decoded 130 rows meanwhile, D_ref 335.5 rows/s, lost 1262 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 130 windows, ple hit n/a
+strata batch: slot 8 takes 4777 tokens (copied in 8.2 ms)
+strata serve: prompt 4777 tokens = 0 reused + 4777 read in 1692 ms (2823.5 tok/s), 1 generated in 12 ms (84.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4771 tokens in 1642 ms (drain 6.0 ms); the slots decoded 128 rows meanwhile, D_ref 335.5 rows/s, lost 1266 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 128 windows, ple hit n/a
+strata batch: slot 0 takes 4778 tokens (copied in 8.0 ms)
+strata serve: prompt 4778 tokens = 0 reused + 4778 read in 1690 ms (2827.1 tok/s), 1 generated in 12 ms (81.8 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4773 tokens in 1652 ms (drain 8.3 ms); the slots decoded 123 rows meanwhile, D_ref 335.5 rows/s, lost 1293 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 123 windows, ple hit n/a
+strata batch: slot 4 takes 4780 tokens (copied in 8.0 ms)
+strata serve: prompt 4780 tokens = 0 reused + 4780 read in 1703 ms (2807.4 tok/s), 1 generated in 12 ms (84.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4776 tokens in 1637 ms (drain 11.7 ms); the slots decoded 129 rows meanwhile, D_ref 335.5 rows/s, lost 1265 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 129 windows, ple hit n/a
+strata batch: slot 8 takes 4783 tokens (copied in 8.2 ms)
+strata serve: prompt 4783 tokens = 0 reused + 4783 read in 1692 ms (2827.3 tok/s), 1 generated in 12 ms (84.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4774 tokens in 1623 ms (drain 2.0 ms); the slots decoded 124 rows meanwhile, D_ref 335.5 rows/s, lost 1255 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 124 windows, ple hit n/a
+strata batch: slot 0 takes 4781 tokens (copied in 8.0 ms)
+strata serve: prompt 4781 tokens = 0 reused + 4781 read in 1667 ms (2867.6 tok/s), 1 generated in 12 ms (84.5 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4769 tokens in 1635 ms (drain 8.7 ms); the slots decoded 125 rows meanwhile, D_ref 335.5 rows/s, lost 1271 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 125 windows, ple hit n/a
+strata batch: slot 4 takes 4776 tokens (copied in 7.9 ms)
+strata serve: prompt 4776 tokens = 0 reused + 4776 read in 1686 ms (2832.7 tok/s), 1 generated in 12 ms (84.4 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4770 tokens in 1636 ms (drain 10.7 ms); the slots decoded 125 rows meanwhile, D_ref 335.5 rows/s, lost 1274 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 125 windows, ple hit n/a
+strata batch: slot 8 takes 4777 tokens (copied in 8.2 ms)
+strata serve: prompt 4777 tokens = 0 reused + 4777 read in 1689 ms (2827.8 tok/s), 1 generated in 12 ms (84.7 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4773 tokens in 1617 ms (drain 11.8 ms); the slots decoded 127 rows meanwhile, D_ref 335.5 rows/s, lost 1250 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 127 windows, ple hit n/a
+strata batch: slot 0 takes 4780 tokens (copied in 8.0 ms)
+strata serve: prompt 4780 tokens = 0 reused + 4780 read in 1671 ms (2860.0 tok/s), 1 generated in 12 ms (84.4 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4770 tokens in 1650 ms (drain 8.8 ms); the slots decoded 127 rows meanwhile, D_ref 335.5 rows/s, lost 1280 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 127 windows, ple hit n/a
+strata batch: slot 4 takes 4777 tokens (copied in 8.0 ms)
+strata serve: prompt 4777 tokens = 0 reused + 4777 read in 1702 ms (2807.3 tok/s), 1 generated in 12 ms (84.5 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4772 tokens in 1653 ms (drain 10.9 ms); the slots decoded 128 rows meanwhile, D_ref 335.5 rows/s, lost 1282 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 128 windows, ple hit n/a
+strata batch: slot 8 takes 4779 tokens (copied in 8.2 ms)
+strata serve: prompt 4779 tokens = 0 reused + 4779 read in 1706 ms (2801.4 tok/s), 1 generated in 12 ms (84.7 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4769 tokens in 1623 ms (drain 10.2 ms); the slots decoded 124 rows meanwhile, D_ref 335.5 rows/s, lost 1263 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 124 windows, ple hit n/a
+strata batch: slot 0 takes 4776 tokens (copied in 8.0 ms)
+strata serve: prompt 4776 tokens = 0 reused + 4776 read in 1675 ms (2850.7 tok/s), 1 generated in 12 ms (84.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4770 tokens in 1644 ms (drain 8.8 ms); the slots decoded 127 rows meanwhile, D_ref 335.5 rows/s, lost 1274 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 127 windows, ple hit n/a
+strata batch: slot 4 takes 4777 tokens (copied in 8.0 ms)
+strata serve: prompt 4777 tokens = 0 reused + 4777 read in 1695 ms (2818.3 tok/s), 1 generated in 12 ms (84.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4770 tokens in 1631 ms (drain 4.2 ms); the slots decoded 125 rows meanwhile, D_ref 335.5 rows/s, lost 1263 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 125 windows, ple hit n/a
+strata batch: slot 8 takes 4777 tokens (copied in 8.2 ms)
+strata serve: prompt 4777 tokens = 0 reused + 4777 read in 1678 ms (2846.7 tok/s), 1 generated in 12 ms (84.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch: overlapped read of 4769 tokens in 1645 ms (drain 5.7 ms); the slots decoded 127 rows meanwhile, D_ref 335.5 rows/s, lost 1272 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.006 ms avg over 127 windows, ple hit n/a
+strata batch: slot 0 takes 4776 tokens (copied in 8.0 ms)
+strata serve: prompt 4776 tokens = 0 reused + 4776 read in 1693 ms (2820.3 tok/s), 1 generated in 12 ms (84.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata batch (pipelined, 4 groups of 4): 1951 group-steps, 1951 rows in 26278 ms = 74.2 rows/s (admissions included)
+strata batch: slot 0 gave back 4823 tokens of this conversation (all it holds) in 0.7 ms
+strata serve: prompt 4824 tokens = 4823 reused + 1 read in 1 ms (1429.1 tok/s), 80 generated in 628 ms (127.4 tok/s), drafts accepted 48 of 71, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads

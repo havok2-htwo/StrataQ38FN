@@ -1,0 +1,13 @@
+Review fix for lever 3: mmq::whole_tiles was evaluated twice per MoE layer per prefill chunk on the host path.
+Now MmqPlan::group_sort (prefill.cpp, built once with mmq_plan()) holds the verdict per MMQ layer, computed only when
+STRATA_MMQ_GROUP_SORT=1 and STRATA_MMQ_RESIDENT_SORT_NE unset; the sort hook reads the flag. Engine log (switch on):
+"strata: prompt MMQ sorts the full expert groups (STRATA_MMQ_GROUP_SORT=1): 48 of 48 layers". Switch off: nothing new runs.
+Session 2026-10-12 04:02-04:07, 4x RTX 3090, T16-142fcb, run.sh arms (run1.log).
+Gates:
+  R dumps d_ref (142fc) vs d_gs (142lv + GROUP_SORT=1): rall (2965 rows BF16) + r64 fp32 byte-identical, tokens identical
+    (cmp.txt; .rall deleted after comparing); d_gs.r64 also byte-identical to the previous build's ../d_gs.r64
+  batch_test16 (142lv + GROUP_SORT=1 + config env): 16/16 IDENTICAL, bt16-gs.json byte-identical to auxcheck/bt16-fcb.json
+  prefill_mmq_tab_test: 890 comparisons, 0 failed
+Read times (pf_reads.py, idle, median of 6, back to back):
+  t_ref (142fc)                 150: 152.4 ms  1200: 435.4 ms
+  t_gs  (142lv + GROUP_SORT=1)  150: 135.3 ms  1200: 360.7 ms   (previous build's t_gs: 136.2 / 363.4)

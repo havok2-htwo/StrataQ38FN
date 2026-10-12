@@ -1,0 +1,31 @@
+    1   2/2       9.3    110.6    118.9   113.7      0.32      0.33      0.33      4.6      4.8
+   16  32/32     36.9    443.6     30.7    27.9      1.73      5.23      5.81     18.4     21.8
+   24  48/48     58.8    418.3     31.1    29.0      2.52     21.38     37.90     18.4     37.7
+    1   2/2       9.6    107.0    126.0   125.4      0.73      0.73      0.73      4.8      4.8
+   16  32/32     50.1    327.0     24.0    21.1      4.15     11.00     12.18     25.0     32.1
+strata generate: experts via mmap (--mmap-experts; the GGUF shards in place, no experts.bin)
+strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): 48 of 48 layers
+strata generate: +256 B guard per sized slot (STRATA_MMQ_DIRECT)
+prompt 1231 tokens = 0 reused + 1231 read in 956 ms
+prompt 1230 tokens = 0 reused + 1230 read in 720 ms
+prompt 1229 tokens = 0 reused + 1229 read in 708 ms
+prompt 1233 tokens = 0 reused + 1233 read in 675 ms
+    1   2/2       9.8    104.0    126.5   124.8      0.88      0.90      0.91      4.9      5.0
+   16  32/32     55.4    295.5     22.1    19.2      4.30     13.40     14.85     27.7     36.4
+# strata-X16-agent-mmqtab-mt-u16: 16 users x 5 turns, doc 8000 + 3000/turn, 400 out
+turn  prompt  cached  TTFT p50  TTFT p95  dec p50
+   1   11131       0     47.27     91.22      5.1
+   2   15611   11223      7.55     23.70      5.8
+   3   20057   15686      4.57     11.92      5.9
+   4   24465   20113      3.68      9.97      7.5
+   5   28873   24597      3.74      7.80     13.0
+wall 308s, output 22320 tok = 72.4 tok/s, prompt tokens sent 1602237, follow-up TTFT p50 4.57 s
+# strata-X16-agent-direct-mt-u16: 16 users x 5 turns, doc 8000 + 3000/turn, 400 out
+turn  prompt  cached  TTFT p50  TTFT p95  dec p50
+   1   11131       0     51.23     96.43      3.9
+   2   15538   11186      5.38     13.50      5.1
+   3   19952   15618      7.76     15.80      5.9
+   4   24342   19999      4.88     18.69      8.0
+   5   28730   24465      5.02     11.19     11.5
+wall 319s, output 19656 tok = 61.6 tok/s, prompt tokens sent 1595148, follow-up TTFT p50 5.05 s
+SERIES MMQTAB DONE

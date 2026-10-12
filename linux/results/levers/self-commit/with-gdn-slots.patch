@@ -1,0 +1,423 @@
+diff --git a/include/strata/kernels/verify_kernels.hpp b/include/strata/kernels/verify_kernels.hpp
+index 777f12f8..daeaf98a 100644
+--- a/include/strata/kernels/verify_kernels.hpp
++++ b/include/strata/kernels/verify_kernels.hpp
+@@ -38,6 +38,17 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const
+                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+ /// (xq_out, S26 STRATA_QFUSE: also write the q8_1 image of output rows [t_out_begin, n_tok) there - the bytes
+ /// native_quantize_q8_1(y + t_out_begin * value_dim, xq_out, value_dim, n_tok - t_out_begin) would write.)
++/// A batch window whose rows are each another sequence's one token: row r's GDN layer state (or conv history).
++struct GdnSlotStates { float* p[kVerifyMaxT]; };
++/// gdn_conv_l2_multi for n_rows such rows in one launch: row r is one token over history.p[r] (qkv and h row r),
++/// with `commit` that history keeps it.  Bitwise the per-row calls.
++void gdn_conv_l2_slots(const GdnSlotStates& history, const float* qkv, const float* conv_w, float* h, int channels,
++                       int qk_heads, float eps, int n_rows, void* stream, bool commit);
++/// gdn_step_norm_multi for n_rows such rows in one launch: row r is one token over state.p[r] (h, gate, beta, z and
++/// y row r); with n_keep (*n_keep = 1) each state is written.  Bitwise the per-row calls.
++void gdn_step_norm_slots(const GdnSlotStates& state, const float* h, int conv_channels, const float* gate,
++                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
++                         int n_rows, const int32_t* n_keep, void* stream);
+ /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
+ /// outstanding at once (the split verify window keeps two).
+ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index dadb47bb..4d2669e3 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -163,6 +163,24 @@ const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
+ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
+ const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
+ const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
++// STRATA_BATCH_SELF_COMMIT=1 (opt-in): a batch window whose rows are each another slot's one token keeps them itself,
++// as a one-token window does (record_window): the GDN conv histories and states advance inside the window graph, and
++// no commit graph runs after it.  Such a window's commit is unconditional (each slot keeps its one row), and the rest
++// of the commit graph only repeats what the window wrote: the indexer tails are put back and appended again from the
++// same rows, the PLE histories are put back to the window's own snapshot.
++const bool g_batch_self_commit = env_on("STRATA_BATCH_SELF_COMMIT");
++// STRATA_GDN_SLOTS=1 (opt-in): such a window runs each GDN layer's conv and recurrence as one launch over its rows
++// (gdn_conv_l2_slots, gdn_step_norm_slots) instead of one launch per row; every row's arithmetic is the same
++const bool g_gdn_slots = env_on("STRATA_GDN_SLOTS");
++
++// every row of a batch window is another slot's (no slot has proposal rows)
++bool one_row_per_slot(const int* rows, int S) {
++    for (int i = 0; i < S; ++i)
++        for (int j = i + 1; j < S; ++j)
++            if (rows[i] == rows[j]) return false;
++    return S >= 1;
++}
++bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && one_row_per_slot(rows, S); }
+ 
+ // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
+ // overlap pays off on CUDA, where it was added (cfd3b72).  On HIP a cross-stream event dependency costs more than the
+@@ -823,6 +841,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+     // a batch window: row t is slot t, whose state lives in its own session
+     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
+     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
++    // STRATA_BATCH_SELF_COMMIT: the window keeps its rows (no commit graph, nothing to snapshot for one)
++    const bool keep_rows = batch_rec_ && batch_self_commits(brow_, T);
++    const bool gdn_slots = batch_rec_ && g_gdn_slots && one_row_per_slot(brow_, T);   // STRATA_GDN_SLOTS
+ 
+     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
+     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
+@@ -988,7 +1009,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     err = std::string("verify PLE: ") + e.what();
+                     return false;
+                 }
+-                copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
++                if (!keep_rows) copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
+             }
+             pending = false;
+         }
+@@ -1063,6 +1084,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 }
+                 mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                 stamp(l, 2, grp);
++                if (gdn_slots) {   // one launch over the rows, each over its own slot's history
++                    GdnSlotStates hs{};
++                    for (int t = tb; t < te; ++t) {
++                        SessionState& sx = slot_ss(t);
++                        hs.p[t - tb] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
++                                       (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
++                    }
++                    gdn_conv_l2_slots(hs, qkv + (size_t) tb * C, (const float*) wc->data, hb + (size_t) tb * C, (int) C,
++                                      (int) (2 * HK), EPS, n, cs, keep_rows);
++                } else
+                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
+                     for (int t = tb; t < te;) {
+                         const int first = t;
+@@ -1071,7 +1102,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                         const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
+                                           (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                         gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
+-                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0);
++                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0,
++                                          keep_rows);
+                     }
+                 } else
+                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)
+@@ -1090,6 +1122,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 stamp(l, 5, grp);
+                 }
+                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
++                if (gdn_slots && std::getenv("STRATA_GDN_SLOTS")[0] != '2') {   // one launch over the rows, each over its own slot's state
++                    GdnSlotStates ps{};
++                    for (int t = tb; t < te; ++t) {
++                        SessionState& sx = slot_ss(t);
++                        ps.p[t - tb] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
++                    }
++                    gdn_step_norm_slots(ps, hb + (size_t) tb * C, (int) C, gate + (size_t) tb * HV, beta + (size_t) tb * HV,
++                                        z_ + (size_t) tb * ZV, (const float*) wnm->data, EPS, y_ + (size_t) tb * ZV,
++                                        (int) HK, (int) HV, n, keep_rows ? one_ : nullptr, cs);
++                } else
+                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
+                     for (int t = tb; t < te;) {
+                         const int first = t;
+@@ -1099,7 +1141,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                         gdn_step_norm_multi(stx, hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
+                                             beta + (size_t) first * HV, z_ + (size_t) first * ZV,
+                                             (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
+-                                            (int) HK, (int) HV, t - first, nullptr, cs, 0);
++                                            (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0);
+                     }
+                 } else
+                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+@@ -1184,7 +1226,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 }
+                 stamp(l, 8, grp);
+                 if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
+-                    for (int t = tb; t < te; ++t)
++                    for (int t = tb; t < te && !keep_rows; ++t)
+                         if (t == tb || brow_[t] != brow_[t - 1])
+                             copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
+                                              slot_ss(t).qsa_states[qi].idx_tail, TS, cs);
+@@ -2416,8 +2458,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string&
+     tail_snap_b_ = (float*) ((uint8_t*) d + a);
+     slots_ = slots;
+     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
+-    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
+-                 (long long) lb_, (long long) le_);
++    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s%s\n", (long long) S,
++                 (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "",
++                 g_gdn_slots ? ", GDN rows in one launch" : "");
+     return true;
+ }
+ 
+@@ -2454,6 +2497,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
+ }
+ 
+ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
++    if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
+     cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
+     if (cex != nullptr) return true;
+     using namespace strata::kernels;
+@@ -2821,10 +2865,12 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
+             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
+     }
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+-    const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
+-    if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+-    const cudaError_t se = cudaStreamSynchronize(cs_);
+-    if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
++    if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
++        const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
++        if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
++        const cudaError_t se = cudaStreamSynchronize(cs_);
++        if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
++    }
+     if (ple_stage())
+         for (int t = 0; t < S;) {
+             const int first = t;
+@@ -2864,6 +2910,8 @@ bool Verifier::has_batch_layout(int base, int S) const {
+ bool Verifier::layout_captured(const std::vector<int>& key) const {
+     const auto e = exec_bm_.find(key);   // (find: a failed capture leaves a null entry)
+     const auto c = commit_bm_.find(key);
++    if (key.size() >= 3 && batch_self_commits(key.data() + 1, (int) key.size() - 2))   // [hbase, rows.., ar_off_]
++        return e != exec_bm_.end() && e->second != nullptr;   // the window keeps its rows: no commit graph
+     return e != exec_bm_.end() && e->second != nullptr && c != commit_bm_.end() && c->second != nullptr;
+ }
+ 
+@@ -2901,7 +2949,7 @@ bool Verifier::ensure_batch_layouts(int GS, int groups, int& captured, std::stri
+             return false;
+         bm_used_[key] = ++bm_tick_;
+         if (!capture_batch(rows, S, base, err) || !capture_commit_batch(rows, S, base, err)) return false;
+-        cudaGraphUpload(commit_bm_[key], cs_);
++        if (!batch_self_commits(rows, S)) cudaGraphUpload(commit_bm_[key], cs_);
+         ++captured;
+     }
+     if (captured > 0 && cudaStreamSynchronize(cs_) != cudaSuccess) {
+@@ -2924,7 +2972,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
+     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
+-    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
++    if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
++        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+diff --git a/src/kernels/cuda/verify_kernels.cu b/src/kernels/cuda/verify_kernels.cu
+index 6642f074..ccec5b46 100644
+--- a/src/kernels/cuda/verify_kernels.cu
++++ b/src/kernels/cuda/verify_kernels.cu
+@@ -32,12 +32,20 @@ void check(const char* what) {
+     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+ }
+ 
+-// `commit` (one token): the history then keeps it - [hist1, hist2, x_0], each thread its channel's, after reading them
++// `commit` (one token): the history then keeps it - [hist1, hist2, x_0], each thread its channel's, after reading them.
++// SLOTS: row y of the launch is another sequence's one token (its history slots.p[y], its rows of qkv and h at y)
++template <bool SLOTS>
+ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(float* hist, const float* __restrict__ qkv,
+                                                               const float* __restrict__ w, float* __restrict__ h,
+-                                                              int C, int qk_heads, float eps, int t_begin, bool commit) {
++                                                              int C, int qk_heads, float eps, int t_begin, bool commit,
++                                                              GdnSlotStates slots) {
+     __shared__ float part[S / 32];
+-    const int t = t_begin + blockIdx.y;
++    if constexpr (SLOTS) {
++        hist = slots.p[blockIdx.y];
++        qkv += (size_t) blockIdx.y * C;
++        h += (size_t) blockIdx.y * C;
++    }
++    const int t = SLOTS ? 0 : t_begin + blockIdx.y;
+     const int c = blockIdx.x * S + threadIdx.x;
+     // the window of token t: [hist0, hist1, hist2, x_0, ..., x_t], its last four entries
+     float win[3];
+@@ -203,7 +211,8 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
+     if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
+ }
+ 
+-template <bool ALL_OUT, bool Q>
++// SLOTS: block row y is another sequence's one token (T = 1): its state slots.p[y], its rows of h, gate, beta, z, y
++template <bool ALL_OUT, bool Q, bool SLOTS = false>
+ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
+                                                                      const float* __restrict__ hbuf, int C,
+                                                                      const float* __restrict__ gate,
+@@ -212,7 +221,16 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
+                                                                      const float* __restrict__ gamma, float eps,
+                                                                      float* __restrict__ y, int h_k, int h_v, int T,
+                                                                      const int32_t* __restrict__ n_keep, int t_out_begin,
+-                                                                     GdnQ81* __restrict__ xq) {
++                                                                     GdnQ81* __restrict__ xq, GdnSlotStates slots) {
++    if constexpr (SLOTS) {
++        const int r = blockIdx.y;
++        state = slots.p[r];
++        hbuf += (size_t) r * C;
++        gate += (size_t) r * h_v;
++        beta += (size_t) r * h_v;
++        z += (size_t) r * S * h_v;
++        y += (size_t) r * S * h_v;
++    }
+     __shared__ float sk[2][S], sq[2][S];
+     __shared__ float red_kv[RG][S];
+     __shared__ float red_o[RG][S];
+@@ -878,8 +896,8 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
+         std::fprintf(stderr, "gdn_conv_l2_multi: invalid arguments\n");
+         std::exit(1);
+     }
+-    gdn_conv_l2_multi_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
+-        const_cast<float*>(history), qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit);
++    gdn_conv_l2_multi_kernel<false><<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
++        const_cast<float*>(history), qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, GdnSlotStates{});
+     check("gdn_conv_l2_multi");
+ }
+ 
+@@ -953,19 +971,48 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const
+     const bool all_out = n_keep == nullptr && t_out_begin <= 0;
+     if (xq && t_out_begin < n_tok) {
+         if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
++            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq, GdnSlotStates{});
+         else gdn_step_norm_multi_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq);
++            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq, GdnSlotStates{});
+     } else if (all_out) {
+         gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, nullptr);
++            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, nullptr, GdnSlotStates{});
+     } else {
+         gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, nullptr);
++            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, nullptr, GdnSlotStates{});
+     }
+     check("gdn_step_norm_multi");
+ }
+ 
++void gdn_conv_l2_slots(const GdnSlotStates& history, const float* qkv, const float* conv_w, float* h, int channels,
++                       int qk_heads, float eps, int n_rows, void* stream, bool commit) {
++    if (!qkv || !conv_w || !h || channels % S != 0 || n_rows < 1 || n_rows > kVerifyMaxT) {
++        std::fprintf(stderr, "gdn_conv_l2_slots: invalid arguments\n");
++        std::exit(1);
++    }
++    gdn_conv_l2_multi_kernel<true><<<dim3((unsigned) (channels / S), (unsigned) n_rows), S, 0, (cudaStream_t) stream>>>(
++        nullptr, qkv, conv_w, h, channels, qk_heads, eps, 0, commit, history);
++    check("gdn_conv_l2_slots");
++}
++
++void gdn_step_norm_slots(const GdnSlotStates& state, const float* h, int conv_channels, const float* gate,
++                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
++                         int n_rows, const int32_t* n_keep, void* stream) {
++    if (!h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_rows < 1 || n_rows > kVerifyMaxT) {
++        std::fprintf(stderr, "gdn_step_norm_slots: invalid arguments\n");
++        std::exit(1);
++    }
++    // the kernels gdn_step_norm_multi runs for one token: all outputs (verify), or with n_keep (= 1) the state kept too
++    const dim3 g1((unsigned) h_v, (unsigned) n_rows), b1(S, RG);
++    if (n_keep == nullptr)
++        gdn_step_norm_multi_kernel<true, false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
++            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 1, nullptr, 0, nullptr, state);
++    else
++        gdn_step_norm_multi_kernel<false, false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
++            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 1, n_keep, 0, nullptr, state);
++    check("gdn_step_norm_slots");
++}
++
+ namespace {
+ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+     while (*flag < value) strata_spin_pause();
+diff --git a/src/kernels/gdn_parity.cpp b/src/kernels/gdn_parity.cpp
+index 7e0b1d00..0078ba10 100644
+--- a/src/kernels/gdn_parity.cpp
++++ b/src/kernels/gdn_parity.cpp
+@@ -520,6 +520,101 @@ int main(int argc, char** argv) {
+         bad += ab_bad + sn_bad;
+     }
+ 
++    // ================= 6. a batch window's rows as one launch: gdn_conv_l2_slots / gdn_step_norm_slots =================
++    // Each row is another sequence's one token with its own state; the one launch over the rows must be bitwise the
++    // per-row calls (record_window's batch path), the verify form and the form that keeps the token (n_keep = 1).
++    {
++        const int qk = S * h_k, C = 2 * qk + S * h_v, vd = S * h_v, n_st = S * h_v * S;
++        const float eps = 1e-6f;
++        auto dev = [&](size_t bytes) {
++            void* p = nullptr;
++            check(cudaMalloc(&p, bytes), "m6");
++            return p;
++        };
++        auto up = [&](const std::vector<float>& h) {
++            void* p = dev(h.size() * 4);
++            check(cudaMemcpy(p, h.data(), h.size() * 4, cudaMemcpyHostToDevice), "u6");
++            return (float*) p;
++        };
++        auto down = [&](const float* d, size_t n) {
++            std::vector<float> h(n);
++            check(cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost), "d6");
++            return h;
++        };
++        auto same = [&](const float* a, const float* b, size_t n) {
++            const std::vector<float> x = down(a, n), y = down(b, n);
++            return std::memcmp(x.data(), y.data(), n * 4) == 0;
++        };
++        std::vector<float> wc((size_t) C * 4), gm((size_t) S);
++        for (auto& v : wc) v = gauss(rng) * 0.5f;
++        for (auto& v : gm) v = 1.0f + 0.1f * gauss(rng);
++        float* d_wc = up(wc);
++        float* d_gm = up(gm);
++        int32_t* d_one = (int32_t*) dev(4);
++        const int32_t one = 1;
++        check(cudaMemcpy(d_one, &one, 4, cudaMemcpyHostToDevice), "one");
++        int cv_bad = 0, st_bad = 0, n_cases = 0;
++        for (int R = 1; R <= strata::kernels::kVerifyMaxT; ++R) {
++            std::vector<float> qkv((size_t) R * C), hist((size_t) R * C * 3), st((size_t) R * n_st), gate((size_t) R * h_v),
++                beta((size_t) R * h_v), z((size_t) R * vd);
++            for (auto& v : qkv) v = gauss(rng);
++            for (auto& v : hist) v = gauss(rng);
++            for (auto& v : st) v = gauss(rng) * 0.1f;
++            for (auto& v : gate) v = -(0.5f + 3.0f * (float) (rng() % 100) / 100.0f);
++            for (auto& v : beta) v = (float) (rng() % 100) / 100.0f;
++            for (auto& v : z) v = gauss(rng);
++            float* d_qkv = up(qkv);
++            float* d_gate = up(gate);
++            float* d_beta = up(beta);
++            float* d_z = up(z);
++            for (int keep = 0; keep < 2; ++keep) {
++                ++n_cases;
++                // the conv: one launch over R histories against R per-row calls
++                float* d_h1 = (float*) dev((size_t) R * C * 4);
++                float* d_h2 = (float*) dev((size_t) R * C * 4);
++                float* d_hist1 = up(hist);
++                float* d_hist2 = up(hist);
++                strata::kernels::GdnSlotStates hs{};
++                for (int r = 0; r < R; ++r) hs.p[r] = d_hist1 + (size_t) r * C * 3;
++                strata::kernels::gdn_conv_l2_slots(hs, d_qkv, d_wc, d_h1, C, 2 * h_k, eps, R, nullptr, keep != 0);
++                for (int r = 0; r < R; ++r)
++                    strata::kernels::gdn_conv_l2_multi(d_hist2 + (size_t) r * C * 3, d_qkv + (size_t) r * C, d_wc,
++                                                       d_h2 + (size_t) r * C, C, 2 * h_k, eps, 1, nullptr, 0, keep != 0);
++                if (!same(d_h1, d_h2, (size_t) R * C) || !same(d_hist1, d_hist2, (size_t) R * C * 3)) {
++                    std::printf("    *** gdn_conv_l2_slots R=%d%s differs from the per-row calls ***\n", R, keep ? " (commit)" : "");
++                    ++cv_bad;
++                }
++                // the recurrence, its inputs the conv's rows
++                float* d_st1 = up(st);
++                float* d_st2 = up(st);
++                float* d_y1 = (float*) dev((size_t) R * vd * 4);
++                float* d_y2 = (float*) dev((size_t) R * vd * 4);
++                strata::kernels::GdnSlotStates ss{};
++                for (int r = 0; r < R; ++r) ss.p[r] = d_st1 + (size_t) r * n_st;
++                strata::kernels::gdn_step_norm_slots(ss, d_h2, C, d_gate, d_beta, d_z, d_gm, eps, d_y1, h_k, h_v, R,
++                                                     keep ? d_one : nullptr, nullptr);
++                for (int r = 0; r < R; ++r)
++                    strata::kernels::gdn_step_norm_multi(d_st2 + (size_t) r * n_st, d_h2 + (size_t) r * C, C,
++                                                         d_gate + (size_t) r * h_v, d_beta + (size_t) r * h_v,
++                                                         d_z + (size_t) r * vd, d_gm, eps, d_y2 + (size_t) r * vd, h_k, h_v,
++                                                         1, keep ? d_one : nullptr, nullptr, 0);
++                const std::vector<float> st1 = down(d_st1, (size_t) R * n_st);
++                const bool st_moved = std::memcmp(st1.data(), st.data(), st.size() * 4) != 0;
++                if (!same(d_y1, d_y2, (size_t) R * vd) || !same(d_st1, d_st2, (size_t) R * n_st) || (keep != 0) != st_moved) {
++                    std::printf("    *** gdn_step_norm_slots R=%d%s differs from the per-row calls ***\n", R, keep ? " (commit)" : "");
++                    ++st_bad;
++                }
++                cudaFree(d_h1); cudaFree(d_h2); cudaFree(d_hist1); cudaFree(d_hist2);
++                cudaFree(d_st1); cudaFree(d_st2); cudaFree(d_y1); cudaFree(d_y2);
++            }
++            cudaFree(d_qkv); cudaFree(d_gate); cudaFree(d_beta); cudaFree(d_z);
++        }
++        cudaFree(d_wc); cudaFree(d_gm); cudaFree(d_one);
++        std::printf("  %-42s %s (%d cases)\n", "gdn_conv_l2_slots == per-row calls", cv_bad ? "*** NO ***" : "bitwise", n_cases);
++        std::printf("  %-42s %s (%d cases)\n", "gdn_step_norm_slots == per-row calls", st_bad ? "*** NO ***" : "bitwise", n_cases);
++        bad += cv_bad + st_bad;
++    }
++
+     std::printf("\ngdn: %d failures\n", bad);
+     if (bad) return 1;
+     if (selftest) std::printf("gdn_parity OK\n");

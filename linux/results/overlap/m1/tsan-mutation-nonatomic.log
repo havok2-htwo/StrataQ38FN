@@ -1,0 +1,132 @@
+==================
+WARNING: ThreadSanitizer: data race (pid=2667300)
+  Read of size 8 at 0x72c800000020 by thread T120:
+    #0 strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 (tsan_na+0x1c28f) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #1 strata::kernels::PleTable::gather_batch(unsigned int const*, unsigned long, float*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, bool) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:602 (tsan_na+0x1c28f)
+    #2 operator() src/ngram/ple_reader_test.cpp:309 (tsan_na+0xac9b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 __invoke_impl<void, (anonymous namespace)::concurrent_table(const std::string&)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (tsan_na+0xad8e) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #4 __invoke<(anonymous namespace)::concurrent_table(const std::string&)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (tsan_na+0xad8e)
+    #5 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (tsan_na+0xad8e)
+    #6 operator() /usr/include/c++/13/bits/std_thread.h:299 (tsan_na+0xad8e)
+    #7 _M_run /usr/include/c++/13/bits/std_thread.h:244 (tsan_na+0xad8e)
+    #8 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous write of size 8 at 0x72c800000020 by main thread:
+    #0 strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 (tsan_na+0x1c29b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #1 strata::kernels::PleTable::gather_batch(unsigned int const*, unsigned long, float*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, bool) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:602 (tsan_na+0x1c29b)
+    #2 concurrent_table src/ngram/ple_reader_test.cpp:322 (tsan_na+0xe12b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+  Location is heap block of size 88320 at 0x72c800000000 allocated by main thread:
+    #0 operator new(unsigned long) ../../../../src/libsanitizer/tsan/tsan_new_delete.cpp:64 (libtsan.so.2+0xa6fae) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 strata::kernels::PleTable::PleTable() /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:242 (tsan_na+0x19cf8) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #2 concurrent_table src/ngram/ple_reader_test.cpp:272 (tsan_na+0xcc83) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+  Thread T120 (tid=2667424, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 in strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=2667300)
+  Write of size 8 at 0x72c800000020 by thread T120:
+    #0 strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 (tsan_na+0x1c29b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #1 strata::kernels::PleTable::gather_batch(unsigned int const*, unsigned long, float*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, bool) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:602 (tsan_na+0x1c29b)
+    #2 operator() src/ngram/ple_reader_test.cpp:309 (tsan_na+0xac9b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 __invoke_impl<void, (anonymous namespace)::concurrent_table(const std::string&)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (tsan_na+0xad8e) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #4 __invoke<(anonymous namespace)::concurrent_table(const std::string&)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (tsan_na+0xad8e)
+    #5 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (tsan_na+0xad8e)
+    #6 operator() /usr/include/c++/13/bits/std_thread.h:299 (tsan_na+0xad8e)
+    #7 _M_run /usr/include/c++/13/bits/std_thread.h:244 (tsan_na+0xad8e)
+    #8 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous write of size 8 at 0x72c800000020 by main thread:
+    #0 strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 (tsan_na+0x1c29b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #1 strata::kernels::PleTable::gather_batch(unsigned int const*, unsigned long, float*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, bool) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:602 (tsan_na+0x1c29b)
+    #2 concurrent_table src/ngram/ple_reader_test.cpp:322 (tsan_na+0xe12b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+  Location is heap block of size 88320 at 0x72c800000000 allocated by main thread:
+    #0 operator new(unsigned long) ../../../../src/libsanitizer/tsan/tsan_new_delete.cpp:64 (libtsan.so.2+0xa6fae) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 strata::kernels::PleTable::PleTable() /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:242 (tsan_na+0x19cf8) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #2 concurrent_table src/ngram/ple_reader_test.cpp:272 (tsan_na+0xcc83) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+  Thread T120 (tid=2667424, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 in strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order)
+==================
+FAIL src/ngram/ple_reader_test.cpp:330: concurrent mmap: bytes_read 8714880, rows 96960 x 90
+==================
+WARNING: ThreadSanitizer: data race (pid=2667300)
+  Read of size 8 at 0x72c800000020 by thread T138:
+    #0 strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 (tsan_na+0x1c1a7) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #1 strata::kernels::PleTable::gather_batch(unsigned int const*, unsigned long, float*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, bool) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:595 (tsan_na+0x1c1a7)
+    #2 operator() src/ngram/ple_reader_test.cpp:309 (tsan_na+0xac9b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 __invoke_impl<void, (anonymous namespace)::concurrent_table(const std::string&)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (tsan_na+0xad8e) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #4 __invoke<(anonymous namespace)::concurrent_table(const std::string&)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (tsan_na+0xad8e)
+    #5 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (tsan_na+0xad8e)
+    #6 operator() /usr/include/c++/13/bits/std_thread.h:299 (tsan_na+0xad8e)
+    #7 _M_run /usr/include/c++/13/bits/std_thread.h:244 (tsan_na+0xad8e)
+    #8 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous write of size 8 at 0x72c800000020 by main thread:
+    #0 strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 (tsan_na+0x1c1b3) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #1 strata::kernels::PleTable::gather_batch(unsigned int const*, unsigned long, float*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, bool) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:595 (tsan_na+0x1c1b3)
+    #2 concurrent_table src/ngram/ple_reader_test.cpp:322 (tsan_na+0xe12b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+  Location is heap block of size 88320 at 0x72c800000000 allocated by main thread:
+    #0 operator new(unsigned long) ../../../../src/libsanitizer/tsan/tsan_new_delete.cpp:64 (libtsan.so.2+0xa6fae) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 strata::kernels::PleTable::PleTable() /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:242 (tsan_na+0x19cf8) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #2 concurrent_table src/ngram/ple_reader_test.cpp:272 (tsan_na+0xcc83) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+  Thread T138 (tid=2667443, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 in strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=2667300)
+  Write of size 8 at 0x72c800000020 by main thread:
+    #0 strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 (tsan_na+0x1c1b3) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #1 strata::kernels::PleTable::gather_batch(unsigned int const*, unsigned long, float*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, bool) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:595 (tsan_na+0x1c1b3)
+    #2 concurrent_table src/ngram/ple_reader_test.cpp:322 (tsan_na+0xe12b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+  Previous write of size 8 at 0x72c800000020 by thread T138:
+    #0 strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 (tsan_na+0x1c1b3) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #1 strata::kernels::PleTable::gather_batch(unsigned int const*, unsigned long, float*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, bool) /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:595 (tsan_na+0x1c1b3)
+    #2 operator() src/ngram/ple_reader_test.cpp:309 (tsan_na+0xac9b) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 __invoke_impl<void, (anonymous namespace)::concurrent_table(const std::string&)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (tsan_na+0xad8e) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #4 __invoke<(anonymous namespace)::concurrent_table(const std::string&)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (tsan_na+0xad8e)
+    #5 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (tsan_na+0xad8e)
+    #6 operator() /usr/include/c++/13/bits/std_thread.h:299 (tsan_na+0xad8e)
+    #7 _M_run /usr/include/c++/13/bits/std_thread.h:244 (tsan_na+0xad8e)
+    #8 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is heap block of size 88320 at 0x72c800000000 allocated by main thread:
+    #0 operator new(unsigned long) ../../../../src/libsanitizer/tsan/tsan_new_delete.cpp:64 (libtsan.so.2+0xa6fae) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 strata::kernels::PleTable::PleTable() /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:242 (tsan_na+0x19cf8) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #2 concurrent_table src/ngram/ple_reader_test.cpp:272 (tsan_na+0xcc83) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+    #3 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+  Thread T138 (tid=2667443, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 main src/ngram/ple_reader_test.cpp:667 (tsan_na+0x145f2) (BuildId: 49dcb54da8229f9a4866c33efd42996dd3b51511)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-1000/-home-administrator-G3-VLLM/ddcb6733-9ffb-4382-97c5-d4797ced160b/scratchpad/m1/mut/ngram.cpp:208 in strata::kernels::PleTable::Impl::NA::fetch_add(unsigned long, std::memory_order)
+==================
+FAIL src/ngram/ple_reader_test.cpp:330: concurrent direct, I/O worker, no cache: bytes_read 6808320, rows 75712 x 90
+ple formats, both readers vs their dequantizers: IQ4_NL Q5_0 F8_E4M3 Q5_1 Q8_0 Q4_0 BF16: OK
+ThreadSanitizer: reported 4 warnings

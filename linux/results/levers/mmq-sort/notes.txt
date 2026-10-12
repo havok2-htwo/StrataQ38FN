@@ -1,0 +1,14 @@
+Lever 3: MMQ group sort keeping the partial (stream-k) group. Commit faddbb2e (Strata-142, branch g3-142), binary
+engine/strata-g3-142lv, env STRATA_MMQ_GROUP_SORT=1. Session 2026-10-12 02:50-02:58, 4x RTX 3090, T16-142fcb.
+run.sh arms (pf_driver.py = profile2/prof_driver.py with PF_STAMP=fixed: identical prompts across arms).
+
+Timing (pf_reads.py, idle, medians of 6, back to back):
+  t_ref (142fc plain)        150: 145.8 ms  1200: 428.6 ms
+  t_ne  (142fc + SORT_NE=1)  150: 134.9 ms  1200: 358.6 ms   (zero-code probe; not exact)
+  t_gs  (142lv + GROUP_SORT) 150: 136.2 ms  1200: 363.4 ms   -> -9.6 ms / -65.2 ms
+Exactness:
+  prefill_mmq_tab_test: 890 comparisons, 0 failed (part 4: 16 group-order cases, full-sorted 0 rows differ;
+    all-sorted 133-1881 rows differ) -> prefill_mmq_tab_test.txt
+  R dumps (d_* arms, 5 prompts 300/1200/150/150/1200, 2965 rows x 10240 BF16 + fp32 every 64th of the last 1.2K):
+    d_ref vs d_gs byte-identical; d_ref vs d_ne all 2965 rows differ -> cmp.txt (.rall files deleted, 60 MB each)
+  batch_test16 (142lv + GROUP_SORT=1): 16/16 IDENTICAL, dump bt16-gs.json byte-identical to auxcheck/bt16-fcb.json

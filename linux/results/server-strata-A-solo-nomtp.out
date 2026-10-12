@@ -1,0 +1,20 @@
+Running as unit: strata-bench.scope; invocation ID: bb3ffbb53ca24aa9add87ec71d35837a
+loading the model (the first start takes a minute or two) ...
+[strata] layer split across GPUs [0, 1, 2, 3] (auto)
+[strata] starting the engine: reading the model's weights ...
+Traceback (most recent call last):
+  File "/media/raid0/StrataQ38FN/Strata/serve/server.py", line 5895, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/media/raid0/StrataQ38FN/Strata/serve/server.py", line 5720, in main
+    engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/media/raid0/StrataQ38FN/Strata/serve/server.py", line 693, in __init__
+    raise RuntimeError(why + (f" (see {log})" if log else "") +
+RuntimeError: the engine exited before it was ready (see /media/raid0/StrataQ38FN/Strata/strata-unsloth-ud-iq4_xs.log)
+the engine log's last lines:
+  [strata] 2026-10-10 15:23:18 engine started: /media/raid0/StrataQ38FN/Strata/engine/strata --serve --pack /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs --native /media/raid0/Models/Strata-GGUF/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf --expert-profile /media/raid0/StrataQ38FN/Strata/data/expert-profile.bin --expert-cache auto --prefill auto --max-context 32768 --kv int8 --resident-experts --layer-split auto
+  strata generate: layer split across 4 GPUs: CUDA0, then CUDA1,2,3 (split auto)
+  strata generate: PCIe probe: 13.0 GB/s host->device (best of 13.0 13.0 13.0 13.0) -> pcie_frac 0.36 (default 0.55)
+  strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+  strata generate: /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK
