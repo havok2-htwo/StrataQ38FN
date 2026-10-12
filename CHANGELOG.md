@@ -27,6 +27,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.18.0] – 2026-10-12
+
+Linux (4× RTX 3090, 256 GB RAM).
+
+### Added
+- KV tiering stage 3: SSD emergency tier (`STRATA_CONV_TIER_DIR`, exact): conversations the RAM cache must evict go to
+  the RAID only if ≥ 16K tokens, written once, daily write budget 200 GB, cap, TTL; counters at GET /metrics and in
+  the dashboard. +25 % throughput when the RAM tier overflows, no cost otherwise. Default
+  `configs/T16-143-64khocast.json` (production config, `linux/configs/production.json`).
+- Production setup: systemd user services for Strata, G3, Open WebUI and the dashboard (`linux/systemd/`),
+  `linux/cutover.sh` / `linux/rollback.sh` for the switch from G3/vLLM to Strata behind G3's proxy.
+
 ## [0.17.0] – 2026-10-12
 
 Linux (4× RTX 3090, now 256 GB RAM).

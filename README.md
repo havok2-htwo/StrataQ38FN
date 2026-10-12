@@ -26,7 +26,7 @@ users, with a measurably lower quality checkpoint ([linux/README.md](linux/READM
 
 **Is this a fork?** In substance, yes: a downstream fork. It is not a GitHub fork of the engine repository. This
 repository holds the deployment (configs, start scripts, a vLLM-compatible facade, a dashboard) and the engine patch
-series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.43/`, 38
+series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.43/`, 40
 patches). The patches are kept upstream-ready (opt-in switches, default path unchanged), so they can be offered back
 to Strata.
 

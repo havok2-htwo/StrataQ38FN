@@ -1,0 +1,18 @@
+# Genesis3 dashboard + OpenAI proxy (port 8000) as a user service; routes /v1 to Strata via its external-backend entry.
+[Unit]
+Description=Genesis3 (G3_VLLM) dashboard + OpenAI proxy on port 8000
+After=network-online.target strata.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/administrator/G3_VLLM
+Environment=PATH=/home/administrator/G3_VLLM/venv/bin:/usr/local/cuda-13.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/administrator/G3_VLLM/start.sh
+KillMode=mixed
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

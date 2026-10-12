@@ -1,0 +1,17 @@
+# Open WebUI (chat client, no RAG) on port 8080, talking to G3's proxy on port 8000.
+[Unit]
+Description=Open WebUI on port 8080
+After=network-online.target g3.service
+
+[Service]
+Type=simple
+Environment=OPENAI_API_BASE_URL=http://127.0.0.1:8000/v1
+Environment=OPENAI_API_KEY=dummy
+Environment=ENABLE_RAG=false
+Environment=RAG_ENABLED=false
+ExecStart=/bin/bash -lc 'source /media/raid0/miniconda3/etc/profile.d/conda.sh && conda activate open-webui && exec open-webui serve --host 0.0.0.0 --port 8080'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

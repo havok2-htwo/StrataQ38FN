@@ -1,0 +1,15 @@
+# LAN dashboard (GPUs incl. PCIe, Strata live requests/slots) on port 8082.
+[Unit]
+Description=StrataQ38FN LAN dashboard on port 8082
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/media/raid0/StrataQ38FN/dashboard
+ExecStart=/usr/bin/python3 dashboard.py --port 8082 --host 0.0.0.0 --strata /media/raid0/StrataQ38FN/Strata-143/serve --engine-config /media/raid0/StrataQ38FN/linux/configs/production.json --state /media/raid0/StrataQ38FN/dashboard/state-linux.json --settings /media/raid0/StrataQ38FN/dashboard/settings-linux.json --source http://127.0.0.1:8090
+MemoryMax=1G
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

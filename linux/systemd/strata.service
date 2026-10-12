@@ -1,0 +1,22 @@
+# Strata (Qwen3.8-Flash-Next UD-IQ4_XS, 4x RTX 3090) as a user service. Config: linux/configs/production.json (symlink).
+# Install: linux/systemd/install-user-services.sh; boot without login needs: sudo loginctl enable-linger administrator
+[Unit]
+Description=Strata server (Qwen3.8-Flash-Next) on port 8090
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/media/raid0/StrataQ38FN/Strata-143
+Environment=PATH=/usr/local/cuda-13.0/bin:/usr/bin:/bin
+ExecStart=/media/raid0/StrataQ38FN/Strata/.venv/bin/python /media/raid0/StrataQ38FN/Strata-143/serve/server.py --engine strata --config /media/raid0/StrataQ38FN/linux/configs/production.json --port 8090 --host 0.0.0.0
+MemoryMax=200G
+MemorySwapMax=0
+KillMode=mixed
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,2289 @@
+From dc911b987fb3be51765ab745e13bec924e85fdee Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 17:45:48 +0200
+Subject: [PATCH 39/40] serve: STRATA_CONV_TIER_DIR=<folder> spills
+ conversations the RAM cache evicts to disk, and reads them back
+
+An emergency overflow below the conversation cache (conversation_tier.hpp, pure host code).  When make_room evicts a
+conversation to make room for another, one of at least STRATA_CONV_TIER_MIN_TOKENS (16384) tokens goes to a writer
+thread instead of being freed: one session file (format v1: O_DIRECT, temporary file, flush, rename) per stage of a
+layer split, written at once, then a meta file as the commit record (tokens, checkpoint lengths, the run-time marks v1
+does not hold: pinned, slot_turn, draftless).  A request whose prompt the tier holds STRATA_CONV_TIER_MIN_GAIN (2048)
+more tokens of than the RAM cache, a slot or the live session reads it back (all stages at once, the per-stage read
+limits, the RAM preflight) and validates it before anything is parked; an image still waiting for the writer is
+handed back as it is.  Any failure (I/O, a corrupt or foreign file, RAM) reads the prompt instead.
+
+- Only make_room's evictions spill: ConversationCache::evict_oldest(spill) and an eviction sink.  The RAM floor's and a
+  save's evictions free the memory at once (counted as drops_ram); drop_superseded and clear() never reach the sink.
+- Written once: an image a file holds all but fewer than STRATA_CONV_TIER_REGROW_TOKENS (8192) of, or an earlier copy
+  of a conversation on disk, is not written again; grown further it is written in full and the older file set goes.
+- STRATA_CONV_TIER_WRITE_GB_DAY (200 GB per local calendar day, kept in <folder>/budget), _CAP_GB (600), _MAX_FILES
+  (2000), _TTL_H (168, by last use, LRU to the cap), _INFLIGHT_MIB (2048), _MIN_FREE_GB (64).
+- Identity: the session identity mixed with the engine binary, its arguments and its STRATA_* environment.  An earlier
+  run's files are removed at start unless STRATA_CONV_TIER_WARM=1 (then indexed; other identities kept to their TTL).
+- STRATA_CONV_TIER_VERIFY=1: every write read back and compared with the evicted image; every restore checked against
+  a digest of it.  #879 clears the tier too.
+- Counters on every "conversation tier:" log line (files, disk bytes, written today, budget left, spills, restores,
+  misses, drops by reason).  conversation_session_read_limits gets a draft-pointer overload.
+
+Off (no env): byte-identical (bt16, il against the stage-1 dumps).  Forced on (one RAM slot, every eviction spilled,
+verify): bt16, T=0.7, interleave byte-identical with 15/15/9 restores from disk; overlap PASS; conversation_tier_test
+(107 checks: spill only on eviction, min size, write-once, budget and day, TTL and cap, queue and in-flight bound,
+exact restore, identity, I/O faults, crash leftovers).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |    8 +-
+ docs/DETAILS.md                               |   21 +
+ include/strata/core/conversation_cache.hpp    |   22 +-
+ include/strata/core/conversation_snapshot.hpp |    5 +
+ include/strata/core/conversation_tier.hpp     |  187 +++
+ src/core/conversation_state.cpp               |   16 +-
+ src/core/conversation_tier.cpp                | 1070 +++++++++++++++++
+ src/core/conversation_tier_test.cpp           |  601 +++++++++
+ src/program/generate.cpp                      |  137 ++-
+ 9 files changed, 2054 insertions(+), 13 deletions(-)
+ create mode 100644 include/strata/core/conversation_tier.hpp
+ create mode 100644 src/core/conversation_tier.cpp
+ create mode 100644 src/core/conversation_tier_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9e991e14..c071f0a6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -126,6 +126,12 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
+   target_include_directories(session_save_reclaim_test PRIVATE include)
+   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
++  find_package(Threads REQUIRED)
++  add_executable(conversation_tier_test src/core/conversation_tier_test.cpp src/core/conversation_tier.cpp
++    src/core/conversation_file.cpp)
++  target_include_directories(conversation_tier_test PRIVATE include)
++  target_link_libraries(conversation_tier_test PRIVATE Threads::Threads)
++  add_test(NAME conversation_tier_test COMMAND conversation_tier_test)
+ endif()
+ 
+ if(STRATA_HIP_GFX906)
+@@ -491,7 +497,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
++    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_tier.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 7a2cc4e7..98fbef82 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -987,6 +987,27 @@ requests' length keeps the long conversation parked. The check runs before `make
+ nothing and stores nothing; the log line is `conversation cache: skip parking (N tokens, below the M minimum;
+ parked=P)`. 0 is the pre-flag behaviour and the flag leaves the answers untouched - it only decides which
+ conversations keep a slot.
++`STRATA_CONV_TIER_DIR=<folder>` (unset: off) adds a disk tier below the RAM cache, an emergency overflow
++(`conversation_tier.hpp`). When the cache evicts a conversation to make room for another (budget or slots), a
++conversation of at least `STRATA_CONV_TIER_MIN_TOKENS` (16384) tokens is written to the folder by a writer thread -
++one session file (format v1, below: O_DIRECT, temporary file, flush, rename) per stage of a layer split, then a small
++meta file as the commit record - and a later request that continues it reads it back (all stages at once) instead of
++reading its prompt again, when the file holds at least `STRATA_CONV_TIER_MIN_GAIN` (2048) more tokens of it than the
++RAM cache, a slot or the live session. Evictions for the RAM floor or a save free their memory at once and are not
++written. A conversation is written once: one that a file holds all but fewer than `STRATA_CONV_TIER_REGROW_TOKENS`
++(8192) tokens of is not written again (its request reads the new tokens on top of the file); grown further, it is
++written in full and its older file goes. Writes stop for the day at `STRATA_CONV_TIER_WRITE_GB_DAY` (200 GB per local
++calendar day, kept in `<folder>/budget`); the folder keeps at most `STRATA_CONV_TIER_CAP_GB` (600) GB and
++`STRATA_CONV_TIER_MAX_FILES` (2000) conversations, least recently used out first, each for
++`STRATA_CONV_TIER_TTL_H` (168) hours after its last use; evicted images wait for the writer in at most
++`STRATA_CONV_TIER_INFLIGHT_MIB` (2048) MiB of RAM, and every write keeps `STRATA_CONV_TIER_MIN_FREE_GB` (64) GiB free.
++Whatever does not fit is dropped as without the tier, and counted. The files are bound to the session identity plus
++the engine binary, its arguments and its `STRATA_*` environment; an earlier run's files are removed at start unless
++`STRATA_CONV_TIER_WARM=1` (then this engine's are used and others are left to their time to live). A restore is the
++evicted image byte for byte; `STRATA_CONV_TIER_VERIFY=1` reads every write back and compares it, and checks every
++restore against a digest of the evicted image. Any failure (I/O, a corrupt or foreign file, RAM) reads the prompt
++instead. The log lines are `conversation tier: <event>; files=F ... budget_left=L spills=S restores=R misses=M
++drops_budget=B ...`; the server reads them into `/metrics`' `conversation_cache.tier`.
+ `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
+ RAM headroom remain available: the engine checks before allocation (against the
+ snapshot's estimated size, less the K/V it already retains) and again after capture.
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index e84ed986..adea2ea9 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -9,6 +9,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <deque>
++#include <functional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -347,7 +348,7 @@ public:
+         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
+             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
+-            if (!evict_oldest()) return false;
++            if (!evict_oldest(true)) return false;
+         }
+         return true;
+     }
+@@ -358,14 +359,26 @@ public:
+     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
+     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
+     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
+-    bool evict_oldest() {
++    // `spill` (make_room's evictions: the cache made room for another image): an eviction sink may keep the image
++    // (STRATA_CONV_TIER_DIR, conversation_tier.hpp).  The physical-RAM gate and a save's reclaim evict to get the memory
++    // back, so their victims are freed here at once - the sink only hears of them.
++    bool evict_oldest(bool spill = false) {
+         auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
+         if (victim == entries_.end()) return false;
+         bytes_ -= victim->bytes();
+-        entries_.erase(victim);
+         ++evictions_;
+-        return true;
++        if (!evict_sink_) {
++            entries_.erase(victim);
++            return true;
++        }
++        SavedConversation image = std::move(*victim);
++        entries_.erase(victim);
++        evict_sink_(std::move(image), spill);
++        return true;   // (whatever the sink left of `image` is freed here)
+     }
++    /// Where evicted images go (none: freed).  Never drop_superseded's or clear()'s: those are not wanted any more.
++    using EvictSink = std::function<void(SavedConversation&&, bool spill)>;
++    void set_evict_sink(EvictSink sink) { evict_sink_ = std::move(sink); }
+ 
+     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
+     // may carry the poison.  Returns how many were parked.
+@@ -474,6 +487,7 @@ private:
+     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
+     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+     bool supersede_prefix_ = false;   // drop_superseded by tokens (set_supersede_prefix)
++    EvictSink evict_sink_;            // set_evict_sink
+     std::deque<SavedConversation> entries_; // least recently active first
+     ConversationKvReuse reuse_;
+ };
+diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
+index 01f88621..17be75ed 100644
+--- a/include/strata/core/conversation_snapshot.hpp
++++ b/include/strata/core/conversation_snapshot.hpp
+@@ -76,6 +76,11 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
+ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                       std::string& error);
++// The same for a session without the draft layer's K/V (draft == nullptr): a layer split's earlier stages, and an image
++// that holds none (a batch slot's).
++bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
++                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
++                                      std::string& error);
+ 
+ struct ConversationStateSizes {
+     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
+diff --git a/include/strata/core/conversation_tier.hpp b/include/strata/core/conversation_tier.hpp
+new file mode 100644
+index 00000000..3ccedb4e
+--- /dev/null
++++ b/include/strata/core/conversation_tier.hpp
+@@ -0,0 +1,187 @@
++// The conversation cache's disk tier (STRATA_CONV_TIER_DIR): an emergency overflow for parked conversations.  When the
++// RAM cache has to evict a long conversation (ConversationCache::make_room), the image goes here instead of being
++// dropped, and a later request that continues it reads it back instead of reading its prompt again.  Pure host code:
++// no CUDA.
++//
++// What it writes: one session file (format v1, conversation_file.hpp: O_DIRECT, temporary file, flush, rename) per
++// stage of a layer split - each stage's part of a parked image is an ordinary single-carve image - and then a small
++// `.meta` file, the commit record: the tokens, the checkpoints' lengths and the run-time marks the v1 format does not
++// hold (pinned, slot_turn, draftless).  A set without its meta file is never used and is removed at the next start.
++//
++// What it keeps apart: a conversation is written once.  An image whose tokens a file already holds, or holds all but
++// fewer than `regrow_tokens` of (the same conversation a few turns on), is not written again: the file stays, and the
++// request that continues it reads the few new tokens on top of it.  Grown by more, it is written in full and the older
++// file of it goes.  A daily write budget, a disk cap (bytes and images), a time to live and an in-flight bound decide
++// the rest; what does not fit is dropped as without the tier, and counted.
++//
++// Exactness: a read gives the image the RAM cache evicted, byte for byte (the v1 round trip, plus the marks from the
++// meta file).  `verify` reads every file back after the write and compares it with the image, and stores a digest of
++// the whole image that every restore is checked against.  Identity: every file carries the session identity (model
++// and configuration fingerprints, conversation_file.hpp); the engine mixes into it a fingerprint of its binary, its
++// arguments and its STRATA_* environment, so a file of another build, model or setting is never restored.
++#pragma once
++
++#include "strata/core/conversation_cache.hpp"
++#include "strata/core/conversation_file.hpp"
++
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace strata::core {
++
++struct ConversationTierConfig {
++    std::string dir;                              ///< where the files go (created, mode 0700 on POSIX)
++    int64_t min_tokens = 16384;                   ///< a shorter conversation is dropped, not written
++    uint64_t budget_bytes = 200ull * 1000 * 1000 * 1000;   ///< bytes written per day (local calendar day); 0: none
++    uint64_t cap_bytes = 600ull * 1000 * 1000 * 1000;      ///< bytes on disk at most
++    uint64_t max_images = 2000;                   ///< conversations on disk at most (each is parts + 1 files)
++    int64_t ttl_s = 168 * 3600;                   ///< an image unused this long is removed
++    uint64_t inflight_bytes = 2048ull << 20;      ///< RAM evicted images may hold while they wait for the writer
++    int64_t regrow_tokens = 8192;                 ///< a conversation on disk is written again once it grew this much
++    uint64_t min_free_bytes = 64ull << 30;        ///< the disk keeps this much free (each file's preflight)
++    bool warm = false;                            ///< keep (and index) the files of an earlier run; else remove them
++    bool verify = false;                          ///< read every write back and check every restore's digest
++    bool durable = true;                          ///< flush files and the folder (the crash-safety of the rename)
++    SessionFileIdentity id;                       ///< written into every file; a read with another is refused
++    std::function<void()> thread_start;           ///< run first on every thread the tier starts (CPU placement)
++    std::function<int64_t()> clock;               ///< unix seconds (tests); default: the system clock
++    std::function<void(const std::string&)> log;  ///< one event line, the counters appended (default: none)
++    /// tests: an errno value makes a step fail.  The session file steps ("write", "file_flush", "rename",
++    /// "dir_flush") and the tier's own: "meta" (the commit record's write), "read" (a restore's read)
++    std::function<int(const char* step)> fault;
++};
++
++struct ConversationTierStats {
++    uint64_t files = 0, parts = 0, disk_bytes = 0;            ///< conversations on disk, their files, their bytes
++    uint64_t written_today = 0, budget = 0, budget_left = 0;
++    uint64_t spills = 0, written_bytes = 0;                   ///< conversations written (this run) and their bytes
++    uint64_t restores = 0, restores_queue = 0, read_bytes = 0; ///< read back (from disk / taken from the write queue)
++    uint64_t misses = 0;                                      ///< a restore that failed: the prompt is read instead
++    uint64_t drops_small = 0, drops_budget = 0, drops_busy = 0, drops_ram = 0, drops_cap = 0, drops_io = 0;
++    uint64_t kept = 0;                                        ///< evictions a file already held (nothing written)
++    uint64_t superseded = 0, expired = 0, evicted = 0;        ///< files removed: grown on, too old, over the cap
++    uint64_t pending = 0, pending_bytes = 0;                  ///< evicted images waiting for the writer
++    uint64_t foreign = 0;                                     ///< files of another identity left in the folder
++    uint64_t verified = 0;                                    ///< writes and restores `verify` compared
++};
++
++/// A digest of every byte, id and mark of a parked image (its stage images too), for `verify`.
++uint64_t conversation_image_digest(const SavedConversation& image);
++
++/// The tier's fingerprint of what the engine runs: the configuration fingerprint, the binary at `exe` (its size, first
++/// and last MiB), the arguments and every STRATA_* environment variable but STRATA_CONV_TIER_*, sorted.
++bool conversation_tier_fingerprint(uint64_t config, const std::string& exe, const std::vector<std::string>& args,
++                                   uint64_t& out, std::string& error);
++
++class ConversationTier {
++public:
++    struct Match {
++        uint64_t key = 0;
++        int64_t tokens = 0;
++        bool live = false;       ///< the conversation's end (else one of its checkpoints)
++        bool draftless = false;  ///< its last stage's image has no draft-layer K/V (conversation_cache.hpp)
++        size_t parts = 0;        ///< images: 1 + the later stages'
++    };
++    struct LoadInfo {
++        bool from_queue = false; ///< still waiting for the writer: handed back without a read
++        uint64_t bytes = 0;      ///< read from disk
++        double ms = 0;
++    };
++
++    explicit ConversationTier(ConversationTierConfig config);
++    ~ConversationTier();   // what waits for the writer is dropped; a write under way finishes first
++    ConversationTier(const ConversationTier&) = delete;
++    ConversationTier& operator=(const ConversationTier&) = delete;
++
++    /// Creates the folder, reads the day's budget, removes what an earlier run left (or indexes it, `warm`) and starts
++    /// the writer.  False: the tier stays off (`error` says why).
++    bool start(std::string& error);
++    bool on() const { return started_; }
++
++    /// The RAM cache let `image` go (ConversationCache's eviction sink).  `spill`: it may be written (the cache made
++    /// room for another image); false: it is freed now (the RAM floor or a save asked for the memory) and counted.
++    void evicted(SavedConversation&& image, bool spill);
++
++    /// The image on disk (or waiting for the writer) that holds the longest start of `prompt`, as
++    /// ConversationCache::best matches (tokens, pictures, control vector mode).  tokens == 0: none.
++    /// (instantiated for int32_t and int64_t tokens)
++    template<class Token>
++    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const;
++
++    /// Reads the image `key` names: one session file per part at once, each with its `limits` (part 0: the first
++    /// stage, k: stage k), then the marks of the meta file.  An image still waiting for the writer is handed back
++    /// as it is.  False: `why` says why, nothing usable came back, the caller reads the prompt; a file that is
++    /// unreadable or not this engine's goes (a RAM refusal leaves it).
++    bool load(uint64_t key, const std::vector<SessionReadLimits>& limits, SavedConversation& out, std::string& why,
++              LoadInfo* info = nullptr);
++    /// The caller refused an image `load` gave (its validation): the files go and it counts as a miss.
++    void reject(uint64_t key, const std::string& why);
++
++    /// #879: every image goes, the ones waiting for the writer and the files.
++    void clear();
++    /// Waits until the writer has nothing left (tests, and the engine's teardown never needs it).
++    void drain();
++
++    ConversationTierStats stats() const;
++    /// "files=F parts=P disk_bytes=D written_today=W budget=B budget_left=L spills=S ..." (every stats field)
++    std::string status() const;
++
++private:
++    enum class State { queued, writing, disk };
++    struct Entry {
++        uint64_t key = 0;
++        State state = State::queued;
++        std::vector<int32_t> ids;
++        std::vector<ConversationImageKey> imgs;
++        bool cvec = true;
++        struct Check { size_t len = 0; std::vector<int32_t> own; std::vector<ConversationImageKey> imgs; };
++        std::vector<Check> checks;   ///< own ids only when not a start of `ids`
++        struct Marks { bool draftless = false, live_pinned = false, live_slot_turn = false;
++                       std::vector<uint8_t> pinned, slot_turn; };
++        std::vector<Marks> parts;    ///< per part
++        std::vector<uint64_t> part_bytes;
++        uint64_t bytes = 0;          ///< the files (parts and meta); queued: the image's RAM
++        uint64_t digest = 0;
++        int64_t created = 0, used = 0;
++        int readers = 0;
++        bool cancelled = false;      ///< clear() while it was written: its files go when the write ends
++        std::unique_ptr<SavedConversation> image;   ///< queued / writing only
++    };
++    using EntryPtr = std::shared_ptr<Entry>;
++
++    int64_t now() const;
++    void log_event(const std::string& what);
++    std::string status_locked() const;
++    std::string path(uint64_t key, int part) const;   ///< part < 0: the meta file
++    void writer_loop();
++    bool write_set(Entry& e, uint64_t& bytes, std::string& why);   ///< writer thread, without the lock
++    void remove_files(uint64_t key, size_t parts);
++    void remove_entry_locked(size_t i);               ///< and its files (an image on disk)
++    bool sweep_locked(uint64_t incoming);             ///< false: the cap leaves no room for `incoming` bytes
++    void roll_day_locked();
++    void save_budget_locked();
++    void scan(std::string& error);
++    size_t find_locked(uint64_t key) const;          ///< SIZE_MAX: none
++    size_t cover_locked(const SavedConversation& image) const;   ///< an entry index that holds it, or SIZE_MAX
++    static int64_t day_of(int64_t unix_s);
++
++    ConversationTierConfig cfg_;
++    bool started_ = false;
++    mutable std::mutex mu_;
++    std::condition_variable work_, idle_, changed_;
++    std::vector<EntryPtr> entries_;   ///< everything known, oldest first: queued, writing, on disk
++    std::thread writer_;
++    bool stop_ = false, busy_ = false;
++    uint64_t next_key_ = 0;
++    int64_t day_ = 0;
++    ConversationTierStats st_;
++};
++
++} // namespace strata::core
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index 5b30cfa0..ff104558 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -362,6 +362,12 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
+ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
+                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                       std::string& error) {
++    return conversation_session_read_limits(limits, ss, g, &draft, max_tokens, max_checkpoints, error);
++}
++
++bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
++                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
++                                      std::string& error) {
+     ConversationStateSizes z;
+     if (!conversation_session_sizes(g, ss, z, error)) return false;
+     if (ss.max_cells < 0) return fail(error, "invalid session cells");
+@@ -374,18 +380,20 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
+     SessionReadLimits l = limits;   // keeps the caller's admit / progress / max_file_bytes
+     l.max_tokens = tokens;
+     l.max_checkpoints = max_checkpoints;
+-    l.max_kv_layers = layers + 1;
++    l.max_kv_layers = layers + (draft ? 1 : 0);
+     l.geometry = geometry_key(g);
+     l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
+     l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
+-    l.max_kv_bytes.assign(layers + 1, {});
++    l.max_kv_bytes.assign(layers + (draft ? 1 : 0), {});
+     for (size_t j = 0; j < layers; ++j) {
+         const auto& st = owned(ss, j);
+         const int64_t upto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(st.max_cells, 0));
+         if (!conversation_kv_part_sizes(st, g, upto, true, l.max_kv_bytes[j], error)) return false;
+     }
+-    const int64_t dupto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(draft.max_cells, 0));
+-    if (!conversation_kv_part_sizes(draft, g, dupto, false, l.max_kv_bytes.back(), error)) return false;
++    if (draft) {
++        const int64_t dupto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(draft->max_cells, 0));
++        if (!conversation_kv_part_sizes(*draft, g, dupto, false, l.max_kv_bytes.back(), error)) return false;
++    }
+     limits = std::move(l);
+     return true;
+ }
+diff --git a/src/core/conversation_tier.cpp b/src/core/conversation_tier.cpp
+new file mode 100644
+index 00000000..c4e7aa87
+--- /dev/null
++++ b/src/core/conversation_tier.cpp
+@@ -0,0 +1,1070 @@
++#include "strata/core/conversation_tier.hpp"
++
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <exception>
++#include <filesystem>
++#include <fstream>
++#include <new>
++#include <random>
++#include <set>
++#include <sstream>
++#include <system_error>
++#include <unordered_map>
++#include <utility>
++#ifdef _WIN32
++#include <stdlib.h>
++#else
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++extern char** environ;
++#endif
++
++namespace strata::core {
++namespace fs = std::filesystem;
++namespace {
++
++constexpr char kMetaMagic[8] = {'S', 'T', 'R', 'T', 'I', 'E', 'R', '\x01'};
++constexpr uint32_t kMetaVersion = 1;
++constexpr uint64_t kMetaMaxBytes = 64ull << 20;   // a meta file holds ids and marks: far below this
++
++// ---- digest of a parked image (verify)
++void hash_ck(SessionHasher& h, const ConversationCheckpoint& c) {
++    auto vec = [&](const auto& v) {
++        const uint64_t n = v.size();
++        h.update(&n, 8);
++        if (n) h.update(v.data(), n * sizeof(v[0]));
++    };
++    vec(c.ids);
++    const uint64_t ni = c.imgs.size();
++    h.update(&ni, 8);
++    for (const auto& k : c.imgs) { h.update(&k.start, 8); h.update(&k.hash, 8); }
++    vec(c.gdn); vec(c.ple); vec(c.tails); vec(c.dead); vec(c.block_pos);
++    const uint64_t marks[3] = {c.used, c.pinned ? 1u : 0u, c.slot_turn ? 1u : 0u};
++    h.update(marks, sizeof marks);
++    const uint64_t np = c.stage_parts.size();
++    h.update(&np, 8);
++    for (const auto& p : c.stage_parts) hash_ck(h, p);
++}
++void hash_buf(SessionHasher& h, const ConversationBuffer& b) {
++    const uint64_t n = b.size();
++    h.update(&n, 8);
++    b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { h.update(p, c); return true; });
++}
++void hash_image(SessionHasher& h, const SavedConversation& s) {
++    h.update(s.geometry.data(), sizeof(s.geometry));
++    const int64_t head[5] = {s.layer_lo, s.layer_hi, s.cvec ? 1 : 0, s.draftless ? 1 : 0, (int64_t) s.checkpoints.size()};
++    h.update(head, sizeof head);
++    hash_ck(h, s.live);
++    for (const auto& c : s.checkpoints) hash_ck(h, c);
++    const uint64_t nk = s.kv.size();
++    h.update(&nk, 8);
++    for (const auto& k : s.kv) {
++        const int64_t m[7] = {k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim};
++        h.update(m, sizeof m);
++        hash_buf(h, k.k); hash_buf(h, k.v); hash_buf(h, k.k_scale); hash_buf(h, k.v_scale); hash_buf(h, k.pooled);
++    }
++    const uint64_t ns = s.stage_images.size();
++    h.update(&ns, 8);
++    for (const auto& p : s.stage_images) hash_image(h, p);
++}
++
++// one part of an image against another, its stage images aside (a part file holds none)
++bool same_part(const SavedConversation& a, const SavedConversation& b) {
++    if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec ||
++        a.draftless != b.draftless || !conversation_checkpoint_same(a.live, b.live) ||
++        a.checkpoints.size() != b.checkpoints.size() || a.kv.size() != b.kv.size()) return false;
++    for (size_t i = 0; i < a.checkpoints.size(); ++i)
++        if (!conversation_checkpoint_same(a.checkpoints[i], b.checkpoints[i])) return false;
++    for (size_t i = 0; i < a.kv.size(); ++i)
++        if (!conversation_kv_same(a.kv[i], b.kv[i])) return false;
++    return true;
++}
++
++// `n` tokens at `ids` with the pictures `imgs` start `full` (whose pictures are `full_imgs`): ConversationCache's
++// prefix rule (drop_superseded_by_prefix's `starts`)
++template<class Token>
++bool starts(const int32_t* ids, size_t n, const std::vector<ConversationImageKey>& imgs, const std::vector<Token>& full,
++            const std::vector<ConversationImageKey>& full_imgs) {
++    if (n == 0 || n > full.size() || !std::equal(ids, ids + n, full.begin())) return false;
++    size_t j = 0;
++    for (const auto& image : full_imgs) {
++        if (image.start >= (int64_t) n) continue;
++        if (j == imgs.size() || !(imgs[j++] == image)) return false;
++    }
++    return j == imgs.size();
++}
++
++std::string hex16(uint64_t v) {
++    char b[17];
++    std::snprintf(b, sizeof b, "%016llx", (unsigned long long) v);
++    return b;
++}
++bool parse_hex16(const std::string& s, uint64_t& v) {
++    if (s.size() != 16) return false;
++    v = 0;
++    for (char c : s) {
++        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
++        if (d < 0) return false;
++        v = (v << 4) | (uint64_t) d;
++    }
++    return true;
++}
++
++// ---- the meta file: the commit record
++struct MetaOut {
++    std::vector<uint8_t> b;
++    void raw(const void* p, size_t n) { const auto* c = static_cast<const uint8_t*>(p); b.insert(b.end(), c, c + n); }
++    void u64(uint64_t v) { raw(&v, 8); }
++    void u8(uint8_t v) { b.push_back(v); }
++    void ids(const std::vector<int32_t>& v) { u64(v.size()); raw(v.data(), v.size() * 4); }
++    void imgs(const std::vector<ConversationImageKey>& v) {
++        u64(v.size());
++        for (const auto& k : v) { u64((uint64_t) k.start); u64(k.hash); }
++    }
++};
++struct MetaIn {
++    const uint8_t* p;
++    size_t left;
++    bool raw(void* d, size_t n) { if (n > left) return false; std::memcpy(d, p, n); p += n; left -= n; return true; }
++    bool u64(uint64_t& v) { return raw(&v, 8); }
++    bool u8(uint8_t& v) { return raw(&v, 1); }
++    bool ids(std::vector<int32_t>& v) {
++        uint64_t n = 0;
++        if (!u64(n) || n > left / 4) return false;
++        v.resize((size_t) n);
++        return raw(v.data(), (size_t) n * 4);
++    }
++    bool imgs(std::vector<ConversationImageKey>& v) {
++        uint64_t n = 0;
++        if (!u64(n) || n > left / 16) return false;
++        v.resize((size_t) n);
++        for (auto& k : v) {
++            uint64_t s = 0;
++            if (!u64(s) || !u64(k.hash)) return false;
++            k.start = (int64_t) s;
++        }
++        return true;
++    }
++};
++
++// a small file written whole: temporary name, flush, rename, folder flush (POSIX); false + `why`
++bool write_small(const std::string& dir, const std::string& leaf, const std::vector<uint8_t>& bytes, bool durable,
++                 std::string& why) {
++    static std::atomic<uint64_t> seq{0};
++    const std::string tmp = dir + "/." + leaf + "." + hex16(++seq ^ (uint64_t) std::chrono::steady_clock::now()
++                                                                        .time_since_epoch().count()) + ".tmp";
++    const std::string dst = dir + "/" + leaf;
++#ifdef _WIN32
++    {
++        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
++        if (!f) { why = "cannot create " + tmp; return false; }
++        f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize) bytes.size());
++        f.flush();
++        if (!f) { std::error_code ec; fs::remove(tmp, ec); why = "cannot write " + tmp; return false; }
++    }
++    (void) durable;
++    std::error_code ec;
++    fs::rename(tmp, dst, ec);
++    if (ec) { fs::remove(tmp, ec); why = "cannot rename " + tmp + ": " + ec.message(); return false; }
++    return true;
++#else
++    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++    if (fd < 0) { why = "cannot create " + tmp + ": " + std::strerror(errno); return false; }
++    const uint8_t* p = bytes.data();
++    size_t n = bytes.size();
++    bool ok = true;
++    while (n && ok) {
++        const ssize_t w = ::write(fd, p, n);
++        if (w < 0 && errno == EINTR) continue;
++        if (w <= 0) { why = std::string("write: ") + (w < 0 ? std::strerror(errno) : "short write"); ok = false; break; }
++        p += w; n -= (size_t) w;
++    }
++    if (ok && durable && ::fsync(fd) != 0) { why = std::string("flush: ") + std::strerror(errno); ok = false; }
++    if (::close(fd) != 0 && ok) { why = std::string("close: ") + std::strerror(errno); ok = false; }
++    if (ok && ::rename(tmp.c_str(), dst.c_str()) != 0) { why = std::string("rename: ") + std::strerror(errno); ok = false; }
++    if (!ok) { ::unlink(tmp.c_str()); return false; }
++    if (durable) {
++        const int d = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++        if (d >= 0) {
++            if (::fsync(d) != 0 && errno != EINVAL) { why = std::string("folder flush: ") + std::strerror(errno); ::close(d); return false; }
++            ::close(d);
++        }
++    }
++    return true;
++#endif
++}
++
++bool read_small(const std::string& path, std::vector<uint8_t>& out, uint64_t max) {
++    std::ifstream f(path, std::ios::binary);
++    if (!f) return false;
++    f.seekg(0, std::ios::end);
++    const std::streamoff n = f.tellg();
++    if (n < 0 || (uint64_t) n > max) return false;
++    f.seekg(0);
++    out.resize((size_t) n);
++    f.read(reinterpret_cast<char*>(out.data()), n);
++    return (bool) f;
++}
++
++int64_t mtime_s(const std::string& path, int64_t fallback) {
++#ifdef _WIN32
++    (void) path;
++    return fallback;
++#else
++    struct stat st {};
++    return ::stat(path.c_str(), &st) == 0 ? (int64_t) st.st_mtime : fallback;
++#endif
++}
++void touch(const std::string& path) {
++#ifndef _WIN32
++    (void) ::utimensat(AT_FDCWD, path.c_str(), nullptr, 0);
++#else
++    (void) path;
++#endif
++}
++
++uint64_t file_size(const std::string& path) {
++    std::error_code ec;
++    const auto n = fs::file_size(path, ec);
++    return ec ? UINT64_MAX : (uint64_t) n;
++}
++
++} // namespace
++
++uint64_t conversation_image_digest(const SavedConversation& image) {
++    SessionHasher h(0x5354524954494552ull);
++    hash_image(h, image);
++    return h.digest();
++}
++
++bool conversation_tier_fingerprint(uint64_t config, const std::string& exe, const std::vector<std::string>& args,
++                                   uint64_t& out, std::string& error) {
++    uint64_t binary = 0;
++    if (!session_model_fingerprint({{"engine binary", exe}}, binary, error)) return false;
++    std::vector<std::string> env;
++#ifdef _WIN32
++    char** e = _environ;
++#else
++    char** e = environ;
++#endif
++    for (; e != nullptr && *e != nullptr; ++e) {
++        const std::string kv = *e;
++        if (kv.rfind("STRATA_", 0) == 0 && kv.rfind("STRATA_CONV_TIER_", 0) != 0) env.push_back(kv);
++    }
++    std::sort(env.begin(), env.end());
++    SessionIdentityBuilder b(0x5354524954494552ull);
++    b.u64("config", config);
++    b.u64("binary", binary);
++    b.i64("args", (int64_t) args.size());
++    for (const auto& a : args) b.str("arg", a);
++    b.i64("env", (int64_t) env.size());
++    for (const auto& v : env) b.str("var", v);
++    out = b.digest();
++    return true;
++}
++
++ConversationTier::ConversationTier(ConversationTierConfig config) : cfg_(std::move(config)) {
++    while (cfg_.dir.size() > 1 && cfg_.dir.back() == '/') cfg_.dir.pop_back();
++}
++
++ConversationTier::~ConversationTier() {
++    std::vector<std::unique_ptr<SavedConversation>> drop;
++    {
++        std::lock_guard<std::mutex> lk(mu_);
++        stop_ = true;
++        for (size_t i = 0; i < entries_.size();) {
++            if (entries_[i]->state == State::queued) {
++                drop.push_back(std::move(entries_[i]->image));
++                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
++                continue;
++            }
++            ++i;
++        }
++    }
++    work_.notify_all();
++    if (writer_.joinable()) writer_.join();
++}
++
++int64_t ConversationTier::now() const {
++    return cfg_.clock ? cfg_.clock() : (int64_t) std::time(nullptr);
++}
++
++int64_t ConversationTier::day_of(int64_t unix_s) {
++    const std::time_t t = (std::time_t) unix_s;
++    std::tm tm{};
++#ifdef _WIN32
++    localtime_s(&tm, &t);
++#else
++    localtime_r(&t, &tm);
++#endif
++    return (int64_t) (tm.tm_year + 1900) * 10000 + (tm.tm_mon + 1) * 100 + tm.tm_mday;
++}
++
++std::string ConversationTier::path(uint64_t key, int part) const {
++    return cfg_.dir + "/" + hex16(key) + (part < 0 ? std::string(".meta") : "." + std::to_string(part) + ".ses");
++}
++
++void ConversationTier::log_event(const std::string& what) {
++    if (cfg_.log) cfg_.log(what + "; " + status_locked());
++}
++
++std::string ConversationTier::status_locked() const {
++    const ConversationTierStats& s = st_;
++    char b[1024];
++    std::snprintf(b, sizeof b,
++                  "files=%llu parts=%llu disk_bytes=%llu written_today=%llu budget=%llu budget_left=%llu spills=%llu "
++                  "written_bytes=%llu restores=%llu restores_queue=%llu read_bytes=%llu misses=%llu drops_small=%llu "
++                  "drops_budget=%llu drops_busy=%llu drops_ram=%llu drops_cap=%llu drops_io=%llu kept=%llu "
++                  "superseded=%llu expired=%llu evicted=%llu pending=%llu pending_bytes=%llu foreign=%llu verified=%llu",
++                  (unsigned long long) s.files, (unsigned long long) s.parts, (unsigned long long) s.disk_bytes,
++                  (unsigned long long) s.written_today, (unsigned long long) cfg_.budget_bytes,
++                  (unsigned long long) (cfg_.budget_bytes > s.written_today ? cfg_.budget_bytes - s.written_today : 0),
++                  (unsigned long long) s.spills, (unsigned long long) s.written_bytes, (unsigned long long) s.restores,
++                  (unsigned long long) s.restores_queue, (unsigned long long) s.read_bytes,
++                  (unsigned long long) s.misses, (unsigned long long) s.drops_small,
++                  (unsigned long long) s.drops_budget, (unsigned long long) s.drops_busy,
++                  (unsigned long long) s.drops_ram, (unsigned long long) s.drops_cap, (unsigned long long) s.drops_io,
++                  (unsigned long long) s.kept, (unsigned long long) s.superseded, (unsigned long long) s.expired,
++                  (unsigned long long) s.evicted, (unsigned long long) s.pending, (unsigned long long) s.pending_bytes,
++                  (unsigned long long) s.foreign, (unsigned long long) s.verified);
++    return b;
++}
++
++ConversationTierStats ConversationTier::stats() const {
++    std::lock_guard<std::mutex> lk(mu_);
++    ConversationTierStats s = st_;
++    s.budget = cfg_.budget_bytes;
++    s.budget_left = cfg_.budget_bytes > s.written_today ? cfg_.budget_bytes - s.written_today : 0;
++    return s;
++}
++
++std::string ConversationTier::status() const {
++    std::lock_guard<std::mutex> lk(mu_);
++    return status_locked();
++}
++
++void ConversationTier::roll_day_locked() {
++    const int64_t d = day_of(now());
++    if (d != day_) {
++        day_ = d;
++        st_.written_today = 0;
++    }
++}
++
++void ConversationTier::save_budget_locked() {
++    const std::string text = std::to_string(day_) + " " + std::to_string(st_.written_today) + "\n";
++    std::string why;
++    (void) write_small(cfg_.dir, "budget", std::vector<uint8_t>(text.begin(), text.end()), false, why);
++}
++
++size_t ConversationTier::find_locked(uint64_t key) const {
++    for (size_t i = 0; i < entries_.size(); ++i)
++        if (entries_[i]->key == key) return i;
++    return SIZE_MAX;
++}
++
++void ConversationTier::remove_files(uint64_t key, size_t parts) {
++    std::error_code ec;
++    fs::remove(path(key, -1), ec);   // the commit record first: a set without it is never used
++    for (size_t k = 0; k < parts; ++k) fs::remove(path(key, (int) k), ec);
++}
++
++void ConversationTier::remove_entry_locked(size_t i) {
++    const EntryPtr e = entries_[i];
++    if (e->state == State::disk) {
++        remove_files(e->key, e->parts.size());
++        st_.files -= 1;
++        st_.parts -= e->parts.size();
++        st_.disk_bytes -= std::min(st_.disk_bytes, e->bytes);
++    } else if (e->state == State::queued) {
++        st_.pending -= 1;
++        st_.pending_bytes -= std::min(st_.pending_bytes, e->bytes);
++    }
++    entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
++}
++
++bool ConversationTier::sweep_locked(uint64_t incoming) {
++    const int64_t t = now();
++    size_t gone = 0;
++    for (size_t i = 0; i < entries_.size();) {
++        const Entry& e = *entries_[i];
++        if (e.state == State::disk && e.readers == 0 && cfg_.ttl_s > 0 && t - e.used > cfg_.ttl_s) {
++            remove_entry_locked(i);
++            ++st_.expired;
++            ++gone;
++            continue;
++        }
++        ++i;
++    }
++    if (gone) log_event("expired " + std::to_string(gone) + " (unused for " + std::to_string(cfg_.ttl_s / 3600) + " h)");
++    size_t evicted = 0;
++    bool room = true;
++    while (st_.disk_bytes + incoming > cfg_.cap_bytes || st_.files + 1 > cfg_.max_images) {
++        size_t victim = SIZE_MAX;
++        for (size_t i = 0; i < entries_.size(); ++i) {
++            const Entry& e = *entries_[i];
++            if (e.state == State::disk && e.readers == 0 && (victim == SIZE_MAX || e.used < entries_[victim]->used))
++                victim = i;
++        }
++        if (victim == SIZE_MAX) { room = false; break; }
++        remove_entry_locked(victim);
++        ++st_.evicted;
++        ++evicted;
++    }
++    if (evicted) log_event("removed " + std::to_string(evicted) + " least recently used (disk cap)");
++    return room;
++}
++
++size_t ConversationTier::cover_locked(const SavedConversation& image) const {
++    const auto& ids = image.live.ids;
++    const auto& imgs = image.live.imgs;
++    const size_t L = ids.size();
++    for (size_t i = entries_.size(); i-- > 0;) {
++        const Entry& e = *entries_[i];
++        if (e.cvec != image.cvec) continue;
++        // a later state of this conversation is held already
++        if (starts(ids.data(), L, imgs, e.ids, e.imgs)) return i;
++        // it holds this conversation all but fewer than regrow_tokens
++        size_t m = starts(e.ids.data(), e.ids.size(), e.imgs, ids, imgs) ? e.ids.size() : 0;
++        for (const auto& c : e.checks) {
++            const int32_t* p = c.own.empty() ? e.ids.data() : c.own.data();
++            if (c.len > m && starts(p, c.len, c.imgs, ids, imgs)) m = c.len;
++        }
++        if (m > 0 && (int64_t) (L - m) < cfg_.regrow_tokens) return i;
++    }
++    return SIZE_MAX;
++}
++
++bool ConversationTier::start(std::string& error) {
++    error.clear();
++    if (cfg_.dir.empty()) { error = "no folder"; return false; }
++    std::error_code ec;
++    const bool made = fs::create_directories(cfg_.dir, ec);
++    if (ec || !fs::is_directory(cfg_.dir, ec)) {
++        error = "cannot create the folder " + cfg_.dir + (ec ? ": " + ec.message() : std::string());
++        return false;
++    }
++#ifndef _WIN32
++    if (made) (void) ::chmod(cfg_.dir.c_str(), 0700);
++#else
++    (void) made;
++#endif
++    {
++        std::lock_guard<std::mutex> lk(mu_);
++        day_ = day_of(now());
++        std::vector<uint8_t> b;
++        if (read_small(cfg_.dir + "/budget", b, 256)) {
++            long long d = 0;
++            unsigned long long n = 0;
++            const std::string s(b.begin(), b.end());
++            if (std::sscanf(s.c_str(), "%lld %llu", &d, &n) == 2 && d == day_) st_.written_today = n;
++        }
++        std::random_device rd;
++        next_key_ = ((uint64_t) rd() << 32) ^ rd() ^ (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
++    }
++    scan(error);
++    if (!error.empty()) return false;
++    try {
++        writer_ = std::thread([this] { writer_loop(); });
++    } catch (const std::exception& e) {
++        error = std::string("cannot start the writer: ") + e.what();
++        return false;
++    }
++    started_ = true;
++    std::lock_guard<std::mutex> lk(mu_);
++    log_event(std::string("on: ") + cfg_.dir + (cfg_.warm ? " (warm)" : ""));
++    return true;
++}
++
++void ConversationTier::scan(std::string& error) {
++    std::error_code ec;
++    std::vector<std::string> temps;
++    std::unordered_map<uint64_t, std::vector<int>> parts;   // key -> its part numbers
++    std::vector<uint64_t> metas;
++    for (fs::directory_iterator it(cfg_.dir, ec), end; !ec && it != end; it.increment(ec)) {
++        const std::string name = it->path().filename().string();
++        if (name.size() > 5 && name[0] == '.' && name.compare(name.size() - 4, 4, ".tmp") == 0) {
++            temps.push_back(name);   // a write an earlier run did not finish
++            continue;
++        }
++        uint64_t key = 0;
++        if (name.size() < 17 || name[16] != '.' || !parse_hex16(name.substr(0, 16), key)) continue;
++        const std::string rest = name.substr(17);
++        if (rest == "meta") { metas.push_back(key); continue; }
++        if (rest.size() > 4 && rest.compare(rest.size() - 4, 4, ".ses") == 0) {
++            const std::string num = rest.substr(0, rest.size() - 4);
++            if (!num.empty() && num.size() < 4 && std::all_of(num.begin(), num.end(), [](char c) { return c >= '0' && c <= '9'; }))
++                parts[key].push_back(std::stoi(num));
++        }
++    }
++    if (ec) { error = "cannot list " + cfg_.dir + ": " + ec.message(); return; }
++    for (const auto& t : temps) fs::remove(cfg_.dir + "/" + t, ec);
++    std::lock_guard<std::mutex> lk(mu_);
++    std::set<uint64_t> keep;
++    size_t removed = 0, indexed = 0;
++    for (uint64_t key : metas) {
++        bool ok = false, foreign = false;
++        auto e = std::make_shared<Entry>();
++        e->key = key;
++        if (cfg_.warm) {
++            std::vector<uint8_t> b;
++            if (read_small(path(key, -1), b, kMetaMaxBytes) && b.size() >= 8 + 8) {
++                const uint64_t want = session_hash64(b.data(), b.size() - 8, 0);
++                uint64_t have = 0;
++                std::memcpy(&have, b.data() + b.size() - 8, 8);
++                MetaIn in{b.data(), b.size() - 8};
++                char magic[8];
++                uint64_t version = 0, model = 0, config = 0, k = 0, created = 0, cvec = 0, nchecks = 0, nparts = 0;
++                if (want == have && in.raw(magic, 8) && std::memcmp(magic, kMetaMagic, 8) == 0 && in.u64(version) &&
++                    version == kMetaVersion && in.u64(model) && in.u64(config) && in.u64(k) && k == key) {
++                    if (model != cfg_.id.model || config != cfg_.id.config) {
++                        foreign = true;
++                    } else if (in.u64(created) && in.u64(e->digest) && in.u64(cvec) && in.ids(e->ids) &&
++                               in.imgs(e->imgs) && in.u64(nchecks) && nchecks <= in.left / 8) {
++                        e->created = (int64_t) created;
++                        e->cvec = cvec != 0;
++                        bool good = true;
++                        e->checks.resize((size_t) nchecks);
++                        for (auto& c : e->checks) {
++                            uint64_t len = 0;
++                            uint8_t prefix = 0;
++                            good = good && in.u64(len) && in.u8(prefix);
++                            if (good && !prefix) good = in.ids(c.own) && c.own.size() == len;
++                            good = good && in.imgs(c.imgs) && (!prefix || len <= e->ids.size());
++                            c.len = (size_t) len;
++                            if (!good) break;
++                        }
++                        good = good && in.u64(nparts) && nparts > 0 && nparts < 64;
++                        if (good) {
++                            e->parts.resize((size_t) nparts);
++                            e->part_bytes.resize((size_t) nparts);
++                            for (size_t p = 0; p < nparts && good; ++p) {
++                                auto& m = e->parts[p];
++                                uint64_t bytes = 0, nck = 0;
++                                uint8_t dl = 0, lp = 0, ls = 0;
++                                good = in.u64(bytes) && in.u8(dl) && in.u8(lp) && in.u8(ls) && in.u64(nck) &&
++                                       nck <= in.left / 2;
++                                if (!good) break;
++                                m.draftless = dl; m.live_pinned = lp; m.live_slot_turn = ls;
++                                m.pinned.resize((size_t) nck);
++                                m.slot_turn.resize((size_t) nck);
++                                for (size_t c = 0; c < nck && good; ++c) good = in.u8(m.pinned[c]) && in.u8(m.slot_turn[c]);
++                                e->part_bytes[p] = bytes;
++                                good = good && file_size(path(key, (int) p)) == bytes;
++                            }
++                        }
++                        ok = good && in.left == 0;
++                    }
++                }
++            }
++        }
++        if (foreign) {   // another engine's (another build, model or setting): kept until its time to live is over
++            const int64_t used = mtime_s(path(key, -1), now());
++            if (cfg_.ttl_s > 0 && now() - used > cfg_.ttl_s) {
++                remove_files(key, parts.count(key) ? (size_t) *std::max_element(parts[key].begin(), parts[key].end()) + 1 : 0);
++                ++removed;
++            } else {
++                keep.insert(key);
++                ++st_.foreign;
++            }
++            continue;
++        }
++        if (!ok) {
++            fs::remove(path(key, -1), ec);
++            ++removed;
++            continue;
++        }
++        e->state = State::disk;
++        e->used = mtime_s(path(key, -1), e->created);
++        e->bytes = file_size(path(key, -1));
++        for (uint64_t b : e->part_bytes) e->bytes += b;
++        keep.insert(key);
++        st_.files += 1;
++        st_.parts += e->parts.size();
++        st_.disk_bytes += e->bytes;
++        entries_.push_back(e);
++        ++indexed;
++    }
++    // part files without a commit record (a run ended between the parts and the meta file, or not warm)
++    for (auto& [key, nums] : parts) {
++        if (keep.count(key)) continue;
++        for (int n : nums) fs::remove(path(key, n), ec);
++        ++removed;
++    }
++    std::sort(entries_.begin(), entries_.end(), [](const EntryPtr& a, const EntryPtr& b) { return a->used < b->used; });
++    if (removed || indexed || !temps.empty() || st_.foreign)
++        log_event("start: indexed " + std::to_string(indexed) + ", removed " + std::to_string(removed) + " set" +
++                  (removed == 1 ? "" : "s") + " and " + std::to_string(temps.size()) + " unfinished file" +
++                  (temps.size() == 1 ? "" : "s") + ", " + std::to_string(st_.foreign) + " of another engine kept");
++}
++
++void ConversationTier::evicted(SavedConversation&& image, bool spill) {
++    if (!started_) return;
++    const size_t tokens = image.live.ids.size();
++    if (!spill) {
++        if ((int64_t) tokens >= cfg_.min_tokens) {
++            std::lock_guard<std::mutex> lk(mu_);
++            ++st_.drops_ram;
++        }
++        return;   // the caller frees it now
++    }
++    try {
++        std::lock_guard<std::mutex> lk(mu_);
++        if ((int64_t) tokens < cfg_.min_tokens) {
++            ++st_.drops_small;
++            log_event("dropped " + std::to_string(tokens) + " tokens (below the " + std::to_string(cfg_.min_tokens) +
++                      " minimum)");
++            return;
++        }
++        const size_t cover = cover_locked(image);
++        if (cover != SIZE_MAX) {
++            Entry& e = *entries_[cover];
++            e.used = now();
++            if (e.state == State::disk) touch(path(e.key, -1));
++            ++st_.kept;
++            log_event("kept " + std::to_string(tokens) + " tokens: the file of " + std::to_string(e.ids.size()) +
++                      " tokens holds them (nothing written)");
++            return;
++        }
++        const uint64_t est = image.bytes();
++        roll_day_locked();
++        if (cfg_.budget_bytes == 0 || st_.written_today + st_.pending_bytes + est > cfg_.budget_bytes) {
++            ++st_.drops_budget;
++            log_event("dropped " + std::to_string(tokens) + " tokens (" + std::to_string(est >> 20) +
++                      " MiB: the day's write budget is used up)");
++            return;
++        }
++        if (st_.pending > 0 && st_.pending_bytes + est > cfg_.inflight_bytes) {
++            ++st_.drops_busy;
++            log_event("dropped " + std::to_string(tokens) + " tokens (the writer is behind: " +
++                      std::to_string(st_.pending_bytes >> 20) + " MiB waiting)");
++            return;
++        }
++        auto e = std::make_shared<Entry>();
++        do e->key = ++next_key_ * 0x9E3779B97F4A7C15ull;
++        while (e->key == 0 || find_locked(e->key) != SIZE_MAX || fs::exists(path(e->key, -1)));
++        e->ids = image.live.ids;
++        e->imgs = image.live.imgs;
++        e->cvec = image.cvec;
++        for (const auto& c : image.checkpoints) {
++            Entry::Check k;
++            k.len = c.ids.size();
++            k.imgs = c.imgs;
++            if (!(k.len <= e->ids.size() && std::equal(c.ids.begin(), c.ids.end(), e->ids.begin()))) k.own = c.ids;
++            e->checks.push_back(std::move(k));
++        }
++        auto marks = [](const SavedConversation& p) {
++            Entry::Marks m;
++            m.draftless = p.draftless;
++            m.live_pinned = p.live.pinned;
++            m.live_slot_turn = p.live.slot_turn;
++            for (const auto& c : p.checkpoints) { m.pinned.push_back(c.pinned); m.slot_turn.push_back(c.slot_turn); }
++            return m;
++        };
++        e->parts.push_back(marks(image));
++        for (const auto& s : image.stage_images) e->parts.push_back(marks(s));
++        e->bytes = est;
++        e->created = e->used = now();
++        e->image = std::make_unique<SavedConversation>(std::move(image));
++        entries_.push_back(e);
++        ++st_.pending;
++        st_.pending_bytes += est;
++        work_.notify_one();
++    } catch (const std::exception&) {   // (bad_alloc, a filesystem error): dropped as without the tier
++        std::lock_guard<std::mutex> lk(mu_);
++        ++st_.drops_io;
++    }
++}
++
++template<class Token>
++ConversationTier::Match ConversationTier::best(const std::vector<Token>& prompt,
++                                               const std::vector<ConversationImageKey>& images, bool cvec) const {
++    Match best;
++    if (!started_) return best;
++    std::lock_guard<std::mutex> lk(mu_);
++    // the prompt's last token always starts the next window: a match is shorter than the prompt (conversation_prefix)
++    auto prefix = [&](const int32_t* ids, size_t n, const std::vector<ConversationImageKey>& imgs) -> int64_t {
++        if (n >= prompt.size()) return 0;
++        return starts(ids, n, imgs, prompt, images) ? (int64_t) n : 0;
++    };
++    for (size_t i = entries_.size(); i-- > 0;) {
++        const Entry& e = *entries_[i];
++        if (e.cvec != cvec || e.cancelled) continue;
++        auto take = [&](int64_t n, bool live) {
++            if (n > best.tokens) best = {e.key, n, live, e.parts.empty() ? false : e.parts[0].draftless, e.parts.size()};
++        };
++        take(prefix(e.ids.data(), e.ids.size(), e.imgs), true);
++        for (const auto& c : e.checks) take(prefix(c.own.empty() ? e.ids.data() : c.own.data(), c.len, c.imgs), false);
++    }
++    return best;
++}
++
++template ConversationTier::Match ConversationTier::best(const std::vector<int32_t>&,
++                                                        const std::vector<ConversationImageKey>&, bool) const;
++template ConversationTier::Match ConversationTier::best(const std::vector<int64_t>&,
++                                                        const std::vector<ConversationImageKey>&, bool) const;
++
++bool ConversationTier::load(uint64_t key, const std::vector<SessionReadLimits>& limits, SavedConversation& out,
++                            std::string& why, LoadInfo* info) {
++    const auto t0 = std::chrono::steady_clock::now();
++    if (!started_) { why = "off"; return false; }
++    EntryPtr e;
++    {
++        std::unique_lock<std::mutex> lk(mu_);
++        size_t i = find_locked(key);
++        if (i != SIZE_MAX && entries_[i]->state == State::writing) {
++            const EntryPtr w = entries_[i];
++            changed_.wait(lk, [&] { return w->state != State::writing || w->cancelled || find_locked(key) == SIZE_MAX; });
++            i = find_locked(key);
++        }
++        if (i == SIZE_MAX || entries_[i]->cancelled || entries_[i]->state == State::writing) {
++            ++st_.misses;
++            why = "gone (removed meanwhile)";
++            log_event("miss: " + why);
++            return false;
++        }
++        e = entries_[i];
++        if (e->state == State::queued) {   // never written: the image itself comes back
++            std::unique_ptr<SavedConversation> img = std::move(e->image);
++            const size_t tokens = e->ids.size();
++            remove_entry_locked(i);
++            ++st_.restores;
++            ++st_.restores_queue;
++            if (info) { info->from_queue = true; info->bytes = 0; }
++            out = std::move(*img);
++            if (info) info->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++            log_event("restored " + std::to_string(tokens) + " tokens from the write queue");
++            return true;
++        }
++        ++e->readers;
++    }
++    const size_t n = e->parts.size();
++    std::vector<SavedConversation> part(n);
++    std::vector<std::string> err(n);
++    std::vector<SessionStatus> status(n);
++    std::vector<size_t> got(n, 0);
++    std::vector<char> ok(n, 0);
++    bool good = limits.size() >= n;
++    if (!good) why = "read limits for " + std::to_string(limits.size()) + " of " + std::to_string(n) + " parts";
++    if (good && cfg_.fault) {
++        if (const int f = cfg_.fault("read")) { good = false; why = std::string("read: ") + std::strerror(f); }
++    }
++    if (good) {
++        auto job = [&](size_t k, bool spawned) {
++            try {
++                if (cfg_.thread_start && spawned) cfg_.thread_start();   // (never the caller's own thread)
++                ok[k] = session_file_read(path(key, (int) k), cfg_.id, part[k], got[k], err[k], limits[k], &status[k]);
++            } catch (const std::exception& x) {
++                err[k] = x.what();
++                status[k].error = SessionError::memory;
++            }
++        };
++        std::vector<std::thread> threads;
++        try {
++            for (size_t k = 1; k < n; ++k) threads.emplace_back(job, k, true);
++        } catch (const std::exception&) {}
++        job(0, false);
++        for (size_t k = threads.size() + 1; k < n; ++k) job(k, false);   // a thread that could not start: here
++        for (auto& t : threads) t.join();
++        for (size_t k = 0; k < n && good; ++k)
++            if (!ok[k]) { good = false; why = err[k]; }
++    }
++    bool keep_files = false;
++    for (size_t k = 0; k < n; ++k) keep_files = keep_files || (!ok[k] && status[k].error == SessionError::memory);
++    // the parts against the commit record: the same conversation, the marks' checkpoint counts
++    if (good) {
++        for (size_t k = 0; k < n && good; ++k) {
++            const auto& p = part[k];
++            const auto& m = e->parts[k];
++            if (p.live.ids != e->ids || p.live.imgs != e->imgs || p.cvec != e->cvec ||
++                p.checkpoints.size() != m.pinned.size() || (k == 0 && p.checkpoints.size() != e->checks.size())) {
++                good = false;
++                why = "part " + std::to_string(k) + " does not match its commit record";
++            }
++        }
++    }
++    uint64_t bytes = 0;
++    if (good) {
++        for (size_t k = 0; k < n; ++k) {
++            auto& p = part[k];
++            const auto& m = e->parts[k];
++            p.draftless = m.draftless;
++            p.live.pinned = m.live_pinned;
++            p.live.slot_turn = m.live_slot_turn;
++            for (size_t c = 0; c < p.checkpoints.size(); ++c) {
++                p.checkpoints[c].pinned = m.pinned[c] != 0;
++                p.checkpoints[c].slot_turn = m.slot_turn[c] != 0;
++            }
++            bytes += got[k];
++        }
++        SavedConversation img = std::move(part[0]);
++        try {
++            for (size_t k = 1; k < n; ++k) img.stage_images.push_back(std::move(part[k]));
++        } catch (const std::bad_alloc&) {
++            good = false;
++            keep_files = true;
++            why = "out of memory";
++        }
++        if (good && cfg_.verify && e->digest != 0 && conversation_image_digest(img) != e->digest) {
++            good = false;
++            why = "verify: the image read back differs from the one evicted (digest)";
++        }
++        if (good) out = std::move(img);
++    }
++    std::lock_guard<std::mutex> lk(mu_);
++    --e->readers;
++    const size_t i = find_locked(key);
++    if (!good) {
++        ++st_.misses;
++        if (!keep_files && i != SIZE_MAX && e->readers == 0) remove_entry_locked(i);
++        log_event("miss: " + why + (keep_files ? " (the files stay)" : " (the files go)"));
++        return false;
++    }
++    if (cfg_.verify && e->digest != 0) ++st_.verified;
++    e->used = now();
++    touch(path(key, -1));
++    ++st_.restores;
++    st_.read_bytes += bytes;
++    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    if (info) { info->from_queue = false; info->bytes = bytes; info->ms = ms; }
++    char b[160];
++    std::snprintf(b, sizeof b, "restored %zu tokens from disk in %.1f ms (read %.1f MB, %zu files%s)", e->ids.size(), ms,
++                  bytes / 1e6, n, cfg_.verify && e->digest != 0 ? ", digest verified" : "");
++    log_event(b);
++    return true;
++}
++
++void ConversationTier::reject(uint64_t key, const std::string& why) {
++    std::lock_guard<std::mutex> lk(mu_);
++    ++st_.misses;
++    const size_t i = find_locked(key);
++    if (i != SIZE_MAX && entries_[i]->state == State::disk && entries_[i]->readers == 0) remove_entry_locked(i);
++    log_event("miss: refused (" + why + "); the files go");
++}
++
++void ConversationTier::clear() {
++    if (!started_) return;
++    std::vector<std::unique_ptr<SavedConversation>> drop;
++    std::lock_guard<std::mutex> lk(mu_);
++    size_t n = 0;
++    for (size_t i = 0; i < entries_.size();) {
++        Entry& e = *entries_[i];
++        if (e.state == State::writing) { e.cancelled = true; ++i; ++n; continue; }
++        if (e.state == State::queued) drop.push_back(std::move(e.image));
++        remove_entry_locked(i);
++        ++n;
++    }
++    log_event("cleared " + std::to_string(n) + " (non-finite logits)");
++}
++
++void ConversationTier::drain() {
++    std::unique_lock<std::mutex> lk(mu_);
++    idle_.wait(lk, [&] {
++        if (busy_) return false;
++        for (const auto& e : entries_) if (e->state == State::queued) return false;
++        return true;
++    });
++}
++
++bool ConversationTier::write_set(Entry& e, uint64_t& total, std::string& why) {
++    SavedConversation& image = *e.image;
++    const size_t n = 1 + image.stage_images.size();
++    std::vector<std::string> err(n);
++    std::vector<size_t> bytes(n, 0);
++    std::vector<char> ok(n, 0);
++    auto src = [&](size_t k) -> const SavedConversation& { return k == 0 ? image : image.stage_images[k - 1]; };
++    auto job = [&](size_t k, bool spawned) {
++        try {
++            if (cfg_.thread_start && spawned) cfg_.thread_start();
++            SessionWriteOptions o;
++            o.min_free_bytes = cfg_.min_free_bytes;
++            o.durable = cfg_.durable;
++            o.fault = cfg_.fault;
++            ok[k] = session_file_write(path(e.key, (int) k), src(k), cfg_.id, bytes[k], err[k], o);
++        } catch (const std::exception& x) {
++            err[k] = x.what();
++        }
++    };
++    {
++        std::vector<std::thread> threads;
++        try {
++            for (size_t k = 1; k < n; ++k) threads.emplace_back(job, k, true);
++        } catch (const std::exception&) {}
++        job(0, false);
++        for (size_t k = threads.size() + 1; k < n; ++k) job(k, false);
++        for (auto& t : threads) t.join();
++    }
++    for (size_t k = 0; k < n; ++k)
++        if (!ok[k]) { why = err[k]; remove_files(e.key, n); return false; }
++    e.part_bytes.assign(bytes.begin(), bytes.end());
++    // the commit record, after every part is in place
++    MetaOut m;
++    m.raw(kMetaMagic, 8);
++    m.u64(kMetaVersion);
++    m.u64(cfg_.id.model);
++    m.u64(cfg_.id.config);
++    m.u64(e.key);
++    m.u64((uint64_t) e.created);
++    m.u64(e.digest);
++    m.u64(e.cvec ? 1 : 0);
++    m.ids(e.ids);
++    m.imgs(e.imgs);
++    m.u64(e.checks.size());
++    for (const auto& c : e.checks) {
++        m.u64(c.len);
++        m.u8(c.own.empty() ? 1 : 0);
++        if (!c.own.empty()) m.ids(c.own);
++        m.imgs(c.imgs);
++    }
++    m.u64(n);
++    for (size_t k = 0; k < n; ++k) {
++        const auto& p = e.parts[k];
++        m.u64(bytes[k]);
++        m.u8(p.draftless); m.u8(p.live_pinned); m.u8(p.live_slot_turn);
++        m.u64(p.pinned.size());
++        for (size_t c = 0; c < p.pinned.size(); ++c) { m.u8(p.pinned[c]); m.u8(p.slot_turn[c]); }
++    }
++    m.u64(session_hash64(m.b.data(), m.b.size(), 0));
++    if (cfg_.fault) {
++        if (const int f = cfg_.fault("meta")) { why = std::string("meta: ") + std::strerror(f); remove_files(e.key, n); return false; }
++    }
++    if (!write_small(cfg_.dir, hex16(e.key) + ".meta", m.b, cfg_.durable, why)) {
++        why = "meta: " + why;
++        remove_files(e.key, n);
++        return false;
++    }
++    total = m.b.size();
++    for (size_t b : bytes) total += b;
++    if (cfg_.verify) {   // every part read back and compared with what was evicted
++        for (size_t k = 0; k < n; ++k) {
++            SavedConversation back;
++            size_t got = 0;
++            std::string e2;
++            if (!session_file_read(path(e.key, (int) k), cfg_.id, back, got, e2)) {
++                why = "verify: reading part " + std::to_string(k) + " back: " + e2;
++                remove_files(e.key, n);
++                return false;
++            }
++            const auto& p = e.parts[k];
++            back.draftless = p.draftless;
++            back.live.pinned = p.live_pinned;
++            back.live.slot_turn = p.live_slot_turn;
++            for (size_t c = 0; c < back.checkpoints.size() && c < p.pinned.size(); ++c) {
++                back.checkpoints[c].pinned = p.pinned[c] != 0;
++                back.checkpoints[c].slot_turn = p.slot_turn[c] != 0;
++            }
++            if (!same_part(back, src(k))) {
++                why = "verify: part " + std::to_string(k) + " read back differs from the evicted image";
++                remove_files(e.key, n);
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++void ConversationTier::writer_loop() {
++    if (cfg_.thread_start) cfg_.thread_start();
++    std::unique_lock<std::mutex> lk(mu_);
++    for (;;) {
++        EntryPtr e;
++        for (const auto& x : entries_)
++            if (x->state == State::queued) { e = x; break; }
++        if (!e) {
++            idle_.notify_all();
++            if (stop_) return;
++            // an idle minute: the day's budget and the time to live move on without writes
++            if (!work_.wait_for(lk, std::chrono::seconds(60), [&] {
++                    if (stop_) return true;
++                    for (const auto& x : entries_) if (x->state == State::queued) return true;
++                    return false;
++                })) {
++                const int64_t d = day_;
++                roll_day_locked();
++                if (d != day_) { save_budget_locked(); log_event("a new day: the write budget starts again"); }
++                (void) sweep_locked(0);
++            }
++            continue;
++        }
++        if (stop_) return;
++        const auto t0 = std::chrono::steady_clock::now();
++        roll_day_locked();
++        e->state = State::writing;
++        busy_ = true;
++        --st_.pending;
++        st_.pending_bytes -= std::min(st_.pending_bytes, e->bytes);
++        const bool room = sweep_locked(e->bytes);
++        bool ok = false;
++        uint64_t total = 0;
++        std::string why;
++        if (!room) {
++            why = "cap";
++        } else {
++            lk.unlock();
++            try {
++                if (cfg_.verify) e->digest = conversation_image_digest(*e->image);
++                ok = write_set(*e, total, why);
++            } catch (const std::exception& x) {
++                why = x.what();
++                ok = false;
++            }
++            e->image.reset();   // the RAM goes back now
++            lk.lock();
++        }
++        e->image.reset();
++        const size_t i = find_locked(e->key);
++        busy_ = false;
++        if (e->cancelled || i == SIZE_MAX) {
++            if (ok) remove_files(e->key, e->parts.size());
++            if (i != SIZE_MAX) entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
++        } else if (ok) {
++            e->state = State::disk;
++            e->bytes = total;
++            e->used = now();
++            st_.files += 1;
++            st_.parts += e->parts.size();
++            st_.disk_bytes += total;
++            st_.written_today += total;
++            st_.written_bytes += total;
++            ++st_.spills;
++            if (cfg_.verify) ++st_.verified;
++            // the older files of this conversation (its tokens start this one's) go
++            size_t gone = 0;
++            for (size_t j = 0; j < entries_.size();) {
++                const Entry& d = *entries_[j];
++                if (entries_[j] != e && d.state == State::disk && d.readers == 0 && d.cvec == e->cvec &&
++                    d.ids.size() < e->ids.size() && starts(d.ids.data(), d.ids.size(), d.imgs, e->ids, e->imgs)) {
++                    remove_entry_locked(j);
++                    ++st_.superseded;
++                    ++gone;
++                    continue;
++                }
++                ++j;
++            }
++            save_budget_locked();
++            char b[200];
++            std::snprintf(b, sizeof b, "spilled %zu tokens (%.1f MB, %zu files%s) in %.1f ms%s", e->ids.size(),
++                          total / 1e6, e->parts.size() + 1, cfg_.verify ? ", verified" : "",
++                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
++                          gone ? (", " + std::to_string(gone) + " older file set" + (gone == 1 ? "" : "s") + " of it removed").c_str() : "");
++            log_event(b);
++        } else {
++            if (why == "cap") ++st_.drops_cap; else ++st_.drops_io;
++            entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
++            log_event("dropped " + std::to_string(e->ids.size()) + " tokens (" +
++                      (why == "cap" ? std::string("the disk cap: every file is in use") : "write failed: " + why) + ")");
++        }
++        changed_.notify_all();
++    }
++}
++
++} // namespace strata::core
+diff --git a/src/core/conversation_tier_test.cpp b/src/core/conversation_tier_test.cpp
+new file mode 100644
+index 00000000..5ddff6d2
+--- /dev/null
++++ b/src/core/conversation_tier_test.cpp
+@@ -0,0 +1,601 @@
++// CPU-only tests for the conversation cache's disk tier (include/strata/core/conversation_tier.hpp).
++// Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
++#include "strata/core/conversation_tier.hpp"
++
++#include <atomic>
++#include <chrono>
++#include <cerrno>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++using namespace strata::core;
++namespace fs = std::filesystem;
++
++namespace {
++void set_env(const char* name, const char* value) {
++#ifdef _WIN32
++    _putenv_s(name, value ? value : "");
++#else
++    if (value) setenv(name, value, 1); else unsetenv(name);
++#endif
++}
++int checks = 0;
++void check(bool ok, const char* label) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
++}
++
++ConversationBuffer pattern(size_t n, uint8_t seed) {
++    ConversationBuffer b;
++    b.resize(n);
++    b.visit(0, n, [&](uint8_t* p, size_t c, size_t at) {
++        for (size_t i = 0; i < c; ++i) p[i] = uint8_t((at + i) * 131u + seed);
++        return true;
++    });
++    return b;
++}
++std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
++    std::vector<uint8_t> v(n);
++    for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 7u + seed);
++    return v;
++}
++std::vector<int32_t> tokens(size_t n, int32_t base) {
++    std::vector<int32_t> v(n);
++    for (size_t i = 0; i < n; ++i) v[i] = base + int32_t(i % 977);
++    return v;
++}
++ConversationCheckpoint state(const std::vector<int32_t>& ids, uint8_t seed) {
++    ConversationCheckpoint c;
++    c.ids = ids;
++    c.gdn = bytes_of(4099, seed);
++    c.ple = bytes_of(77, seed + 1);
++    c.tails = bytes_of(301, seed + 2);
++    c.dead = bytes_of(64, seed + 3);
++    c.block_pos = bytes_of(8, seed + 4);
++    c.used = 40 + seed;
++    return c;
++}
++// one stage's image: the live state, a root checkpoint (pinned mark) and a turn checkpoint (slot_turn mark), 2 layers
++SavedConversation part(const std::vector<int32_t>& ids, int64_t lo, int64_t hi, uint8_t seed, bool pin = false) {
++    SavedConversation s;
++    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(100 + i);
++    s.layer_lo = lo; s.layer_hi = hi;
++    s.cvec = true;
++    s.live = state(ids, seed);
++    s.checkpoints.push_back(state(std::vector<int32_t>(ids.begin(), ids.begin() + 50), seed + 10));
++    s.checkpoints.back().pinned = pin;
++    s.checkpoints.push_back(state(std::vector<int32_t>(ids.begin(), ids.end() - 20), seed + 20));
++    s.checkpoints.back().slot_turn = true;
++    for (int layer = 0; layer < 2; ++layer) {
++        ConversationKv kv;
++        kv.format = 2; kv.cells = (int64_t) ids.size(); kv.heads = 2; kv.head_dim = 64; kv.page_size = 64;
++        kv.pooled_rows = 4; kv.idx_dim = 16;
++        kv.k = pattern(ids.size() * 8 + layer, uint8_t(seed + layer));
++        kv.v = pattern(ids.size() * 8, uint8_t(seed + layer + 3));
++        kv.k_scale = pattern(64, uint8_t(seed + 5));
++        kv.v_scale = pattern(64, uint8_t(seed + 6));
++        kv.pooled = pattern(4 * 16, uint8_t(seed + 7));
++        s.kv.push_back(std::move(kv));
++    }
++    return s;
++}
++// a layer split's image: stage 0 plus three later stages (the first marked like a batch slot's: draftless)
++SavedConversation image_of(const std::vector<int32_t>& ids, uint8_t seed, bool pin = false) {
++    SavedConversation s = part(ids, 0, 12, seed, pin);
++    s.draftless = true;
++    for (int k = 1; k < 4; ++k) s.stage_images.push_back(part(ids, 12 * k, 12 * k + 12, uint8_t(seed + 30 * k), pin));
++    return s;
++}
++SavedConversation image(size_t n, int32_t base = 1000, uint8_t seed = 1, bool pin = false) {
++    return image_of(tokens(n, base), seed, pin);
++}
++std::vector<int32_t> extend(const std::vector<int32_t>& ids, size_t more) {
++    std::vector<int32_t> v = ids;
++    v.push_back(1);
++    for (size_t i = 0; i < more; ++i) v.push_back(int32_t(5000 + i));
++    return v;
++}
++
++struct Fixture {
++    std::string dir;
++    int64_t t = 1'760'000'000;
++    std::vector<std::string> lines;
++    std::mutex mu;
++    explicit Fixture(const char* name) {
++        dir = (fs::temp_directory_path() / ("strata_tier_test_" + std::to_string((unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count()) + "_" + name)).string();
++        fs::remove_all(dir);
++    }
++    ~Fixture() { std::error_code ec; fs::remove_all(dir, ec); }
++    ConversationTierConfig config() {
++        ConversationTierConfig c;
++        c.dir = dir;
++        c.min_tokens = 100;
++        c.budget_bytes = 1ull << 30;
++        c.cap_bytes = 1ull << 30;
++        c.max_images = 100;
++        c.ttl_s = 3600;
++        c.inflight_bytes = 1ull << 30;
++        c.regrow_tokens = 64;
++        c.min_free_bytes = 0;
++        c.durable = false;
++        c.id = {0x1111, 0x2222};
++        c.clock = [this] { return t; };
++        c.log = [this](const std::string& l) { std::lock_guard<std::mutex> lk(mu); lines.push_back(l); };
++        return c;
++    }
++    size_t files() const {
++        size_t n = 0;
++        std::error_code ec;
++        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
++            if (it->path().filename() != "budget") ++n;
++        return n;
++    }
++    bool any_temp() const {
++        std::error_code ec;
++        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
++            const std::string n = it->path().filename().string();
++            if (n.size() > 4 && n.compare(n.size() - 4, 4, ".tmp") == 0) return true;
++        }
++        return false;
++    }
++};
++
++bool start_ok(ConversationTier& t, std::string& err) {
++    const bool ok = t.start(err);
++    if (!ok) std::fprintf(stderr, "start: %s\n", err.c_str());
++    return ok;
++}
++
++// read limits as the engine passes them: open (the engine's are its runtime's); one per part
++std::vector<SessionReadLimits> limits(size_t parts) { return std::vector<SessionReadLimits>(parts); }
++
++std::vector<int32_t> prompt_after(const SavedConversation& s, size_t more = 10) { return extend(s.live.ids, more); }
++
++void test_spill_only_on_eviction_and_restore_exact() {
++    Fixture f("evict");
++    ConversationTier tier(f.config());
++    std::string err;
++    check(start_ok(tier, err), "the tier starts");
++    ConversationCache cache(1ull << 30, 2);
++    cache.set_evict_sink([&](SavedConversation&& img, bool spill) { tier.evicted(std::move(img), spill); });
++    const SavedConversation a = image(300, 1000, 1), b = image(310, 2000, 2), c = image(320, 3000, 3);
++    check(cache.put(SavedConversation(a)) && cache.put(SavedConversation(b)), "two images parked");
++    tier.drain();
++    check(tier.stats().spills == 0 && f.files() == 0, "nothing is written while the RAM cache holds everything");
++    check(cache.put(SavedConversation(c)), "a third image: make_room evicts the oldest");
++    tier.drain();
++    auto st = tier.stats();
++    check(st.spills == 1 && st.files == 1 && st.parts == 4 && f.files() == 5, "the evicted image went to disk: 4 parts + meta");
++    check(st.written_today == st.disk_bytes && st.written_bytes == st.disk_bytes && st.disk_bytes > 0, "bytes counted");
++    // the physical-RAM gate's eviction: freed now, counted, never written
++    check(cache.evict_oldest() && cache.size() == 1, "the gate evicts one");
++    tier.drain();
++    st = tier.stats();
++    check(st.spills == 1 && st.drops_ram == 1 && f.files() == 5, "a gate eviction is not written (drops_ram)");
++    // drop_superseded and clear() never reach the sink
++    cache.set_supersede_prefix(true);
++    cache.drop_superseded(prompt_after(c), {}, {}, true);
++    cache.clear();
++    tier.drain();
++    st = tier.stats();
++    check(st.spills == 1 && st.drops_ram == 1 && st.drops_small == 0, "superseded and cleared images are not spilled");
++    // the restore: the image that was evicted, byte for byte (stage images and marks included)
++    const auto m = tier.best(prompt_after(a), {}, true);
++    check(m.key != 0 && m.tokens == 300 && m.live && m.parts == 4 && m.draftless, "best finds the spilled conversation");
++    check(tier.best(prompt_after(b), {}, true).tokens == 0, "the gate-evicted one is not on disk");
++    check(tier.best(prompt_after(a), {}, false).tokens == 0, "another control vector mode does not match");
++    const auto ck = tier.best(extend(std::vector<int32_t>(a.live.ids.begin(), a.live.ids.end() - 20), 5), {}, true);
++    check(ck.tokens == 280 && !ck.live, "a checkpoint matches too (a rewritten tail)");
++    SavedConversation back;
++    ConversationTier::LoadInfo info;
++    check(tier.load(m.key, limits(4), back, err, &info), "load");
++    check(!info.from_queue && info.bytes > 0, "read from disk");
++    check(conversation_image_same(back, a), "the restored image is byte-identical to the evicted one (marks too)");
++    check(tier.stats().restores == 1 && tier.stats().read_bytes == info.bytes, "restore counted");
++    check(conversation_image_digest(back) == conversation_image_digest(a), "digest equal");
++    SavedConversation other = a;
++    other.stage_images[2].checkpoints[1].slot_turn = false;
++    check(conversation_image_digest(other) != conversation_image_digest(a), "the digest sees a mark");
++}
++
++void test_min_tokens_and_write_once() {
++    Fixture f("once");
++    ConversationTier tier(f.config());
++    std::string err;
++    check(start_ok(tier, err), "start");
++    tier.evicted(image(99), true);
++    tier.drain();
++    check(tier.stats().drops_small == 1 && tier.stats().spills == 0 && f.files() == 0, "below min_tokens: dropped");
++    const SavedConversation a = image(400, 1000, 1);
++    tier.evicted(SavedConversation(a), true);
++    tier.drain();
++    const auto written = tier.stats().written_bytes;
++    check(tier.stats().spills == 1 && written > 0, "written once");
++    // restored and evicted again unchanged: nothing written
++    tier.evicted(SavedConversation(a), true);
++    tier.drain();
++    check(tier.stats().spills == 1 && tier.stats().kept == 1 && tier.stats().written_bytes == written,
++          "an unchanged conversation is never written twice");
++    // the same conversation a little further on (fewer than regrow_tokens new): the file holds it
++    const auto grown = extend(a.live.ids, 40);
++    SavedConversation g1 = part(grown, 0, 12, 7);
++    tier.evicted(std::move(g1), true);
++    tier.drain();
++    check(tier.stats().spills == 1 && tier.stats().kept == 2, "grown by less than regrow_tokens: kept, not rewritten");
++    // an older, shorter copy of it (a turn back): held by the file of the later state
++    SavedConversation older = part(std::vector<int32_t>(a.live.ids.begin(), a.live.ids.begin() + 200), 0, 12, 8);
++    tier.evicted(std::move(older), true);
++    tier.drain();
++    check(tier.stats().spills == 1 && tier.stats().kept == 3, "an earlier copy of a conversation on disk is not written");
++    // grown by regrow_tokens or more: written in full, the older file goes
++    tier.evicted(image_of(extend(a.live.ids, 100), 9), true);
++    tier.drain();
++    const auto st = tier.stats();
++    check(st.spills == 2 && st.superseded == 1 && st.files == 1 && f.files() == 5,
++          "grown past regrow_tokens: rewritten, the older file set removed");
++    check(tier.best(extend(extend(a.live.ids, 100), 3), {}, true).tokens == 501, "matched at its new length");
++}
++
++void test_budget_and_day() {
++    Fixture f("budget");
++    auto cfg = f.config();
++    const uint64_t one = image(300).bytes();
++    cfg.budget_bytes = one + one / 2;   // room for one image a day
++    ConversationTier tier(cfg);
++    std::string err;
++    check(start_ok(tier, err), "start");
++    tier.evicted(image(300, 1000), true);
++    tier.drain();
++    tier.evicted(image(300, 2000), true);
++    tier.drain();
++    auto st = tier.stats();
++    check(st.spills == 1 && st.drops_budget == 1 && st.files == 1, "the second write would pass the budget: dropped");
++    check(st.budget == cfg.budget_bytes && st.budget_left == cfg.budget_bytes - st.written_today, "budget left");
++    f.t += 86400;   // the next day
++    tier.evicted(image(300, 3000), true);
++    tier.drain();
++    st = tier.stats();
++    check(st.spills == 2 && st.drops_budget == 1, "a new day: the budget starts again");
++    auto cfg0 = f.config();
++    cfg0.budget_bytes = 0;
++    Fixture g("budget0");
++    cfg0.dir = g.dir;
++    ConversationTier none(cfg0);
++    check(start_ok(none, err), "start");
++    none.evicted(image(300), true);
++    none.drain();
++    check(none.stats().drops_budget == 1 && g.files() == 0, "budget 0: nothing is ever written");
++}
++
++void test_budget_persists() {
++    Fixture f("budgetfile");
++    auto cfg = f.config();
++    {
++        ConversationTier tier(cfg);
++        std::string err;
++        check(start_ok(tier, err), "start");
++        tier.evicted(image(300), true);
++        tier.drain();
++    }
++    ConversationTier tier(cfg);
++    std::string err;
++    check(start_ok(tier, err), "start again");
++    check(tier.stats().written_today > 0, "the day's written bytes survive a restart");
++    check(tier.stats().files == 0 && f.files() == 0, "not warm: the earlier run's files are removed at start");
++}
++
++void test_ttl_and_cap() {
++    Fixture f("ttl");
++    auto cfg = f.config();
++    const uint64_t one = image(300).bytes();
++    cfg.ttl_s = 3600;
++    cfg.max_images = 2;
++    ConversationTier tier(cfg);
++    std::string err;
++    check(start_ok(tier, err), "start");
++    tier.evicted(image(300, 1000), true);
++    tier.drain();
++    f.t += 10;
++    tier.evicted(image(300, 2000), true);
++    tier.drain();
++    f.t += 10;
++    // touch the first (a restore): the second is now the least recently used
++    SavedConversation back;
++    check(tier.load(tier.best(prompt_after(image(300, 1000)), {}, true).key, limits(4), back, err), "load the first");
++    f.t += 10;
++    tier.evicted(image(300, 3000), true);
++    tier.drain();
++    auto st = tier.stats();
++    check(st.files == 2 && st.evicted == 1, "max_images: the least recently used set goes");
++    check(tier.best(prompt_after(image(300, 2000)), {}, true).tokens == 0, "it was the unused one");
++    check(tier.best(prompt_after(image(300, 1000)), {}, true).tokens == 300, "the restored one stays");
++    // the byte cap
++    Fixture g("cap");
++    auto c2 = g.config();
++    c2.cap_bytes = one * 2;   // two images' RAM; a set on disk is about that size
++    ConversationTier capped(c2);
++    check(start_ok(capped, err), "start");
++    for (int i = 0; i < 4; ++i) { capped.evicted(image(300, 1000 * (i + 1)), true); capped.drain(); g.t += 5; }
++    st = capped.stats();
++    check(st.disk_bytes <= c2.cap_bytes && st.evicted >= 2 && st.spills == 4, "cap_bytes holds, LRU evicted");
++    // the time to live: an hour without use, then the next write's sweep removes it
++    f.t += 7200;
++    tier.evicted(image(300, 9000), true);
++    tier.drain();
++    st = tier.stats();
++    check(st.expired == 2 && st.files == 1, "expired by last use");
++}
++
++// the writer held at a write: the queue, the in-flight bound, a restore from the queue, a restore that waits
++void test_queue_and_inflight() {
++    Fixture f("queue");
++    auto cfg = f.config();
++    std::mutex mu;
++    std::condition_variable cv;
++    bool hold = true;
++    std::atomic<int> entered{0};
++    cfg.fault = [&](const char* step) {
++        if (std::strcmp(step, "write") == 0) {
++            ++entered;
++            std::unique_lock<std::mutex> lk(mu);
++            cv.wait(lk, [&] { return !hold; });
++        }
++        return 0;
++    };
++    const uint64_t one = image(300).bytes();
++    cfg.inflight_bytes = one + one / 2;
++    ConversationTier tier(cfg);
++    std::string err;
++    check(start_ok(tier, err), "start");
++    const SavedConversation a = image(300, 1000), b = image(300, 2000), c = image(300, 3000);
++    tier.evicted(SavedConversation(a), true);
++    while (entered.load() == 0) std::this_thread::yield();   // a is being written (held)
++    tier.evicted(SavedConversation(b), true);                // waits
++    tier.evicted(SavedConversation(c), true);                // the in-flight bound
++    auto st = tier.stats();
++    check(st.pending == 1 && st.drops_busy == 1, "the in-flight bound drops what does not fit beside the queue");
++    SavedConversation back;
++    ConversationTier::LoadInfo info;
++    check(tier.load(tier.best(prompt_after(b), {}, true).key, limits(4), back, err, &info), "load from the queue");
++    check(info.from_queue && conversation_image_same(back, b), "a waiting image comes back as it is, no read");
++    check(tier.stats().pending == 0 && tier.stats().restores_queue == 1, "taken out of the queue");
++    // a restore of the one being written waits for the write and then reads it
++    std::thread release([&] {
++        std::this_thread::sleep_for(std::chrono::milliseconds(50));
++        { std::lock_guard<std::mutex> lk(mu); hold = false; }
++        cv.notify_all();
++    });
++    check(tier.load(tier.best(prompt_after(a), {}, true).key, limits(4), back, err, &info), "load waits for the write");
++    release.join();
++    check(!info.from_queue && conversation_image_same(back, a), "then reads it from disk, byte-identical");
++}
++
++void test_io_errors_and_crash_safety() {
++    std::string err;
++    for (const char* step : {"write", "file_flush", "rename", "meta"}) {
++        Fixture f(step);
++        auto cfg = f.config();
++        cfg.durable = true;
++        cfg.fault = [step](const char* s) { return std::strcmp(s, step) == 0 ? EIO : 0; };
++        ConversationTier tier(cfg);
++        check(start_ok(tier, err), "start");
++        SavedConversation img = image(300);
++        img.kv[0].k = pattern((17u << 20) + 3, 9);   // a block write happens before the last block (the "write" step)
++        tier.evicted(std::move(img), true);
++        tier.drain();
++        const auto st = tier.stats();
++        check(st.drops_io == 1 && st.spills == 0 && st.files == 0, "a failed write is dropped and counted");
++        check(f.files() == 0 && !f.any_temp(), "no part, meta or temporary file is left behind");
++        check(tier.best(prompt_after(image(300)), {}, true).tokens == 0, "nothing to restore");
++    }
++    // read errors: the fault, a corrupt part, a missing part -> false, a miss, the files go; never a partial image
++    {
++        Fixture f("readfault");
++        auto cfg = f.config();
++        bool fail_read = false;
++        cfg.fault = [&](const char* s) { return fail_read && std::strcmp(s, "read") == 0 ? EIO : 0; };
++        ConversationTier tier(cfg);
++        check(start_ok(tier, err), "start");
++        tier.evicted(image(300), true);
++        tier.drain();
++        fail_read = true;
++        SavedConversation back;
++        back.layer_lo = 77;
++        check(!tier.load(tier.best(prompt_after(image(300)), {}, true).key, limits(4), back, err), "an I/O error: false");
++        check(back.layer_lo == 77 && back.kv.empty(), "the output is untouched");
++        check(tier.stats().misses == 1 && tier.stats().files == 0 && f.files() == 0, "a miss; the set goes");
++    }
++    {
++        Fixture f("corrupt");
++        ConversationTier tier(f.config());
++        check(start_ok(tier, err), "start");
++        tier.evicted(image(300), true);
++        tier.drain();
++        const auto m = tier.best(prompt_after(image(300)), {}, true);
++        std::string p;
++        for (const auto& e : fs::directory_iterator(f.dir))
++            if (e.path().string().size() > 6 && e.path().string().compare(e.path().string().size() - 6, 6, ".2.ses") == 0)
++                p = e.path().string();
++        check(!p.empty(), "part 2 is on disk");
++        {
++            std::fstream fh(p, std::ios::in | std::ios::out | std::ios::binary);
++            fh.seekp(200);
++            char x = 0;
++            fh.read(&x, 1);
++            fh.seekp(200);
++            x ^= 0x5a;
++            fh.write(&x, 1);
++        }
++        SavedConversation back;
++        check(!tier.load(m.key, limits(4), back, err), "a corrupt part is refused");
++        check(err.find("checksum") != std::string::npos, "by its payload checksum");
++        check(tier.stats().misses == 1 && f.files() == 0, "the set goes");
++    }
++    {
++        Fixture f("missing");
++        ConversationTier tier(f.config());
++        check(start_ok(tier, err), "start");
++        tier.evicted(image(300), true);
++        tier.drain();
++        const auto m = tier.best(prompt_after(image(300)), {}, true);
++        for (const auto& e : fs::directory_iterator(f.dir))
++            if (e.path().string().find(".3.ses") != std::string::npos) fs::remove(e.path());
++        SavedConversation back;
++        check(!tier.load(m.key, limits(4), back, err) && tier.stats().misses == 1, "a missing part: a miss");
++    }
++    // RAM refusal (the read preflight): false, but the files stay
++    {
++        Fixture f("ramref");
++        ConversationTier tier(f.config());
++        check(start_ok(tier, err), "start");
++        tier.evicted(image(300), true);
++        tier.drain();
++        auto l = limits(4);
++        l[1].admit = [](uint64_t, std::string& why) { why = "no RAM"; return false; };
++        SavedConversation back;
++        check(!tier.load(tier.best(prompt_after(image(300)), {}, true).key, l, back, err), "a RAM refusal");
++        check(tier.stats().files == 1 && f.files() == 5, "the files stay for a later try");
++        check(tier.load(tier.best(prompt_after(image(300)), {}, true).key, limits(4), back, err), "and load later");
++    }
++    // a crash between the parts and the commit record, or during a write: at the next start nothing of it is used
++    {
++        Fixture f("crash");
++        auto cfg = f.config();
++        {
++            ConversationTier tier(cfg);
++            check(start_ok(tier, err), "start");
++            tier.evicted(image(300), true);
++            tier.drain();
++        }
++        std::string meta;
++        for (const auto& e : fs::directory_iterator(f.dir))
++            if (e.path().extension() == ".meta") meta = e.path().string();
++        fs::remove(meta);   // the commit record never made it
++        std::ofstream(f.dir + "/.0123456789abcdef.0.ses.deadbeefdeadbeef.tmp") << "partial";
++        cfg.warm = true;
++        ConversationTier tier(cfg);
++        check(start_ok(tier, err), "start warm");
++        check(tier.stats().files == 0 && f.files() == 0, "parts without a commit record and temporary files are removed");
++    }
++}
++
++void test_warm_identity_and_verify() {
++    Fixture f("warm");
++    auto cfg = f.config();
++    cfg.verify = true;
++    const SavedConversation a = image(300, 1000, 1, true);   // marks: pinned, slot_turn, draftless
++    std::string err;
++    {
++        ConversationTier tier(cfg);
++        check(start_ok(tier, err), "start");
++        tier.evicted(SavedConversation(a), true);
++        tier.drain();
++        check(tier.stats().verified == 1 && tier.stats().spills == 1, "verify: the write was read back and compared");
++    }
++    // another identity (another build, model or setting): not indexed, never restored, kept until its time to live
++    {
++        auto other = cfg;
++        other.warm = true;
++        other.id.config ^= 1;
++        ConversationTier tier(other);
++        check(start_ok(tier, err), "start with another identity");
++        check(tier.best(prompt_after(a), {}, true).tokens == 0 && tier.stats().foreign == 1 && f.files() == 5,
++              "a file of another identity is refused (not indexed) and left alone");
++    }
++    // the same identity, warm: indexed, restored byte for byte, digest checked
++    {
++        auto same = cfg;
++        same.warm = true;
++        ConversationTier tier(same);
++        check(start_ok(tier, err), "start warm");
++        const auto m = tier.best(prompt_after(a), {}, true);
++        check(m.tokens == 300 && tier.stats().files == 1, "a warm start indexes this engine's files");
++        SavedConversation back;
++        check(tier.load(m.key, limits(4), back, err), "warm load");
++        check(conversation_image_same(back, a) && tier.stats().verified == 1, "byte-identical, digest verified");
++    }
++    // a part file with another identity in its header (swapped in under the same name): refused by the read
++    {
++        Fixture g("swap");
++        auto c1 = g.config();
++        auto c2 = g.config();
++        c2.id.model ^= 7;
++        Fixture h("swapsrc");
++        c2.dir = h.dir;
++        ConversationTier t1(c1), t2(c2);
++        check(start_ok(t1, err) && start_ok(t2, err), "start both");
++        t1.evicted(SavedConversation(a), true);
++        t2.evicted(SavedConversation(a), true);
++        t1.drain();
++        t2.drain();
++        std::string p1, p2;
++        for (const auto& e : fs::directory_iterator(g.dir)) if (e.path().string().find(".1.ses") != std::string::npos) p1 = e.path().string();
++        for (const auto& e : fs::directory_iterator(h.dir)) if (e.path().string().find(".1.ses") != std::string::npos) p2 = e.path().string();
++        fs::copy_file(p2, p1, fs::copy_options::overwrite_existing);
++        SavedConversation back;
++        check(!t1.load(t1.best(prompt_after(a), {}, true).key, limits(4), back, err), "a part of another model is refused");
++        check(err.find("another model") != std::string::npos && t1.stats().misses == 1, "by its identity");
++    }
++}
++
++void test_clear_and_reject() {
++    Fixture f("clear");
++    ConversationTier tier(f.config());
++    std::string err;
++    check(start_ok(tier, err), "start");
++    tier.evicted(image(300, 1000), true);
++    tier.evicted(image(300, 2000), true);
++    tier.drain();
++    check(tier.stats().files == 2, "two on disk");
++    tier.reject(tier.best(prompt_after(image(300, 1000)), {}, true).key, "test");
++    check(tier.stats().files == 1 && tier.stats().misses == 1, "a refused image goes");
++    tier.clear();
++    tier.drain();
++    check(tier.stats().files == 0 && f.files() == 0, "#879: everything goes");
++}
++
++void test_fingerprint() {
++    Fixture f("fp");
++    fs::create_directories(f.dir);
++    const std::string exe = f.dir + "/engine";
++    std::ofstream(exe) << "binary one";
++    uint64_t a = 0, b = 0, c = 0, d = 0;
++    std::string err;
++    check(conversation_tier_fingerprint(1, exe, {"--x", "1"}, a, err), "fingerprint");
++    check(conversation_tier_fingerprint(1, exe, {"--x", "2"}, b, err) && a != b, "the arguments count");
++    check(conversation_tier_fingerprint(2, exe, {"--x", "1"}, c, err) && a != c, "the configuration counts");
++    std::ofstream(exe) << "binary two";
++    check(conversation_tier_fingerprint(1, exe, {"--x", "1"}, d, err) && a != d, "the binary counts");
++    set_env("STRATA_TIER_TEST_SWITCH", "1");
++    std::ofstream(exe) << "binary one";
++    uint64_t e = 0, g = 0;
++    check(conversation_tier_fingerprint(1, exe, {"--x", "1"}, e, err) && a != e, "a STRATA_* variable counts");
++    set_env("STRATA_TIER_TEST_SWITCH", nullptr);
++    set_env("STRATA_CONV_TIER_TTL_H", "5");
++    check(conversation_tier_fingerprint(1, exe, {"--x", "1"}, g, err) && a == g, "the tier's own knobs do not");
++    set_env("STRATA_CONV_TIER_TTL_H", nullptr);
++}
++} // namespace
++
++int main() {
++    test_spill_only_on_eviction_and_restore_exact();
++    test_min_tokens_and_write_once();
++    test_budget_and_day();
++    test_budget_persists();
++    test_ttl_and_cap();
++    test_queue_and_inflight();
++    test_io_errors_and_crash_safety();
++    test_warm_identity_and_verify();
++    test_clear_and_reject();
++    test_fingerprint();
++    std::printf("conversation_tier_test: %d checks passed\n", checks);
++    return 0;
++}
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3b9abc0e..58c06991 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -24,6 +24,7 @@
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/conversation_snapshot.hpp"
+ #include "strata/core/conversation_file.hpp"
++#include "strata/core/conversation_tier.hpp"
+ #include "strata/core/session_save_reclaim.hpp"
+ #include "strata/core/conversation_memory.hpp"
+ #include "strata/core/coupled_draft.hpp"
+@@ -8325,6 +8326,83 @@ int main(int argc, char** argv) {
+             id.config = *config_fp;
+             return true;
+         };
++        // STRATA_CONV_TIER_DIR=<folder> (unset: off): the conversation cache's disk tier, an emergency overflow
++        // (conversation_tier.hpp).  A long conversation the RAM cache has to evict to make room for another is written
++        // there (one session file per stage, O_DIRECT, temporary file + rename, a meta file last) by a writer thread,
++        // instead of being dropped; a request that continues it reads it back instead of its prompt.  Only evictions
++        // to make room spill: the RAM floor's and a save's evictions free the memory at once.  A conversation is
++        // written once (one a file holds all but fewer than STRATA_CONV_TIER_REGROW_TOKENS of is not written again;
++        // its request reads the new tokens on top of the file).  The knobs, all optional:
++        //   STRATA_CONV_TIER_MIN_TOKENS (16384)   shorter conversations are dropped as before
++        //   STRATA_CONV_TIER_WRITE_GB_DAY (200)   bytes written per calendar day (kept in <folder>/budget); then dropped
++        //   STRATA_CONV_TIER_CAP_GB (600), _MAX_FILES (2000), _TTL_H (168)   the disk cap and time to live (LRU, last use)
++        //   STRATA_CONV_TIER_INFLIGHT_MIB (2048)  RAM evicted images may hold while they wait for the writer
++        //   STRATA_CONV_TIER_REGROW_TOKENS (8192), STRATA_CONV_TIER_MIN_FREE_GB (64)
++        //   STRATA_CONV_TIER_MIN_GAIN (2048)      a file is read only when it holds this many more tokens than the RAM
++        //                                         cache, a slot or the live session
++        //   STRATA_CONV_TIER_WARM=1               keep and use the files of an earlier run (else they are removed at start)
++        //   STRATA_CONV_TIER_VERIFY=1             every write read back and compared; every restore checked by digest
++        // A file is bound to the session identity plus the engine binary, its arguments and its STRATA_* environment.
++        // An image read back is the image the RAM cache evicted, byte for byte; any failure reads the prompt instead.
++        std::unique_ptr<strata::core::ConversationTier> tier;
++        int64_t tier_min_gain = 2048;
++        if (const char* td = std::getenv("STRATA_CONV_TIER_DIR"); td != nullptr && td[0] != '\0') {
++            auto env_n = [](const char* name, int64_t def) -> int64_t {
++                const char* v = std::getenv(name);
++                if (v == nullptr || v[0] == '\0') return def;
++                char* end = nullptr;
++                const long long x = std::strtoll(v, &end, 10);
++                return end != nullptr && *end == '\0' && x >= 0 ? (int64_t) x : def;
++            };
++            if (!conversations.enabled()) {
++                std::fprintf(stderr, "strata serve: conversation tier: off (STRATA_CONV_TIER_DIR needs the conversation "
++                                     "cache: --conversation-cache-mib)\n");
++            } else {
++                strata::core::ConversationTierConfig tc;
++                tc.dir = td;
++                tc.min_tokens = env_n("STRATA_CONV_TIER_MIN_TOKENS", 16384);
++                tc.budget_bytes = (uint64_t) env_n("STRATA_CONV_TIER_WRITE_GB_DAY", 200) * 1000000000ull;
++                tc.cap_bytes = (uint64_t) env_n("STRATA_CONV_TIER_CAP_GB", 600) * 1000000000ull;
++                tc.max_images = (uint64_t) env_n("STRATA_CONV_TIER_MAX_FILES", 2000);
++                tc.ttl_s = env_n("STRATA_CONV_TIER_TTL_H", 168) * 3600;
++                tc.inflight_bytes = (uint64_t) env_n("STRATA_CONV_TIER_INFLIGHT_MIB", 2048) << 20;
++                tc.regrow_tokens = env_n("STRATA_CONV_TIER_REGROW_TOKENS", 8192);
++                tc.min_free_bytes = (uint64_t) env_n("STRATA_CONV_TIER_MIN_FREE_GB", 64) << 30;
++                tc.warm = env_n("STRATA_CONV_TIER_WARM", 0) != 0;
++                tc.verify = env_n("STRATA_CONV_TIER_VERIFY", 0) != 0;
++                tier_min_gain = env_n("STRATA_CONV_TIER_MIN_GAIN", 2048);
++                tc.thread_start = [] { spread_engine_thread(); };
++                tc.log = [](const std::string& l) {
++                    std::fprintf(stderr, "strata serve: conversation tier: %s\n", l.c_str());
++                };
++                std::string e;
++                strata::core::SessionFileIdentity id;
++                // no announcement callback: nothing waits for these reads (a SAVE's SWAIT lines go to stdout)
++                bool ok = session_identity(id, e, {});
++                uint64_t fp = 0;
++#if defined(__linux__)
++                const std::string exe = "/proc/self/exe";
++#else
++                const std::string exe = argv[0];
++#endif
++                if (ok) ok = strata::core::conversation_tier_fingerprint(id.config, exe,
++                                                                         std::vector<std::string>(argv + 1, argv + argc), fp, e);
++                if (ok) {
++                    id.config = fp;
++                    tc.id = id;
++                    tier = std::make_unique<strata::core::ConversationTier>(std::move(tc));
++                    ok = tier->start(e);
++                }
++                if (!ok) {
++                    std::fprintf(stderr, "strata serve: conversation tier: off (%s)\n", e.c_str());
++                    tier.reset();
++                } else {
++                    conversations.set_evict_sink([&tier](strata::core::SavedConversation&& image, bool spill) {
++                        tier->evicted(std::move(image), spill);
++                    });
++                }
++            }
++        }
+         // STRATA_PARK_ASYNC: the capture of the main sessions a request left (park_async_start, after it), on one
+         // ParkThreads thread per stage device, that the next request's park decision takes (park_async_take) or stops
+         // (park_async_drop).  Declared before the threads: the threads stop first (park_stop), then this goes
+@@ -11700,6 +11778,7 @@ int main(int argc, char** argv) {
+                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
+                         nan_flush = false;
+                         const size_t n_parked = conversations.clear();
++                        if (tier) tier->clear();
+                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
+                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
+                                      n_parked == 1 ? "" : "s");
+@@ -11954,6 +12033,7 @@ int main(int argc, char** argv) {
+                 checks.clear();
+                 tail_ckpt_len = -1;
+                 const size_t n_parked = conversations.clear();
++                if (tier) tier->clear();   // (STRATA_CONV_TIER_DIR: what it holds may carry the poison too)
+                 size_t n_slots = 0, n_running = 0;
+                 for (BSlot& sl : bs)
+                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
+@@ -12053,9 +12133,58 @@ int main(int argc, char** argv) {
+                             slot_ck = &c;
+                         }
+                 }
+-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
++            auto parked = conversations.best(ids, req_imgs, want_cvec);
+             std::optional<strata::core::SavedConversation> incoming;
+-            if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
++            // STRATA_CONV_TIER_DIR: a conversation the RAM cache evicted to disk, when it holds at least
++            // STRATA_CONV_TIER_MIN_GAIN more of this prompt than the RAM cache, a slot or the live session.  It is
++            // read and validated whole before anything is parked or written; any failure reads the prompt instead
++            bool from_tier = false;
++            if (tier && o.prompt_cache > 0) {
++                const auto tm = tier->best(ids, req_imgs, want_cvec);
++                if (tm.tokens > std::max({resume, slot_tokens, parked.tokens}) + tier_min_gain) {
++                    std::string why;
++                    bool ok = tm.parts == stages.size() + 1;
++                    if (!ok) why = "stage count";
++                    std::vector<strata::core::SessionReadLimits> lim(tm.parts);
++                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
++                    for (size_t k = 0; k < tm.parts && ok; ++k) {
++                        lim[k].admit = [floor, &o](uint64_t need, std::string& w) {
++                            const auto mem = strata::core::sample_host_memory();
++                            if (strata::core::conversation_memory_admit(
++                                    mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor)) return true;
++                            w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
++                                std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB, " + ram_note(mem) + ")";
++                            return false;
++                        };
++                        // the draft layer's K/V: the last stage's, unless the image holds none (a batch slot's)
++                        const bool draft = use_mtp && !tm.draftless && k == stages.size();
++                        ok = strata::core::conversation_session_read_limits(lim[k], k == 0 ? ss : stages[k - 1]->ss, g,
++                                draft ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
++                                (uint64_t) std::max(o.prompt_cache, 1) + 64, why);
++                    }
++                    strata::core::SavedConversation img;
++                    if (ok) ok = tier->load(tm.key, lim, img, why);
++                    for (size_t i = 0; ok && i < stages.size(); ++i) {
++                        const strata::core::OnDevice on(stages[i]->dev);
++                        ok = strata::core::conversation_snapshot_validate(img.stage_images[i], stages[i]->ss, g,
++                                use_mtp && !img.draftless && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, why);
++                        if (!ok) tier->reject(tm.key, why);
++                    }
++                    if (ok && !(ok = strata::core::conversation_snapshot_validate(img, ss, g,
++                            use_mtp && !img.draftless && stages.empty() ? &mtp.kv_state() : nullptr, why)))
++                        tier->reject(tm.key, why);
++                    if (ok) {
++                        incoming.emplace(std::move(img));
++                        parked.tokens = tm.tokens;
++                        parked.live = tm.live;
++                        from_tier = true;
++                    } else {
++                        std::fprintf(stderr, "strata serve: conversation tier: %lld tokens not restored (%s); reading the "
++                                             "prompt instead\n", (long long) tm.tokens, why.c_str());
++                    }
++                }
++            }
++            if (!from_tier && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+             if (incoming) slot_source = -1;
+             // Reject the entire image before parking/overwriting the outgoing
+             // state. Invalid entries can safely fall back to its existing prefix.
+@@ -12237,10 +12366,10 @@ int main(int argc, char** argv) {
+                 }
+                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                 lent_slot = -1;   // (the main session holds the parked conversation now)
+-                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
++                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu%s\n",
+                              (long long) resume, from_live ? "live" : "checkpoint",
+                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+-                             conversations.size(), conversations.bytes());
++                             conversations.size(), conversations.bytes(), from_tier ? " from=disk" : "");
+             }
+             if (want_cvec != cvec_cached) {
+                 live_ok = false;
+-- 
+2.43.0
+

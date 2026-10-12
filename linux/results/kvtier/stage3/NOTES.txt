@@ -1,0 +1,101 @@
+KV tiering stage 3: SSD emergency tier (STRATA_CONV_TIER_DIR), 2026-10-12
+Code: Strata-143 g3-143 dc911b98 (engine + tests + docs) and ee67a078 (server /metrics), on 97941564 (stage 2a).
+Build: build-143 -> engine/strata-g3-143k4.  Dashboard: StrataQ38FN 4acbae2 (conversation cache card, SSD tier line).
+Configs: linux/configs/T16-143-64khocast.json (= 64khocas + STRATA_CONV_TIER_DIR=/media/raid0/strata-kvspill, exe 143k4);
+this dir: off/ton/tfv.json (gates), mt-off/mt-tier/mt-tierv/mt-bud/mt-bud2.json (multi-turn).
+
+What it does (critique order 3a + 3c; 3b as "keep the old file, read the suffix")
+- ConversationCache::evict_oldest(spill) + an eviction sink.  Only make_room's evictions (budget / slots) spill; the RAM
+  floor's and a save's evictions free at once (counted drops_ram); drop_superseded and clear() never reach the sink.
+- Spill: >= STRATA_CONV_TIER_MIN_TOKENS (16384), day budget left, in-flight bound; queued to one writer thread, which
+  writes each stage's image as a plain v1 session file (O_DIRECT, temp + fsync + rename + dir fsync), the 4 stages at
+  once, then <key>.meta as the commit record (ids, checkpoint lengths, marks pinned/slot_turn/draftless).  RAM freed
+  after the write.  A set without meta is never used and removed at the next start (as are temp files).
+- Write once: an image a file holds all but < STRATA_CONV_TIER_REGROW_TOKENS (8192) of, or an earlier copy of a
+  conversation on disk, is not written ("kept"); the request restores the file and reads the suffix.  Grown further:
+  written in full, the older set removed ("superseded").
+- Restore (request start, before any park): the tier's best match must beat RAM cache / slot / live by
+  STRATA_CONV_TIER_MIN_GAIN (2048); 4 parallel reads with per-stage read limits (new draft-pointer overload) and the
+  RAM preflight, consistency against the meta, marks restored, then the normal validation; an image still queued is
+  handed back without a read.  Any failure (I/O, checksum, identity, RAM) -> miss, prompt read instead.
+- Budget per local calendar day (STRATA_CONV_TIER_WRITE_GB_DAY 200, <dir>/budget, survives restarts); cap
+  STRATA_CONV_TIER_CAP_GB 600 / MAX_FILES 2000 (LRU), TTL_H 168 by last use; INFLIGHT_MIB 2048; MIN_FREE_GB 64.
+- Identity: session identity (model + config fp) mixed with the engine binary (/proc/self/exe), argv and the sorted
+  STRATA_* env (STRATA_CONV_TIER_* excluded), in every file header and the meta.  WARM unset: the folder is emptied at
+  start; STRATA_CONV_TIER_WARM=1 indexes this engine's sets, keeps other identities until their TTL.
+- STRATA_CONV_TIER_VERIFY=1: each written part read back and compared (same_part); each restore checked against a
+  digest of the evicted image (conversation_image_digest).  #879 clears the tier.
+- Status: every event logs "conversation tier: <event>; files= parts= disk_bytes= written_today= budget= budget_left=
+  spills= written_bytes= restores= restores_queue= read_bytes= misses= drops_small= drops_budget= drops_busy=
+  drops_ram= drops_cap= drops_io= kept= superseded= expired= evicted= pending= pending_bytes= foreign= verified=";
+  server.py ConvCacheLog -> GET /metrics conversation_cache.tier (absent without the tier).
+
+Unit tests (conversation_tier_test, 107 checks; also clean under ASan/UBSan and TSan; all 9 conversation ctests pass;
+serve/test_monitor ConversationCacheCard 4/4): spill only on make_room eviction (gate eviction counted, superseded and
+cleared never written), exact restore incl. stage images and marks, checkpoint match, min size, write-once (unchanged,
+< regrow, older copy; >= regrow rewrites and supersedes), budget exhaustion + day roll + budget 0 + budget file
+survives a restart, TTL by last use, max_images and cap_bytes LRU, queue restore + in-flight bound + restore waiting on
+a running write, I/O faults (write/file_flush/rename/meta -> dropped, no file or temp left), read fault / corrupt part
+(checksum) / missing part -> miss, set removed, output untouched, RAM refusal keeps the files, crash leftovers (parts
+without meta, temp files) removed at start, warm index + foreign identity refused and kept, swapped part of another
+model refused, clear/reject, fingerprint sensitivity (args, config, binary, STRATA_* yes; STRATA_CONV_TIER_* no).
+
+Exactness gates (run_exact.sh; refs = stage1/*-ref.json; env + STRATA_MMQ_DIRECT=1 STRATA_IQ_MT_MIN=1, layer split)
+- bt16:off, il:off (tier off, k4)                    bytes IDENTICAL
+- bt16:ton (tier on, default knobs, 48 GiB cache)    IDENTICAL (inert: nothing evicted)
+- tfv = tier forced: --conversation-cache-slots 1, MIN_TOKENS 1, MIN_GAIN 0, REGROW 1, VERIFY 1
+  bt16:tfv  IDENTICAL, 15 spills, 15 restores from disk
+  t07:tfv   IDENTICAL (T=0.7 seed 1234), 15 spills, 15 restores from disk
+  il:tfv    IDENTICAL, 16 spills, 9 restores from disk, 5 kept; every write verified, every restore digest-checked
+  ov1:tfv   PASS, token- and RESUME-identical to handoff/ov1.json; background slots stopped at other lengths
+            (identical prefixes) - the same timing pattern as stage 1/2's ov1 runs
+  gc-tfv    answers IDENTICAL to stage2 gc-off and gc-ont (tool's own count check FAILs on the reference too)
+
+Forced-spill multi-turn (mt.sh / mt_series.sh: 48 users x 4 turns, doc 10000 + 3000/turn, 400 out, greedy;
+RAM tier --conversation-cache-mib 6144; turn prompts 14.1K / 18.6K / 23.2K / 27.7K)
+  arm                         tok/s   follow-up TTFT p50   TTFT p95 t2/t3/t4    cached t2/t3/t4         restores RAM+disk
+  m6off   (re-read, tier off)  119.7   36.08 s              263 / 282 / 121 s    6908 /  9099 / 14225    68 + 0
+  m6offb  (same, rerun)        116.0   37.57 s              265 / 124 / 119 s    5419 /  8737 / 15216    63 + 0
+  m6tier  (tier, defaults)     149.6   34.98 s              159 / 134 / 114 s    6032 / 18978 / 21897    54 + 57
+  m6tierv (tier + VERIFY)      145.4   39.44 s              192 / 148 /  98 s    5411 / 18975 / 21976    52 + 59
+  m128off (128 GiB, no evict)  180.9   18.80 s              128 /  80 /  44 s   14442 / 18977 / 23494   138 + 0
+  -> tier vs re-read: +25 % tok/s (149.6 / 117.9 mean of the two refs), TTFT p95 -40..-50 % at turns 2/3; turns 3-4
+     reuse ~what the never-evicting 128 GiB cache reuses.  Turn 2 gains nothing: its 14.5K-token images are below
+     the 16384 minimum (drops_small 28).
+  m6tier tier counters: spills 67 (42.4 GB written), restores 57 (33.1 GB read), misses 0, kept 24, superseded 24,
+     drops_small 28, drops_busy 1, drops_budget 0; on disk at the end 43 sets / 28.7 GB.
+     disk restore p50 104 ms / p95 134 ms for 620 MB (~6 GB/s, 4 O_DIRECT streams) + H2D p50 39 ms
+     (RAM restores p50 45 ms); spill p50 86 ms / p95 118 ms for 631 MB (writer thread, off the critical path).
+  m6tierv: verified 123 (64 writes read back identical + 59 restores digest-identical), misses 0.
+  Bytes written per hour in this overload: 42.4 GB / 402 s = 379 GB/h (m6tierv 356 GB/h) - the 200 GB/day budget
+     would last ~32 min of this extreme overflow (48 agents on a 6 GiB RAM tier), then evictions are dropped.
+  cgroup: file_dirty <= 160 KB in every tier arm (O_DIRECT: no dirty page cache charged); tier arm cgroup 20.1 GB vs
+     ref 22.0 GB.
+  Reply hashes (mt_cmp.py): turn 1 48/48 in every pair.  Later turns are path dependent (TESTLOG #59; which source
+  a follow-up resumes from depends on eviction timing): re-read vs its own rerun 88/192; tier vs re-read 109/192;
+  tier vs tier+verify 124/192; 128 GiB vs re-read 97/192, vs tier 110/192.  So multi-turn hashes cannot separate
+  the arms here; byte exactness rests on VERIFY (123/123) and the gates above.
+
+Budget + warm restart on the engine (24 users x 3 turns, 6 GiB, WARM=1; the day's budget file held 95.6 GB of
+these tests): mbud (100 GB/day): 4 spills, 2.3 GB.  mbud2 (98 GB/day, restarted): "start: indexed 4" (identity
+stable across starts), 4 restores from the previous run's files (misses 0), 4 spills dropped by the budget
+(drops_budget 4, budget_left 86.6 MB in /metrics).  The ab_quick tier arm (WARM unset) had emptied the folder before.
+
+One-shot A/B (ab-kt3.out, ab_quick REPS=1, 16 users greedy): 64khocas (k3) vs 64khocast (k4 + tier on)
+  short 567.3 -> 567.2 (-0.02 %), long 446.3 -> 446.3 (+0.00 %); replies identical 32/32 in both.
+
+Recommended default: T16-143-64khocast (tier on, default knobs, WARM unset).  Zero cost while RAM holds everything
+(A/B 0.00 %, inert without evictions), +25 % tok/s in RAM overflow; 200 GB/day caps the SSD wear (~73 TB/year worst
+case).  MIN_TOKENS 16384 / REGROW 8192 / MIN_GAIN 2048 as defaults; WARM=1 works (tested) but see open points.
+
+Open points
+- Foreign-identity files under WARM=1 are kept until their TTL and not counted against the cap/max_files (only
+  reported as foreign); a shared folder for A/B arms should stay WARM unset (emptied at start).
+- File deletions (supersede/expire/cap) run under the tier lock on the writer thread; a request's best() waits for
+  them (ext4 unlink of ~150 MB parts, not measured separately; no stall visible in the runs).
+- "kept" restores an older file and re-reads up to REGROW_TOKENS - 1 tokens; no delta files (critique 3b) yet.
+- A write fault at SessionWriteOptions level is only injected at the first full 16 MiB block (small files skip it);
+  the tests use a > 16 MiB image for that step.
+- SYCL: not built here (its generate.cpp does not use the tier; the shared headers compile unchanged by default).
+  HIP: no CUDA API in the new code; not built here.
+- Test artefacts: /media/raid0/strata-kvspill was removed after the runs (incl. its budget file).
