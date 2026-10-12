@@ -58,7 +58,9 @@ The engine and the models are **not** included. The repository holds everything 
 - start/stop scripts for three model variants (only one runs at a time)
 - tuned Strata configs (`strata-configs/`, `linux/configs/`)
 - a **vLLM-compatible facade** (`vllm_facade/`), so vLLM clients (e.g. genesis3) connect unchanged
-- a **LAN dashboard** (`dashboard/`) with speed, caches, memory, power and cost
+- a **LAN dashboard** (`dashboard/`, Windows and Linux) with live requests (answering progress, batch slots),
+  speed, caches, memory, every GPU (load, VRAM, power, temperature, clocks, PCIe link and traffic), power and cost;
+  it also runs without a Strata server (`Start-Dashboard.bat`, Linux: `linux/start-dashboard.sh`, port 8082)
 - benchmark and A/B tools with their measurement data and analysis reports
 - the engine patch series and its design documents (`linux/patches/`, `linux/upstream/`)
 

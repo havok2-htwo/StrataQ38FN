@@ -5,6 +5,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Dashboard for Windows and Linux (`dashboard/`, `linux/start-dashboard.sh`): Strata's live view (answering progress of
+  the running request, prompt-reading progress, every `--batch` slot, queue), one card per GPU (load, VRAM, power,
+  temperature, SM clock, PCIe link gen/width and RX/TX MB/s) with per-GPU charts, Linux memory (`/proc/meminfo`) and
+  disks (md/dm volumes, no double counting). Runs without a Strata server (engine panels: offline / last seen);
+  sources configurable (`--source URL[,KEYFILE]`) plus the servers found in the process list, answers that are not
+  Strata's `/metrics` are ignored. NVML via Strata's `telemetry.py` (`--strata`) or an own ctypes reader.
 - `THIRD_PARTY_NOTICES.md`: MIT notices of Strata and llama.cpp/ggml (the engine patches contain their code), dataset
   licenses of the eval set. The rebased patch series carries the ggml notice in `moe_mmq_tab.cuh` itself.
 

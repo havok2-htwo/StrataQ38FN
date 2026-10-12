@@ -96,6 +96,24 @@ th { color: var(--muted); font-weight: 600; } th:first-child, td:first-child { t
 .split .row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--ink-2); margin-bottom: 6px; }
 .split .bar { height: 14px; }
 .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+.live-grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+@media (max-width: 1100px) { .live-grid { grid-template-columns: 1fr; } }
+.answer .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.answer .phase { font-size: 22px; font-weight: 600; }
+.answer .bar { height: 12px; }
+.answer .bar > span { transition: width .4s; }
+.answer .meter .row b { color: var(--ink); font-weight: 600; }
+.slots { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); margin-top: 12px; }
+.slot { background: var(--surface-2); border-radius: 8px; padding: 8px 10px; font-size: 12px; min-width: 0; }
+.slot .row { display: flex; justify-content: space-between; gap: 6px; color: var(--ink-2); margin-bottom: 5px; white-space: nowrap; }
+.slot .row b { color: var(--ink); }
+.slot .bar { height: 6px; background: var(--page); }
+.slot.idle { opacity: .55; }
+.src { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); margin-top: 8px; }
+.gpu .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.gpu .head b { font-size: 15px; }
+.gpu .meter { margin-top: 8px; }
+.gpu .err { color: var(--crit); font-size: 12px; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -109,6 +127,26 @@ th { color: var(--muted); font-weight: 600; } th:first-child, td:first-child { t
     <span class="meta" id="clock"></span>
     <button class="theme" id="themeBtn" type="button">Hell/Dunkel</button>
   </header>
+
+  <section>
+    <div class="sec-head"><h2>Engine live</h2><span class="meta" id="liveMeta">–</span></div>
+    <div class="live-grid">
+      <div class="card answer">
+        <div class="head"><span class="phase" id="ansPhase">–</span><span class="meta" id="ansWhat">–</span></div>
+        <div class="meter"><div class="row"><span>Antwort (Tokens erzeugt von max.)</span><span id="ansTxt">–</span></div>
+          <div class="bar"><span id="ansBar" style="background:var(--good);width:0"></span></div></div>
+        <div class="meter"><div class="row"><span>Prompt lesen</span><span id="promptTxt">–</span></div>
+          <div class="bar"><span id="promptBar" style="background:var(--warn);width:0"></span></div></div>
+        <div class="src" id="srcList"></div>
+      </div>
+      <div class="card tile"><div class="label">Batch-Slots</div><div class="value" id="slotsBusy">–</div>
+        <div class="sub" id="slotsSub">–</div>
+        <div class="meter"><div class="bar" id="slotsBar"></div></div>
+        <div class="stack-legend"><span><i style="background:var(--warn)"></i>liest</span><span><i style="background:var(--good)"></i>schreibt</span><span><i style="background:var(--surface-2);outline:1px solid var(--axis)"></i>frei</span></div>
+      </div>
+    </div>
+    <div class="slots" id="slots"></div>
+  </section>
 
   <section>
     <h2>Geschwindigkeit</h2>
@@ -178,18 +216,23 @@ th { color: var(--muted); font-weight: 600; } th:first-child, td:first-child { t
   <section>
     <h2>Hardware</h2>
     <div class="grid g4">
-      <div class="card tile"><div class="label">GPU-Leistung</div><div class="value" id="pw">–<small>W</small></div>
+      <div class="card tile"><div class="label" id="pwLbl">GPU-Leistung</div><div class="value" id="pw">–<small>W</small></div>
         <div class="sub" id="pwSub">–</div>
         <div class="meter"><div class="bar"><span id="pwBar" style="background:var(--s1);width:0"></span></div></div></div>
-      <div class="card tile"><div class="label">GPU-Last · Temperatur</div><div class="value" id="gpuUtil">–<small>%</small></div>
+      <div class="card tile"><div class="label" id="gpuUtilLbl">GPU-Last · Temperatur</div><div class="value" id="gpuUtil">–<small>%</small></div>
         <div class="sub" id="gpuSub">–</div>
         <div class="meter"><div class="bar"><span id="utilBar" style="background:var(--s1);width:0"></span></div></div></div>
       <div class="card tile"><div class="label">CPU</div><div class="value" id="cpu">–<small>%</small></div>
         <div class="sub" id="cpuSub">–</div>
         <div class="meter"><div class="bar"><span id="cpuBar" style="background:var(--s1);width:0"></span></div></div></div>
-      <div class="card tile"><div class="label">PCIe (GPU)</div><div class="value" id="pcie">–<small>GB/s</small></div>
+      <div class="card tile"><div class="label" id="pcieLbl">PCIe (GPU)</div><div class="value" id="pcie">–<small>GB/s</small></div>
         <div class="sub" id="pcieSub">–</div></div>
     </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>GPUs</h2><span class="meta" id="gpuMeta">–</span></div>
+    <div class="grid g4" id="gpus"></div>
   </section>
 
   <section>
@@ -204,9 +247,9 @@ th { color: var(--muted); font-weight: 600; } th:first-child, td:first-child { t
       <div class="card">
         <div class="meter"><div class="row"><span>RAM (physisch)</span><span id="ramTxt">–</span></div>
           <div class="bar"><span id="ramBar" style="background:var(--s1);width:0"></span></div></div>
-        <div class="meter"><div class="row"><span>Commit (die knappe Ressource)</span><span id="comTxt">–</span></div>
+        <div class="meter"><div class="row"><span id="comLbl">Commit (die knappe Ressource)</span><span id="comTxt">–</span></div>
           <div class="bar"><span id="comBar" style="background:var(--s1);width:0"></span></div></div>
-        <div class="kv" style="margin-top:10px"><dt>strata.exe privat · Working Set</dt><dd id="proc">–</dd><dt>Datei-Cache (Standby)</dt><dd id="syscache">–</dd></div>
+        <div class="kv" style="margin-top:10px"><dt id="procLbl">strata.exe privat · Working Set</dt><dd id="proc">–</dd><dt id="cacheLbl">Datei-Cache (Standby)</dt><dd id="syscache">–</dd></div>
       </div>
       <div class="card">
         <div class="meter"><div class="row"><span>KV-Cache (Kontext aktuell)</span><span id="kvTxt">–</span></div>
@@ -238,12 +281,15 @@ th { color: var(--muted); font-weight: 600; } th:first-child, td:first-child { t
   <section>
     <h2>Verlauf (10 min)</h2>
     <div class="grid g3">
-      <div class="card chart-card"><div class="chart-head"><h3>Decode tok/s</h3><span class="now" id="c_decode_now"></span></div><svg class="chart" id="c_decode"></svg></div>
+      <div class="card chart-card"><div class="chart-head"><h3 id="c_decode_t">Decode tok/s</h3><span class="now" id="c_decode_now"></span></div><svg class="chart" id="c_decode"></svg></div>
       <div class="card chart-card"><div class="chart-head"><h3>Leistung W</h3><span class="legend" id="lg_power"></span></div><svg class="chart" id="c_power"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>GPU-Last %</h3><span class="now" id="c_util_now"></span></div><svg class="chart" id="c_util"></svg></div>
+      <div class="card chart-card"><div class="chart-head"><h3>GPU-Last %</h3><span class="legend" id="lg_util"></span></div><svg class="chart" id="c_util"></svg></div>
+      <div class="card chart-card"><div class="chart-head"><h3>PCIe je GPU MB/s (zur + von GPU)</h3><span class="legend" id="lg_pcie"></span></div><svg class="chart" id="c_pcie"></svg></div>
+      <div class="card chart-card"><div class="chart-head"><h3>GPU-Temperatur °C</h3><span class="legend" id="lg_temp"></span></div><svg class="chart" id="c_temp"></svg></div>
+      <div class="card chart-card"><div class="chart-head"><h3>CPU %</h3><span class="now" id="c_cpu_now"></span></div><svg class="chart" id="c_cpu"></svg></div>
       <div class="card chart-card"><div class="chart-head"><h3>SSD lesen MB/s</h3><span class="legend" id="lg_read"></span></div><svg class="chart" id="c_read"></svg></div>
       <div class="card chart-card"><div class="chart-head"><h3>SSD schreiben MB/s</h3><span class="legend" id="lg_write"></span></div><svg class="chart" id="c_write"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>Commit belegt GB</h3><span class="now" id="c_commit_now"></span></div><svg class="chart" id="c_commit"></svg></div>
+      <div class="card chart-card"><div class="chart-head"><h3 id="c_commit_t">Commit belegt GB</h3><span class="now" id="c_commit_now"></span></div><svg class="chart" id="c_commit"></svg></div>
     </div>
   </section>
 
@@ -328,14 +374,22 @@ function lineChart(svgId, series, opts = {}) {
 }
 function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))); for (const m of [1, 1.2, 1.6, 2, 3, 4, 6, 8, 10]) if (v <= m * p) return m * p; return 10 * p; }
 
-let diskLabels = [];
+let diskLabels = [], gpuCount = 0;
+const gcol = i => ['--s1', '--s2', '--s3', '--s4'][i % 4] ;
 function drawAll() {
   // derived series
   H.commit_gb = (H.commit_used || []).map(v => v == null ? null : v / 1e9);
+  const gi = [...Array(gpuCount).keys()];
+  for (const i of gi) H[`gpu${i}_pcie`] = (H[`gpu${i}_rx`] || []).map((v, k) => v == null ? null : v + ((H[`gpu${i}_tx`] || [])[k] || 0));
+  const gl = gi.map(i => `<span><i style="background:${css(gcol(i))}"></i>GPU ${i}</span>`).join('');
   lineChart('c_decode', [{key: 'decode', color: '--s1'}], {unit: 'tok/s'});
   lineChart('c_power', [{key: 'wall', color: '--s2', name: 'Steckdose'}, {key: 'power', color: '--s1', name: 'GPU'}], {unit: 'W'});
   $('lg_power').innerHTML = `<span><i style="background:${css('--s2')}"></i>Steckdose (gesch.)</span><span><i style="background:${css('--s1')}"></i>GPU</span>`;
-  lineChart('c_util', [{key: 'gpu_util', color: '--s1'}], {unit: '%', max: 100});
+  lineChart('c_util', gpuCount > 1 ? gi.map(i => ({key: `gpu${i}_util`, color: gcol(i), name: 'GPU ' + i})) : [{key: 'gpu_util', color: '--s1'}], {unit: '%', max: 100});
+  lineChart('c_pcie', gi.map(i => ({key: `gpu${i}_pcie`, color: gcol(i), name: 'GPU ' + i})), {unit: 'MB/s', digits: 1});
+  lineChart('c_temp', gi.map(i => ({key: `gpu${i}_temp`, color: gcol(i), name: 'GPU ' + i})), {unit: '°C'});
+  lineChart('c_cpu', [{key: 'cpu', color: '--s1'}], {unit: '%', max: 100});
+  for (const id of ['lg_util', 'lg_pcie', 'lg_temp']) $(id).innerHTML = gpuCount > 1 ? gl : '';
   const cols = ['--s1', '--s3', '--s4', '--muted'];   // --s2 is Strata's
   const strataS = (key) => ({key, color: '--s2', name: 'Strata', dash: true});
   lineChart('c_read', [...diskLabels.map((l, i) => ({key: 'disk_r_' + l, color: cols[i % 4], name: l})), strataS('strata_r')], {unit: 'MB/s', digits: 1});
@@ -352,9 +406,10 @@ function render(s) {
   $('model').textContent = e.model || 'kein Modell erreichbar';
   const st = !s.online ? ['offline', 'var(--crit)'] : live.state === 'generating' ? ['schreibt', 'var(--good)']
     : live.state === 'reading' ? ['liest Prompt', 'var(--warn)'] : live.state === 'unloaded' ? ['entladen', 'var(--muted)'] : ['bereit', 'var(--s1)'];
-  $('state').innerHTML = `<span class="dot" style="background:${st[1]}"></span><span>${st[0]}${live.queued ? ' · ' + live.queued + ' wartend' : ''}</span>`;
+  const bt = s.batch && s.batch.busy ? ` · ${s.batch.busy}/${s.batch.slots} Slots` : '';
+  $('state').innerHTML = `<span class="dot" style="background:${st[1]}"></span><span>${st[0]}${bt}${live.queued ? ' · ' + live.queued + ' wartend' : ''}</span>`;
   $('meta').textContent = e.version ? `Engine ${e.version} · Kontext ${compact(e.max_context)} · spec ${e.spec ?? '–'}`
-    + (s.online ? ` · ${s.source}` : ` · zuletzt gesehen ${tm(s.stale_at)}`) : '';
+    + (s.online ? ` · ${s.source}` : ` · zuletzt gesehen ${tm(s.last_seen || s.stale_at)}`) : (s.online ? '' : 'GPU, CPU, RAM und SSD laufen weiter live');
   $('clock').textContent = tm(s.now);
 
   // speed: "jetzt" while it runs, else the last request's value (grey).  A prefill takes ~1 s, so at 1 Hz it is
@@ -364,8 +419,9 @@ function render(s) {
     el.classList.toggle('stale', live == null && last != null);
     el.innerHTML = `${live != null ? fmt(live, d) : last ? fmt(last.tps, d) : '–'}<small>tok/s</small>`; };
   const gen = live.state === 'generating', rd = live.state === 'reading';
-  showNow('decNow', gen ? live.tok_s : null, ld, 1);
-  $('decSub').textContent = gen ? `${fmt(live.generated)} von ${fmt(live.max_tokens)} Tokens · Ø ${fmt(live.tok_s_mean, 1)}`
+  showNow('decNow', s.batch && s.batch.decoding ? s.batch.tok_s_sum : gen ? live.tok_s : null, ld, 1);
+  $('decSub').textContent = s.batch && s.batch.decoding ? `Σ ${s.batch.decoding} Slots · neuester ${fmt(live.tok_s, 1)} tok/s`
+    : gen ? `${fmt(live.generated)} von ${fmt(live.max_tokens)} Tokens · Ø ${fmt(live.tok_s_mean, 1)}`
     : rd ? 'liest gerade den Prompt' : ld ? `letzter Request · ${fmt(ld.tokens)} Tokens · ${ago(ld.at)}` : 'wartet auf Request';
   showNow('preNow', rd && live.prefill_tok_s_mean ? live.prefill_tok_s_mean : null, lp, 0);
   $('preSub').textContent = rd ? `liest ${fmt(live.prompt_read)} / ${fmt(live.prompt_total || live.prompt_tokens)} Tokens · ${fmt(live.elapsed_s, 1)} s`
@@ -378,9 +434,14 @@ function render(s) {
   $('avgPreSub').textContent = tot.prompt_ms ? `${compact(tot.read)} neu gelesen in ${dur(tot.prompt_ms / 1000)} (Cache-Treffer zählen nicht)` : '–';
 
   renderMeter(s);
+  renderLive(s);
+  renderGpus(s);
 
   // hardware
-  const lim = hw.gpu_power_limit || 600;
+  const lim = hw.gpu_power_limit || 600, multi = (hw.gpu_count || 0) > 1;
+  $('pwLbl').textContent = multi ? `GPU-Leistung (Summe ${hw.gpu_count} Karten)` : 'GPU-Leistung';
+  $('gpuUtilLbl').textContent = multi ? 'GPU-Last Ø · heißeste Karte' : 'GPU-Last · Temperatur';
+  $('pcieLbl').textContent = multi ? 'PCIe (alle GPUs)' : 'PCIe (GPU)';
   $('pw').innerHTML = `${fmt(hw.gpu_power)}<small>W</small>`; $('pwSub').textContent = `Limit ${fmt(lim)} W · Spitze ${fmt(tot.peak_power)} W`;
   setBar($('pwBar'), (hw.gpu_power || 0) / lim);
   $('gpuUtil').innerHTML = `${fmt(hw.gpu_util)}<small>%</small>`; $('gpuSub').textContent = `${fmt(hw.gpu_temp)} °C · ${hw.gpu_name || ''}`;
@@ -388,7 +449,7 @@ function render(s) {
   $('cpu').innerHTML = `${fmt(hw.cpu)}<small>%</small>`; $('cpuSub').textContent = hw.cpu_name ? `${hw.cpu_name.replace(/ \d+-Core Processor/, '')} · ${hw.cores}C/${hw.threads}T` : '–';
   setBar($('cpuBar'), (hw.cpu || 0) / 100);
   $('pcie').innerHTML = `${hw.gpu_pcie_rx_mb != null ? fmt((hw.gpu_pcie_rx_mb + (hw.gpu_pcie_tx_mb || 0)) / 1000, 1) : '–'}<small>GB/s</small>`;
-  $('pcieSub').textContent = hw.gpu_pcie_gen ? `Gen ${hw.gpu_pcie_gen} x${hw.gpu_pcie_width} · rein ${fmt((hw.gpu_pcie_rx_mb || 0) / 1000, 1)} / raus ${fmt((hw.gpu_pcie_tx_mb || 0) / 1000, 1)}` : '–';
+  $('pcieSub').textContent = hw.gpu_pcie_rx_mb != null ? (multi ? 'Summe' : `Gen ${hw.gpu_pcie_gen} x${hw.gpu_pcie_width}`) + ` · zur GPU ${fmt((hw.gpu_pcie_rx_mb || 0) / 1000, 2)} / von GPU ${fmt((hw.gpu_pcie_tx_mb || 0) / 1000, 2)} GB/s` : '–';
 
   // memory
   const vt = hw.gpu_mem_total, vu = hw.gpu_mem_used, ec = (e.expert_cache_mib || 0) * 2 ** 20;
@@ -399,8 +460,14 @@ function render(s) {
   $('vramFree').textContent = e.vram_free_mib != null ? fmt(e.vram_free_mib) + ' MiB' : '–';
   const ru = mem.phys_total - mem.phys_avail; $('ramTxt').textContent = `${gib(ru)} / ${gib(mem.phys_total)}`;
   const rf = ru / mem.phys_total; $('ramBar').style.background = sev(rf); setBar($('ramBar'), rf);
-  const cf = mem.commit_used / mem.commit_limit; $('comTxt').textContent = `${gib(mem.commit_used)} / ${gib(mem.commit_limit)} · frei ${gib(mem.commit_limit - mem.commit_used)}`;
-  $('comBar').style.background = sev(cf); setBar($('comBar'), cf);
+  const cf = mem.commit_used / mem.commit_limit, lin = mem.os === 'linux';
+  $('comLbl').textContent = lin ? (mem.commit_enforced ? 'Commit (Committed_AS / CommitLimit)' : 'Committed_AS / CommitLimit (nicht erzwungen, overcommit)') : 'Commit (die knappe Ressource)';
+  $('comTxt').textContent = `${gib(mem.commit_used)} / ${gib(mem.commit_limit)}` + (mem.commit_enforced ? ` · frei ${gib(mem.commit_limit - mem.commit_used)}` : '')
+    + (lin && mem.swap_total ? ` · Swap ${gib(mem.swap_used)} / ${gib(mem.swap_total)}` : '');
+  $('comBar').style.background = mem.commit_enforced ? sev(cf) : 'var(--s1)'; setBar($('comBar'), cf);
+  $('c_commit_t').textContent = lin ? 'Committed_AS GB' : 'Commit belegt GB';
+  $('procLbl').textContent = mem.process ? `${mem.process.name || 'Engine'} privat · ${lin ? 'RSS' : 'Working Set'}` : (lin ? 'Engine-Prozess privat · RSS' : 'strata.exe privat · Working Set');
+  $('cacheLbl').textContent = lin ? 'Page-Cache + Buffers' : 'Datei-Cache (Standby)';
   $('proc').textContent = mem.process ? `${gib(mem.process.private)} · ${gib(mem.process.working_set)}` : '–';
   $('syscache').textContent = gib(mem.system_cache);
   const ctxNow = live.prompt_tokens ? live.prompt_tokens + (live.generated || 0) : (s.requests && s.requests[0] ? s.requests[0].prompt + (s.requests[0].out || 0) : 0);
@@ -424,7 +491,7 @@ function render(s) {
   // disks
   const ds = s.disks || {}; diskLabels = Object.keys(ds).sort();
   const sio = s.strata_io || {}, se = sio.engine || {}, sv = sio.server || {};
-  const strataCard = `<div class="card tile" style="border-color:var(--s2)"><div class="label">Strata (strata.exe) – alle Laufwerke</div>
+  const strataCard = `<div class="card tile" style="border-color:var(--s2)"><div class="label">Strata-Engine (${(mem.process && mem.process.name) || (s.platform === 'linux' ? 'strata*' : 'strata.exe')}) – alle Laufwerke</div>
     <div class="value">${fmt(se.read_mbs, 1)}<small>MB/s lesen</small></div>
     <div class="sub">schreiben ${fmt(se.write_mbs, 1)} MB/s</div>
     <dl class="kv" style="margin-top:8px"><dt>gelesen seit Zählung</dt><dd>${bytes(se.total_read)}</dd><dt>geschrieben seit Zählung</dt><dd>${bytes(se.total_write)}</dd>
@@ -450,7 +517,84 @@ function render(s) {
   $('reqTbl').innerHTML = (s.requests || []).map(r => `<tr><td>${tm(r.time)}</td><td>${fmt(r.prompt)}</td><td>${fmt(r.reused)}</td><td>${fmt(r.read)}</td>
     <td>${r.read >= 256 ? fmt(r.prefill_tps) : '–'}</td><td>${fmt(r.out)}</td><td>${fmt(r.decode_tps, 1)}</td><td>${r.hit != null ? pct(r.hit) + ' %' : '–'}</td>
     <td>${r.accept != null ? pct(r.accept, 0) + ' %' : '–'}</td><td>${fmt(r.file_mb, 0)}</td><td>${r.finish || ''}</td></tr>`).join('');
-  $('foot').textContent = `* gesamt = seit das Dashboard zählt. Strata-SSD = I/O-Zähler von strata.exe (Experten/PLE werden ungepuffert gelesen, das ist echter SSD-Verkehr; Windows trennt ihn nicht nach Laufwerk). Quelle: ${s.source || '–'} · Log: ${s.log || '–'}`;
+  $('foot').textContent = `* gesamt = seit das Dashboard zählt. Strata-SSD = I/O-Zähler des Engine-Prozesses (Experten/PLE werden ungepuffert gelesen, das ist echter SSD-Verkehr; das Betriebssystem trennt ihn nicht nach Laufwerk). `
+    + (s.platform === 'linux' ? 'Linux: nur ganze Laufwerke und RAID-/DM-Volumes (RAID-Mitglieder zählen im Volume). ' : '')
+    + `Quelle: ${s.source || 'offline'} · Log: ${s.log || '–'} · GPUs: ${s.gpu_backend || s.gpu_error || '–'}` + (s.error ? ` · Fehler: ${s.error}` : '');
+}
+
+// ---- engine live: the running request's answering / prompt-reading progress, batch slots, sources
+const phaseDe = p => !p ? null : p === 'thinking' ? 'Denkt' : p === 'answering' ? 'Antwortet' : p === 'tool call complete' ? 'Tool-Aufruf fertig'
+  : p.startsWith('writing a tool call') ? 'Schreibt Tool-Aufruf' + p.slice('writing a tool call'.length) : p[0].toUpperCase() + p.slice(1);
+function renderLive(s) {
+  const live = s.live || {}, b = s.batch, e = s.engine || {}, last = (s.requests || [])[0];
+  $('srcList').innerHTML = (s.sources || []).map(x => `<span><span class="dot" style="background:${x.state === 'online' ? 'var(--good)' : x.state === 'offline' ? 'var(--muted)' : 'var(--warn)'}"></span> ${x.url}${x.origin === 'process' ? ' (Prozess)' : ''}${x.key ? ' · Key' : ''}: ${x.state}</span>`).join('');
+  $('liveMeta').textContent = s.online ? `${s.source}${live.queued ? ' · ' + live.queued + ' in der Warteschlange' : ''}` : (s.last_seen ? `offline · zuletzt gesehen ${dt(s.last_seen)}` : 'offline');
+  const gen = live.generated, max = live.max_tokens;
+  if (!s.online) {
+    $('ansPhase').textContent = 'Engine offline';
+    $('ansWhat').textContent = s.last_seen ? `zuletzt gesehen ${tm(s.last_seen)} (${ago(s.last_seen)})` : 'seit Start des Dashboards nicht erreichbar';
+    $('ansTxt').textContent = last ? `letzter Request: ${fmt(last.out)} Tokens · ${fmt(last.decode_tps, 1)} tok/s` : '–';
+    setBar($('ansBar'), 0); $('promptTxt').textContent = '–'; setBar($('promptBar'), 0);
+  } else {
+    const st = live.state;
+    $('ansPhase').textContent = st === 'reading' ? 'Liest Prompt' : st === 'generating' ? (phaseDe(live.phase) || 'Schreibt')
+      : st === 'unloaded' ? 'Modell entladen' : 'Bereit · wartet auf Request';
+    $('ansWhat').textContent = (b && live.running ? `neuester von ${live.running} laufenden Requests · ` : '') + (live.elapsed_s != null ? `läuft seit ${fmt(live.elapsed_s, 1)} s` : '');
+    if (gen != null && st !== 'reading') {
+      $('ansTxt').innerHTML = `<b>${fmt(gen)}</b> / ${max ? fmt(max) : '–'} Tokens · ${fmt(live.tok_s, 1)} tok/s · Ø ${fmt(live.tok_s_mean, 1)}`;
+      setBar($('ansBar'), max ? gen / max : 0);
+    } else {
+      $('ansTxt').textContent = last ? `letzter Request: ${fmt(last.out)} Tokens · ${fmt(last.decode_tps, 1)} tok/s` : '–';
+      setBar($('ansBar'), 0);
+    }
+    if (st === 'reading' && live.prompt_total) {
+      $('promptTxt').innerHTML = `<b>${fmt(live.prompt_read)}</b> / ${fmt(live.prompt_total)} Tokens · ${fmt(live.prompt_read / live.prompt_total * 100)} %` + (live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : '');
+      setBar($('promptBar'), live.prompt_read / live.prompt_total);
+    } else if (live.prompt_tokens != null) {
+      $('promptTxt').textContent = `${fmt(live.prompt_tokens)} Tokens` + (st === 'reading' ? ' · liest …' : ' gelesen') + (live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : '');
+      setBar($('promptBar'), st === 'reading' ? 0 : 1);
+    } else { $('promptTxt').textContent = '–'; setBar($('promptBar'), 0); }
+  }
+  // slots (--batch)
+  if (b) {
+    $('slotsBusy').innerHTML = `${b.busy}<small>/ ${b.slots} belegt</small>`;
+    $('slotsSub').textContent = `${b.reading} lesen · ${b.decoding} schreiben · Σ ${fmt(b.tok_s_sum, 1)} tok/s · ${fmt(live.waiting || 0)} warten`
+      + (live.admitting ? ` · ${live.admitting} werden aufgenommen` : '') + (live.outside_slots ? ` · ${live.outside_slots} außerhalb` : '');
+    $('slotsBar').innerHTML = `<span style="width:${b.reading / b.slots * 100}%;background:var(--warn)"></span><span style="width:${b.decoding / b.slots * 100}%;background:var(--good)"></span>`;
+  } else {
+    $('slotsBusy').innerHTML = s.online ? (live.state === 'generating' || live.state === 'reading' ? '1<small>/ 1</small>' : '0<small>/ 1</small>') : `–<small>${e.batch_slots ? '/ ' + e.batch_slots : ''}</small>`;
+    $('slotsSub').textContent = s.online ? 'kein --batch: ein Request zur Zeit' + (live.queued ? ` · ${live.queued} wartend` : '') : 'Engine offline';
+    $('slotsBar').innerHTML = '';
+  }
+  const ctx = e.max_context || 0;
+  $('slots').innerHTML = (live.slots || []).map(sl => {
+    const idle = sl.state === 'idle', rd = sl.state === 'reading';
+    const used = idle ? (sl.held_tokens || 0) : (sl.prompt_tokens || 0) + (sl.generated || 0);
+    const col = idle ? 'var(--axis)' : rd ? 'var(--warn)' : 'var(--good)';
+    const txt = idle ? `frei${sl.held_tokens ? ' · hält ' + compact(sl.held_tokens) + ' Tokens' : ''}`
+      : rd ? `liest ${compact(sl.prompt_tokens)} Tokens · ${fmt(sl.elapsed_s, 1)} s`
+      : `<b>${fmt(sl.generated)}</b> Tokens · <b>${fmt(sl.tok_s, 1)}</b> tok/s · ${fmt(sl.elapsed_s, 0)} s`;
+    return `<div class="slot${idle ? ' idle' : ''}"><div class="row"><span><span class="dot" style="background:${col}"></span> Slot ${sl.slot}</span><span>${txt}</span></div>
+      <div class="bar" title="Kontext ${compact(used)} / ${compact(ctx)} Tokens"><span style="width:${ctx ? Math.min(100, used / ctx * 100) : 0}%;background:${col}"></span></div></div>`; }).join('');
+}
+
+// ---- every GPU: load, VRAM, power, temperature, clocks, PCIe link and traffic
+function renderGpus(s) {
+  const gs = s.gpus || [];
+  gpuCount = gs.length;
+  $('gpuMeta').textContent = gs.length ? `${gs.length} Karte${gs.length > 1 ? 'n' : ''} · ${s.gpu_backend || ''}` : (s.gpu_error || 'keine NVIDIA-GPU gefunden');
+  const mb = v => v == null ? '–' : fmt(v, v < 10 ? 1 : 0);
+  $('gpus').innerHTML = gs.map(g => {
+    const vf = g.mem_total ? g.mem_used / g.mem_total : 0, pf = g.power_limit ? g.power / g.power_limit : 0;
+    return `<div class="card gpu"><div class="head"><b>GPU ${g.index}</b><span class="meta">${g.name || ''}${g.bus ? ' · ' + g.bus.replace(/^0+(?=[0-9a-f]{4}:)/, '') : ''}</span></div>
+      <div class="meter"><div class="row"><span>Last</span><span>${fmt(g.util)} %</span></div><div class="bar"><span style="width:${Math.min(100, g.util || 0)}%;background:var(--s1)"></span></div></div>
+      <div class="meter"><div class="row"><span>VRAM</span><span>${gib(g.mem_used)} / ${gib(g.mem_total)}</span></div><div class="bar"><span style="width:${vf * 100}%;background:${sev(vf)}"></span></div></div>
+      <div class="meter"><div class="row"><span>Leistung</span><span>${fmt(g.power)} / ${fmt(g.power_limit)} W</span></div><div class="bar"><span style="width:${Math.min(100, pf * 100)}%;background:var(--s2)"></span></div></div>
+      <dl class="kv" style="margin-top:10px"><dt>Temperatur</dt><dd>${fmt(g.temp)} °C</dd>
+        <dt>SM-Takt</dt><dd>${fmt(g.sm_clock)}${g.sm_clock_max ? ' / ' + fmt(g.sm_clock_max) : ''} MHz</dd>
+        <dt>PCIe-Link (jetzt / max)</dt><dd>Gen ${g.pcie_gen ?? '–'} x${g.pcie_width ?? '–'} / Gen ${g.pcie_gen_max ?? '–'} x${g.pcie_width_max ?? '–'}</dd>
+        <dt>PCIe zur GPU (RX)</dt><dd>${mb(g.pcie_rx_mb)} MB/s</dd><dt>PCIe von GPU (TX)</dt><dd>${mb(g.pcie_tx_mb)} MB/s</dd></dl>
+      ${g.error ? `<div class="err">${g.error}</div>` : ''}</div>`; }).join('');
 }
 
 // ---- runtime, power, cost, 24 h projection

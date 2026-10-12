@@ -420,6 +420,31 @@ stage (decode 654 → 686 rows/s at 16 slots). Through the server (2 ABBA pairs,
 `strata-g3-142lv`), used by `start-strata.sh`; agent load: `configs/X16-agent-142gsc.json` (split 12,25,37, because
 with the agent's K/V the 12,24,37 split made CUDA2 borrow expert slots, #59).
 
+## LAN dashboard
+
+The repository's dashboard (`dashboard/`, the same one as on Windows) runs here too, with or without a Strata server:
+
+```bash
+linux/start-dashboard.sh                  # http://192.168.20.126:8082/ (binds 0.0.0.0, port 8082)
+PORT=8083 linux/start-dashboard.sh        # another port; the script refuses a port that is in use
+systemctl --user stop strata-dashboard.scope
+```
+
+- Own systemd user scope (`strata-dashboard.scope`, `MemoryMax=1G`), Python stdlib + psutil (system `python3`,
+  else Strata's venv), ~3 % of one core. Log: `dashboard/dashboard-linux.out`; totals and power settings in
+  `dashboard/state-linux.json` / `settings-linux.json` (not tracked; set the idle wall/GPU power on the page).
+- Always live: all 4 GPUs (load, VRAM, power, temperature, SM clock, PCIe link gen/width now and max, PCIe RX/TX in
+  MB/s from NVML), CPU, RAM, disks (whole disks and the md RAID volume, members not counted twice).
+  NVML through Strata's `serve/telemetry.py` (`STRATA_SERVE`, default `Strata-142/serve`) or an own ctypes reader;
+  read-only queries only, safe while benchmarks run.
+- With a Strata server: live request (phase, answering progress tokens/max, tok/s, prompt-reading progress), every
+  `--batch` slot (reading / decoding / idle, tokens, tok/s), speeds, caches, recent requests, decode timing from the
+  engine log (the running server's config `"log"`, else `CONFIG`'s). Sources: `SOURCES` (default
+  `http://127.0.0.1:8090 http://127.0.0.1:8080`) plus every running `server.py --engine` found in the process list;
+  port 8080 is Open WebUI here and is recognised as "not a Strata server". `API_KEY_FILE` for a server with a key
+  (the key stays on this machine). Only `GET /metrics` is sent, never a request that runs the model.
+- Engine offline: the engine panels show "offline · last seen" and the last known values; the rest stays live.
+
 ## License notices
 
 The engine patches contain Strata source (MIT) and, in the pointer-table MMQ series, code mirrored from
@@ -432,6 +457,7 @@ llama.cpp/ggml (MIT); both notices are in [`THIRD_PARTY_NOTICES.md`](../THIRD_PA
 |---|---|
 | `TESTLOG.md` | **chronological log of all tests with verdict**: check here before every new test |
 | `start-strata.sh` | start the recommended configuration |
+| `start-dashboard.sh` | start the LAN dashboard (port 8082, own scope; see LAN dashboard) |
 | `run_strata_variant.sh` | start a config variant, run the benchmark, stop |
 | `bench_concurrency.py` | load benchmark (OpenAI-compatible, streaming, TTFT/decode/total) |
 | `ab_quick.sh` | quick A/B protocol since #49: one server start per arm, 16 users, greedy, short + 1.2K |
