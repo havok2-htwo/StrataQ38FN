@@ -51,6 +51,8 @@ Linux (4× RTX 3090).
 ### Added
 - Engine patch series 5 "fixed per-admission cost" (six opt-in switches, `linux/patches/v0.1.42/`), exact. New
   default `configs/T16-142fc.json`: 16 users 493 tok/s short / 357 tok/s 1.2K (was 470 / 349), TTFT p95 −21 %.
+  Note: both figures are greedy (`ab_quick.sh`, baseline `T16-142` re-measured), i.e. +5.0 % / +2.2 %; the 0.9.0
+  figures 467 / 342 were at temperature 0.7 (3 runs), so 0.9.0 → 0.10.0 must not be read as +5.6 % / +4.4 %.
 
 ## [0.9.0] – 2026-10-11
 
@@ -123,7 +125,8 @@ Windows (RTX 5090 + 64 GB).
   but −70% time to first token.
 
 ### Rejected (measured)
-- Rebalancing the layer split (`12,24,37`, `13,25,37`): no gain.
+- Rebalancing the layer split (`12,24,37`, `13,25,37`): no gain. *Later adopted:* on 0.1.42, after the `--aux-cpus`
+  fix (0.11.0), split `12,24,37` gave +5 % and is part of the default since 0.12.0 (TESTLOG #30 → #56/#57).
 - `STRATA_PF_FUSED=1` for the UD-IQ4_XS: only kicks in from 1,024-token chunks, no effect with `--prefill 512`.
 
 ## [0.4.0] – 2026-10-11

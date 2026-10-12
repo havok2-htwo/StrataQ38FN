@@ -1,3 +1,5 @@
+> **Status:** drafts for 0.1.41 (fb58e0d), to be redone on the current base (0.1.42 + `../patches/v0.1.42/`, default `T16-142fcb`). Numbers, patch paths and engine names here are superseded; see `REVIEW-2026-10-12.md`.
+
 ## batch: more than 8 slots on a layer split, and a device-to-device slot copy
 
 Two independent commits on top of fb58e0d (a third, larger series is described at the end and would go in a separate PR). Measurements and context are in #<issue>.

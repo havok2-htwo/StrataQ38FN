@@ -1,3 +1,5 @@
+> **Status:** drafts for 0.1.41 (fb58e0d), to be redone on the current base (0.1.42 + `../patches/v0.1.42/`, default `T16-142fcb`). Numbers, patch paths and engine names here are superseded; see `REVIEW-2026-10-12.md`. The interleave part-4 failure under Finding 1 still reproduces on 0.1.42.
+
 # Batching on a 4-GPU layer split (4x RTX 3090): measurements, two patches, and three findings
 
 Hi, thanks for Strata. We ran it as a multi-user server on 4x RTX 3090 (24 GB each, PCIe ~13 GB/s per card, no P2P), a Threadripper 3990X and 128 GB RAM, with Qwen3.8-Flash-Next UD-IQ4_XS. Engine 0.1.41 (fb58e0d), compiled for sm_86 with CUDA 13.0. All 24,576 experts fit VRAM with the split 12/24/36. Below are the measurements, two small patches that are ready to upstream, and three findings that may be worth a doc fix or a follow-up.
