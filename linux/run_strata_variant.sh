@@ -24,7 +24,7 @@ if [ "${ATTACH:-0}" != "1" ]; then
   systemctl --user stop strata-bench.scope 2>/dev/null
   systemctl --user reset-failed strata-bench.scope 2>/dev/null
   cd "$SERVER_DIR" || exit 1
-  systemd-run --user --scope --unit=strata-bench -p MemoryMax="${MEMMAX:-90G}" -p MemorySwapMax=0 \
+  systemd-run --user --scope --unit=strata-bench -p MemoryMax="${MEMMAX:-200G}" -p MemorySwapMax=0 \
     "$STRATA/.venv/bin/python" "$SERVER_DIR/serve/server.py" --engine strata --config "$CFG" --port "$PORT" --host "${BIND:-0.0.0.0}" \
     > "$LOG" 2>&1 < /dev/null &
   sleep 5

@@ -15,5 +15,5 @@ EXTRA=()
 [ -n "${HOST:-}" ] && EXTRA+=(--host "$HOST")
 [ -n "${API_KEY:-}" ] && EXTRA+=(--api-key "$API_KEY")
 cd "$STRATA"
-exec systemd-run --user --scope --unit=strata -p MemoryMax=${MEMMAX:-90G} -p MemorySwapMax=0 \
+exec systemd-run --user --scope --unit=strata -p MemoryMax=${MEMMAX:-200G} -p MemorySwapMax=0 \
   "$STRATA/.venv/bin/python" "$SERVER_DIR/serve/server.py" --engine strata --config "$CONFIG" --port "$PORT" "${EXTRA[@]}"

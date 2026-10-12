@@ -32,7 +32,7 @@ PY
 used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -n | tail -1)
 if [ "$used" -ge 1000 ]; then echo "GPU busy ($used MiB)"; exit 1; fi
 cd "$SERVER_DIR" || exit 1
-systemd-run --user --scope -q -p MemoryMax=90G -p MemorySwapMax=0 --unit="$UNIT" \
+systemd-run --user --scope -q -p MemoryMax=${MEMMAX:-200G} -p MemorySwapMax=0 --unit="$UNIT" \
   "$STRATA/.venv/bin/python" "$SERVER_DIR/serve/server.py" --engine strata --config "$CFG" --port "$PORT" --host 0.0.0.0 \
   > "$OUT/server-$LABEL.out" 2>&1 < /dev/null &
 sleep 5
