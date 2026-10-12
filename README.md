@@ -47,6 +47,11 @@ to Strata.
   - quick A/B runs with GPU telemetry;
   - a profiling report and ranked lever list ([linux/upstream/](linux/upstream/)).
 
+- KV tiering so long agent conversations are never read twice: 64K–262K context per conversation, parked
+  conversations in RAM (asynchronous, off the critical path) and an SSD emergency tier with a daily write budget.
+- Production setup: Strata behind the Genesis3 (G3_VLLM) OpenAI proxy, Open WebUI and a LAN dashboard (per-GPU load,
+  PCIe throughput, live answering bars) as systemd services, day/night GPU power limits, `cutover.sh` / `rollback.sh`.
+
 **RTX 5090 + RAM (one GPU, experts partly in system RAM)**: this README, below
 - Tuned residency, caching and prefetch for agentic load: resident experts, a conversation cache for parked
   sessions, asynchronous expert adaptation, KV prefetch, direct PLE I/O.

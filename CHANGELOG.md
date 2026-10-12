@@ -27,6 +27,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.19.0] – 2026-10-12
+
+Linux (4× RTX 3090, 256 GB RAM): production.
+
+### Added
+- Production config `linux/configs/production.json` → `T16-143-prod262`: up to 262K context per conversation (K/V
+  streamed, 32K cells in VRAM, split 12,25,37 without expert loans), 48 GiB conversation cache, async + slot parking,
+  SSD emergency tier. 16 users 540 / 428 tok/s, a 170K-token prompt is read in ~30 s (TESTLOG #73).
+- Stability soak: 13 cycles of mixed load (16 users, mixed lengths, 24 agents, 150K requests, dropped streams) without
+  a single error; VRAM flat (TESTLOG #74).
+- Live since 2026-10-12 20:05: Strata behind G3's OpenAI proxy on port 8000 as "Qwen3.8-Flash-Next" (G3 2.6.0:
+  external backends, night-mode switch, optional GPU fan curves), Open WebUI on 8080, LAN dashboard on 8082, all as
+  systemd user services with linger; GPU power by G3: 380 W day, 280 W night (22:00–07:00).
+
 ## [0.18.0] – 2026-10-12
 
 Linux (4× RTX 3090, 256 GB RAM).
