@@ -89,6 +89,7 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
 | 60 | **Levers 3 + 4 through the HTTP server** (`ab_quick.sh`, greedy, 16 users; reply sha256 per request compared with `compare_replies.py`): one run `T16-142fcb` / + group sort (`T16-142gs`) / + both (`T16-142gsc`), then 2 ABBA pairs fcb vs gsc | single run: short 525.2 / 529.3 (+0.8 %, within noise) / **550.7 (+4.9 %)**, long 403.1 / 426.2 (+5.7 %) / **440.9 (+9.4 %)**. ABBA (means): short 511.6 → **549.1 (+7.3 %, pairs +8.1 / +6.6)**, long 397.1 → **439.2 (+10.6 %, pairs +11.1 / +10.1)**, TTFT p50 long 2.49 → 2.04 s. **All replies identical through the server (32/32 in every pair)** - the first token-level exactness check over the production path | ✅ **`T16-142gsc` new default** (engine `strata-g3-142lv`); agent default `X16-agent-142gsc` (split 12,25,37, #59) | `results/ab-lev34.out`, `results/ab-lev34c.out`, `results/sweep.requests.jsonl` |
 | 61 | **Rebase onto upstream 0.1.43** (worktree `Strata-143`, branch `g3-143`, engine `strata-g3-143`): all 32 commits kept (26 clean, 3 context moves, 4 small conflicts with upstream's NaN guard #879 and DETAILS.md); llama.cpp pin unchanged (MMQ-tab hash check passes). Review found 1 real defect: `STRATA_SLOT_CKPT_MOVE` could resume from a running slot's checkpoint after upstream's NaN flush (fixed in 42740f84, reproduced with `STRATA_NAN_INJECT` before/after) | exact and **byte-identical tokens to the 0.1.42 default** in every dump: batch_test16/32, interleave (11 checks), overlap test on/off (token + RESUME), T=0.7 seed 1234, prefill_mmq_tab_test 890/890; 100 % resident, no loans, MMQ direct + group sort 48/48, self-commit on all 4 stages. NaN guard on by default (no token changed). Upstream: server timings now split `prompt_n`/`cache_n` | ✅ exact; speed → #62 | `results/rebase143/` |
 | 62 | 0.1.43 vs 0.1.42 through the server (quick A/B, greedy, 16 users, each arm with its own checkout's server.py): `T16-142gsc` / `T16-143gsc` (NaN guard on, upstream default) / `T16-143gsc-noguard` (`STRATA_NAN_GUARD=0`) | short **555.3** / 537.2 (−3.3 %) / 547.8 (−1.4 %, within noise); long **437.5** / 432.6 (−1.1 %) / 439.0 (+0.3 %); all replies identical to 0.1.42 (32/32 each). The NaN guard (#879) costs ~2 % here (upstream measured < 0.2 %) | ➖ no speed gain from 0.1.43; default stays `T16-142gsc`; development continues on `g3-143` (upstream base for PRs); the guard's cost on pipelined batch windows is an upstream note | `results/ab-v143a.out`, `results/ab-v143b.out` |
+| 63 | Upstream bitwise switches `STRATA_LFUSE=1` (shared-expert gate launch + KV append folded) and `STRATA_TSUM=1` on `T16-142gsc` (quick A/B, 1 run) | short 545.8 / 549.2 (+0.6 %) / 551.6 (+1.1 %), long 437.6 / 438.3 (+0.2 %) / 440.5 (+0.7 %); replies identical (32/32 each) | ➖ within noise (single run resolves ~1.2 %); re-test both in an ABBA run together with lever 5 | `results/ab-lt.out` |
 
 ## Analyses (no GPU)
 
@@ -99,6 +100,10 @@ Verdicts: ✅ adopted · ➖ no measurable effect · ❌ worse / discarded · �
   B (MMQ directly on the cache slots), C (fused kernels).
 
 ## Open / next steps
+
+- Dashboard (user wish 2026-10-12): extend `dashboard/` into one cross-platform monitor that also runs without the Strata
+  server: Strata's own monitor features (the live "answering" progress bar per request, slots), multi-GPU view for 4 cards
+  incl. PCIe bus throughput per card, always showing a UI.
 
 Test protocol from #49 on: `ab_quick.sh` (one server start per arm, 16 users, greedy, short + 1.2K, ~4–5 min per arm);
 three repetitions only to confirm a new default.
