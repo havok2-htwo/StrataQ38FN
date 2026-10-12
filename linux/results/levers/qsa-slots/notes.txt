@@ -1,0 +1,51 @@
+Lever 5 (PROFILE-next-levers.md row 5 / decode #3): multi-slot QSA select + attention, STRATA_QSA_SLOTS=1 (opt-in).
+Code: Strata-143 (g3-143), build-143, engine/strata-g3-143l5.  2026-10-12.
+
+What runs per slot today (verify.cpp batch_rec_ branch, per QSA layer per window row): qsa_block_scores (multi kernel,
+nq=1, 256 CTAs), qsa_block_topk (reg kernel, 1 CTA), qsa_kv_resolve (no-op unless KV streaming), qsa_decode_attn_batch
+(chunk kernel grid (cap/64, 2) + merge).  With the switch: per window (chunks of 8 rows) one block_scores_slots_kernel
+(grid (256, m), blockIdx.y = row, its own pooled/dead), ONE qsa_block_topk over the m rows (that kernel only reads
+scores/steps, so it is already per-row; same dispatch on sm_86: reg kernel; sm_90 cluster for nq<=16 both ways),
+one attn_chunk_slots_kernel (blockIdx.z = row, own QsaAttnPools from a by-value 8-entry table) + one merge.
+Not with a streamed KV cache (falls back to the per-row loop: resolve order matters there).  Launchers decline
+(-> per-row calls) where the per-row call would pick another kernel: STRATA_SCORES_MULTI=0, pre-sm_75/gfx103x
+(pre75) kernel, gfx906 query swizzle.  KV append / indexer append per slot remain (0.04-0.08 ms per window: small).
+
+Exactness
+- SASS (cuobjdump, sm_86) of every pre-existing kernel in qsa_select.cu (9) identical before/after (incl.
+  block_scores_multi_kernel, now a wrapper around the shared body); qsa_decode_attn.cu: the 4 default
+  attn_chunk_kernel<M> and the merge identical; the 4 opt-in lane-cell instantiations (STRATA_ATTN_LANECELL=1) differ
+  only in register allocation/MOV/NOP/S2R (FP-op histograms identical).  sass/, sass_cmp.py.
+- New slot kernels: same FP-op histogram as the single-slot kernels (FFMA/FADD/FMUL/FMNMX/SHFL sequence identical;
+  the scores kernel replaces an FSEL key select by a branch).  No stack/local memory (scores kernel picks the slot's
+  pointers by unrolled selects; first version indexed the arg array -> 128 B stack, fixed).
+- qsa_slots_parity (new ctest, + _lanecell): 4 KV formats (fp16, int8, q4_0, int8K/q4V) x 1/2/4/8 rows of different
+  slots, own page tables (shuffled, 3 non-resident pages), contexts 37..32768: scores, ids, attention memcmp-identical
+  to one call per row.  PASS both (parity.txt).  ctest also qsa_topk_active_parity, kv_stream/hybrid_parity pass.
+- Engine gates (STRATA_QSA_SLOTS=1, T16-143l5.json, run_exact.sh, final binary): bt16, bt32, il, t07 dumps BYTE-IDENTICAL
+  to rebase143/exact; il all 10 checks IDENTICAL; ov1 (STRATA_PIPE_OVERLAP=1) token-identical + RESUME identical
+  (tool --compare), cmp.py shows only longer background slots (prefix-equal: the run is faster).
+- Switch off: bt16off.json byte-identical to the reference; off16 684.8 rows/s = reference.
+
+Speed (prof_driver decode, 30 s, T16-143gsc env + STRATA_NAN_GUARD=0, back to back, time.log)
+  16 slots: ref 681.0 / 685.4  new 725.4 / 727.0  -> +6.3 %   (stage-window 5.85 -> 5.50 ms)   off 684.8
+  32 slots: ref 750.0          new 801.6           -> +6.9 %   (10.68 -> 10.00 ms)
+  with STRATA_VERIFY_PROFILE: 16 649.2 -> 687.9 (+6.0 %), 32 729.4 -> 779.6 (+6.9 %)
+VERIFY_PROFILE (vprof16.txt / vprof32.txt), ms per stage-window S1/S2/S3/S4:
+  QSA proj+attention  16: 0.90/0.88/0.89/0.90 -> 0.52/0.51/0.52/0.52   32: 1.52/1.50/1.49/1.56 -> 0.81/0.78/0.77/0.81
+  of which stamp 10->13 (scores+topk+attention, batch path) S1: 16 0.61 -> 0.23, 32 1.09 -> 0.35
+  total stamped 16: 5.87/5.34/5.81/5.93 -> 5.52/4.99/5.46/5.59; 32: 9.48/8.46/9.19/10.06 -> 8.85/7.82/8.56/9.45
+  (other categories unchanged; vprof's "HC read (mid) + router" reads 0.00 on 143: its label changed, not this lever)
+Other per-slot sequences in the window (kv/idx append 0.04-0.08, GDN step = lever 6 est. -0.09/-0.19) are smaller;
+attention was the best target.
+commit 8013f726 (g3-143, Strata-143); binary engine/strata-g3-143l5 = build-143/strata at that commit
+
+== Review fix (2026-10-12): qsa_slots_parity skips instead of failing where a slots launcher declines by design
+- check() returns pass/fail/skip; a declined qsa_block_scores_slots / qsa_decode_attn_slots prints SKIP and counts as
+  declined (gfx906 query swizzle declines only int8 K/V, so other formats still run); all cases declined -> exit 77.
+  main() returns 77 up front for STRATA_SCORES_MULTI=0.
+- Engine binary unchanged (build-143/strata cmp-identical to engine/strata-g3-143l5): only the test executable relinked,
+  so the engine exactness gates (bt16/bt32/interleave/overlap) still hold as recorded above; not re-run.
+- ctest default: qsa_slots_parity + _lanecell Passed. STRATA_SCORES_MULTI=0: both Skipped (exit 77).
+  In-check decline path (up-front check removed in a scratch build, STRATA_SCORES_MULTI=0): 16x SKIP, exit 77.
+  Log: ctest_skipfix.txt. pre-sm_75 decline not reproducible here (no STRATA_EXPERIMENTAL_SM60 build / no cc<7.5 card).

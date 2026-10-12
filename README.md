@@ -12,19 +12,19 @@ to a test.
 
 | Setup | Original Strata | This fork | Gain |
 |---|---|---|---|
-| **4× RTX 3090 + RAM**, 16 concurrent users, short prompts | ~88 tok/s (setup default) · ~175 tok/s (Strata's own batching, max. 8 slots) | **~550 tok/s** | **6.3×** · **3.1×** |
-| **4× RTX 3090 + RAM**, 16 concurrent users, 1.2K-token prompts | ~88 tok/s · ~175 tok/s | **~440 tok/s** | **5.0×** · **2.5×** |
+| **4× RTX 3090 + RAM**, 16 concurrent users, short prompts | ~88 tok/s (setup default) · ~175 tok/s (Strata's own batching, max. 8 slots) | **~578 tok/s** | **6.6×** · **3.3×** |
+| **4× RTX 3090 + RAM**, 16 concurrent users, 1.2K-token prompts | ~88 tok/s · ~175 tok/s | **~456 tok/s** | **5.2×** · **2.6×** |
 | **4× RTX 3090**, single user (decode) | ~121 tok/s | ~131 tok/s | +8 % |
 | **RTX 5090 + 64 GB RAM**, single user (decode) | ~125 tok/s (setup default) | **~145 tok/s** | +16 % |
 | **RTX 5090 + 64 GB RAM**, switch between main agent and sub-agent | ~25 s prompt re-read | **~1.5 s** | 16× |
 
-4× RTX 3090: Strata 0.1.42 + our patch series, greedy, 512 output tokens per request (TESTLOG #57–#60 in
+4× RTX 3090: Strata 0.1.43 + our patch series, greedy, 512 output tokens per request (TESTLOG #57–#64 in
 [linux/TESTLOG.md](linux/TESTLOG.md)). For comparison, vLLM 0.31 on the same box reaches 622 / 386 tok/s at 16
 users, with a measurably lower quality checkpoint ([linux/README.md](linux/README.md)).
 
 **Is this a fork?** In substance, yes: a downstream fork. It is not a GitHub fork of the engine repository. This
 repository holds the deployment (configs, start scripts, a vLLM-compatible facade, a dashboard) and the engine patch
-series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.42/`, 32
+series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.43/`, 35
 patches). The patches are kept upstream-ready (opt-in switches, default path unchanged), so they can be offered back
 to Strata.
 
@@ -36,7 +36,7 @@ to Strata.
 - An admission path with ~25 ms less fixed cost per new request; checkpoints are saved on 4 threads and moved into
   the slot.
 - MMQ expert groups sorted by row count (−17 % prompt read time).
-- Batch windows that commit their own state (+5 % decode).
+- Batch windows that commit their own state (+5 % decode) and run QSA attention for all slots in one launch (+6 % decode).
 - An optional overlapped admission: new prompts are read while the other users keep decoding (latency option).
 - Tuning found by profiling: layer split 12,24,37 (GPU3 was the decode bottleneck), `--aux-cpus` (the prefill
   threads were stuck on the host's CPU core), batched draft-layer reads.
@@ -168,7 +168,7 @@ Not in the repository (`.gitignore`): `Strata/` and `Strata-*/` (engine clones +
 Strata commit `82f46a8` (0.1.42 in the Unreleased measurements) · models on NVMe (WD SN850X, `C:\StrataQ38FN-models`).
 
 **Linux** (see [linux/README.md](linux/README.md)): Ubuntu, kernel 7.0 · AMD Threadripper 3990X · 128 GB RAM ·
-4× NVIDIA RTX 3090 (driver 580, CUDA 13.0) · Strata v0.1.42 plus our patch series · models on RAID
+4× NVIDIA RTX 3090 (driver 580, CUDA 13.0) · Strata v0.1.43 plus our patch series · models on RAID
 (`/media/raid0/Models/Strata-GGUF`).
 
 ## License

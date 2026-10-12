@@ -445,6 +445,16 @@ systemctl --user stop strata-dashboard.scope
   (the key stays on this machine). Only `GET /metrics` is sent, never a request that runs the model.
 - Engine offline: the engine panels show "offline · last seen" and the last known values; the rest stays live.
 
+## Engine 0.1.43 and multi-slot QSA attention (default since 0.14.0)
+
+The series is rebased onto upstream 0.1.43 (`patches/v0.1.43/`, worktree `Strata-143`; tokens byte-identical to the
+0.1.42 build, #61). Upstream's new NaN guard costs ~2 % on our pipelined batch windows (#62) and is switched off in our
+configs (`STRATA_NAN_GUARD=0`). Lever 5, `STRATA_QSA_SLOTS=1`, runs the QSA block scores, top-k and attention of a batch
+window in one launch over all its slots instead of one launch per slot (bitwise identical; decode +6.3 % at 16 slots).
+Through the server (2 ABBA pairs, #64): 16 users **578 tok/s short, 456 tok/s 1.2K** (+5.3 % / +4.1 %), every reply
+identical. Config `configs/T16-143l5.json` (engine `strata-g3-143l5`, server `Strata-143/serve/server.py`), used by
+`start-strata.sh`; agent load `configs/X16-agent-143l5.json`.
+
 ## License notices
 
 The engine patches contain Strata source (MIT) and, in the pointer-table MMQ series, code mirrored from

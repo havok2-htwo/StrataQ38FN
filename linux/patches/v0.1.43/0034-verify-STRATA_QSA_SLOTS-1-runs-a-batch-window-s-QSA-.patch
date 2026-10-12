@@ -1,0 +1,657 @@
+From 8013f72673bb038ca9d83d01e121aa056732591b Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 06:20:44 +0200
+Subject: [PATCH 34/35] verify: STRATA_QSA_SLOTS=1 runs a batch window's QSA
+ block scores, top-k and attention as one launch over its rows
+
+In a batch window every row reads its own slot's indexer keys and K/V, so each QSA layer ran the
+selection and attention once per row: four rows (16 slots) or eight (32 slots) times qsa_block_scores,
+qsa_block_topk and qsa_decode_attn_batch, each launch small (the top-k on one CTA, the attention on
+cap/64 x 2 blocks).  With the switch, per window (up to 8 rows per launch):
+
+- block_scores_slots_kernel: grid (256, rows), blockIdx.y runs the single-query block_scores_multi_kernel
+  body with that row's slot keys (block_scores_multi_kernel is now a wrapper around the same body)
+- qsa_block_topk over the rows in one call (it only reads the rows' scores and steps)
+- attn_chunk_slots_kernel: attn_chunk_kernel's body with the row's own QsaAttnPools (an 8-entry table
+  passed by value, blockIdx.z picks), then the existing batched merge
+
+Each row is computed by the same kernel body with the same reduction order as its own call.  The
+launchers decline (the per-row calls run) where that call would pick another kernel: STRATA_SCORES_MULTI=0,
+the pre-sm_75 / gfx103x attention, the gfx906 query swizzle.  A streamed KV cache keeps the per-row
+resolve-then-attend loop.  Default (switch off): unchanged.
+
+Checked on 4x RTX 3090, T16-143gsc setup (layer split 12,24,37, int8 KV):
+- SASS (sm_86) of every existing kernel in qsa_select.cu and of the default attn_chunk_kernel<M> and the
+  merge is identical before/after; the opt-in lane-cell instantiations differ only in register allocation
+- new qsa_slots_parity (ctest, also with STRATA_ATTN_LANECELL=1): fp16, int8, q4_0 and int8-K/q4_0-V
+  pools, 1/2/4/8 rows of different slots with their own page tables and contexts 37..32768: scores, ids
+  and attention bitwise identical to one call per row
+- batch_test16/32 (greedy and t=0.7), batch_interleave_test and batch_overlap_test (STRATA_PIPE_OVERLAP=1)
+  token-identical to the build without the change; with the switch off batch_test16 is byte-identical too
+- batch decode rows/s (engine level, 30 s, back to back with the reference): 16 slots 683 -> 726 (+6.3 %),
+  32 slots 750 -> 802 (+6.9 %); STRATA_VERIFY_PROFILE "QSA projections + attention" per stage-window
+  0.89 -> 0.52 ms (16) and 1.52 -> 0.79 ms (32)
+
+HIP: the new code uses only what the existing kernels use; SYCL has its own sources and only sees the new
+declarations.  Neither was built here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                             |   9 +
+ include/strata/kernels/qsa_decode_attn.hpp |  15 ++
+ include/strata/kernels/qsa_select.hpp      |   7 +
+ src/core/verify.cpp                        |  43 ++++-
+ src/kernels/cuda/qsa_decode_attn.cu        | 114 ++++++++++-
+ src/kernels/cuda/qsa_select.cu             |  79 ++++++--
+ src/kernels/qsa_slots_parity.cpp           | 209 +++++++++++++++++++++
+ 7 files changed, 455 insertions(+), 21 deletions(-)
+ create mode 100644 src/kernels/qsa_slots_parity.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2457a956..9e991e14 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -403,6 +403,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
+     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
+     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
++    # STRATA_QSA_SLOTS: a batch window's scores, top-k and attention as one launch over rows of different slots
++    # against one call per row, bitwise (synthetic, no model)
++    add_executable(qsa_slots_parity src/kernels/qsa_slots_parity.cpp)
++    target_include_directories(qsa_slots_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
++    target_link_libraries(qsa_slots_parity PRIVATE strata_kernels CUDA::cudart)
++    add_test(NAME qsa_slots_parity COMMAND qsa_slots_parity)
++    add_test(NAME qsa_slots_parity_lanecell COMMAND qsa_slots_parity)
++    set_tests_properties(qsa_slots_parity qsa_slots_parity_lanecell PROPERTIES SKIP_RETURN_CODE 77)
++    set_tests_properties(qsa_slots_parity_lanecell PROPERTIES ENVIRONMENT "STRATA_ATTN_LANECELL=1")
+   endif()
+   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
+   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
+diff --git a/include/strata/kernels/qsa_decode_attn.hpp b/include/strata/kernels/qsa_decode_attn.hpp
+index 45c0f301..d68bab43 100644
+--- a/include/strata/kernels/qsa_decode_attn.hpp
++++ b/include/strata/kernels/qsa_decode_attn.hpp
+@@ -43,4 +43,19 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+ 
++/// Up to this many queries of different slots in one qsa_decode_attn_slots call.
++constexpr int kQsaAttnMaxSlots = 8;
++
++/// One KV pool set per query of a qsa_decode_attn_slots call (passed by value as a kernel argument).
++struct QsaAttnSlotPools {
++    QsaAttnPools p[kQsaAttnMaxSlots];
++};
++
++/// qsa_decode_attn_batch for `n_q` queries that each attend over their OWN pools (`pools.p[i]`, one KV cache per batch
++/// slot): one launch instead of one call per query, every block computing exactly what the per-query call computes.
++/// The pools must all have one KV format. False (nothing launched) where the per-query call would run another kernel
++/// (n_q > kQsaAttnMaxSlots, mixed formats, the pre-sm_75 / gfx103x or gfx906 variants): the caller loops instead.
++bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
++                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
++
+ }  // namespace strata::kernels
+diff --git a/include/strata/kernels/qsa_select.hpp b/include/strata/kernels/qsa_select.hpp
+index c36d29cf..3ff769a9 100644
+--- a/include/strata/kernels/qsa_select.hpp
++++ b/include/strata/kernels/qsa_select.hpp
+@@ -29,6 +29,13 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
+                       int64_t active_blocks = -1);   ///< perf-review C-1: > 0 launches only this many blocks (the
+                                                      ///< batch's largest n_bid + 1; not for a captured graph)
+ 
++/// qsa_block_scores for `nq` queries of different slots, query i scoring its own slot's keys (pooled[i], dead[i]; host
++/// arrays of device pointers): one launch whose blocks each compute exactly what the single-query call computes.
++/// False (nothing launched) where that call would run another kernel (nq > 8, STRATA_SCORES_MULTI=0): loop instead.
++bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
++                            const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
++                            void* stream);
++
+ /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
+ /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.
+ /// On AMD it is the gfx12 (RDNA4) WMMA kernel (a three-way bf16 split, six products); false on any other AMD target.
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 0d9f6111..789b1684 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -186,6 +186,11 @@ const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: pe
+ // of the commit graph only repeats what the window wrote: the indexer tails are put back and appended again from the
+ // same rows, the PLE histories are put back to the window's own snapshot.
+ const bool g_batch_self_commit = env_on("STRATA_BATCH_SELF_COMMIT");
++// STRATA_QSA_SLOTS=1 (opt-in): in a batch window, a QSA layer's block scores, top-k and attention run as one launch
++// each over the window's rows (up to 8 per launch, each row reading its own slot's indexer keys and K/V) instead of
++// one call per row; every row is computed by the same kernel with the same arithmetic as its own call.  Not with a
++// streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
++const bool g_qsa_slots = env_on("STRATA_QSA_SLOTS");
+ 
+ // every row of a batch window is another slot's (no slot has proposal rows)
+ bool one_row_per_slot(const int* rows, int S) {
+@@ -1395,7 +1400,43 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 }
+                 }
+                 stamp(l, 10, grp);
+-                if (batch_rec_) {   // each row selects and attends over its own slot's K/V
++                bool streamed = false;   // a streamed KV cache keeps the per-row resolve-then-attend order
++                if (batch_rec_ && g_qsa_slots)
++                    for (int t = tb; t < te; ++t) streamed = streamed || slot_ss(t).qsa_states[qi].kv_mode == 1;
++                if (batch_rec_ && g_qsa_slots && !streamed) {
++                    // the rows' block scores, top-k and attention, up to 8 rows per launch.  The rows only read
++                    // their slots' keys and K/V here and write their own scores/sel/scratch/attn rows, so running
++                    // each step for all rows before the next is the per-row loop's result
++                    for (int t0 = tb; t0 < te; t0 += kQsaAttnMaxSlots) {
++                        const int m = std::min(te - t0, kQsaAttnMaxSlots);
++                        const float* pooled[kQsaAttnMaxSlots];
++                        const float* dead[kQsaAttnMaxSlots];
++                        QsaAttnSlotPools px;
++                        for (int i = 0; i < m; ++i) {
++                            const QsaState& sx = slot_ss(t0 + i).qsa_states[qi];
++                            pooled[i] = sx.idx_pooled;
++                            dead[i] = sx.idx_dead;
++                            px.p[i] = qsa_attn_pools(sx);
++                        }
++                        // a launcher that would not run the per-row call's kernel launches nothing: per-row calls
++                        if (!qsa_block_scores_slots(pooled, dead, qidx_ + t0 * IQ * ID, step_ + t0 * kStepCount, m,
++                                                    max_blocks_, s, scores_ + (size_t) t0 * max_blocks_, cs))
++                            for (int t = t0; t < t0 + m; ++t)
++                                qsa_block_scores(pooled[t - t0], dead[t - t0], qidx_ + t * IQ * ID, step_ + t * kStepCount,
++                                                 1, max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
++                        qsa_block_topk(scores_ + (size_t) t0 * max_blocks_, step_ + t0 * kStepCount, m, max_blocks_,
++                                       cap_, s, sel_ + (size_t) t0 * cap_, cs);
++                        if (!qsa_decode_attn_slots(qcur_ + t0 * NH * HD, px, sel_ + (size_t) t0 * cap_,
++                                                   step_ + t0 * kStepCount, cap_, s,
++                                                   attn_scratch_ + (size_t) t0 * attn_scratch_floats_,
++                                                   attn_ + t0 * NH * HD, m, cs))
++                            for (int t = t0; t < t0 + m; ++t)
++                                qsa_decode_attn_batch(qcur_ + t * NH * HD, px.p[t - t0], sel_ + (size_t) t * cap_,
++                                                      step_ + t * kStepCount, cap_, s,
++                                                      attn_scratch_ + (size_t) t * attn_scratch_floats_,
++                                                      attn_ + t * NH * HD, 1, cs);
++                    }
++                } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
+                     for (int t = tb; t < te; ++t) {
+                         const QsaState& sx = slot_ss(t).qsa_states[qi];
+                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index 624036c6..0ff46770 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -114,13 +114,14 @@ __device__ __forceinline__ int reduce12_head_of_lane(int lane) {
+     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
+ }
+ 
+-template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false>
+-__global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
+-                                                             const int32_t* __restrict__ ids,
+-                                                             const int32_t* __restrict__ step, int n_kv_heads,
+-                                                             int page_size, float scale, float* __restrict__ part_acc,
+-                                                             float* __restrict__ part_m, float* __restrict__ part_l,
+-                                                             int n_chunks, int cap = 0, long long scratch_stride = 0) {
++// The chunk kernel's body; `p` is the query's KV pools (the call's one set, or blockIdx.z's slot's set).
++template <int KV_MODE, bool LANE_CELL, bool QUERY_SWIZZLE, bool REDUCE12>
++__device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, QsaAttnPools p,
++                                                const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
++                                                int n_kv_heads, int page_size, float scale,
++                                                float* __restrict__ part_acc, float* __restrict__ part_m,
++                                                float* __restrict__ part_l, int n_chunks, int cap,
++                                                long long scratch_stride) {
+     // batched form: query blockIdx.z, with its own q row, selection, step and scratch
+     q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
+     ids += (size_t) blockIdx.z * (size_t) cap;
+@@ -279,6 +280,33 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
+     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+ }
+ 
++template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false>
++__global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
++                                                             const int32_t* __restrict__ ids,
++                                                             const int32_t* __restrict__ step, int n_kv_heads,
++                                                             int page_size, float scale, float* __restrict__ part_acc,
++                                                             float* __restrict__ part_m, float* __restrict__ part_l,
++                                                             int n_chunks, int cap = 0, long long scratch_stride = 0) {
++    attn_chunk_body<KV_MODE, LANE_CELL, QUERY_SWIZZLE, REDUCE12>(q, p, ids, step, n_kv_heads, page_size, scale,
++                                                                 part_acc, part_m, part_l, n_chunks, cap,
++                                                                 scratch_stride);
++}
++
++// The same blocks for queries of different slots: query blockIdx.z reads its own slot's pools, everything else is
++// attn_chunk_kernel's batched form (qsa_decode_attn_slots).
++template <int KV_MODE, bool LANE_CELL>
++__global__ void __launch_bounds__(THREADS) attn_chunk_slots_kernel(const float* __restrict__ q, QsaAttnSlotPools ps,
++                                                                   const int32_t* __restrict__ ids,
++                                                                   const int32_t* __restrict__ step, int n_kv_heads,
++                                                                   int page_size, float scale,
++                                                                   float* __restrict__ part_acc,
++                                                                   float* __restrict__ part_m,
++                                                                   float* __restrict__ part_l, int n_chunks, int cap,
++                                                                   long long scratch_stride) {
++    attn_chunk_body<KV_MODE, LANE_CELL, false, false>(q, ps.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
++                                                      part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
++}
++
+ // PR #540 (sskver): the same attention with fewer shuffles and less shared-memory traffic, bit for bit the kernel
+ // above (same operands, same order); +7% prompt speed on a V100, where this kernel reads every prompt chunk.  It
+ // uses more registers (80 vs 38 on sm_70), so on CUDA it runs on cards below sm_75 only, and exists only in the
+@@ -613,6 +641,17 @@ bool pre75_attn() {
+ #define STRATA_ATTN_CHUNK(M) attn_chunk_kernel<M>
+ #endif
+ 
++// S25: STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
++bool lane_cell_attn() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
++    return on;
++}
++
++// 0 fp16, 1 int8, 2 q4_0, 3 int8 K with q4_0 V
++int attn_kv_mode(const QsaAttnPools& p) {
++    return p.k_q4 != nullptr ? 2 : (p.k_q != nullptr && p.v_q4 != nullptr ? 3 : (p.k_q != nullptr ? 1 : 0));
++}
++
+ }  // namespace
+ 
+ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+@@ -634,8 +673,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     const float scale = 1.0f / sqrtf((float) HD);
+     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
+     cudaStream_t st = (cudaStream_t) stream;
+-    // S25: STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
+-    static const bool lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
++    const bool lane_cell = lane_cell_attn();
+ #if defined(STRATA_HIP_GFX906)
+     static const bool query_swizzle = [] {
+         const char* v = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE"); return v && v[0] == '1';
+@@ -708,6 +746,64 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     }
+ }
+ 
++bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
++                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
++    if (n_q <= 0) return true;
++    if (n_q > kQsaAttnMaxSlots) return false;
++    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps) {
++        std::fprintf(stderr, "qsa_decode_attn_slots: unsupported geometry or missing buffers\n");
++        std::exit(1);
++    }
++    const int kv_mode = attn_kv_mode(pools.p[0]);
++    for (int64_t z = 0; z < n_q; ++z) {
++        if (!pools.p[z].page_table) {
++            std::fprintf(stderr, "qsa_decode_attn_slots: missing page table\n");
++            std::exit(1);
++        }
++        if (attn_kv_mode(pools.p[z]) != kv_mode) return false;
++    }
++    const bool lane_cell = lane_cell_attn();
++    // only where qsa_decode_attn_batch runs attn_chunk_kernel; its other variants keep the per-query calls
++#if defined(STRATA_ATTN_PRE75_BUILT)
++    if (!lane_cell && pre75_attn()) return false;
++#endif
++#if defined(STRATA_HIP_GFX906)
++    static const bool query_swizzle = [] {
++        const char* v = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE"); return v && v[0] == '1';
++    }();
++    if (query_swizzle && !lane_cell && kv_mode == 1 && query_swizzle_gfx906_device()) return false;
++#endif
++    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
++    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
++    float* part_acc = scratch;
++    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
++    float* part_l = part_m + (size_t) n_chunks * s.n_head;
++    const float scale = 1.0f / sqrtf((float) HD);
++    const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
++    cudaStream_t st = (cudaStream_t) stream;
++#define STRATA_ATTN_SLOTS(M, LC) attn_chunk_slots_kernel<M, LC><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
++    if (lane_cell) {
++        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, true);
++        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true);
++        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, true);
++        else STRATA_ATTN_SLOTS(0, true);
++    } else {
++        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, false);
++        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, false);
++        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, false);
++        else STRATA_ATTN_SLOTS(0, false);
++    }
++#undef STRATA_ATTN_SLOTS
++    attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
++                                                                                  attn, stride);
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "qsa_decode_attn_slots: %s\n", cudaGetErrorString(e));
++        std::exit(1);
++    }
++    return true;
++}
++
+ uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
+     const int64_t chunks = (cap + CHUNK - 1) / CHUNK;
+     return (uint64_t) chunks * (uint64_t) s.n_head * (HD + 2) + 64;
+diff --git a/src/kernels/cuda/qsa_select.cu b/src/kernels/cuda/qsa_select.cu
+index 4820d208..ed2fd343 100644
+--- a/src/kernels/cuda/qsa_select.cu
++++ b/src/kernels/cuda/qsa_select.cu
+@@ -813,12 +813,11 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
+ // qsa_block_scores takes it for every call without an active-block count and at most MQ queries: the captured decode
+ // window, the uncaptured decode, and prefill's pooled16 call.
+ constexpr int MQ = 8;
+-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
+-                                                                              const float* __restrict__ dead,
+-                                                                              const float* __restrict__ q_idx,
+-                                                                              const int32_t* __restrict__ steps, int nq,
+-                                                                              int64_t max_blocks, float* __restrict__ out,
+-                                                                              bool early_exit) {
++__device__ __forceinline__ void block_scores_multi_body(const float* __restrict__ pooled,
++                                                        const float* __restrict__ dead,
++                                                        const float* __restrict__ q_idx,
++                                                        const int32_t* __restrict__ steps, int nq, int64_t max_blocks,
++                                                        float* __restrict__ out, bool early_exit) {
+     __shared__ __align__(16) float qs[MQ * IDX_HEADS * IDX_DIM];
+     __shared__ int64_t s_nkv[MQ], s_nbid[MQ];
+     if (!early_exit)
+@@ -865,6 +864,37 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
+     }
+ }
+ 
++__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
++                                                                              const float* __restrict__ dead,
++                                                                              const float* __restrict__ q_idx,
++                                                                              const int32_t* __restrict__ steps, int nq,
++                                                                              int64_t max_blocks, float* __restrict__ out,
++                                                                              bool early_exit) {
++    block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit);
++}
++
++// Queries of different slots, each with its own indexer keys: blockIdx.y is the query, and its CTAs run exactly the
++// single-query call of block_scores_multi_kernel (qsa_block_scores_slots).
++struct ScoreSlotKeys {
++    const float* pooled[MQ];
++    const float* dead[MQ];
++};
++__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(ScoreSlotKeys keys,
++                                                                              const float* __restrict__ q_idx,
++                                                                              const int32_t* __restrict__ steps,
++                                                                              int64_t max_blocks, float* __restrict__ out,
++                                                                              bool early_exit) {
++    const unsigned z = blockIdx.y;
++    // the slot's pointers picked by unrolled selects: indexing the argument array by z would copy it to local memory
++    const float* pooled = keys.pooled[0];
++    const float* dead = keys.dead[0];
++#pragma unroll
++    for (unsigned i = 1; i < MQ; ++i)
++        if (z == i) { pooled = keys.pooled[i]; dead = keys.dead[i]; }
++    block_scores_multi_body(pooled, dead, q_idx + (size_t) z * IDX_HEADS * IDX_DIM,
++                            steps + (size_t) z * kStepCount, 1, max_blocks, out + (size_t) z * max_blocks, early_exit);
++}
++
+ #if !defined(__HIPCC__)
+ // ---- the decode top-k on a thread-block cluster (sm_90+; S19).  One CTA per query (block_topk_reg_kernel, or
+ // block_topk_kernel above 33,792 blocks: a --max-context over ~135K) makes four radix passes and two scans over up to
+@@ -1087,8 +1117,38 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
+ #endif
+ }
+ #endif  // !__HIPCC__
++bool scores_multi_on() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
++    return on;
++}
++// STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
++bool scores_early_exit() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
++    return on;
++}
+ }  // namespace
+ 
++bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
++                            const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
++                            void* stream) {
++    if (nq <= 0) return true;
++    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) {
++        std::fprintf(stderr, "qsa_block_scores_slots: unsupported indexer geometry\n");
++        std::exit(1);
++    }
++    if (nq > MQ || !scores_multi_on()) return false;   // the single-query call would not run the multi kernel
++    ScoreSlotKeys keys{};
++    for (int64_t z = 0; z < nq; ++z) {
++        keys.pooled[z] = pooled[z];
++        keys.dead[z] = dead[z];
++    }
++    block_scores_slots_kernel<<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
++        keys, q_idx, steps, max_blocks, scores, scores_early_exit());
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slots: %s\n", cudaGetErrorString(e)); std::exit(1); }
++    return true;
++}
++
+ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
+     if (nq <= 0) return;
+@@ -1097,12 +1157,9 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
+         std::exit(1);
+     }
+     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
+-    static const bool multi = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
+-    if (multi && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
+-        // STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
+-        static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
++    if (scores_multi_on() && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
+         block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
+-                                                                                     max_blocks, scores, early);
++                                                                                     max_blocks, scores, scores_early_exit());
+         const cudaError_t e = cudaGetLastError();
+         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
+         return;
+diff --git a/src/kernels/qsa_slots_parity.cpp b/src/kernels/qsa_slots_parity.cpp
+new file mode 100644
+index 00000000..d204a699
+--- /dev/null
++++ b/src/kernels/qsa_slots_parity.cpp
+@@ -0,0 +1,209 @@
++// src/kernels/qsa_slots_parity.cpp - STRATA_QSA_SLOTS: a batch window's block scores, top-k and attention as one
++// launch over rows of different slots (qsa_block_scores_slots, qsa_block_topk over the rows, qsa_decode_attn_slots)
++// against one call per row, as verify.cpp makes them without the switch.  Every slot has its own indexer keys, page
++// table and K/V pools (fp16, int8, q4_0 and int8-K/q4_0-V) and its own context length; scores, selected ids and the
++// attention output must be bitwise identical.  Synthetic data, no model.  Run it once more with
++// STRATA_ATTN_LANECELL=1 for the lane-cell kernels.
++#include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_q8.hpp"
++#include "strata/kernels/qsa.hpp"
++#include "strata/kernels/qsa_decode_attn.hpp"
++#include "strata/kernels/qsa_select.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <numeric>
++#include <random>
++#include <vector>
++
++namespace k = strata::kernels;
++namespace {
++
++void ck(cudaError_t e) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "CUDA: %s\n", cudaGetErrorString(e));
++        std::exit(2);
++    }
++}
++template <typename T> T* up(const std::vector<T>& h) {
++    T* d = nullptr;
++    ck(cudaMalloc(&d, h.size() * sizeof(T)));
++    ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
++    return d;
++}
++template <typename T> std::vector<T> down(const T* d, size_t n) {
++    std::vector<T> h(n);
++    ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost));
++    return h;
++}
++// a finite fp16 of magnitude 2^-5 .. 2^2
++uint16_t rnd_half(std::mt19937& r) {
++    const uint32_t x = r();
++    return (uint16_t) (((x & 1u) << 15) | ((10u + (x >> 1) % 7u) << 10) | ((x >> 4) & 0x3ffu));
++}
++
++constexpr int64_t kMaxCells = 32768;
++
++struct Slot {
++    float *pooled = nullptr, *dead = nullptr;
++    int32_t* page_table = nullptr;
++    void* bufs[6] = {};
++    k::QsaAttnPools pools;
++};
++
++Slot make_slot(int fmt, const k::QsaShapes& s, int64_t max_blocks, std::mt19937& r) {
++    Slot sl;
++    std::normal_distribution<float> nd(0.f, 1.f);
++    std::vector<float> pooled((size_t) (max_blocks * s.idx_dim)), dead((size_t) s.idx_dim);
++    for (auto& v : pooled) v = nd(r);
++    for (auto& v : dead) v = nd(r);
++    sl.pooled = up(pooled);
++    sl.dead = up(dead);
++    const int64_t pages = kMaxCells / s.page_size;
++    std::vector<int32_t> pt((size_t) pages);
++    std::iota(pt.begin(), pt.end(), 0);
++    std::shuffle(pt.begin(), pt.end(), r);
++    for (int i = 0; i < 3; ++i) pt[(size_t) (r() % pages)] = -1;   // a few non-resident pages (masked cells)
++    sl.page_table = up(pt);
++    sl.pools.page_table = sl.page_table;
++    const size_t rows = (size_t) (pages * s.n_head_kv * s.page_size), hd = (size_t) s.head_dim;
++    auto halves = [&](size_t n) { std::vector<uint16_t> h(n); for (auto& v : h) v = rnd_half(r); return h; };
++    auto codes = [&](size_t n) { std::vector<int8_t> h(n); for (auto& v : h) v = (int8_t) (r() & 0xff); return h; };
++    auto q4 = [&](size_t n_rows) {
++        std::vector<uint8_t> h(n_rows * (size_t) k::kv_q4_bytes_per_head((int) hd));
++        k::block_q4_0* b = reinterpret_cast<k::block_q4_0*>(h.data());
++        for (size_t i = 0; i < h.size() / sizeof(k::block_q4_0); ++i) {
++            b[i].d = rnd_half(r);
++            for (auto& q : b[i].qs) q = (uint8_t) (r() & 0xff);
++        }
++        return h;
++    };
++    if (fmt == 0) {
++        sl.pools.k_pool = (const uint16_t*) (sl.bufs[0] = up(halves(rows * hd)));
++        sl.pools.v_pool = (const uint16_t*) (sl.bufs[1] = up(halves(rows * hd)));
++    } else if (fmt == 1 || fmt == 3) {
++        sl.pools.k_q = (const int8_t*) (sl.bufs[0] = up(codes(rows * hd)));
++        sl.pools.k_scale = (const uint16_t*) (sl.bufs[1] = up(halves(rows * hd / k::KV_Q8_GROUP)));
++        if (fmt == 1) {
++            sl.pools.v_q = (const int8_t*) (sl.bufs[2] = up(codes(rows * hd)));
++            sl.pools.v_scale = (const uint16_t*) (sl.bufs[3] = up(halves(rows * hd / k::KV_Q8_GROUP)));
++        } else {
++            sl.pools.v_q4 = (const uint8_t*) (sl.bufs[2] = up(q4(rows)));
++        }
++    } else {
++        sl.pools.k_q4 = (const uint8_t*) (sl.bufs[0] = up(q4(rows)));
++        sl.pools.v_q4 = (const uint8_t*) (sl.bufs[1] = up(q4(rows)));
++    }
++    return sl;
++}
++
++void free_slot(Slot& sl) {
++    ck(cudaFree(sl.pooled)); ck(cudaFree(sl.dead)); ck(cudaFree(sl.page_table));
++    for (void* b : sl.bufs) if (b) ck(cudaFree(b));
++}
++
++// one case: `m` rows of different slots, KV format `fmt`, contexts `ctx[i]`
++bool check(int fmt, int m, const int64_t* ctx, uint32_t seed) {
++    const k::QsaShapes s = k::qsa_real_shapes();
++    const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
++    const int64_t max_blocks = kMaxCells / s.idx_block + 2;
++    const int64_t NH = s.n_head, HD = s.head_dim, QI = s.idx_n_head * s.idx_dim;
++    const int64_t sf = (int64_t) k::qsa_decode_attn_scratch_floats(cap, s);
++    std::mt19937 r(seed);
++    std::normal_distribution<float> nd(0.f, 1.f);
++    std::vector<Slot> slots;
++    for (int i = 0; i < m; ++i) slots.push_back(make_slot(fmt, s, max_blocks, r));
++    std::vector<float> qidx((size_t) (m * QI)), qcur((size_t) (m * NH * HD));
++    for (auto& v : qidx) v = nd(r);
++    for (auto& v : qcur) v = nd(r);
++    std::vector<int32_t> steps((size_t) (m * k::kStepCount));
++    for (int i = 0; i < m; ++i) k::qsa_step_fill(steps.data() + i * k::kStepCount, ctx[i] - 1, s);
++    float* d_qidx = up(qidx);
++    float* d_qcur = up(qcur);
++    int32_t* d_steps = up(steps);
++    float *sc[2], *scratch[2], *attn[2];
++    int32_t* sel[2];
++    for (int v = 0; v < 2; ++v) {
++        ck(cudaMalloc(&sc[v], (size_t) (m * max_blocks) * 4));
++        ck(cudaMalloc(&sel[v], (size_t) (m * cap) * 4));
++        ck(cudaMalloc(&scratch[v], (size_t) (m * sf) * 4));
++        ck(cudaMalloc(&attn[v], (size_t) (m * NH * HD) * 4));
++        ck(cudaMemset(sc[v], 0, (size_t) (m * max_blocks) * 4));
++        ck(cudaMemset(sel[v], 0, (size_t) (m * cap) * 4));
++        ck(cudaMemset(attn[v], 0, (size_t) (m * NH * HD) * 4));
++    }
++    // 0: one call per row (verify.cpp's batch-window loop)
++    for (int t = 0; t < m; ++t) {
++        k::qsa_block_scores(slots[t].pooled, slots[t].dead, d_qidx + t * QI, d_steps + t * k::kStepCount, 1,
++                            max_blocks, s, sc[0] + t * max_blocks, nullptr);
++        k::qsa_block_topk(sc[0] + t * max_blocks, d_steps + t * k::kStepCount, 1, max_blocks, cap, s, sel[0] + t * cap,
++                          nullptr);
++        k::qsa_decode_attn_batch(d_qcur + t * NH * HD, slots[t].pools, sel[0] + t * cap, d_steps + t * k::kStepCount,
++                                 cap, s, scratch[0] + t * sf, attn[0] + t * NH * HD, 1, nullptr);
++    }
++    // 1: one launch per step over the rows
++    const float* pooled[k::kQsaAttnMaxSlots];
++    const float* dead[k::kQsaAttnMaxSlots];
++    k::QsaAttnSlotPools px;
++    for (int t = 0; t < m; ++t) { pooled[t] = slots[t].pooled; dead[t] = slots[t].dead; px.p[t] = slots[t].pools; }
++    if (!k::qsa_block_scores_slots(pooled, dead, d_qidx, d_steps, m, max_blocks, s, sc[1], nullptr)) {
++        std::fprintf(stderr, "FAIL: qsa_block_scores_slots declined (STRATA_SCORES_MULTI=0?)\n");
++        return false;
++    }
++    k::qsa_block_topk(sc[1], d_steps, m, max_blocks, cap, s, sel[1], nullptr);
++    if (!k::qsa_decode_attn_slots(d_qcur, px, sel[1], d_steps, cap, s, scratch[1], attn[1], m, nullptr)) {
++        std::fprintf(stderr, "FAIL: qsa_decode_attn_slots declined (a pre-sm_75 card or STRATA_ATTN_PRE75=1?)\n");
++        return false;
++    }
++    ck(cudaDeviceSynchronize());
++    bool ok = true;
++    const auto s0 = down(sc[0], (size_t) (m * max_blocks)), s1 = down(sc[1], (size_t) (m * max_blocks));
++    const auto i0 = down(sel[0], (size_t) (m * cap)), i1 = down(sel[1], (size_t) (m * cap));
++    const auto a0 = down(attn[0], (size_t) (m * NH * HD)), a1 = down(attn[1], (size_t) (m * NH * HD));
++    for (int t = 0; t < m && ok; ++t) {
++        const int64_t nb = steps[(size_t) (t * k::kStepCount + k::kStepNBid)] + 1;
++        const int64_t w = steps[(size_t) (t * k::kStepCount + k::kStepWidth)];
++        const char* what = nullptr;
++        if (std::memcmp(&s0[(size_t) (t * max_blocks)], &s1[(size_t) (t * max_blocks)], (size_t) nb * 4)) what = "scores";
++        else if (std::memcmp(&i0[(size_t) (t * cap)], &i1[(size_t) (t * cap)], (size_t) w * 4)) what = "ids";
++        else if (std::memcmp(&a0[(size_t) (t * NH * HD)], &a1[(size_t) (t * NH * HD)], (size_t) (NH * HD) * 4))
++            what = "attention";
++        if (what) {
++            std::fprintf(stderr, "FAIL fmt=%d rows=%d row=%d ctx=%lld: %s differ\n", fmt, m, t, (long long) ctx[t], what);
++            ok = false;
++        }
++    }
++    double mag = 0;   // the attention output is not trivially zero
++    for (float v : a0) mag += std::fabs(v);
++    if (ok && !(mag > 0)) { std::fprintf(stderr, "FAIL fmt=%d rows=%d: attention output is zero\n", fmt, m); ok = false; }
++    for (int v = 0; v < 2; ++v) { ck(cudaFree(sc[v])); ck(cudaFree(sel[v])); ck(cudaFree(scratch[v])); ck(cudaFree(attn[v])); }
++    ck(cudaFree(d_qidx)); ck(cudaFree(d_qcur)); ck(cudaFree(d_steps));
++    for (auto& sl : slots) free_slot(sl);
++    return ok;
++}
++
++}  // namespace
++
++int main() {
++    int devices = 0;
++    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
++        std::puts("SKIP: no CUDA device");
++        return 77;
++    }
++    // contexts per row: under and over the selection width (2048 cells), partial and complete indexer blocks
++    const int64_t ctx[8] = {1500, 37, 9000, 2049, 32768, 300, 20001, 4096};
++    int cases = 0;
++    for (int fmt = 0; fmt < 4; ++fmt)
++        for (int m : {1, 2, 4, 8}) {
++            if (!check(fmt, m, ctx, 1000u * (uint32_t) fmt + (uint32_t) m)) return 1;
++            ++cases;
++        }
++    std::printf("PASS: %d cases (4 KV formats x 1/2/4/8 rows of different slots%s): scores, ids and attention bitwise "
++                "identical to one call per row\n", cases, std::getenv("STRATA_ATTN_LANECELL") ? ", lane-cell" : "");
++    return 0;
++}
+-- 
+2.43.0
+

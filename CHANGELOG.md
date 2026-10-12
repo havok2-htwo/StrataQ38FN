@@ -27,6 +27,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.14.0] – 2026-10-12
+
+Linux (4× RTX 3090).
+
+### Changed
+- Engine rebased onto upstream Strata 0.1.43 (`linux/patches/v0.1.43/`), exact. New default `configs/T16-143l5.json`
+  with lever 5 `STRATA_QSA_SLOTS=1` (multi-slot QSA attention, bitwise identical) and `STRATA_NAN_GUARD=0`:
+  16 users 578 tok/s short / 456 tok/s 1.2K (+5.3 % / +4.1 %, ABBA), replies identical.
+
+### Added
+- One cross-platform LAN dashboard (`dashboard/`, `linux/start-dashboard.sh`, port 8082): Strata's live answering
+  bar and batch slots, per-GPU load/VRAM/power/temperature/clock and PCIe link + RX/TX throughput for all cards; runs
+  without a Strata server.
+
 ## [0.13.0] – 2026-10-12
 
 Linux (4× RTX 3090).
