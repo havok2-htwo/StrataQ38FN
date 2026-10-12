@@ -1,0 +1,353 @@
+From faddbb2ef66c5e8bebab2b3e03bfd5657a66585c Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 02:58:41 +0200
+Subject: [PATCH 29/32] prefill: STRATA_MMQ_GROUP_SORT=1 sorts the full MMQ
+ groups by row count, keeping the partial group
+
+STRATA_MMQ_RESIDENT_SORT_NE=1 puts a fully resident layer's experts in row-count order, so each
+16-expert group's max_rows (its tile padding) is close to its experts' own. It also moves the hottest
+experts into the last, partial group, whose few tiles take MMQ's stream-k split: the K boundaries move
+with the group's tile count and the prompt's bits change.
+
+The new switch sorts only order[0, n - n % 16] (mmq_resident_sort_span) and leaves the partial group's
+experts, and so its rows, where they were. A full group's launch has 160 (gate/up) or 320 (down) tiles
+per column tile; mmq::whole_tiles checks on every visible GPU that every such launch runs one block per
+tile (tile efficiency >= 90 %, NVIDIA) and that all tile widths share the I/K tiles and SRAM layout. Then
+each expert's rows get the same bits in any full group whatever its group-mates and max_rows. Where it does
+not hold (e.g. 108 or 128 SMs, AMD's stream-k grid) the switch does nothing. RESIDENT_SORT_NE takes
+precedence when both are set; with neither the code path is unchanged.
+
+prefill_mmq_tab_test part 4 runs a layer's groups as prefill.cpp does (src-gathered q8_1 rows, absolute
+bounds, the group's max_rows) in ID order and in both sorted orders, for IQ3_S / IQ4_XS gate/up and
+IQ4_NL / Q8_0 down: with the partial group kept every token's rows are bitwise equal (16 cases); sorting
+the partial group too changes 133-1881 rows per case. 890 comparisons, 0 failed (RTX 3090).
+
+Measured on 4x RTX 3090, UD-IQ4_XS, T16-142fcb (split 12,24,37, every expert resident), read time,
+medians of 6, back to back: 150-token prompt 145.8 -> 136.2 ms, 1,200-token prompt 428.6 -> 363.4 ms
+(RESIDENT_SORT_NE: 134.9 / 358.6 ms). The final residuals of five prompts (300-1,200 tokens,
+STRATA_PREFILL_DUMP_R_ALL every position and STRATA_PREFILL_DUMP_R fp32) are byte-identical to the
+reference build; with RESIDENT_SORT_NE every row differs. batch_test16 (16 slots, a 1,200-token prompt)
+is token-identical to the reference dump.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/prefill/moe_mmq.hpp |   5 ++
+ src/prefill/mmq_resident_sort.hpp  |  23 ++++-
+ src/prefill/moe_mmq.cu             |  33 +++++++
+ src/prefill/prefill.cpp            |  13 ++-
+ tests/cuda/prefill_mmq_tab_test.cu | 137 +++++++++++++++++++++++++++++
+ 5 files changed, 207 insertions(+), 4 deletions(-)
+
+diff --git a/include/strata/prefill/moe_mmq.hpp b/include/strata/prefill/moe_mmq.hpp
+index e51e40c0..9636b750 100644
+--- a/include/strata/prefill/moe_mmq.hpp
++++ b/include/strata/prefill/moe_mmq.hpp
+@@ -113,6 +113,11 @@ bool tab_fits(int ggml_type, int64_t w_rows);
+ size_t overread_bytes(int ggml_type, int64_t cols);
+ /// The room kept after each sized expert slot's blob for that over-read (the guard).
+ constexpr size_t kSlotGuard = 256;
++/// Every launch of `n_experts` experts of [w_rows, *] `ggml_type` weights computes each output tile in one block
++/// with no stream-k K split, and every tile width has the same I/K tiles and SRAM layout, on every visible GPU - so an
++/// expert's rows get the same bits in any such launch, whatever its group-mates and max_rows (STRATA_MMQ_GROUP_SORT).
++/// 160 or 320 tiles per column tile on 82 SMs: yes; 108 or 128 SMs: no (stream-k splits the few-tile launches).
++bool whole_tiles(int ggml_type, int64_t w_rows, int n_experts);
+ /// STRATA_MMQ_DIRECT, read once: 0 (default) today's gather; 1 the guard layout and resident experts read in
+ /// place; 2 the guard layout with today's gather (the bitwise A/B reference).  0 whenever !tab_built().
+ int direct_mode();
+diff --git a/src/prefill/mmq_resident_sort.hpp b/src/prefill/mmq_resident_sort.hpp
+index c81b4562..ae3f8e10 100644
+--- a/src/prefill/mmq_resident_sort.hpp
++++ b/src/prefill/mmq_resident_sort.hpp
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cstddef>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+@@ -18,6 +19,22 @@ inline bool mmq_resident_sort_requested() {
+     return on;
+ }
+ 
++// STRATA_MMQ_GROUP_SORT=1: the same row-count order for the full 16-expert groups only; the last, partial group keeps
++// its experts in ID order. A full group's launch has 160 * ntx (gate/up) or 320 * ntx (down) tiles, at or above the
++// 90 % tile efficiency on the cards' SM counts, so it runs one block per tile with no stream-k K split whatever its tile
++// width: each expert's rows get the same bits in any full group. The partial group can take the stream-k split, whose
++// K boundaries depend on the group's tile count - leaving it unchanged keeps the prompt's bits.
++inline bool mmq_group_sort_requested() {
++    static const bool on = mmq_resident_sort_flag(std::getenv("STRATA_MMQ_GROUP_SORT"));
++    return on;
++}
++
++// How many of `n` ordered experts the sort may move: all of them (STRATA_MMQ_RESIDENT_SORT_NE), or the full groups
++// of `group` experts (STRATA_MMQ_GROUP_SORT).
++inline size_t mmq_resident_sort_span(size_t n, size_t group, bool keep_tail) {
++    return keep_tail && group > 0 ? n - n % group : n;
++}
++
+ inline bool mmq_resident_sort_eligible(bool requested, bool use_mmq, bool native_layout, bool has_cache,
+                                       const int32_t* layer_resident, int64_t n_expert,
+                                       bool stream_all, bool layer_stream_empty) {
+@@ -35,10 +52,12 @@ inline bool mmq_resident_sort_eligible(bool requested, bool use_mmq, bool native
+ // order contains each positive-count expert once in ID order; off has count.size()+1 entries;
+ // routes fits its original int32 offsets, and slot/src each have routes writable entries.
+ // After sorting, off[e] is an expert-indexed START, not an ID-prefix end at off[e+1].
++// Only order[0, span) is sorted (span >= order.size(): all of it); the entries after it keep their positions.
+ inline void mmq_resident_sort_rows(const int32_t* ids, int64_t routes, int32_t k,
+                                    const std::vector<int32_t>& count, std::vector<int32_t>& off,
+-                                   std::vector<int32_t>& order, int32_t* slot, int32_t* src) {
+-    std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
++                                   std::vector<int32_t>& order, int32_t* slot, int32_t* src,
++                                   size_t span = SIZE_MAX) {
++    std::stable_sort(order.begin(), order.begin() + (ptrdiff_t) std::min(span, order.size()), [&](int32_t a, int32_t b) {
+         return count[(size_t) a] != count[(size_t) b]
+             ? count[(size_t) a] < count[(size_t) b] : a < b;
+     });
+diff --git a/src/prefill/moe_mmq.cu b/src/prefill/moe_mmq.cu
+index 63a36765..ea747a99 100644
+--- a/src/prefill/moe_mmq.cu
++++ b/src/prefill/moe_mmq.cu
+@@ -338,6 +338,39 @@ size_t overread_bytes(int t, int64_t cols) {
+     return (size_t) blocks * ggml_type_size((ggml_type) t);
+ }
+ 
++bool whole_tiles(int t, int64_t w_rows, int n_experts) {
++    if (!supported(t) || w_rows % 128 != 0 || n_experts <= 0) return false;
++    // launch_mul_mat_q's grid: without stream-k one block per tile; with it one block per tile when the tiles fill
++    // their waves to >= 90 % (NVIDIA), else nsm blocks that split tiles along K at boundaries set by the tile count.
++    // The tile count is nty * n_experts * ntx, ntx = any positive count of J-wide column tiles (max_rows decides),
++    // and ntiles >= 9 * nsm always fills its waves to >= 90 %: the ntx below that are checked one by one.
++    const ggml_cuda_device_info& info = ggml_cuda_info();
++    for (int id = 0; id < info.device_count; ++id) {
++        const int cc = info.devices[id].cc, nsm = info.devices[id].nsm;
++        const size_t smpbo = info.devices[id].smpbo;
++        bool any = false, stream_k = false;
++        ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config((ggml_type) t, 8, false, cc);
++        for (int J = 8; J <= 128; J += 8) {
++            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, cc);
++            if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
++            if (!any) c0 = c;
++            any = true;
++            // every tile width accumulates each output over the same K tiles in the same order
++            if (c.I != c0.I || c.K_vram != c0.K_vram || c.sram_layout != c0.sram_layout) return false;
++            stream_k = stream_k || c.stream_k;
++        }
++        if (!any) return false;
++        if (!stream_k) continue;
++        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || nsm <= 0) return false;
++        const int64_t per_ntx = (w_rows / c0.I) * n_experts;
++        for (int64_t ntx = 1; per_ntx * ntx < 9 * (int64_t) nsm + per_ntx; ++ntx) {
++            const int64_t tiles = per_ntx * ntx, waves = (tiles + nsm - 1) / nsm;
++            if (100 * tiles / (nsm * waves) < 90) return false;
++        }
++    }
++    return true;
++}
++
+ int direct_mode() {
+     static const int mode = [] {
+         const char* v = std::getenv("STRATA_MMQ_DIRECT");
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index cc8b5c49..34991fbd 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -76,6 +76,7 @@ void iota(int32_t*, int64_t, void*) {}
+ bool tab_built() { return false; }
+ bool tab_fits(int, int64_t) { return false; }
+ size_t overread_bytes(int, int64_t) { return 0; }
++bool whole_tiles(int, int64_t, int) { return false; }
+ int direct_mode() { return 0; }
+ size_t direct_slot_guard() { return 0; }
+ void prep_group(const GuardTab&, size_t, void*, void*, size_t, void*) {}
+@@ -3287,10 +3288,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         // run through MMQ groups takes them in row-count order, so each 16-expert group's max_rows
+                         // (its padded tile rows) is close to its experts' own; slot/src/off are rebuilt coherently
+                         // before the upload, the routed ids, weights and the within-expert row order stay as they are.
+-                        if (detail::mmq_resident_sort_eligible(detail::mmq_resident_sort_requested() && on_peer.empty(), use_mmq, lay.native,
++                        // STRATA_MMQ_GROUP_SORT=1 (opt-in, exact): the same order for the full groups only, where each
++                        // tile is one block's whole K (mmq::whole_tiles); the partial group keeps its ID order and bits.
++                        // STRATA_MMQ_RESIDENT_SORT_NE=1 takes precedence (it sorts the partial group too).
++                        const bool sort_all = detail::mmq_resident_sort_requested();
++                        const bool sort_full = !sort_all && detail::mmq_group_sort_requested() && use_mmq &&
++                                               order.size() >= (size_t) MMQ_GROUP && mmq::whole_tiles(mmq_gt, 1280, MMQ_GROUP) &&
++                                               mmq::whole_tiles(mmq_dt, N, MMQ_GROUP);
++                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
+                                 m.cache != nullptr, m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
+                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
+-                            detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h);
++                            detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,
++                                                           detail::mmq_resident_sort_span(order.size(), MMQ_GROUP, sort_full));
+                         if (grp_mapped) {
+                             copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
+                             copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
+diff --git a/tests/cuda/prefill_mmq_tab_test.cu b/tests/cuda/prefill_mmq_tab_test.cu
+index 76be697a..69518299 100644
+--- a/tests/cuda/prefill_mmq_tab_test.cu
++++ b/tests/cuda/prefill_mmq_tab_test.cu
+@@ -15,11 +15,18 @@
+ // IQ3_S + Q8_0, some read in place (direct), the others gathered at compact positions c != q - one at a time
+ // (gather_native) or by gather_native_group with a mid-group flush (first > 0) - including groups whose last entry is
+ // direct and groups with no gathered entry; both products bitwise equal to all-gathered.
++// Part 4, STRATA_MMQ_GROUP_SORT: a layer's experts in groups of 16 as prefill.cpp runs them (activations quantized
++// in group order through the src map, absolute bounds, max_rows = the group's largest count), once in ID order and
++// once with the full groups in row-count order (mmq_resident_sort_rows, the partial group kept): every token's
++// product row bitwise equal, when mmq::whole_tiles says so for this card (else only reported). Sorting the partial
++// group too (STRATA_MMQ_RESIDENT_SORT_NE) is reported, not required.
+ // Exit 77 without a CUDA device of sm_80 or newer or without the pointer-table build.
+ #include "strata/prefill/moe_mmq.hpp"
+ 
+ #include "ggml.h"
+ 
++#include "../../src/prefill/mmq_resident_sort.hpp"
++
+ #include <cuda_runtime.h>
+ 
+ #include <algorithm>
+@@ -386,6 +393,123 @@ void group_case(mmq::Context& ctx, const Pair& pr, const std::vector<int>& cnt,
+     same_bits(ref_d, got_d, out_d, w2.c_str());
+ }
+ 
++
++// Part 4: one layer's experts in groups of G; `span` as mmq_resident_sort_span gives it (0: ID order)
++struct Layer {
++    std::vector<int32_t> ids, count, off, order, slot, src;
++};
++Layer route(const std::vector<int>& cnt, std::mt19937& rng) {
++    Layer L;
++    for (size_t e = 0; e < cnt.size(); ++e)
++        for (int r = 0; r < cnt[e]; ++r) L.ids.push_back((int32_t) e);
++    std::shuffle(L.ids.begin(), L.ids.end(), rng);   // one route per token (K = 1), experts interleaved
++    L.count.assign(cnt.begin(), cnt.end());
++    L.off.assign(cnt.size() + 1, 0);
++    for (size_t e = 0; e < cnt.size(); ++e) L.off[e + 1] = L.off[e] + cnt[e];
++    for (size_t e = 0; e < cnt.size(); ++e)
++        if (cnt[e] > 0) L.order.push_back((int32_t) e);
++    L.slot.assign(L.ids.size(), 0);
++    L.src.assign(L.ids.size(), 0);
++    std::vector<int32_t> fill(L.off.begin(), L.off.end() - 1);
++    for (size_t i = 0; i < L.ids.size(); ++i) {
++        const int32_t p = fill[(size_t) L.ids[i]]++;
++        L.slot[i] = p;
++        L.src[(size_t) p] = (int32_t) i;
++    }
++    return L;
++}
++
++// the layer's product rows in the layer's row order (row p = token src[p])
++std::vector<float> run_layer(mmq::Context& ctx, const Shape& sh, const Layer& L, const std::vector<std::vector<uint8_t>>& w,
++                             const Dev& x, cudaStream_t s) {
++    const int64_t T = (int64_t) L.ids.size();
++    const size_t eb = mmq::matrix_bytes((int) sh.t, sh.rows, sh.cols), n = L.order.size();
++    Dev src((size_t) T * 4), xq(mmq::q8_bytes(T, sh.cols)), ids((size_t) (T + kIdsPad) * 4), bounds((n + 1) * 4);
++    Dev grp((size_t) G * eb + TAIL), out((size_t) T * sh.rows * 4);
++    upload(src.p, L.src.data(), (size_t) T * 4, "src");
++    std::vector<int32_t> hb(n + 1);
++    for (size_t j = 0; j < n; ++j) hb[j] = L.off[(size_t) L.order[j]];
++    hb[n] = (int32_t) T;
++    upload(bounds.p, hb.data(), hb.size() * 4, "bounds");
++    fill_nan(out.b(), out.n);
++    mmq::iota((int32_t*) ids.p, T + kIdsPad, s);
++    mmq::quantize((const float*) x.p, (const int32_t*) src.p, xq.p, (int) sh.t, sh.cols, sh.cols, T, s);
++    for (size_t j0 = 0; j0 < n; j0 += G) {
++        const int ng = (int) std::min<size_t>(G, n - j0);
++        int64_t maxr = 0;
++        ck(cudaStreamSynchronize(s), "group");   // grp is rewritten below
++        for (int q = 0; q < ng; ++q) {
++            const int32_t e = L.order[j0 + (size_t) q];
++            maxr = std::max<int64_t>(maxr, L.count[(size_t) e]);
++            upload(grp.b() + (size_t) q * eb, w[(size_t) e].data(), eb, "grp");
++        }
++        ck(cudaMemset(grp.b() + (size_t) ng * eb, 0, TAIL), "tail");
++        ck(cudaDeviceSynchronize(), "tail");
++        mmq::Product p;
++        p.w = grp.p; p.type = (int) sh.t; p.w_rows = sh.rows; p.w_cols = sh.cols; p.expert_bytes = eb;
++        p.n = ng; p.xq = xq.p; p.bounds = (const int32_t*) bounds.p + j0; p.ids = (const int32_t*) ids.p;
++        p.total_rows = T; p.max_rows = maxr; p.dst = (float*) out.p; p.ld_dst = sh.rows;
++        ctx.run(p, s);
++    }
++    ck(cudaStreamSynchronize(s), "layer");
++    std::vector<float> h((size_t) T * sh.rows);
++    ck(cudaMemcpy(h.data(), out.p, h.size() * 4, cudaMemcpyDeviceToHost), "dtoh layer");
++    return h;
++}
++
++// tokens whose product row differs between two orders of the same layer
++int64_t rows_differing(const Layer& a, const std::vector<float>& ra, const Layer& b, const std::vector<float>& rb, int64_t cols) {
++    int64_t nd = 0;
++    for (size_t t = 0; t < a.ids.size(); ++t)
++        if (std::memcmp(ra.data() + (size_t) a.slot[t] * cols, rb.data() + (size_t) b.slot[t] * cols, (size_t) cols * 4) != 0) ++nd;
++    return nd;
++}
++
++void order_case(mmq::Context& ctx, const Shape& sh, const std::vector<int>& cnt, bool whole, std::mt19937& rng, cudaStream_t s,
++                const char* label) {
++    const size_t eb = mmq::matrix_bytes((int) sh.t, sh.rows, sh.cols);
++    std::vector<std::vector<uint8_t>> w(cnt.size(), std::vector<uint8_t>(eb));
++    for (auto& m : w) fill_matrix(m.data(), sh.t, sh.rows, sh.cols, rng);
++    Layer id = route(cnt, rng);
++    const int64_t T = (int64_t) id.ids.size();
++    Dev x((size_t) T * sh.cols * 4);
++    {
++        std::vector<float> hx((size_t) T * sh.cols);
++        std::normal_distribution<float> nd(0.0f, 1.0f);
++        for (auto& v : hx) v = nd(rng);
++        upload(x.p, hx.data(), hx.size() * 4, "x");
++    }
++    Layer full = id, all = id;
++    namespace d = strata::prefill::detail;
++    d::mmq_resident_sort_rows(full.ids.data(), T, 1, full.count, full.off, full.order, full.slot.data(), full.src.data(),
++                              d::mmq_resident_sort_span(full.order.size(), G, true));
++    d::mmq_resident_sort_rows(all.ids.data(), T, 1, all.count, all.off, all.order, all.slot.data(), all.src.data(),
++                              d::mmq_resident_sort_span(all.order.size(), G, false));
++    const size_t n = id.order.size(), tail = n % G;
++    // the partial group's entries and row range stay where they were
++    bool kept = std::equal(id.order.end() - (ptrdiff_t) tail, id.order.end(), full.order.end() - (ptrdiff_t) tail);
++    for (size_t j = n - tail; j < n && kept; ++j) kept = full.off[(size_t) full.order[j]] == id.off[(size_t) id.order[j]];
++    const std::vector<float> r_id = run_layer(ctx, sh, id, w, x, s);
++    const std::vector<float> r_full = run_layer(ctx, sh, full, w, x, s);
++    const std::vector<float> r_all = run_layer(ctx, sh, all, w, x, s);
++    const int64_t d_full = rows_differing(id, r_id, full, r_full, sh.rows), d_all = rows_differing(id, r_id, all, r_all, sh.rows);
++    ++g_cases;
++    const bool ok = kept && (!whole || d_full == 0);
++    if (!ok) ++g_fail;
++    std::printf("  %s %-7s %s: %zu experts (%zu in the partial group), %lld rows: full groups sorted %lld rows differ%s, "
++                "all sorted %lld rows differ%s\n", ggml_type_name(sh.t), sh.role, label, n, tail, (long long) T,
++                (long long) d_full, ok ? "" : (kept ? " FAIL" : " FAIL (partial group moved)"), (long long) d_all,
++                whole ? "" : " (whole_tiles false on this card: reported only)");
++}
++
++std::vector<int> skewed_counts(int n, int lo, int hi, std::mt19937& rng) {
++    // prompt-like: most experts few rows, some many (log-uniform)
++    std::uniform_real_distribution<double> u(std::log((double) lo), std::log((double) hi + 1));
++    std::vector<int> c((size_t) n);
++    for (auto& v : c) v = std::max(lo, (int) std::exp(u(rng)));
++    return c;
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -478,6 +602,19 @@ int main() {
+             }
+         }
+         std::printf("mixed groups: %d comparisons, %s\n", g_cases - c0, g_fail == f0 ? "all bitwise identical" : "FAILURES");
++        // Part 4
++        const int f4 = g_fail, c4 = g_cases;
++        const Shape order_shapes[] = {{GGML_TYPE_IQ3_S, 1280, 2560, "gate/up"}, {GGML_TYPE_IQ4_XS, 1280, 2560, "gate/up"},
++                                      {GGML_TYPE_IQ4_NL, 2560, 640, "down"},   {GGML_TYPE_Q8_0, 2560, 640, "down"}};
++        for (const Shape& sh : order_shapes) {
++            const bool whole = mmq::whole_tiles((int) sh.t, sh.rows, G);
++            std::printf("%-8s %-7s whole_tiles(%d experts): %s\n", ggml_type_name(sh.t), sh.role, G, whole ? "yes" : "no");
++            order_case(ctx, sh, skewed_counts(147, 1, 40, rng), whole, rng, s, "150-token prompt");
++            order_case(ctx, sh, skewed_counts(219, 1, 160, rng), whole, rng, s, "512-token chunk");
++            order_case(ctx, sh, skewed_counts(48, 1, 300, rng), whole, rng, s, "no partial group");
++            order_case(ctx, sh, skewed_counts(11, 1, 300, rng), whole, rng, s, "partial group only");
++        }
++        std::printf("group order: %d comparisons, %s\n", g_cases - c4, g_fail == f4 ? "all bitwise identical" : "FAILURES");
+         cudaStreamDestroy(s);
+         std::printf("%d comparisons, %d failed\n", g_cases, g_fail);
+         return g_fail == 0 ? 0 : 1;
+-- 
+2.43.0
+

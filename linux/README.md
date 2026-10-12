@@ -409,6 +409,17 @@ single user unchanged (~131 tok/s decode), output identical. Config `configs/T16
 `12,25,37` was equivalent within noise (517.2 / 396.0 vs 519.2 / 398.0 tok/s, #56). The same split showed no gain on
 0.1.41 (#30, before pointer-table MMQ and `--aux-cpus`); that earlier result is superseded.
 
+## MMQ group sort and self-committing batch windows (default since 0.13.0)
+
+From the profile's ranked list (`upstream/PROFILE-next-levers.md`): `STRATA_MMQ_GROUP_SORT=1` sorts the full
+16-expert MMQ groups of a prompt chunk by row count, keeping the partial group (the stream-k tail) as it is, so most
+groups run with a narrower tile and the output stays bitwise identical (1.2K read 435 → 361 ms). `STRATA_BATCH_SELF_COMMIT=1`
+lets a batch window with one row per slot advance its GDN state itself instead of running a second commit graph per
+stage (decode 654 → 686 rows/s at 16 slots). Through the server (2 ABBA pairs, #60): 16 users **549 tok/s short (+7.3 %),
+439 tok/s 1.2K (+10.6 %)**, every reply identical (reply hashes). Config `configs/T16-142gsc.json` (engine
+`strata-g3-142lv`), used by `start-strata.sh`; agent load: `configs/X16-agent-142gsc.json` (split 12,25,37, because
+with the agent's K/V the 12,24,37 split made CUDA2 borrow expert slots, #59).
+
 ## License notices
 
 The engine patches contain Strata source (MIT) and, in the pointer-table MMQ series, code mirrored from

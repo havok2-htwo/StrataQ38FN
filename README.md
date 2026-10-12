@@ -1,108 +1,176 @@
 # StrataQ38FN
 
-Lokaler Betrieb von **Qwen3.8-Flash-Next** mit der Engine [Strata](https://github.com/Niko1221/Strata) auf einem
-Windows-PC mit **RTX 5090 (32 GB) + 64 GB RAM**, abgestimmt auf agentische Last (lange Kontexte, Haupt- und
-Sub-Agent im Wechsel).
+**A performance fork of the [Strata](https://github.com/Niko1221/Strata) inference engine for running
+Qwen3.8-Flash-Next (a 180B-class MoE) on consumer GPUs: one RTX 5090 with system RAM, and 4× RTX 3090 with system
+RAM.**
 
-Dieses Repo enthält **nicht** die Engine und **nicht** die Modelle, sondern alles drumherum:
+Strata already runs this model on hardware far smaller than the model. This project pushes it further on two
+concrete setups. We measure, profile and patch the engine, and tune every setting for real multi-user and agentic
+load. Every engine change is an opt-in patch on top of upstream Strata, proven bit-exact (each request returns the
+same tokens as when it runs alone). Every measurement is logged, so each number in this README can be traced back
+to a test.
 
-- Start-/Stop-Skripte für drei Modellvarianten (immer nur eines aktiv)
-- getunte Strata-Configs (`strata-configs/`)
-- eine **vLLM-kompatible Fassade** (`vllm_facade/`), damit vLLM-Clients (z. B. genesis3) ohne Änderung andocken
-- ein **LAN-Dashboard** (`dashboard/`) mit Tempo, Caches, Speicher, Strom und Kosten
-- Benchmark- und A/B-Werkzeuge samt Messdaten und Analyseberichten
+| Setup | Original Strata | This fork | Gain |
+|---|---|---|---|
+| **4× RTX 3090 + RAM**, 16 concurrent users, short prompts | ~88 tok/s (setup default) · ~175 tok/s (Strata's own batching, max. 8 slots) | **~550 tok/s** | **6.3×** · **3.1×** |
+| **4× RTX 3090 + RAM**, 16 concurrent users, 1.2K-token prompts | ~88 tok/s · ~175 tok/s | **~440 tok/s** | **5.0×** · **2.5×** |
+| **4× RTX 3090**, single user (decode) | ~121 tok/s | ~131 tok/s | +8 % |
+| **RTX 5090 + 64 GB RAM**, single user (decode) | ~125 tok/s (setup default) | **~145 tok/s** | +16 % |
+| **RTX 5090 + 64 GB RAM**, switch between main agent and sub-agent | ~25 s prompt re-read | **~1.5 s** | 16× |
 
-**Linux mit 4× RTX 3090** (Setup, Batching bis 32 Slots, Vergleich mit vLLM): **[linux/README.md](linux/README.md)**
+4× RTX 3090: Strata 0.1.42 + our patch series, greedy, 512 output tokens per request (TESTLOG #57–#60 in
+[linux/TESTLOG.md](linux/TESTLOG.md)). For comparison, vLLM 0.31 on the same box reaches 622 / 386 tok/s at 16
+users, with a measurably lower quality checkpoint ([linux/README.md](linux/README.md)).
 
-Einrichtung Schritt für Schritt: **[docs/EINRICHTUNG.md](docs/EINRICHTUNG.md)** · Änderungen: [CHANGELOG.md](CHANGELOG.md)
+**Is this a fork?** In substance, yes: a downstream fork. It is not a GitHub fork of the engine repository. This
+repository holds the deployment (configs, start scripts, a vLLM-compatible facade, a dashboard) and the engine patch
+series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.42/`, 32
+patches). The patches are kept upstream-ready (opt-in switches, default path unchanged), so they can be offered back
+to Strata.
 
-## Modelle
+## What the fork changes
 
-| Start | Modell | Qualität / Einsatz | Decode | Kontext |
+**4× RTX 3090 (multi-GPU, layer split)**: [linux/README.md](linux/README.md)
+- More than 8 batch slots on a layer split (8 rows per pipeline group): 16–32 concurrent users instead of 8.
+- Pointer-table MMQ: prompt reads use VRAM-resident experts in place instead of copying them.
+- An admission path with ~25 ms less fixed cost per new request; checkpoints are saved on 4 threads and moved into
+  the slot.
+- MMQ expert groups sorted by row count (−17 % prompt read time).
+- Batch windows that commit their own state (+5 % decode).
+- An optional overlapped admission: new prompts are read while the other users keep decoding (latency option).
+- Tuning found by profiling: layer split 12,24,37 (GPU3 was the decode bottleneck), `--aux-cpus` (the prefill
+  threads were stuck on the host's CPU core), batched draft-layer reads.
+- A test and measurement toolkit:
+  - exactness tests through the engine and through the HTTP server (reply hashes);
+  - quick A/B runs with GPU telemetry;
+  - a profiling report and ranked lever list ([linux/upstream/](linux/upstream/)).
+
+**RTX 5090 + RAM (one GPU, experts partly in system RAM)**: this README, below
+- Tuned residency, caching and prefetch for agentic load: resident experts, a conversation cache for parked
+  sessions, asynchronous expert adaptation, KV prefetch, direct PLE I/O.
+- Main/sub-agent switching drops from ~25 s to ~1.5 s, and the prompt path makes no SSD reads.
+- Start/stop scripts, a vLLM-compatible facade for vLLM clients, and a LAN dashboard.
+
+## This repository
+
+The engine and the models are **not** included. The repository holds everything around them:
+
+- start/stop scripts for three model variants (only one runs at a time)
+- tuned Strata configs (`strata-configs/`, `linux/configs/`)
+- a **vLLM-compatible facade** (`vllm_facade/`), so vLLM clients (e.g. genesis3) connect unchanged
+- a **LAN dashboard** (`dashboard/`) with speed, caches, memory, power and cost
+- benchmark and A/B tools with their measurement data and analysis reports
+- the engine patch series and its design documents (`linux/patches/`, `linux/upstream/`)
+
+**Linux with 4× RTX 3090** (setup, batching up to 32 slots, comparison with vLLM): **[linux/README.md](linux/README.md)**
+
+Step-by-step setup (Windows): **[docs/SETUP.md](docs/SETUP.md)** · Changes: [CHANGELOG.md](CHANGELOG.md) ·
+Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+
+## Windows: RTX 5090 + 64 GB RAM
+
+### Models
+
+| Start | Model | Quality / use | Decode | Context |
 |---|---|---|---|---|
-| `Start-IQ4_XS.bat` **(empfohlen)** | Unsloth UD-IQ4_XS (~4 bit) | Allround, Deutsch | ~145 tok/s | 128K |
-| `Start-Q4_K_XL.bat` | Unsloth UD-Q4_K_XL (~5 bit) | etwas bessere Qualität, braucht ~45 GB RAM | 85–95 tok/s | 64K |
-| `Start-Coder.bat` | ISTA Coder IQ1_M (halbe Experten) | nur Code / Englisch | 165–230 tok/s | 128K |
+| `Start-IQ4_XS.bat` **(recommended)** | Unsloth UD-IQ4_XS (~4 bit) | all-round, German | ~145 tok/s | 128K |
+| `Start-Q4_K_XL.bat` | Unsloth UD-Q4_K_XL (~5 bit) | slightly better quality, needs ~45 GB RAM | 85–95 tok/s | 64K |
+| `Start-Coder.bat` | ISTA Coder IQ1_M (half the experts) | code / English only | 165–230 tok/s | 128K |
 
-`Stop-All.bat` beendet Modell und Fassade. Ein Start beendet automatisch das vorher laufende Modell.
+`Stop-All.bat` stops the model and the facade. Starting a model stops the one that was running.
 
-`Start-Alles.bat [IQ4_XS|Q4_K_XL|Coder]` startet zusätzlich SearXNG (Websuche) und Open WebUI; was schon läuft,
-bleibt unangetastet (ein geladenes Modell wird nicht neu geladen). `Stop-Alles.bat` beendet alles außer dem Dashboard.
+`Start-Alles.bat [IQ4_XS|Q4_K_XL|Coder]` also starts SearXNG (web search) and Open WebUI. Services that are already
+running are left alone, and a loaded model is not reloaded. `Stop-Alles.bat` stops everything except the dashboard.
 
-## Dienste und Ports
+### Services and ports
 
-| Port | Dienst | Adresse |
+| Port | Service | Address |
 |---|---|---|
-| 8080 | Strata: Web-Chat, OpenAI- und Anthropic-API | `http://<PC>:8080/`, `/v1`, `/v1/messages` |
-| 8081 | vLLM-Fassade (für vLLM-Clients) | `http://<PC>:8081/v1` |
-| 8082 | Dashboard (nur Zahlen, keine Prompts) | `http://<PC>:8082/` |
-| 8090 | nur Benchmarks (`agent_bench.py`) | – |
-| 3000 | Open WebUI (eigenes Setup, `X:\dev\OpenWebUI`) | `https://<PC>:3000/` |
-| 8888 | SearXNG (Websuche für Open WebUI, `X:\dev\SearXNG`) | – |
+| 8080 | Strata: web chat, OpenAI and Anthropic API | `http://<PC>:8080/`, `/v1`, `/v1/messages` |
+| 8081 | vLLM facade (for vLLM clients) | `http://<PC>:8081/v1` |
+| 8082 | Dashboard (numbers only, no prompts) | `http://<PC>:8082/` |
+| 8090 | benchmarks only (`agent_bench.py`) | – |
+| 3000 | Open WebUI (own setup, `X:\dev\OpenWebUI`) | `https://<PC>:3000/` |
+| 8888 | SearXNG (web search for Open WebUI, `X:\dev\SearXNG`) | – |
 
-Alle API-Aufrufe brauchen den Header `Authorization: Bearer <Key aus api_key.txt>`. Ports, LAN/lokal und den
-Modellnamen für genesis3 stellt man in `settings.cmd` ein.
+All API calls need the header `Authorization: Bearer <key from api_key.txt>`. Ports, LAN/local binding and the model
+name for genesis3 are set in `settings.cmd`.
 
-**Browser-Clients (CORS):** Web-Apps, die direkt aus dem Browser auf `/v1/*` zugreifen (z. B. Genesis unter
-`http://localhost:3000`), brauchen ihren Origin in `cors_origins` der Strata-Config. Eingetragen sind
-`http://localhost:3000` und `http://127.0.0.1:3000`. Fehlt er, verwirft der Browser die Antwort, und der Client
-meldet irreführend „Could not connect“. Nach einer Änderung muss Strata neu gestartet werden.
+**Browser clients (CORS):** web apps that call `/v1/*` directly from the browser (e.g. Genesis at
+`http://localhost:3000`) need their origin in `cors_origins` of the Strata config. `http://localhost:3000` and
+`http://127.0.0.1:3000` are listed. If the origin is missing, the browser discards the reply and the client reports a
+misleading "Could not connect". Restart Strata after a change.
 
-## Ergebnisse des Tunings (UD-IQ4_XS)
+### Tuning results (UD-IQ4_XS)
 
-Gemessen am 2026-10-08 (Details: [ANALYSE-Speicherhierarchie-XS.md](ANALYSE-Speicherhierarchie-XS.md), Abschnitte 7–8):
+Measured on 2026-10-08 (details: [ANALYSE-Speicherhierarchie-XS.md](ANALYSE-Speicherhierarchie-XS.md), sections 7–8):
 
-| | Setup-Standard | getunt |
+| | Setup default | Tuned |
 |---|---|---|
-| Decode, kurzer Kontext | ~125 tok/s | **~145 tok/s** |
-| Wechsel Haupt-Agent ↔ Sub-Agent | ~25 s Prefill | **~1,5 s** |
-| SSD-Reads im Prompt-Pfad | ja (1,1 TB) | keine |
+| Decode, short context | ~125 tok/s | **~145 tok/s** |
+| Switch main agent ↔ sub-agent | ~25 s prefill | **~1.5 s** |
+| SSD reads in the prompt path | yes (1.1 TB) | none |
 
-Die wichtigsten Flags: `--resident-experts`, `--conversation-cache-mib 10240 --conversation-cache-slots 12`,
-`--adapt-async 1`, `--kv-resident 32768` + `STRATA_KV_PREFETCH=1`, `--vram-reserve-mib 1000`, `--ple-io direct`.
+The key flags are:
+- `--resident-experts`
+- `--conversation-cache-mib 10240 --conversation-cache-slots 12`
+- `--adapt-async 1`
+- `--kv-resident 32768` + `STRATA_KV_PREFETCH=1`
+- `--vram-reserve-mib 1000`
+- `--ple-io direct`
 
-Parken: Bis zu 12 Konversationen (max. 10 GiB RAM, ~0,9 GB je Konversation bei kurzem Kontext) bleiben zwischen den
-Anfragen im RAM. Eine verdrängte Konversation wird nicht auf die SSD ausgelagert, sondern beim nächsten Mal neu
-eingelesen. Wer mehr Kontexte im Wechsel nutzt, hebt Slots und MiB an (RAM-Untergrenze 2,5 GB hält Strata frei).
+Engine 0.1.42 adds +12 % (prose) / +13 % (code) decode through upstream's `STRATA_ROUTE_TAIL_SKIP=7`, which skips
+experts that are not in VRAM (see CHANGELOG, Unreleased).
 
-**Engpass ist der Windows-Commit, nicht das physische RAM.** 262K Kontext läuft ohne Tempoverlust, ist aber erst mit
-fester Auslagerungsdatei betriebssicher (siehe Einrichtung, Schritt 9).
+**Parking:** up to 12 conversations (max. 10 GiB RAM, ~0.9 GB each with a short context) stay in RAM between
+requests. An evicted conversation is not swapped to SSD; it is read again the next time. If you switch between more
+contexts, raise the slots and MiB (Strata keeps a 2.5 GB RAM floor free).
 
-Sackgassen (gemessen, nicht wiederholen): Batching (`parallel` + `--batch-mtp`) bringt mit UD-IQ4_XS keinen Durchsatz (Absturz war ein Engine-Bug, ab Strata v0.1.40.2 behoben; danach 2 Slots 122 statt 128 tok/s gesamt, weil ~60 % der Experten auf der CPU laufen; nur der Coder mit allen Experten im VRAM gewinnt +17 % bei 4 Slots, `batch_bench.py`, `batch_results.jsonl`);
-`--vram-reserve-mib` < 800 meldet LOW; `pcie_frac` > 0,7, `--spec` ≠ 4 und `--spec-min-p` ≠ 0,5 sind langsamer.
+**The limit is the Windows commit charge, not physical RAM.** A 262K context runs without a speed loss, but it is
+only safe with a fixed-size page file (see setup, step 9).
 
-## Verzeichnis
+**Dead ends** (measured, do not repeat):
+- **Batching** (`parallel` + `--batch-mtp`) gives no throughput with UD-IQ4_XS.
+  - The crash was an engine bug, fixed in Strata v0.1.40.2.
+  - Since then 2 slots give 122 instead of 128 tok/s in total, because ~60 % of the experts run on the CPU.
+  - Only the Coder model, with all experts in VRAM, gains: +17 % at 4 slots (`batch_bench.py`,
+    `batch_results.jsonl`).
+- `--vram-reserve-mib` < 800 reports LOW.
+- `pcie_frac` > 0.7, `--spec` ≠ 4 and `--spec-min-p` ≠ 0.5 are slower.
+
+## Directory
 
 ```
-Start-*.bat, Stop-*.bat       Bedienung (Doppelklick)
-_start-model.cmd, _run-*.cmd  intern: startet Strata + Fassade (+ Dashboard)
-settings.cmd                  Ports, Bind-Adresse, genesis3-Modellname
-strata-configs/               Strata-Configs (Vorlagen, werden nach Strata\ kopiert)
-vllm_facade/                  vLLM-Fassade, eigene README und Tests
-dashboard/                    LAN-Dashboard (dashboard.py, index.html, settings.json)
-agent_bench.py                A/B-Runner mit agentischer Last (Port 8090)
+Start-*.bat, Stop-*.bat       operation (double-click)
+_start-model.cmd, _run-*.cmd  internal: starts Strata + facade (+ dashboard)
+settings.cmd                  ports, bind address, genesis3 model name
+strata-configs/               Strata configs (templates, copied into Strata\)
+vllm_facade/                  vLLM facade, own README and tests
+dashboard/                    LAN dashboard (dashboard.py, index.html, settings.json)
+agent_bench.py                A/B runner with agentic load (port 8090)
 bench_strata.py, run_variant.py, parallel_bench.py, stall_probe.py, trace_analyze.py
-series_*.sh                   die gefahrenen Messserien
-configs/, logs/, *.jsonl      Varianten, Engine-Logs und Ergebnisse der Messserien
-ANALYSE-*.md, HEBEL-*.md      Abschlussbericht und offene Hebel
-download_hf.py, download_q4kxl.py  wiederaufnehmbare Hugging-Face-Downloads
-linux/                        Linux-Betrieb auf 4x RTX 3090: Start-/Bench-Skripte, Configs, Messergebnisse,
-                              Engine-Patches (>8 Slots, direkte Slot-Kopie), vLLM-Vergleich, Qualitäts-Eval
+series_*.sh                   the measurement series that were run
+configs/, logs/, *.jsonl      variants, engine logs and results of the measurement series
+ANALYSE-*.md, HEBEL-*.md      final report and open levers (Windows, German)
+download_hf.py, download_q4kxl.py  resumable Hugging Face downloads
+linux/                        Linux on 4x RTX 3090: start/bench scripts, configs, results, engine patch series,
+                              design and profiling reports, vLLM comparison, quality eval
 ```
 
-Nicht im Repo (per `.gitignore`): `Strata/` (Engine-Clone + venv), `Strata-data/` (Packs, MTP),
-`api_key.txt`, Session-Dateien, Traces, Laufzeit-Logs, Dashboard-Zähler.
+Not in the repository (`.gitignore`): `Strata/` and `Strata-*/` (engine clones + venv), `Strata-data/` (packs, MTP),
+`api_key.txt`, session files, traces, runtime logs, dashboard counters.
 
-## Getestete Umgebung
+## Tested environments
 
-Windows 11 Pro · AMD Ryzen 7 9800X3D · 64 GB RAM · NVIDIA RTX 5090 (Treiber 610.88) · Python 3.12.4 ·
-Strata-Commit `82f46a8` · Modelle auf NVMe (WD SN850X, `C:\StrataQ38FN-models`).
+**Windows:** Windows 11 Pro · AMD Ryzen 7 9800X3D · 64 GB RAM · NVIDIA RTX 5090 (driver 610.88) · Python 3.12.4 ·
+Strata commit `82f46a8` (0.1.42 in the Unreleased measurements) · models on NVMe (WD SN850X, `C:\StrataQ38FN-models`).
 
-Linux (siehe [linux/README.md](linux/README.md)): Ubuntu, Kernel 7.0 · AMD Threadripper 3990X · 128 GB RAM ·
-4× NVIDIA RTX 3090 (Treiber 580, CUDA 13.0) · Strata `fb58e0d` (v0.1.41) plus zwei eigene Patches ·
-Modelle auf RAID (`/media/raid0/Models/Strata-GGUF`). Ergebnis: ~121 tok/s für einen Nutzer, ~405 tok/s gesamt
-bei 16 parallelen Nutzern, Agentenlast mit 262K Kontext und ~5 s Wartezeit pro Folge-Turn bei 16 Agenten.
+**Linux** (see [linux/README.md](linux/README.md)): Ubuntu, kernel 7.0 · AMD Threadripper 3990X · 128 GB RAM ·
+4× NVIDIA RTX 3090 (driver 580, CUDA 13.0) · Strata v0.1.42 plus our patch series · models on RAID
+(`/media/raid0/Models/Strata-GGUF`).
 
-## Lizenz
+## License
 
-Strata steht unter eigener Lizenz (siehe Upstream-Repo). Die Modelle unterliegen den Lizenzen von Qwen bzw. Unsloth.
+Strata is under the MIT license (see the upstream repository). Our engine patches contain Strata and llama.cpp/ggml
+code (MIT); the notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The models are under the licenses of
+Qwen and Unsloth.

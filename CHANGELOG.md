@@ -21,6 +21,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefill chunk 16K/32K, drafting, learned expert profile, server options.
 - Fixed swap file, then `--max-context 262144` and `--prompt-cache-every 8192 --prompt-cache 12`.
 
+## [0.13.0] – 2026-10-12
+
+Linux (4× RTX 3090).
+
+### Added
+- Engine levers 3 + 4 (opt-in, exact): `STRATA_MMQ_GROUP_SORT=1` (MMQ groups sorted by row count, 1.2K read −17 %),
+  `STRATA_BATCH_SELF_COMMIT=1` (no commit graph per batch window, decode +4.9 %). New default `configs/T16-142gsc.json`:
+  16 users 549 tok/s short / 439 tok/s 1.2K (+7.3 % / +10.6 % vs 0.12.0, same session, ABBA), replies identical.
+- Exactness checks from the 2026-10-12 review: reply hashes through the server, `batch_interleave_test` on a pipelined
+  batch (steps 4–7 now run), sampled batch = solo, agent config on 0.1.42 (`X16-agent-142gsc`, split 12,25,37).
+- Benchmark tooling: deterministic prompts, per-request reply sha256 (`compare_replies.py`), GPU telemetry, steady-state
+  rate, ABAB/ABBA mode in `ab_quick.sh`.
+
+### Changed
+- Root README in English, positioned as a performance fork of Strata for an RTX 5090 + RAM and 4× RTX 3090 + RAM.
+
+### Found
+- A solo turn decoded with MTP draft windows leaves a numerically different K/V/GDN state than one-row slot windows
+  (its tokens are equal), so a later turn continued from the solo session can diverge from one continued from a slot
+  (upstream behaviour, TESTLOG #59).
+
 ## [0.12.0] – 2026-10-12
 
 Linux (4× RTX 3090).
