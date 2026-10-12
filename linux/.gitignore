@@ -1,0 +1,52 @@
+# --- Raw benchmark data under results/ (TESTLOG's "raw data" column points here)
+# Rule: raw text files below ~1 MB are committed, bigger ones are not.  The root .gitignore drops '*.log' and '*.out'
+# repo-wide; this file (deeper, so it wins) lifts that for results/.  Git cannot match by size, so what is too big
+# is excluded by kind (patterns) and, for the few big files that already exist, by path.  New runs stay small:
+# run_strata_variant.sh writes engine-<label>.run.log (this engine start only, ~60 KB) instead of the cumulative
+# engine log.  Before committing new raw data, list what would be added above 1 MB and add it here:
+#   git ls-files -o --exclude-standard linux/results | xargs -r -d '\n' du -k | awk '$1 > 1000'
+!/results/**/*.out
+!/results/**/*.log
+# cumulative engine-log copies written before 2026-10-12 (every engine start since 2026-10-10, ~12 MB each); the
+# small early ones (< 1 MB) and the new per-start .run.log files stay tracked
+/results/engine-*.log
+!/results/engine-*.run.log
+!/results/engine-strata-A-solo.log
+!/results/engine-strata-B-batch8.log
+!/results/engine-strata-C-batch16.log
+!/results/engine-strata-D-batch32.log
+!/results/engine-strata-K-q4kxl-b12-long.log
+!/results/engine-strata-K-q4kxl-b12-short.log
+!/results/engine-strata-K-q4kxl-solo.log
+# profiler captures and binary dumps (3-60 MB each)
+/results/**/*.nsys-rep
+/results/**/*.qdrep
+/results/**/*.ncu-rep
+/results/**/*.sqlite
+/results/**/*.rall
+# existing files > 1 MB: driver event traces (events.log, 1-2.6 MB; the derived numbers are in notes.txt / TESTLOG)
+/results/batchadmit/scaling/plain/events.log
+/results/batchadmit/scaling/timing/events.log
+/results/fixedcost/ab/drv-ab/events.log
+/results/fixedcost/ab/drv-off/events.log
+/results/fixedcost/final/drv-off/events.log
+/results/fixedcost/final/drv-on/events.log
+/results/fixedcost/k1k2/drv-off/events.log
+/results/fixedcost/k1k2/drv-on/events.log
+/results/fixedcost/k1k2/drv-pool/events.log
+/results/fixedcost/s1/drv-all/events.log
+/results/fixedcost/s1/drv-off/events.log
+/results/fixedcost/s1/drv-s1/events.log
+/results/fixedcost/s1/first/drv-s1/events.log
+/results/fixedcost/s2/drv-off/events.log
+/results/fixedcost/s2/drv-on/events.log
+/results/fixedcost/step0-o1/drv-glibc/events.log
+/results/fixedcost/step0-o1/drv-o1/events.log
+/results/fixedcost/step0-o1/drv-off/events.log
+/results/overlap/m0/runA0-prod-partial/events.log
+/results/overlap/m0/runA-prod/events.log
+/results/overlap/m0/runB-exact/events.log
+/results/overlap/m0/runC-exact-noborrow/events.log
+/results/overlap/m0/runD-split13-25-37/events.log
+/results/overlap/m2/prod-on/events.log
+/results/server-strata-D-batch32.out

@@ -5,11 +5,13 @@ N users each hold one conversation of T turns.  Turn 1 sends a large unique docu
 later turn sends the full history (previous answers included) plus ~ADD new tokens and a new task - the way an agent
 loop or a chat client resends its context.  Users run concurrently, so conversations interleave like a main agent and
 its sub-agents.  What matters: time to first token of the follow-up turns (does the engine reuse the conversation or
-read it again?), decode rate, aggregate output.
+read it again?), decode rate, aggregate output.  The --out row also carries every turn's reply sha256 (uid, turn,
+tokens, sha256): with --temperature 0 two arms of an exact change must match turn by turn (the later turns resend the
+earlier replies, so the first difference cascades into all following turns of that user).
 
   python3 bench_multiturn.py --url http://127.0.0.1:8090 --users 8 --turns 5 --label strata-agent
 """
-import argparse, concurrent.futures as cf, json, statistics, threading, time, urllib.request
+import argparse, concurrent.futures as cf, datetime, hashlib, json, statistics, threading, time, urllib.request
 
 WORDS = ("system design latency throughput cache memory kernel scheduler packet buffer index query storage replica "
          "shard consensus leader follower snapshot checkpoint journal compaction bloom filter hash tree page block "
@@ -28,7 +30,7 @@ def doc(uid, turn, n_tok):
 
 
 def call(a, messages):
-    body = {"model": a.model, "messages": messages, "max_tokens": a.max_tok, "temperature": 0.7, "stream": True,
+    body = {"model": a.model, "messages": messages, "max_tokens": a.max_tok, "temperature": a.temperature, "stream": True,
             "stream_options": {"include_usage": True}}
     if a.vllm:
         body["chat_template_kwargs"] = {"enable_thinking": False}
@@ -69,7 +71,7 @@ def user(a, uid, rows, lock):
                                                 f"to the earlier steps."})
         r = call(a, msgs)
         msgs.append({"role": "assistant", "content": r["text"]})
-        r.pop("text")
+        r["sha256"] = hashlib.sha256(r.pop("text").encode("utf-8")).hexdigest()
         r.update(uid=uid, turn=t + 1)
         with lock:
             rows.append(r)
@@ -88,16 +90,19 @@ def main():
     ap.add_argument("--add", type=int, default=3000, help="new tokens per later turn")
     ap.add_argument("--max-tok", type=int, default=400)
     ap.add_argument("--think", type=float, default=1.0, help="seconds a user waits between turns")
+    ap.add_argument("--temperature", type=float, default=0.7, help="0 = greedy (reply hashes comparable across arms)")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     rows, lock = [], threading.Lock()
+    ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(a.users) as ex:
         list(ex.map(lambda u: user(a, u, rows, lock), range(a.users)))
     wall = time.perf_counter() - t0
     print(f"# {a.label}: {a.users} users x {a.turns} turns, doc {a.doc} + {a.add}/turn, {a.max_tok} out")
     print(f"{'turn':>4} {'prompt':>7} {'cached':>7} {'TTFT p50':>9} {'TTFT p95':>9} {'dec p50':>8}")
-    summary = {"label": a.label, "users": a.users, "turns": a.turns, "wall_s": round(wall, 1)}
+    summary = {"label": a.label, "ts": ts, "users": a.users, "turns": a.turns, "temperature": a.temperature,
+               "wall_s": round(wall, 1)}
     for t in range(1, a.turns + 1):
         rs = [r for r in rows if r["turn"] == t]
         tt = sorted(r["ttft"] for r in rs)
@@ -110,7 +115,10 @@ def main():
     out_tok = sum(r["gen"] for r in rows)
     in_tok = sum(r["prompt"] for r in rows)
     summary.update(out_tok=out_tok, agg_out_tps=round(out_tok / wall, 1), prompt_tok=in_tok,
-                   follow_ttft_p50=round(statistics.median(r["ttft"] for r in rows if r["turn"] > 1), 2))
+                   follow_ttft_p50=round(statistics.median(r["ttft"] for r in rows if r["turn"] > 1), 2),
+                   reply_fields=["uid", "turn", "gen", "sha256"],
+                   replies=[[r["uid"], r["turn"], r["gen"], r["sha256"]]
+                            for r in sorted(rows, key=lambda r: (r["uid"], r["turn"]))])
     print(f"wall {wall:.0f}s, output {out_tok} tok = {out_tok / wall:.1f} tok/s, prompt tokens sent {in_tok}, "
           f"follow-up TTFT p50 {summary['follow_ttft_p50']} s")
     if a.out:
