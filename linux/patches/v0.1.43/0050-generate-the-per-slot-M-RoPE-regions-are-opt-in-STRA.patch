@@ -1,0 +1,54 @@
+From d6d896fb3bb0d599d379875fdf6c71381bbf523d Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:55:42 +0200
+Subject: [PATCH 50/52] generate: the per-slot M-RoPE regions are opt-in
+ (STRATA_MROPE_SLOTS=1)
+
+AGENTS.md: a new feature is opt-in and the default path stays byte-identical. Without the env every session reads
+the one table as before (no regions, no INFO mrope_slots, the engine keeps refusing image and text rows side by side
+and the server runs an image request alone), so the same binary rolls back by dropping the env.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 7ded3c65..bac6cca4 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -203,6 +203,16 @@ bool mrope_region_skip_env() {
+     }();
+     return on;
+ }
++// STRATA_MROPE_SLOTS=1 (read once; off by default): --vision with --batch keeps one M-RoPE table region per slot, so
++// image and text requests share the batch (INFO mrope_slots=1).  Off, every session reads the one table as in the last
++// release, and the engine refuses image and text rows side by side (the server runs an image request alone)
++bool mrope_slots_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_MROPE_SLOTS");
++        return v && v[0] != '\0' && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_CKPT_POOL=1 (read once; off by default): the serve loop keeps the running-state vectors of the conversation
+ // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
+ // resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
+@@ -4919,10 +4929,12 @@ int main(int argc, char** argv) {
+     // (strata/program/mrope_regions.hpp), and each slot session's rows read their own region (mrope_base).  B is the
+     // slots that run, after every clamp above.  Before any CUDA graph is captured (the kernels take the table pointer
+     // as an argument; nothing has captured one yet), so the new allocation simply replaces the one-region table.
+-    // When it does not fit, the slots keep base 0 and the engine keeps refusing image and text rows side by side.
++    // When it does not fit, or without STRATA_MROPE_SLOTS=1 (opt-in), the slots keep base 0 and the engine keeps
++    // refusing image and text rows side by side.
+     int mrope_slot_n = 0;                                  // the slot regions in use (INFO mrope_slots)
+     int64_t mrope_stride = 0;
+-    if (const int want = strata::program::mrope_regions::slot_regions(o.vision && d_mrope != nullptr, o.serve, o.batch);
++    if (const int want = strata::program::mrope_regions::slot_regions(o.vision && d_mrope != nullptr && mrope_slots_env(),
++                                                                      o.serve, o.batch);
+         want > 0 && (int) bslot_ss.size() == 1 + (int) stages.size()) {
+         namespace mr = strata::program::mrope_regions;
+         mrope_stride = mr::stride(o.max_context);
+-- 
+2.43.0
+

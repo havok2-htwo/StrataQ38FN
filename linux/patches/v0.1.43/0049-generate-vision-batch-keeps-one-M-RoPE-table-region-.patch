@@ -1,8 +1,8 @@
-From 49d0d3e0e6c6ef0745e13bd89748316b1a763b27 Mon Sep 17 00:00:00 2001
+From bb01c8a8cc9c11791a0d817ca570e3e016989470 Mon Sep 17 00:00:00 2001
 From: havok2-htwo <havok2-htwo@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 02:31:46 +0200
-Subject: [PATCH] generate: --vision --batch keeps one M-RoPE table region per
- slot (images share the batch)
+Subject: [PATCH 49/52] generate: --vision --batch keeps one M-RoPE table
+ region per slot (images share the batch)
 
 The image position table was one per device for all batch slots (see the vision guard), so an image request had to run
 alone.  Each device's table now has 1 + B regions: region 0 is the main sessions' table as before, region 1 + b
@@ -215,10 +215,10 @@ index 00000000..97520c84
 +
 +}  // namespace strata::program::mrope_regions
 diff --git a/serve/server.py b/serve/server.py
-index 2f09f8b6..059ca542 100644
+index ac3084d0..6c50c601 100644
 --- a/serve/server.py
 +++ b/serve/server.py
-@@ -250,8 +250,9 @@ def _timeout_env(name: str, default: float) -> float | None:
+@@ -278,8 +278,9 @@ def read_load_peak(path, key: str | None) -> float:
  # still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
  # STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
  ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
@@ -230,7 +230,7 @@ index 2f09f8b6..059ca542 100644
  IMAGE_WAIT_S = _timeout_env("STRATA_IMAGE_WAIT_S", 120.0) or 0.0
  STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
  STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
-@@ -903,6 +904,7 @@ class StrataEngine:
+@@ -932,6 +933,7 @@ class StrataEngine:
          exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
          (PR #637)."""
          info = dict(self.info)
@@ -238,7 +238,7 @@ index 2f09f8b6..059ca542 100644
          self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
          try:
              self.close()
-@@ -1359,11 +1361,19 @@ class StrataEngine:
+@@ -1410,11 +1412,19 @@ class StrataEngine:
                  beat = time.monotonic()
                  yield None
  
@@ -262,7 +262,7 @@ index 2f09f8b6..059ca542 100644
          it (image_line); from its arrival no new request is admitted, the ones in slots decode to their end, then it
          takes the control lines with every slot free and keeps them to its DONE (GENI on the solo path; never moved
          into a slot, since nothing it waits for STOPs it, and no read gives way to it)."""
-@@ -1443,7 +1453,7 @@ class StrataEngine:
+@@ -1494,7 +1504,7 @@ class StrataEngine:
          admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
          if not self.alive():
              raise EngineDied("the engine is unavailable; this request was not sent")

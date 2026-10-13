@@ -1,0 +1,30 @@
+From cb95419d599197b249588f8973aead4f7fcac3bc Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 16:42:41 +0200
+Subject: [PATCH 46/52] serve: log which messages carry the pictures of an
+ image request
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ serve/server.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/serve/server.py b/serve/server.py
+index 6b1a21ab..858a1cc0 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -3716,6 +3716,11 @@ class Service:
+         self.embeddings.path = None
+         images = images_of(messages)
+         if images:
++            last_a = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
++            where = [f"{i}:{m.get('role')}" for i, m in enumerate(messages) if isinstance(m.get("content"), list)
++                     and any(isinstance(x, dict) and x.get("type") == "image" for x in m["content"])]
++            print(f"[strata] image request: {len(images)} picture(s) in messages {', '.join(where)} of {len(messages)} "
++                  f"(last assistant turn: {last_a}), {len(ids)} tokens", flush=True)
+             if self.vision is None:
+                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
+                                  "'vision'), so it cannot read images")
+-- 
+2.43.0
+

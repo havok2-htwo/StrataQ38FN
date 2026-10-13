@@ -1,0 +1,340 @@
+From b987b26fb4fc7e9d42771b35cd0ef458796d7e90 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:52:18 +0200
+Subject: [PATCH 48/52] serve: picture age-out is opt-in
+ (STRATA_IMAGE_HISTORY=tools|<N>), keeps a prefill's pictures, logs what it
+ did
+
+AGENTS.md: a new feature is opt-in. Unset (or keep/0) every picture stays, as in the last release. "tools" turns
+pictures a tool returned in answered turns into a note; "<N>" also a picture in the user message right after tool
+results and every user picture N assistant turns old (an agent session that starts with screenshots made every turn
+run alone without the per-slot M-RoPE regions). A trailing assistant message (prefill) no longer counts as an answer,
+nothing is aged without an encoder, and the image-request line counts the prompt with its picture rows, lists at
+most 8 messages and says how many pictures were left out. Tests on the OpenAI, Anthropic and Responses paths.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py             |  71 +++++++++++-----
+ serve/test_image_history.py | 165 ++++++++++++++++++++++++++++++++++++
+ serve/test_load.py          |  30 -------
+ 3 files changed, 217 insertions(+), 49 deletions(-)
+ create mode 100644 serve/test_image_history.py
+
+diff --git a/serve/server.py b/serve/server.py
+index 3e7a75aa..ac3084d0 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -3789,28 +3789,56 @@ class Service:
+                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
+         return fetched
+ 
+-    def _age_out_tool_images(self, messages):
+-        """Pictures a tool returned (an agent's Read of a screenshot) in turns the model has already answered become a
+-        short note.  Clients resend the whole history every turn, so one such picture made every later request of the
+-        conversation an image request, and an image request runs alone: it waits for every slot to finish and holds the
+-        others back (one every ~3 min in production).  The picture of the turn being answered stays; pictures a user
+-        sends stay (a follow-up question may be about them).  STRATA_IMAGE_HISTORY=keep turns this off."""
+-        if os.environ.get("STRATA_IMAGE_HISTORY") == "keep":
+-            return
+-        last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+-        for m in messages[:last]:
+-            content = m.get("content")
+-            if m.get("role") != "tool" or not isinstance(content, list):
++    IMAGE_AGED = "[image omitted: a picture from an earlier turn]"
++
++    @staticmethod
++    def _answered_upto(messages) -> int:
++        """The last assistant message before the turn being answered (-1: none).  A trailing assistant message (a
++        prefill the client wants continued) belongs to that turn: the pictures in front of it are what it is about."""
++        end = len(messages) - 1 if messages and messages[-1].get("role") == "assistant" else len(messages)
++        return max((i for i in range(end) if messages[i].get("role") == "assistant"), default=-1)
++
++    def _age_out_tool_images(self, messages) -> int:
++        """Opt-in (STRATA_IMAGE_HISTORY; unset, "keep" or "0": every picture stays, as in the last release): pictures
++        of turns the model has already answered become a short note -> how many did.  Clients resend the whole history
++        every turn, so one such picture made every later request of the conversation an image request, and without
++        the per-slot M-RoPE regions (INFO mrope_slots) an image request runs alone: it waits for every slot to finish
++        and holds the others back.  The pictures of the turn being answered always stay.  Once a picture is a note it
++        stays one (the answered part of a conversation only grows), so the prompt changes once, where the picture was.
++
++        STRATA_IMAGE_HISTORY=tools: pictures a tool returned (an agent's Read of a screenshot).  STRATA_IMAGE_HISTORY=<N>
++        goes further: a picture in the user message right after tool results (OpenAI's tool messages take text only, so
++        Codex's view_image, opencode and a picture beside an Anthropic tool_result arrive there) is a tool's, and every
++        other picture a user sent becomes a note once N assistant turns have answered it (an agent session that starts
++        with screenshots made every turn of it run alone; the model no longer sees them).  Without an encoder nothing
++        is aged: _note_unreadable_tool_images' note is the same every turn, so the prompt does not change."""
++        mode = (os.environ.get("STRATA_IMAGE_HISTORY") or "").strip().lower()
++        user_after = int(mode) if mode.isdigit() and int(mode) > 0 else None
++        if (mode != "tools" and user_after is None) or self.vision is None:
++            return 0
++        aged = answered = 0
++        for i in range(self._answered_upto(messages), -1, -1):
++            m = messages[i]
++            role, content = m.get("role"), m.get("content")
++            if role == "assistant":
++                answered += 1                         # the assistant turns after every message below this one
++                continue
++            if not isinstance(content, list):
++                continue
++            if role != "tool" and not (role == "user" and user_after is not None and
++                                       (answered >= user_after or (i > 0 and messages[i - 1].get("role") == "tool"))):
+                 continue
+             for n, item in enumerate(content):
+                 if isinstance(item, dict) and item.get("type") == "image":
+-                    content[n] = {"type": "text", "text": "[image omitted: a picture from an earlier turn]"}
++                    content[n] = {"type": "text", "text": self.IMAGE_AGED}
++                    aged += 1
++        return aged
+ 
+     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
+         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
+         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
+         prompt; with thinking, Service.run writes it once the thinking is over."""
+-        self._age_out_tool_images(messages)
++        aged = self._age_out_tool_images(messages)
+         fetched = self._note_unreadable_tool_images(messages)
+         ids = self.encode_prompt(messages, tools, kwargs)
+         if force and kwargs.get("enable_thinking", True) is False:
+@@ -3818,11 +3846,6 @@ class Service:
+         self.embeddings.path = None
+         images = images_of(messages)
+         if images:
+-            last_a = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+-            where = [f"{i}:{m.get('role')}" for i, m in enumerate(messages) if isinstance(m.get("content"), list)
+-                     and any(isinstance(x, dict) and x.get("type") == "image" for x in m["content"])]
+-            print(f"[strata] image request: {len(images)} picture(s) in messages {', '.join(where)} of {len(messages)} "
+-                  f"(last assistant turn: {last_a}), {len(ids)} tokens", flush=True)
+             if self.vision is None:
+                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
+                                  "'vision'), so it cannot read images")
+@@ -3859,6 +3882,16 @@ class Service:
+             if k != len(encoded):
+                 raise ValueError("the prompt and its images do not match")
+             ids = out
++            # which messages make this an image request (indices and roles only, never content), the prompt's length
++            # with the pictures' rows, and what was left out: with --batch it runs alone (see _generate_alone)
++            where = [f"{i}:{m.get('role')}" for i, m in enumerate(messages) if isinstance(m.get("content"), list)
++                     and any(isinstance(x, dict) and x.get("type") == "image" for x in m["content"])]
++            shown = ", ".join(where[:8]) + (f" and {len(where) - 8} more" if len(where) > 8 else "")
++            print(f"[strata] image request: {len(images)} picture(s) in messages {shown} of {len(messages)} "
++                  f"(answered up to {self._answered_upto(messages)}), {len(ids):,} tokens with them"
++                  + (f"; {aged} older picture(s) left out" if aged else ""), flush=True)
++        elif aged:
++            print(f"[strata] {aged} older picture(s) left out: a text request", flush=True)
+         ctx = self.engine.max_context
+         if ctx <= 0:
+             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
+diff --git a/serve/test_image_history.py b/serve/test_image_history.py
+new file mode 100644
+index 00000000..484dec36
+--- /dev/null
++++ b/serve/test_image_history.py
+@@ -0,0 +1,165 @@
++"""serve/test_image_history.py - pictures of answered turns become a note (Service._age_out_tool_images), on every
++request path, and the image request's log line.
++
++    python -m unittest serve.test_image_history -v
++"""
++from __future__ import annotations
++
++import contextlib
++import io
++import os
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from unittest import mock
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages  # noqa: E402
++from serve.responses import input_messages  # noqa: E402
++from serve.server import ByteTokenizer, MockEngine, Service  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[1]
++PNG = "data:image/png;base64,AAAA"
++OA_IMG = {"type": "image_url", "image_url": {"url": PNG}}
++AN_IMG = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
++CALL = {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
++                                                            "function": {"name": "read_file", "arguments": "{}"}}]}
++USE = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
++
++
++def bare(vision=True):
++    s = object.__new__(Service)
++    s.vision = object() if vision else None
++    return s
++
++
++def where(msgs):
++    return [f"{i}:{m['role']}" for i, m in enumerate(msgs) if isinstance(m.get("content"), list)
++            and any(isinstance(x, dict) and x.get("type") == "image" for x in m["content"])]
++
++
++def aged(msgs, env=None, vision=True):
++    with mock.patch.dict(os.environ, {"STRATA_IMAGE_HISTORY": env} if env is not None else {}, clear=False):
++        if env is None:
++            os.environ.pop("STRATA_IMAGE_HISTORY", None)
++        n = bare(vision)._age_out_tool_images(msgs)
++    return n, where(msgs)
++
++
++class PathsTest(unittest.TestCase):
++    def test_tool_pictures_of_answered_turns_on_every_api(self):
++        cases = {
++            "openai": openai_to_messages({"messages": [
++                {"role": "user", "content": "go"}, CALL, {"role": "tool", "tool_call_id": "c1", "content": [OA_IMG]},
++                CALL, {"role": "tool", "tool_call_id": "c1", "content": "text"}]})[0],
++            "anthropic": anthropic_to_messages({"messages": [
++                {"role": "user", "content": "go"}, USE,
++                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [AN_IMG]}]}, USE,
++                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}]})[0],
++            "responses": input_messages({"input": [
++                {"role": "user", "content": "go"},
++                {"type": "function_call", "call_id": "a", "name": "shot", "arguments": "{}"},
++                {"type": "function_call_output", "call_id": "a", "output": [{"type": "input_image", "image_url": PNG}]},
++                {"type": "function_call", "call_id": "b", "name": "ls", "arguments": "{}"},
++                {"type": "function_call_output", "call_id": "b", "output": "ok"}]}),
++        }
++        for name, msgs in cases.items():
++            with self.subTest(api=name):
++                self.assertEqual(aged(copy_of(msgs))[0], 0)            # off by default: the last release's prompt
++                self.assertEqual(aged(copy_of(msgs), "keep")[0], 0)
++                self.assertEqual(aged(msgs, "tools"), (1, []))
++
++    def test_the_turn_being_answered_keeps_its_pictures_also_with_a_prefill(self):
++        msgs = anthropic_to_messages({"messages": [
++            {"role": "user", "content": "go"}, USE,
++            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [AN_IMG]}]},
++            {"role": "assistant", "content": "The screenshot shows"}]})[0]
++        self.assertEqual(aged(msgs, "tools"), (0, ["2:tool"]))
++
++    def test_user_pictures_stay_by_default(self):
++        msgs = openai_to_messages({"messages": [
++            {"role": "system", "content": "s"}, {"role": "user", "content": "env"},
++            {"role": "assistant", "content": "Got it."},
++            {"role": "user", "content": [{"type": "text", "text": "build this"}, OA_IMG, OA_IMG, OA_IMG]},
++            CALL, {"role": "tool", "tool_call_id": "c1", "content": "r"}, CALL,
++            {"role": "tool", "tool_call_id": "c1", "content": "r"}]})[0]
++        self.assertEqual(aged(msgs), (0, ["3:user"]))
++        self.assertEqual(aged(msgs, "keep"), (0, ["3:user"]))
++        self.assertEqual(aged(msgs, "tools"), (0, ["3:user"]))         # a user's pictures are not a tool's
++
++    def test_opt_in_user_pictures_after_n_answers_and_moved_tool_pictures(self):
++        def chat(rounds):
++            m = [{"role": "system", "content": "s"},
++                 {"role": "user", "content": [{"type": "text", "text": "build this"}, OA_IMG]}]
++            for _ in range(rounds):
++                m += [CALL, {"role": "tool", "tool_call_id": "c1", "content": "r"}]
++            return openai_to_messages({"messages": m})[0]
++        self.assertEqual(aged(chat(2), "3"), (0, ["1:user"]))       # answered twice: stays
++        self.assertEqual(aged(chat(3), "3"), (1, []))               # three times: a note from now on
++        moved = openai_to_messages({"messages": [
++            {"role": "user", "content": "go"}, CALL, {"role": "tool", "tool_call_id": "c1", "content": "see below"},
++            {"role": "user", "content": [OA_IMG]}, CALL, {"role": "tool", "tool_call_id": "c1", "content": "r"}]})[0]
++        self.assertEqual(aged(copy_of(moved), "tools"), (0, ["3:user"]))   # "tools": a user message's picture
++        self.assertEqual(aged(moved, "50"), (1, []))                # opt-in: the tool's, answered once
++
++    def test_without_an_encoder_nothing_is_aged(self):
++        msgs = openai_to_messages({"messages": [
++            {"role": "user", "content": "go"}, CALL, {"role": "tool", "tool_call_id": "c1", "content": [OA_IMG]},
++            CALL, {"role": "tool", "tool_call_id": "c1", "content": "r"}]})[0]
++        self.assertEqual(aged(msgs, "tools", vision=False), (0, ["2:tool"]))
++
++
++def copy_of(msgs):
++    import copy
++    return copy.deepcopy(msgs)
++
++
++class FakeVision:
++    def __init__(self, d):
++        self.dir = Path(d)
++        self.rows = self.dir / "img.sve"
++        self.rows.write_bytes(b"rows")
++
++    def encode(self, source):
++        return self.rows, 64
++
++
++class PrepareTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.tok = ByteTokenizer()
++        self.svc = Service(MockEngine(self.tok, "ok", max_context=1 << 20), self.tok,
++                           ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=FakeVision(self.tmp.name))
++
++    def tearDown(self):
++        if self.svc.embeddings.path:
++            Path(self.svc.embeddings.path).unlink(missing_ok=True)
++        self.tmp.cleanup()
++
++    def prepare(self, raw):
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {}, clear=False):
++            os.environ["STRATA_IMAGE_HISTORY"] = "tools"
++            ids, _, _ = self.svc.prepare(openai_to_messages({"messages": raw})[0], None, {})
++        return ids, out.getvalue()
++
++    def test_the_prompt_changes_once_where_the_picture_was_then_stays(self):
++        base = [{"role": "system", "content": "S" * 500}, {"role": "user", "content": "go"}, CALL,
++                {"role": "tool", "tool_call_id": "c1", "content": [OA_IMG]}]
++        turns = [base, base + [CALL, {"role": "tool", "tool_call_id": "c1", "content": "one"}],
++                 base + [CALL, {"role": "tool", "tool_call_id": "c1", "content": "one"},
++                         CALL, {"role": "tool", "tool_call_id": "c1", "content": "two"}]]
++        (a, log_a), (b, log_b), (c, _) = (self.prepare(t) for t in turns)
++        pad = self.tok.encode("<|image_pad|>", parse_special=True)[0]
++        self.assertEqual((a.count(pad), b.count(pad), c.count(pad)), (64, 0, 0))
++        self.assertEqual(c[:len(b) - 5], b[:len(b) - 5])          # turn 3 continues turn 2: no second change
++        first = next(i for i, (x, y) in enumerate(zip(a, b)) if x != y)
++        self.assertIn("[image omitted", self.tok.decode(b[first:first + 40]))
++        self.assertIn(f"{len(a):,} tokens with them", log_a)       # the count with the picture's rows
++        self.assertIn("1 older picture(s) left out", log_b)
++        self.assertNotIn("S" * 20, log_a + log_b)                    # indices and roles only, no content
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/serve/test_load.py b/serve/test_load.py
+index ced576c3..8f84dc1b 100644
+--- a/serve/test_load.py
++++ b/serve/test_load.py
+@@ -293,35 +293,5 @@ class RouteTest(unittest.TestCase):
+         self.assertNotIn("load_pct", v)
+ 
+ 
+-class AgeOutTest(unittest.TestCase):
+-    def messages(self):
+-        img = {"type": "image", "source": "data:image/png;base64,AAAA"}
+-        return [{"role": "user", "content": [{"type": "text", "text": "look"}, dict(img)]},
+-                {"role": "assistant", "content": "ok"},
+-                {"role": "tool", "content": [dict(img)]},
+-                {"role": "assistant", "content": "seen"},
+-                {"role": "tool", "content": [dict(img)]}]
+-
+-    def test_old_tool_images_become_notes_user_and_current_stay(self):
+-        from serve.frontend import images_of
+-        s = object.__new__(Service)
+-        m = self.messages()
+-        s._age_out_tool_images(m)
+-        self.assertEqual(len(images_of(m)), 2)              # the user's picture and the current tool picture
+-        self.assertEqual(m[2]["content"][0]["type"], "text")
+-
+-    def test_keep(self):
+-        import os
+-        from serve.frontend import images_of
+-        s = object.__new__(Service)
+-        m = self.messages()
+-        os.environ["STRATA_IMAGE_HISTORY"] = "keep"
+-        try:
+-            s._age_out_tool_images(m)
+-        finally:
+-            del os.environ["STRATA_IMAGE_HISTORY"]
+-        self.assertEqual(len(images_of(m)), 3)
+-
+-
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

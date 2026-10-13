@@ -1,0 +1,76 @@
+From 10c88d0f89e86099c52d5583f75690cee3735c52 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:29:32 +0200
+Subject: [PATCH 52/52] docs: GET /v1/load, pictures with parallel requests
+ (STRATA_MROPE_SLOTS, STRATA_IMAGE_HISTORY)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/DETAILS.md | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 98fbef82..bd8737c3 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -1496,6 +1496,25 @@ like `nvidia-smi`) to the `"vision"` section of `strata-<model>.json`: the encod
+ `--vram-reserve-mib` in `"args"` to 700 as well, so the engine's cards keep that VRAM for the expert cache. The
+ encoder's card needs code in the ready-made encoder (RTX 20/30/40/50).
+ 
++### Pictures and parallel requests (`"parallel"`, `--batch`)
++
++With several batch slots the engine keeps one M-RoPE position table per GPU, so by default an image request runs
++**alone**: it waits until every slot has finished, runs on the solo path, and new requests wait behind it
++(`STRATA_IMAGE_WAIT_S`, default 120 s, then 503). A client that resends a picture in every turn of a long
++conversation (an agent session that started with screenshots) therefore makes every turn wait for the others and
++every other client wait for it.
++
++- `STRATA_MROPE_SLOTS=1` (engine env, opt-in): the table holds one region per slot (17 regions of 262,208 rows,
++  51.0 MiB per GPU at 262K context and 16 slots), each slot reads its own, and image and text requests share the
++  batch (`INFO ... mrope_slots=1`; the server then admits image requests into slots like text ones). Without it the
++  engine behaves as before.
++- `STRATA_IMAGE_HISTORY` (server env, opt-in; unset: every picture stays): `tools` turns pictures a tool returned
++  in turns the model has already answered into the note `[image omitted: a picture from an earlier turn]`; `<N>`
++  also turns a picture in a user message right after tool results, and every picture a user sent once N assistant
++  turns have answered it, into that note. The model no longer sees those pictures. The prompt changes once, where
++  the first such picture was, so that turn reads the rest of the conversation again; the pictures of the turn being
++  answered always stay.
++
+ ### Sending a picture
+ 
+ **Terminal chat:** type `/image <path to a picture>`, press Enter, then type your question.
+@@ -1955,6 +1974,31 @@ Unloading and shutdown close the native engine's stdin after sending `QUIT`, all
+ stdin reader to see EOF. Cleanup waits for process exit before releasing handles; if forced shutdown still
+ times out, the server keeps ownership and reports an error rather than claiming the model was unloaded.
+ 
++### Server load for clients (`GET /v1/load`)
++
++`GET /v1/load` (also `GET /load`; same API key rule as `/v1/status`) says how busy the server is, so a client can
++hold back work that is not urgent. `POST /v1/load` and `POST /load` still load the model (above).
++
++```json
++{"load_pct": 75, "level": "busy", "would_wait": false, "image_alone": false, "loaded": true,
++ "slots": {"total": 16, "busy": 12, "decoding": 10, "reading_prompt": 2, "free": 4, "waiting": 0},
++ "tok_s": {"now": 250.0, "peak": 660.0, "share_pct": 38}, "server_load": 12,
++ "advice": "defer non-urgent work", "time": 1791900000.0}
++```
++
++- `load_pct` is the larger of two shares: the token rate of the last 3 s against the 100 % mark, and the slots in use
++  against all slots. `level`: `idle` below 25 %, `low` below 50 %, `busy` below 80 %, `saturated` from there.
++- `slots.waiting` counts every request that waits once: for the control lines (one prompt read at a time), for a
++  slot, behind an image request, or before it is registered. `would_wait`: a new request would wait now.
++- `image_alone`: an image request has the engine alone or waits for the slots to empty (without the per-slot M-RoPE
++  regions, see Images); nothing new is admitted meanwhile, so the slots count as all taken.
++- The 100 % mark (`tok_s.peak`) is the highest token rate **held for 10 s while at least half the slots decoded** (one
++  request's speed is not the server's capacity, and a one-second figure can be a burst). It is kept next to the run
++  config (`<config>.load-peak.json`, or the file `STRATA_LOAD_PEAK_FILE` names) with the engine settings it was
++  measured with; a peak measured with another engine or config is not taken. `STRATA_LOAD_REF_TOK_S=<tok/s>` sets the
++  mark by hand. Until one is known, `tok_s.peak` is `null` and only the slots count.
++- `server_load` is vLLM's `GET /load` figure: the requests in flight, queued ones included.
++
+ ### JSON response formats
+ 
+ `POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}` or
+-- 
+2.43.0
+
