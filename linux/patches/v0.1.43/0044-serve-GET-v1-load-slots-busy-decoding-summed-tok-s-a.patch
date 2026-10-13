@@ -1,0 +1,189 @@
+From bca12facc9ea4210ce69aca9ee49608e2bcb4a82 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 15:41:11 +0200
+Subject: [PATCH] serve: GET /v1/load (slots busy/decoding, summed tok/s
+ against the highest seen, load_pct and level)
+
+Clients can hold back work that is not urgent. load_pct is the larger of the tok/s share and the slot share;
+the peak is kept next to the run config (<config>.load-peak.json) or fixed with STRATA_LOAD_REF_TOK_S.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ serve/server.py    | 60 +++++++++++++++++++++++++++++++++++++++++-
+ serve/test_load.py | 65 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 124 insertions(+), 1 deletion(-)
+ create mode 100644 serve/test_load.py
+
+diff --git a/serve/server.py b/serve/server.py
+index 2f09f8b6..a95441d5 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -3002,6 +3002,9 @@ class Service:
+         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
+                        "prompt_ms": 0.0, "decode_ms": 0.0,
+                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
++        self.load_peak = 0.0                             # GET /v1/load: the highest summed tok/s seen (the 100 % mark)
++        self.load_peak_path = None                       # ... kept here between runs (set from the run config)
++        self._load_peak_saved = (0.0, 0.0)               # (value, time) of the last write
+         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+         from serve.prometheus import Latencies
+         self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
+@@ -3376,7 +3379,7 @@ class Service:
+         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
+         if getattr(self, "telemetry", None) is None:
+             from serve.telemetry import Telemetry
+-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
++            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._load_sample(), "tok_s_mean": self._tok_s_mean(),
+                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
+                                        gpu_indices=getattr(self, "gpu_indices", None),
+@@ -3386,6 +3389,52 @@ class Service:
+                 # slow card keeps the GPU at work while the host thread sleeps)
+                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+ 
++    LOAD_PEAK_SAVE_S = 60.0     # the peak file is written at most this often, and only when the peak rose by 2 %
++
++    def _load_sample(self) -> float:
++        """The summed tok/s now (the telemetry calls this once a second); raises the load peak when it is a new high."""
++        rate = self._tok_s()
++        if rate > self.load_peak:
++            self.load_peak = rate
++            saved, at = self._load_peak_saved
++            if self.load_peak_path and rate > saved * 1.02 and time.time() - at >= self.LOAD_PEAK_SAVE_S:
++                try:
++                    Path(self.load_peak_path).write_text(json.dumps({"peak_tok_s": round(rate, 1), "at": time.time()}))
++                except OSError:
++                    pass
++                self._load_peak_saved = (rate, time.time())
++        return rate
++
++    def load_view(self) -> dict:
++        """GET /v1/load: how busy the server is, for clients that can hold back work that is not urgent.
++        `load_pct` is the larger of the two shares: tok/s against the highest rate seen (or STRATA_LOAD_REF_TOK_S), and
++        slots in use against all slots.  `level`: idle < 25 %, low < 50 %, busy < 80 %, saturated from there."""
++        ref_env = os.environ.get("STRATA_LOAD_REF_TOK_S")
++        try:
++            ref = float(ref_env) if ref_env else 0.0
++        except ValueError:
++            ref = 0.0
++        rate = self._tok_s()
++        peak = ref if ref > 0 else max(self.load_peak, rate)
++        total = int(getattr(self.engine, "batch", 0) or 0) or 1
++        with self.status_lock:
++            live = [dict(st) for st, _ in self.live_reqs.values()] or ([dict(self.status)] if self.status.get("busy") else [])
++        decoding = sum(1 for st in live if st.get("first_token"))
++        reading = len(live) - decoding
++        busy = min(total, len(live))
++        waiting = int(getattr(self.engine, "waiting", 0) or 0)
++        tok_share = rate / peak if peak > 0 else 0.0
++        slot_share = busy / total
++        load = min(1.0, max(tok_share, slot_share))
++        level = "idle" if load < 0.25 else "low" if load < 0.5 else "busy" if load < 0.8 else "saturated"
++        return {"load_pct": round(100 * load), "level": level,
++                "slots": {"total": total, "busy": busy, "decoding": decoding, "reading_prompt": reading,
++                          "free": max(0, total - busy), "waiting": waiting},
++                "tok_s": {"now": round(rate, 1), "peak": round(peak, 1), "share_pct": round(100 * min(1.0, tok_share))},
++                "advice": ("run now" if level in ("idle", "low") else
++                           "defer non-urgent work" if level == "busy" or waiting == 0 else "defer, requests are queueing"),
++                "time": time.time()}
++
+     def _tok_s(self):
+         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
+         the sum of theirs."""
+@@ -5110,6 +5159,9 @@ def make_handler(svc: Service):
+                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
+                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                  "loaded": svc.loaded(), "service": "strata"})
++            elif path in ("/v1/load", "/load"):
++                if self._authorized():
++                    self._json(200, svc.load_view())
+             elif path == "/status":
+                 if not self._authorized():                  # #212: it shows the end of the last answer
+                     return
+@@ -6568,6 +6620,12 @@ def main() -> int:
+     if a.config:
+         svc.config_path = a.config                      # #564: the web page's Settings view
+     if a.config:                                        # the Chat settings shared with other apps, from last time
++        svc.load_peak_path = str(Path(a.config).with_suffix("")) + ".load-peak.json"
++        try:
++            svc.load_peak = svc._load_peak_saved = float(json.loads(Path(svc.load_peak_path).read_text())["peak_tok_s"])
++            svc._load_peak_saved = (svc.load_peak, time.time())
++        except (OSError, ValueError, KeyError, TypeError):
++            pass
+         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
+         try:
+             svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
+diff --git a/serve/test_load.py b/serve/test_load.py
+new file mode 100644
+index 00000000..e580a775
+--- /dev/null
++++ b/serve/test_load.py
+@@ -0,0 +1,65 @@
++"""serve/test_load.py - GET /v1/load: the load figure clients use to hold back work that is not urgent.
++
++    python -m unittest serve.test_load -v
++"""
++from __future__ import annotations
++
++import sys
++import tempfile
++import threading
++import time
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from serve.server import Service  # noqa: E402
++
++
++def service(batch=16, decoding=0, reading=0, peak=660.0, waiting=0):
++    s = object.__new__(Service)
++    s.engine = SimpleNamespace(batch=batch, waiting=waiting)
++    s.status_lock = threading.Lock()
++    s.status = {"busy": False}
++    now = time.time()
++    s.live_reqs = {}
++    for i in range(decoding + reading):
++        first = now - 10 if i < decoding else None
++        st = {"busy": True, "started": now - 12, "first_token": first, "generated": 100 if first else 0}
++        rate = [(now - 2, 0), (now, 40)] if first else []   # 20 tok/s each
++        s.live_reqs[i] = (st, rate)
++    s.rate = []
++    s.load_peak, s.load_peak_path, s._load_peak_saved = peak, None, (0.0, 0.0)
++    return s
++
++
++class LoadTest(unittest.TestCase):
++    def test_idle(self):
++        v = service().load_view()
++        self.assertEqual((v["load_pct"], v["level"]), (0, "idle"))
++        self.assertEqual(v["slots"]["free"], 16)
++
++    def test_mixed(self):
++        v = service(decoding=10, reading=2).load_view()
++        self.assertEqual(v["slots"], {"total": 16, "busy": 12, "decoding": 10, "reading_prompt": 2, "free": 4,
++                                      "waiting": 0})
++        self.assertEqual(v["load_pct"], 75)     # slots 12/16 beat the 200/660 tok/s share
++        self.assertEqual(v["level"], "busy")
++
++    def test_saturated_with_queue(self):
++        v = service(decoding=16, waiting=3).load_view()
++        self.assertEqual((v["load_pct"], v["level"]), (100, "saturated"))
++        self.assertIn("queueing", v["advice"])
++
++    def test_peak_rises_and_is_kept(self):
++        with tempfile.TemporaryDirectory() as d:
++            s = service(decoding=4, peak=10.0)
++            s.load_peak_path = str(Path(d) / "p.json")
++            s.LOAD_PEAK_SAVE_S = 0
++            s._load_sample()
++            self.assertGreater(s.load_peak, 10.0)
++            self.assertTrue(Path(s.load_peak_path).exists())
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
