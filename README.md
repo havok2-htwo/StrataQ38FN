@@ -69,9 +69,14 @@ The engine and the models are **not** included. The repository holds everything 
 - start/stop scripts for three model variants (only one runs at a time)
 - tuned Strata configs (`strata-configs/`, `linux/configs/`)
 - a **vLLM-compatible facade** (`vllm_facade/`), so vLLM clients (e.g. genesis3) connect unchanged
-- a **LAN dashboard** (`dashboard/`, Windows and Linux) with live requests (answering progress, batch slots),
-  speed, caches, memory, every GPU (load, VRAM, power, temperature, clocks, PCIe link and traffic), power and cost;
-  it also runs without a Strata server (`Start-Dashboard.bat`, Linux: `linux/start-dashboard.sh`, port 8082)
+- a **LAN dashboard** ("Strata Monitor", `dashboard/`, Windows and Linux): a status band (phase, throughput, batch
+  slots, GPUs, wall power, cost) and panels by question - what is running (all batch slots), speed, cost and 24 h
+  projection, hardware (one table row per GPU and per SSD), memory and caches (parked conversations in GB and
+  approx. tokens), 10-minute charts, recent requests. It also runs without a Strata server (`Start-Dashboard.bat`,
+  Linux: `linux/start-dashboard.sh`, port 8082). Its **⚙ Einstellungen** menu holds the power price, the GPU power
+  limits per GPU for day and night and the fan curves (written through G3's admin API with the G3 admin password;
+  fans: more cooling only, never below G3's default curve), and **ⓘ API** explains the endpoints, context window,
+  thinking levels (none/low/medium/high) and how to send images
 - benchmark and A/B tools with their measurement data and analysis reports
 - the engine patch series and its design documents (`linux/patches/`, `linux/upstream/`)
 

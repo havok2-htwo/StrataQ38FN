@@ -37,6 +37,8 @@ from pathlib import Path
 
 import psutil
 
+import g3control
+
 IS_WIN = os.name == "nt"
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent                      # X:\dev\StrataQ38FN  or  /media/raid0/StrataQ38FN
@@ -530,6 +532,7 @@ RE_TIMING = re.compile(r"decode timing: (\d+) windows, avg T ([\d.]+), ([\d.]+) 
                        r"verify ([\d.]+) \(GPU-reach wait ([\d.]+) \+ per-layer host ([\d.]+) \[.*?CPU ([\d.]+)\] \+ stage ([\d.]+)\)"
                        r".*?draft ([\d.]+)")
 RE_SUFFIX = re.compile(r"suffix drafts: (\d+) windows, (\d+) of (\d+) drafts accepted")
+RE_PARK = re.compile(r"conversation cache: parked (\d+) tokens .*snapshot_bytes=(\d+)")
 
 
 def newest_glob_log():
@@ -835,7 +838,7 @@ class Collector(threading.Thread):
             return lc
         # a busy engine writes its log all the time: parse at most every 5 s
         if path != lc["path"]:                      # another engine log: nothing of the old one carries over
-            lc.update(timing=None, suffix=None)
+            lc.update(timing=None, suffix=None, park_bpt=None)
         if path != lc["path"] or (mt != lc["mtime"] and now - lc["parsed_at"] >= 5):
             lc.update(path=path, mtime=mt, parsed_at=now)
             for line in reversed(tail_lines(path)):
@@ -851,6 +854,11 @@ class Collector(threading.Thread):
                 if m:
                     lc["suffix"] = {"windows": int(m.group(1)), "accepted": int(m.group(2)), "offered": int(m.group(3))}
                     break
+            # parked conversations: bytes per token of the last 200 parks (Σ bytes / Σ tokens) -> token estimate in the UI
+            parks = [m.groups() for m in map(RE_PARK.search, tail_lines(path, 2_000_000)) if m][-200:]
+            tok = sum(int(t) for t, _ in parks)
+            if tok:
+                lc["park_bpt"] = {"bytes_per_token": sum(int(b) for _, b in parks) / tok, "samples": len(parks)}
         return lc
 
     def io_sample(self, io, now):
@@ -1110,7 +1118,8 @@ class Collector(threading.Thread):
             "gpus": gpus,
             "gpu_backend": self.gpus.backend if self.gpus else None,
             "gpu_error": self.gpu_error,
-            "conversation_cache": shown.get("conversation_cache"),
+            "conversation_cache": ({**shown["conversation_cache"], "park_bpt": lc.get("park_bpt")}
+                                   if isinstance(shown.get("conversation_cache"), dict) else shown.get("conversation_cache")),
             "server_totals": (m or {}).get("totals"),
             "totals": {k: st[k] for k in ("since", "requests", "prompt_tokens", "reused", "read", "output_tokens",
                                           "prompt_ms", "decode_ms", "drafts_offered", "drafts_accepted",
@@ -1144,7 +1153,7 @@ class Collector(threading.Thread):
 
 
 # ------------------------------------------------------------------------------------------------ HTTP
-def make_handler(col):
+def make_handler(col, ctl=None):
     page = HERE / "index.html"
 
     class H(BaseHTTPRequestHandler):
@@ -1159,6 +1168,57 @@ def make_handler(col):
             self.end_headers()
             self.wfile.write(body)
 
+        def _ctl_token(self):
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == g3control.COOKIE:
+                    return v
+            return None
+
+        def _same_origin(self):
+            """Writes to G3 only from this page: no other site may ride the login (and JSON forces a CORS preflight)."""
+            site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+            if site and site not in ("same-origin", "none"):
+                return False
+            origin = self.headers.get("Origin")
+            if origin and origin.split("://", 1)[-1].rstrip("/").lower() != (self.headers.get("Host") or "").lower():
+                return False
+            return (self.headers.get("Content-Type") or "").startswith("application/json")
+
+        def _control(self, path, body):
+            if not self._same_origin():
+                return self._send(403, b'{"error": "nur von der Monitor-Seite selbst"}', "application/json")
+            tok = self._ctl_token()
+            try:
+                data = json.loads(body or b"{}")
+                if path == "/api/control/login":
+                    tok = ctl.login(str((data or {}).get("password") or ""))
+                    raw = json.dumps({"ok": True}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Set-Cookie", f"{g3control.COOKIE}={tok}; Path=/; HttpOnly; SameSite=Strict; "
+                                                   f"Max-Age={g3control.SESSION_S}")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    return self.wfile.write(raw)
+                if path == "/api/control/logout":
+                    ctl.logout(tok)
+                    out = {"ok": True}
+                elif path == "/api/control/power":
+                    out = ctl.save_power(tok, data)
+                elif path == "/api/control/fan":
+                    out = ctl.save_fan(tok, data)
+                else:
+                    return self._send(404, b"not found", "text/plain")
+            except PermissionError as e:
+                return self._send(401, json.dumps({"error": str(e)}).encode(), "application/json")
+            except ConnectionError as e:
+                return self._send(502, json.dumps({"error": str(e)}).encode(), "application/json")
+            except (ValueError, TypeError) as e:
+                return self._send(400, json.dumps({"error": str(e)}).encode(), "application/json")
+            self._send(200, json.dumps(out).encode(), "application/json")
+
         def do_GET(self):
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
@@ -1167,6 +1227,8 @@ def make_handler(col):
                 self._send(200, json.dumps(col.get()).encode(), "application/json")
             elif path == "/api/history":
                 self._send(200, json.dumps(col.history(HISTORY)).encode(), "application/json")
+            elif path == "/api/control" and ctl:
+                self._send(200, json.dumps(ctl.view(self._ctl_token())).encode(), "application/json")
             elif path == "/api/stream":
                 # Server-Sent Events: one snapshot per second (+ the newest history point)
                 self.send_response(200)
@@ -1195,6 +1257,8 @@ def make_handler(col):
             if not 0 <= n <= 10_000:
                 return self._send(413, b"too large", "text/plain")
             body = self.rfile.read(n) if n else b"{}"
+            if path.startswith("/api/control/") and ctl:
+                return self._control(path, body)
             try:
                 if path == "/api/settings":
                     data = json.loads(body or b"{}")
@@ -1234,6 +1298,10 @@ def main():
     ap.add_argument("--engine-config", help="Strata run config whose \"log\" is the engine log")
     ap.add_argument("--state", help=f"running totals file (default {STATE_FILE})")
     ap.add_argument("--settings", help=f"power/price settings file (default {SETTINGS_FILE})")
+    ap.add_argument("--g3", default="http://127.0.0.1:8000", help="G3 (Genesis3) whose admin API sets the GPU power "
+                    "limits and fan curves (settings menu; writes need the G3 admin password); 'off' = no menu")
+    ap.add_argument("--g3-dir", default="/home/administrator/G3_VLLM", help="G3 folder (its logs/ settings are read "
+                    "without a login)")
     a = ap.parse_args()
     if a.state:
         STATE_FILE = Path(a.state).resolve()
@@ -1248,7 +1316,7 @@ def main():
     col = Collector(sources=sources, strata_path=a.strata, log_path=a.log, engine_config=a.engine_config,
                     discover=not a.no_discover)
     col.start()
-    srv = ThreadingHTTPServer((a.host, a.port), make_handler(col))
+    srv = ThreadingHTTPServer((a.host, a.port), make_handler(col, None if a.g3 == "off" else g3control.G3Control(a.g3, a.g3_dir)))
     srv.daemon_threads = True
     print(f"Strata dashboard on http://{a.host}:{a.port}/  (state: {STATE_FILE}, settings: {SETTINGS_FILE}, "
           f"GPUs: {len(col.gpus.cards) if col.gpus else 0} via {col.gpus.backend if col.gpus else col.gpu_error}, "

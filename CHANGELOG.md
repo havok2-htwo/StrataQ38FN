@@ -4,6 +4,35 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (dashboard, "Strata Monitor")
+- New layout: a status band (phase, throughput now, batch slots, GPUs, wall power, cost) and panels by question
+  (Was läuft gerade? · Wie schnell? · Was kostet es? · Ist die Hardware ok? · Speicher & Caches · Verlauf ·
+  Requests) with section chips. Tiles with long grey sub-sentences became tables and key/value lists: energy
+  (active/idle/offline × W/kWh/€), the 24 h projection, one row per GPU and per SSD. Every value of the old page is
+  still shown as text (inventory of ~230 values checked against the new page); phone layout one column.
+- Fixed: the id `slots` was used twice, so the batch slot cards never rendered and "Expert-Slots" showed "–". Three
+  charts now show their current value; values that only lived in tooltips (slot context, timing parts) are text.
+- Parked conversations: besides GB also approx. tokens used / fitting ("ca. 718 K von 2,69 Mio Tokens"), from the
+  bytes per token of the last 200 parks in the engine log (`conversation_cache.park_bpt`; approximate, since every
+  parked conversation also has a fixed part of a few hundred MB).
+
+### Added (dashboard)
+- **⚙ Einstellungen** (side panel): power price & consumption (as before), **GPU power limits** per GPU for day and
+  night plus the night window and on/off, and **fan curves** per GPU for day and night (auto or a curve, with a
+  preview against the floor curve and the current temperature). Power and fans are owned by G3: the monitor reads
+  G3's settings files without a login and writes only through G3's admin API (`/api/admin/power|fan/settings`)
+  after a login with the G3 admin password (`dashboard/g3control.py`; the G3 session stays on the server, the
+  browser gets an HttpOnly cookie; writes only from the page itself: `Sec-Fetch-Site`/`Origin` check + JSON).
+  Fans: **more cooling only** - a curve may nowhere run below G3's default curve (40 °C 30 % · 60 °C 45 % · 70 °C
+  65 % · 78 °C 85 % · 83 °C 100 %), minimum speed ≥ 30 %, the 100 % limit ≤ 83 °C, hysteresis ≥ 3 °C (checked in
+  the page and in `dashboard.py`). New options `--g3 URL` (default `http://127.0.0.1:8000`, `off` = no menu) and
+  `--g3-dir`.
+- **ⓘ API & Nutzung**: endpoints (G3 :8000 OpenAI/Anthropic/Responses, Strata :8090), model name, context window
+  (live), what happens on overlong prompts, parallel slots, thinking levels for OpenAI and Anthropic requests
+  (`reasoning_effort` none/low/medium/high, `enable_thinking`, `thinking`, `output_config`,
+  `reasoning_budget_tokens`), sending images (`image_url` with base64/URL, Anthropic image blocks) and copyable
+  curl/Python examples.
+
 ### Added (Linux, images)
 - Images (vision) through the API: OpenAI `image_url` parts (base64 `data:` URL, http(s), local path) and Anthropic
   image blocks, also through G3. Encoder `strata-vision` built for CPU and CUDA, mmproj from ISTA-DASLab (ed59f92),

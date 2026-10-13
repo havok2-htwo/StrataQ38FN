@@ -12,7 +12,10 @@
   --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
   --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
   --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --crit: #d03b3b;
-  --track: #184f95;
+  --track: #1f2f44;            /* desaturated s1 tint: a 1 % meter reads empty */
+  --track-n: var(--surface-2);
+  --track-in: var(--axis);     /* neutral track on --surface-2 tiles */
+  --r-card: 12px; --r-bar: 4px; --r-chip: 999px;
 }
 :root[data-theme="light"] {
   color-scheme: light;
@@ -21,298 +24,837 @@
   --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
   --track: #cde2fb;
+  --track-in: var(--grid);
 }
 * { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
 body { margin: 0; background: var(--page); color: var(--ink);
-  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
-.wrap { max-width: 1500px; margin: 0 auto; padding: 16px; }
-header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-bottom: 16px; }
-header h1 { font-size: 20px; margin: 0; font-weight: 600; }
-.model { color: var(--ink-2); font-size: 15px; }
-.badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
-  background: var(--surface-2); color: var(--ink); font-size: 13px; font-weight: 600; }
-.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.meta { color: var(--muted); font-size: 12px; }
-.spacer { flex: 1; }
-button.theme { background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--ring);
-  border-radius: 8px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px; }
-.grid { display: grid; gap: 12px; }
-.g6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-.g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-@media (max-width: 1100px) { .g6 { grid-template-columns: repeat(3, minmax(0, 1fr)); } .g4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .g3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 640px) { .g6, .g4, .g3, .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); } header .model { overflow-wrap: anywhere; } .kv { grid-template-columns: minmax(0, 1fr) auto; } .sec-head { flex-wrap: wrap; } .wide-m { grid-column: 1 / -1; } }
-section { margin-top: 20px; }
-section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
-  font-weight: 600; margin: 0 0 8px; }
-.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 14px 16px; min-width: 0; }
-.tile .label { color: var(--ink-2); font-size: 13px; }
-.tile .value { font-size: 30px; font-weight: 600; margin-top: 2px; white-space: nowrap; }
-.tile .value small { font-size: 14px; color: var(--ink-2); font-weight: 500; margin-left: 4px; }
-.tile .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
-.hero .value { font-size: 48px; }
-.meter { margin-top: 10px; }
-.meter .row { display: flex; justify-content: space-between; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
-.bar { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; display: flex; gap: 2px; }
-.bar > span { height: 100%; border-radius: 4px; }
-.kv { display: grid; grid-template-columns: auto auto; gap: 4px 16px; font-size: 13px; }
-.kv dt { color: var(--ink-2); } .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
-.chart-card h3 { margin: 0; font-size: 14px; font-weight: 600; }
-.chart-card .now { color: var(--ink-2); font-size: 12px; }
-.chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
-.legend { display: flex; gap: 12px; font-size: 12px; color: var(--ink-2); }
-.legend i { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 4px; }
-svg.chart { width: 100%; height: 140px; display: block; overflow: visible; }
-svg.chart text { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
-.tip { position: fixed; pointer-events: none; background: var(--surface-2); color: var(--ink); border: 1px solid var(--ring);
-  border-radius: 8px; padding: 6px 8px; font-size: 12px; display: none; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,.3); }
-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
-th, td { padding: 6px 8px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; }
-th { color: var(--muted); font-weight: 600; } th:first-child, td:first-child { text-align: left; }
-.tbl { overflow-x: auto; }
-.stack-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); margin-top: 8px; }
-.stack-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; vertical-align: -1px; margin-right: 5px; }
-.offline { color: var(--serious); }
-.tile .value.stale { color: var(--muted); }
-.sec-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 0 0 8px; }
-.sec-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; margin: 0; }
-.sec-head .meta { text-align: right; }
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; overflow-x: hidden; }
+.wrap { max-width: 1500px; margin: 0 auto; padding: 0 16px; }
+b, strong { font-weight: 600; }
+.num, .kv dd, table { font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); } .ink2 { color: var(--ink-2); }
+.na { color: var(--muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.v { white-space: nowrap; }
+.u { font-size: .55em; color: var(--ink-2); font-weight: 500; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; flex: none; }
+.sw.free { background: var(--track-n); box-shadow: inset 0 0 0 1px var(--axis); }
+.hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+.sub { color: var(--ink-2); font-size: 12px; }
+.hr { border: 0; border-top: 1px solid var(--grid); margin: 14px 0; }
+
+/* ---------- header */
+.hdr { position: sticky; top: 0; z-index: 5; background: var(--surface); border-bottom: 1px solid var(--grid); }
+.hdr-row { display: flex; align-items: center; gap: 8px 16px; min-height: 52px; padding-top: 6px; padding-bottom: 6px; }
+.hdr h1 { font-size: 17px; font-weight: 600; margin: 0; white-space: nowrap; }
+.model { color: var(--ink-2); font-size: 15px; overflow-wrap: anywhere; min-width: 0; }
+.hdr .model { flex: 1 1 auto; }
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: var(--r-chip);
+  background: var(--surface-2); color: var(--ink); font-size: 13px; font-weight: 600; white-space: nowrap; }
+.badge.err { color: var(--crit); }
+.clock { color: var(--ink-2); font-size: 13px; font-variant-numeric: tabular-nums; margin-left: auto; white-space: nowrap; }
 .btn { background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--ring); border-radius: 8px;
-  padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px; }
+  padding: 0 12px; height: 30px; cursor: pointer; font: inherit; font-size: 12px; white-space: nowrap; }
+.btn:hover { color: var(--ink); }
 .btn.primary { background: var(--s1); color: #fff; border-color: transparent; }
-.btn.danger { color: var(--crit); }
-.settings { display: none; margin-bottom: 12px; }
+.btn.danger { background: transparent; color: var(--crit); border-color: var(--crit); }
+.hdr-m { display: none; }
+.meta { color: var(--muted); font-size: 12px; margin-top: 10px; overflow-wrap: anywhere; }
+.meta span + span::before { content: " · "; }
+.nav-chips { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; margin-top: 10px; padding-bottom: 2px; }
+.nav-chips::-webkit-scrollbar { display: none; }
+.nav-chips a { flex: none; display: inline-flex; align-items: center; height: 28px; padding: 0 12px; border-radius: var(--r-chip);
+  background: var(--surface-2); color: var(--ink-2); font-size: 12px; text-decoration: none; }
+.nav-chips a:hover { color: var(--ink); }
+
+/* ---------- alarms */
+.alarms { display: none; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.alarms.on { display: flex; }
+.alarm { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: var(--r-chip); font-size: 12px; font-weight: 600;
+  text-decoration: none; color: var(--ink); border: 1px solid var(--crit); background: color-mix(in srgb, var(--crit) 12%, transparent); overflow-wrap: anywhere; }
+.alarm i { font-style: normal; color: var(--crit); }
+.alarm.serious { border-color: var(--serious); background: color-mix(in srgb, var(--serious) 12%, transparent); }
+.alarm.serious i { color: var(--serious); }
+
+/* ---------- cards & panels */
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: var(--r-card); padding: 14px 16px; min-width: 0; }
+.panel { margin-top: 32px; padding-top: 14px; border-top: 1px solid var(--grid); scroll-margin-top: 64px; }
+#verlauf { margin-top: 48px; }
+.ph { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 12px; }
+.ph h2 { font-size: 17px; font-weight: 600; margin: 0; }
+.ph .tag { color: var(--muted); font-size: 12px; }
+.ph .pm { margin-left: auto; color: var(--muted); font-size: 12px; text-align: right; overflow-wrap: anywhere; }
+.ph .btn { margin-left: 4px; }
+.bh { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 8px; }
+.g12.top { align-items: start; }
+.g12 { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 12px; }
+.lead { font-size: 22px; font-weight: 600; line-height: 1.2; }
+.lead-l { font-size: 13px; color: var(--ink-2); margin-bottom: 2px; }
+.lead-row { display: flex; flex-wrap: wrap; gap: 8px 32px; }
+
+/* ---------- status band */
+.band { margin-top: 16px; display: grid; grid-template-columns: 1.15fr 1.6fr 1fr 1fr 1fr 1fr; background: var(--surface);
+  border: 1px solid var(--ring); border-radius: var(--r-card); overflow: hidden; }
+.cell { padding: 14px 16px; border-left: 1px solid var(--grid); min-width: 0; }
+.cell:first-child { border-left: 0; }
+.cl { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+.cv { font-size: 28px; font-weight: 600; line-height: 1.15; }
+.cell .bar { margin-top: 8px; }
+.cell .sub { margin-top: 6px; }
+.cell .sub div + div { margin-top: 2px; }
+.phase { font-size: 24px; font-weight: 600; line-height: 1.2; display: flex; align-items: flex-start; gap: 10px; }
+.phase .dot { width: 10px; height: 10px; margin-top: 10px; }
+.tl { font-size: 12px; color: var(--ink-2); }
+.hero { font-size: 44px; font-weight: 600; line-height: 1.1; }
+.pre-now { font-size: 20px; font-weight: 600; }
+/* reading a prompt: the live Prefill value takes the hero size, the stale Decode value steps down */
+.hero.dim { font-size: 28px; }
+.pre-now.lift { font-size: 44px; line-height: 1.1; }
+.stale, .stale .u { color: var(--muted) !important; }
+.thr { border-top: 1px solid var(--grid); margin: 10px 0 8px; }
+.leg { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; font-size: 12px; color: var(--ink-2); }
+.leg span { display: flex; align-items: center; font-variant-numeric: tabular-nums; }
+.leg.row { flex-direction: row; flex-wrap: wrap; gap: 4px 14px; }
+
+/* ---------- meters & bars */
+.meter + .meter { margin-top: 12px; }
+.mh { display: flex; justify-content: space-between; align-items: baseline; gap: 4px 12px; font-size: 13px; margin-bottom: 6px; flex-wrap: wrap; }
+.mh .l { color: var(--ink-2); }
+.mh .r { font-variant-numeric: tabular-nums; text-align: right; margin-left: auto; }
+.bar { height: 8px; border-radius: var(--r-bar); background: var(--track-n); display: flex; gap: 2px; overflow: hidden; }
+.bar.t { background: var(--track); }
+.bar > span { height: 100%; border-radius: var(--r-bar); flex: 0 1 auto; }
+.bar.stack { background: transparent; }
+.bar.stack > .rest { flex: 1 1 0; background: var(--track-n); min-width: 0; }
+.bar.big { height: 12px; }
+.bar > span.anim { transition: width .4s; }
+
+/* ---------- kv */
+.kv { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 16px; font-size: 13px; margin: 12px 0 0; }
+.kv dt { color: var(--ink-2); min-width: 0; }
+.kv dd { margin: 0; text-align: right; color: var(--ink); }
+.kv dd .sub { display: block; color: var(--muted); }
+.kv .grp { grid-column: 1 / -1; font-weight: 600; color: var(--ink-2); margin-top: 6px; }
+.kv dt.ind { padding-left: 12px; }
+
+/* ---------- P1 live */
+.req3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 24px; }
+.req3 > div { min-width: 0; }
+.src { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+.src span { display: inline-flex; gap: 6px; align-items: baseline; }
+.ml { font-size: 12px; color: var(--ink-2); margin-top: 6px; font-variant-numeric: tabular-nums; }
+details.det > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; min-height: 40px;
+  font-size: 15px; font-weight: 600; user-select: none; }
+details.det > summary::-webkit-details-marker { display: none; }
+details.det > summary::before { content: ""; width: 7px; height: 7px; border-right: 2px solid var(--ink-2); border-bottom: 2px solid var(--ink-2);
+  transform: rotate(-45deg); transition: transform .15s; margin: 0 4px 0 2px; }
+details.det[open] > summary::before { transform: rotate(45deg); }
+.card details.det { border-top: 1px solid var(--grid); margin-top: 14px; padding-top: 4px; }
+.slot-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 8px; margin-top: 4px; }
+.slot-grid:empty { display: none; }
+.slot { background: var(--surface-2); border-radius: 8px; padding: 8px 10px; font-size: 12px; min-width: 0; }
+.slot .r1 { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.slot .r1 span:first-child { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.slot .r1 span:last-child { color: var(--muted); }
+.slot .r2 { color: var(--ink-2); margin: 4px 0 6px; font-variant-numeric: tabular-nums; }
+.slot .r2 b { color: var(--ink); }
+.slot .bar { height: 4px; background: var(--page); }
+:root[data-theme="light"] .slot .bar { background: var(--axis); }
+.slot .r1 + .bar { margin-top: 8px; }
+.slot .r4 { font-size: 11px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.slot.idle { opacity: .55; }
+.slot-note { font-size: 13px; color: var(--ink-2); padding: 4px 0 6px; }
+.slot-note:empty { display: none; }
+
+/* ---------- P2 */
+.mx { display: grid; grid-template-columns: minmax(90px, auto) minmax(0, 1fr) minmax(0, 1fr); gap: 10px 24px; align-items: start; }
+.mx .ch { font-size: 12px; color: var(--muted); font-weight: 600; }
+.mx .rh { font-size: 13px; font-weight: 600; color: var(--ink-2); padding-top: 4px; }
+.mx .cc .cvl { display: none; font-size: 12px; color: var(--muted); }
+.mx .cc .lead + .sub { margin-top: 2px; }
+.eff2 { display: block; }
+
+/* ---------- tables */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 6px 8px; text-align: right; border-bottom: 1px solid var(--grid); }
+th { color: var(--muted); font-weight: 600; font-size: 12px; vertical-align: bottom; }
+th:first-child, td:first-child { text-align: left; padding-left: 0; }
+tr:last-child td { border-bottom: 0; }
+.etbl td:first-child { white-space: nowrap; }
+.etbl tr.sub td { color: var(--ink-2); }
+.etbl tr.sub td:first-child { padding-left: 16px; }
+.ptbl td, .ptbl th { white-space: nowrap; }
+.ptbl td:first-child { white-space: normal; color: var(--ink-2); }
+.ptbl td.k { font-weight: 600; }
+
+/* ---------- settings */
+.settings { display: none; margin-bottom: 12px; scroll-margin-top: 64px; }
 .settings.open { display: block; }
 .settings form { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; align-items: end; }
 .settings label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
-.settings input { background: var(--page); color: var(--ink); border: 1px solid var(--axis); border-radius: 8px;
-  padding: 6px 8px; font: inherit; font-size: 14px; font-variant-numeric: tabular-nums; width: 100%; }
-.settings .hint { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
+.settings input { background: var(--surface-2); color: var(--ink); border: 1px solid var(--ring); border-radius: 6px; height: 32px;
+  padding: 0 8px; font: inherit; font-size: 13px; font-variant-numeric: tabular-nums; width: 100%; }
+.settings .shint { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
 .settings .actions { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-@media (max-width: 1100px) { .settings form { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 640px) { .settings form { grid-template-columns: 1fr 1fr; }
-  .tile .value { font-size: 22px; white-space: normal; } .tile .value small { display: block; margin-left: 0; } }
-.split .row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--ink-2); margin-bottom: 6px; }
-.split .bar { height: 14px; }
-.note { color: var(--muted); font-size: 12px; margin-top: 8px; }
-.live-grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
-@media (max-width: 1100px) { .live-grid { grid-template-columns: 1fr; } }
-.answer .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.answer .phase { font-size: 22px; font-weight: 600; }
-.answer .bar { height: 12px; }
-.answer .bar > span { transition: width .4s; }
-.answer .meter .row b { color: var(--ink); font-weight: 600; }
-.slots { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); margin-top: 12px; }
-.slot { background: var(--surface-2); border-radius: 8px; padding: 8px 10px; font-size: 12px; min-width: 0; }
-.slot .row { display: flex; justify-content: space-between; gap: 6px; color: var(--ink-2); margin-bottom: 5px; white-space: nowrap; }
-.slot .row b { color: var(--ink); }
-.slot .bar { height: 6px; background: var(--page); }
-.slot.idle { opacity: .55; }
-.src { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); margin-top: 8px; }
-.gpu .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-.gpu .head b { font-size: 15px; }
-.gpu .meter { margin-top: 8px; }
-.gpu .err { color: var(--crit); font-size: 12px; margin-top: 6px; }
+.settings .actions .msg { font-size: 12px; color: var(--ink-2); }
+.settings .actions .rz { margin-left: auto; padding-left: 12px; border-left: 1px solid var(--grid); }
+
+/* ---------- P4 hardware */
+.agg { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 0; }
+.agg > div { padding: 0 16px; border-left: 1px solid var(--grid); min-width: 0; }
+.agg > div:first-child { padding-left: 0; border-left: 0; }
+.agg .bar { margin: 8px 0 6px; }
+.gtbl { table-layout: fixed; }
+.gtbl td { vertical-align: top; }
+.gtbl th:nth-child(2), .gtbl th:nth-child(3), .gtbl th:nth-child(4) { text-align: left; }
+.gtbl td:first-child b { display: inline-flex; align-items: center; }
+.gtbl .gsub { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; margin-top: 2px; }
+.ib { display: flex; align-items: center; justify-content: flex-start; gap: 8px; white-space: nowrap; }
+.ib .bar { width: 64px; height: 6px; flex: none; }
+.gtbl tr.gerr td { color: var(--crit); padding-top: 0; text-align: left; }
+.gpu-cards { display: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.gpu-card { background: var(--surface-2); border-radius: 8px; padding: 12px; min-width: 0; }
+.gpu-card .gh { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin-bottom: 10px; }
+.gpu-card .gh b { display: inline-flex; align-items: center; font-size: 15px; }
+.gpu-card .gh span { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.gpu-card .bar:not(.t), .gtbl .bar:not(.t) { background: var(--track-in); }
+.gpu-card .err { color: var(--crit); font-size: 12px; margin-top: 8px; }
+.stbl td:first-child { white-space: normal; overflow-wrap: anywhere; }
+.stbl td, .stbl th { white-space: nowrap; }
+.stbl td:first-child, .stbl th:first-child { white-space: normal; }
+.stbl tr.strata td:first-child, .stbl tr.strata-sub td:first-child { box-shadow: inset 3px 0 0 var(--s2); padding-left: 12px; }
+.stbl tr.strata td { border-bottom: 0; }
+.stbl tr.strata-sub td { font-size: 12px; color: var(--ink-2); padding-top: 0; text-align: left; }
+.ssd-cards { display: none; flex-direction: column; gap: 12px; }
+.ssd-card { background: var(--surface-2); border-radius: 8px; padding: 12px; min-width: 0; }
+.ssd-card.strata { box-shadow: inset 3px 0 0 var(--s2); }
+.ssd-card .sh { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+.ssd-card .two { display: flex; gap: 16px; margin-top: 6px; font-size: 15px; font-weight: 600; flex-wrap: wrap; }
+.ssd-card .two small { font-size: 12px; font-weight: 400; color: var(--ink-2); }
+.ssd-card .kv { margin-top: 8px; }
+.ssd-card .kv.srv { padding-top: 8px; border-top: 1px solid var(--grid); }
+.ssd-card .hint { margin-top: 2px; }
+
+/* ---------- P5 */
+.cache2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+
+/* ---------- charts */
+.charts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.cg { grid-column: 1 / -1; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.cg:first-child { margin-top: 0; }
+.chart-card { background: var(--surface-2); border-radius: 8px; padding: 12px; min-width: 0; display: flex; flex-direction: column; }
+.chart-card > svg.chart { margin-top: auto; flex: none; }
+.chart-card > :nth-last-child(2) { margin-bottom: 8px; }
+.chh { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.chh h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.chh .now { font-size: 13px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lg { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12px; color: var(--ink-2); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.lg:empty { display: none; }
+.lg span { display: inline-flex; align-items: center; white-space: nowrap; }
+.lg i { display: inline-block; width: 12px; height: 2px; border-radius: 1px; margin-right: 5px; }
+.lg i.dash { height: 0; border-top: 2px dashed; background: none !important; }
+.chint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+svg.chart { width: 100%; height: 150px; display: block; overflow: visible; margin-top: 8px; }
+svg.chart text { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.tip { position: fixed; pointer-events: none; background: var(--surface-2); color: var(--ink); border: 1px solid var(--ring);
+  border-radius: 8px; padding: 6px 8px; font-size: 12px; display: none; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,.3); }
+.tip .dot { margin-right: 4px; }
+
+/* ---------- P7 */
+.tot3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 0; }
+.tot3 > div { padding: 0 16px; border-left: 1px solid var(--grid); min-width: 0; }
+.tot3 > div:first-child { padding-left: 0; border-left: 0; }
+.tot3 .kv { margin-top: 8px; max-width: 320px; }
+.req-scroll { overflow-x: auto; }
+.req-hint { display: none; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
+.rtbl { font-size: 12px; min-width: 860px; }
+.rtbl td, .rtbl th { white-space: nowrap; }
+.rtbl tr.grp th { text-align: center; border-bottom: 1px solid var(--axis); color: var(--ink-2); }
+.rtbl tr.grp th:empty { border-bottom: 0; }
+
+/* ---------- footer */
+footer { margin: 32px 0 40px; }
+footer .kv { grid-template-columns: max-content minmax(0, 1fr); max-width: 1100px; }
+footer .kv dd { text-align: left; overflow-wrap: anywhere; }
+footer .kv dd.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+footer p { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 1100px; }
+.crit { color: var(--crit); }
+.jserr { display: none; color: var(--crit); font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+
+/* ---------- layout spans (L) */
+.sp7 { grid-column: span 7; } .sp5 { grid-column: span 5; } .sp4 { grid-column: span 4; } .sp3 { grid-column: span 3; }
+.sp6 { grid-column: span 6; } .sp12 { grid-column: span 12; }
+.lz { display: block; }
+
+/* ---------- M: 700–1179 */
+@media (max-width: 1179px) {
+  .band { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .cell:nth-child(4) { border-left: 0; }
+  .cell:nth-child(n+4) { border-top: 1px solid var(--grid); }
+  .hero { font-size: 36px; }
+  .pre-now.lift { font-size: 36px; }
+  .slot-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .t-mx { grid-column: span 12; } .t-eff { grid-column: span 12; }
+  .eff2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; }
+  .eff2 .hr { display: none; }
+  .k-en { grid-column: span 6; } .k-eur { grid-column: span 6; } .k-lz { grid-column: span 12; }
+  .lz { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 0 32px; }
+  .gtbl-wrap { display: none; }
+  .gpu-cards { display: grid; }
+  .m-vram { grid-column: span 6; } .m-ram { grid-column: span 6; } .m-kv { grid-column: span 12; }
+  .m-kv .kvcols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 32px; }
+  .charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .charts > .chart-card:last-child { grid-column: 1 / -1; }
+  .cg { display: none; }
+  .settings form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+/* ---------- S: < 700 */
+@media (max-width: 699px) {
+  .hdr-row { min-height: 48px; }
+  .nav-chips { -webkit-mask-image: linear-gradient(90deg, #000 82%, transparent); mask-image: linear-gradient(90deg, #000 82%, transparent); padding-right: 48px; }
+  .ptbl td.nx { display: none !important; }
+  .hdr .model, .hdr .badge { display: none; }
+  .hdr-m { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin-top: 12px; }
+  .hdr-m .badge { white-space: normal; }
+  .band { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cell { border-left: 0; border-top: 1px solid var(--grid); }
+  .cell:nth-child(1), .cell:nth-child(2) { grid-column: span 2; }
+  .cell:first-child { border-top: 0; }
+  .cell:nth-child(4), .cell:nth-child(6) { border-left: 1px solid var(--grid); }
+  .cell:nth-child(4) { border-left: 1px solid var(--grid); }
+  .cv { font-size: 24px; }
+  .hero { font-size: 40px; }
+  .hero.dim { font-size: 24px; }
+  .pre-now.lift { font-size: 40px; }
+  .req3 { grid-template-columns: 1fr; }
+  .slot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .g12 > * { grid-column: span 12 !important; }
+  .mx { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .mx .ch, .mx .sp { display: none; }
+  .mx .rh { grid-column: span 2; padding-top: 0; }
+  .mx .cc { background: var(--surface-2); border-radius: 8px; padding: 10px; }
+  .mx .cc .cvl { display: block; }
+  .eff2 { display: block; } .eff2 .hr { display: block; }
+  .lz { display: block; }
+  .ph .pm { margin-left: 0; text-align: left; flex-basis: 100%; }
+  .ph .btn { flex-basis: 100%; margin-left: 0; }
+  .ptbl thead { display: none; }
+  .ptbl, .ptbl tbody, .ptbl tr, .ptbl td { display: block; width: 100%; }
+  .ptbl tr { border-bottom: 1px solid var(--grid); padding: 8px 0; }
+  .ptbl tr:last-child { border-bottom: 0; }
+  .ptbl td { border: 0; padding: 2px 0; display: flex; justify-content: space-between; gap: 12px; text-align: right; }
+  .ptbl td:first-child { color: var(--ink); font-weight: 600; padding-bottom: 4px; }
+  .ptbl td[data-l]::before { content: attr(data-l); color: var(--ink-2); font-weight: 400; text-align: left; }
+  .agg { grid-template-columns: 1fr; gap: 14px; }
+  .agg > div { padding: 0; border-left: 0; }
+  .gpu-cards { grid-template-columns: 1fr; }
+  .stbl-wrap { display: none; }
+  .ssd-cards { display: flex; }
+  .m-kv .kvcols { display: block; }
+  .cache2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .charts { grid-template-columns: 1fr; }
+  svg.chart { height: 140px; }
+  .tot3 { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 0; }
+  .tot3 > div:nth-child(2) { grid-column: 1 / -1; grid-row: 2; padding: 0; border-left: 0; }
+  .tot3 > div:nth-child(3) { grid-row: 1; grid-column: 2; }
+  .req-scroll { -webkit-mask-image: linear-gradient(90deg, #000 80%, transparent); mask-image: linear-gradient(90deg, #000 80%, transparent); }
+  .req-scroll.end { -webkit-mask-image: none; mask-image: none; }
+  .req-hint { display: block; }
+  .rtbl th:first-child, .rtbl td:first-child { position: sticky; left: 0; background: var(--surface); z-index: 1; padding-right: 10px; }
+  .settings form { grid-template-columns: 1fr; }
+  .settings .actions .rz { margin-left: 0; padding-left: 0; border-left: 0; border-top: 1px solid var(--grid); padding-top: 10px; flex-basis: 100%; }
+  .lead { font-size: 20px; }
+}
+@media (max-width: 419px) {
+  .kv.stackable { grid-template-columns: 1fr; gap: 2px; }
+  .kv.stackable dd { text-align: left; margin-bottom: 6px; }
+  footer .kv { grid-template-columns: 1fr; gap: 2px; }
+  footer .kv dd { margin-bottom: 6px; }
+}
+
+/* ---- Einstellungen: Seitenleiste mit Reitern ---- */
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 40; }
+.menu { position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100vw); z-index: 41; background: var(--page);
+  border-left: 1px solid var(--ring); box-shadow: -12px 0 32px rgba(0,0,0,.35); display: flex; flex-direction: column; }
+.menu[hidden], .scrim[hidden] { display: none; }
+.menu .mhd { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 8px; }
+.menu .mhd h2 { margin: 0; font-size: 18px; }
+.menu .tabs { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid var(--grid); }
+.menu .tabs button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--ink-2); font: inherit;
+  font-size: 13px; padding: 8px 10px; cursor: pointer; }
+.menu .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--s1); font-weight: 600; }
+.menu .mbody { overflow-y: auto; padding: 14px 16px 24px; flex: 1; }
+.menu .tab.settings { display: block; margin: 0; }
+.menu .tab[hidden] { display: none !important; }
+.menu .frow label.chk { width: auto; }
+.menu .settings form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.menu .mhint { color: var(--muted); font-size: 12px; margin: 6px 0 10px; }
+.menu .mstat { font-size: 13px; color: var(--ink-2); margin: 8px 0 12px; }
+.menu .mstat b { color: var(--ink); }
+.menu .mstat .err { color: var(--crit); }
+.menu label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+.menu label.chk { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--ink); }
+.menu input, .menu select { background: var(--surface-2); color: var(--ink); border: 1px solid var(--ring); border-radius: 6px;
+  height: 30px; padding: 0 8px; font: inherit; font-size: 13px; font-variant-numeric: tabular-nums; min-width: 0; }
+.menu input[type=checkbox] { height: auto; }
+.menu input:disabled, .menu select:disabled { opacity: .55; }
+.menu .frow { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-bottom: 10px; }
+.menu .frow label { width: 120px; }
+.menu table.ctl { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0; }
+.menu table.ctl th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; padding: 4px 6px; border-bottom: 1px solid var(--grid); }
+.menu table.ctl td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--grid); }
+.menu table.ctl input { width: 90px; }
+.menu .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.menu .actions .msg { font-size: 12px; color: var(--ink-2); }
+.menu .auth { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--ring); font-size: 13px; }
+.menu .auth input { width: 200px; }
+.menu .auth .msg { color: var(--crit); font-size: 12px; }
+.fan-gpu { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 10px 12px; margin-top: 10px; }
+.fan-gpu .fh { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; margin-bottom: 6px; flex-wrap: wrap; }
+.fan-gpu .fh b { font-size: 14px; }
+.fan-gpu .fm { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.fan-gpu .fmode { font-size: 12px; color: var(--ink-2); display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.fan-gpu svg { width: 100%; height: 110px; display: block; }
+.fan-gpu svg text { fill: var(--muted); font-size: 9px; }
+.fan-gpu .pts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center; }
+.fan-gpu .pts span { display: inline-flex; gap: 2px; align-items: center; font-size: 11px; color: var(--muted); }
+.fan-gpu .pts input { width: 46px; height: 26px; padding: 0 4px; font-size: 12px; }
+.fan-gpu .pts button, .fan-gpu .fh button { height: 26px; padding: 0 8px; font-size: 12px; }
+.fan-gpu .bad { outline: 1px solid var(--crit); }
+.fan-gpu .why { color: var(--crit); font-size: 12px; margin-top: 4px; }
+@media (max-width: 640px) { .fan-gpu .fm { grid-template-columns: 1fr; } .menu .settings form { grid-template-columns: 1fr; } .menu .frow label { width: calc(50% - 6px); } }
+
+.menu .tab.api h3 { font-size: 14px; margin: 18px 0 6px; }
+.menu .tab.api h3:first-child { margin-top: 4px; }
+.menu .akv { grid-template-columns: minmax(0, 220px) minmax(0, 1fr); font-size: 13px; }
+.menu .akv dd { text-align: left; overflow-wrap: anywhere; }
+.menu code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; background: var(--surface-2);
+  border-radius: 4px; padding: 1px 4px; }
+.menu pre.code { background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 10px 12px; font-size: 12px;
+  line-height: 1.45; overflow-x: auto; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 6px 0; }
+.menu table.ctl td code { white-space: nowrap; }
+@media (max-width: 640px) { .menu .akv { grid-template-columns: 1fr; } .menu table.ctl td code { white-space: normal; } }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
+<div class="hdr">
+  <div class="wrap hdr-row">
     <h1>Strata Monitor</h1>
     <span class="model" id="model">–</span>
-    <span class="badge" id="state"><span class="dot"></span><span>verbinde …</span></span>
-    <span class="meta" id="meta"></span>
-    <span class="spacer"></span>
-    <span class="meta" id="clock"></span>
-    <button class="theme" id="themeBtn" type="button">Hell/Dunkel</button>
-  </header>
+    <span class="badge" id="state"><span class="dot" style="background:var(--muted)"></span><span>verbinde …</span></span>
+    <span class="clock" id="clock"></span>
+    <button class="btn" id="apiBtn" type="button" aria-haspopup="dialog" aria-controls="menu">ⓘ API</button>
+    <button class="btn" id="menuBtn" type="button" aria-haspopup="dialog" aria-controls="menu">⚙ Einstellungen</button>
+    <button class="btn" id="themeBtn" type="button" aria-label="Hell/Dunkel">Hell/Dunkel</button>
+  </div>
+</div>
 
-  <section>
-    <div class="sec-head"><h2>Engine live</h2><span class="meta" id="liveMeta">–</span></div>
-    <div class="live-grid">
-      <div class="card answer">
-        <div class="head"><span class="phase" id="ansPhase">–</span><span class="meta" id="ansWhat">–</span></div>
-        <div class="meter"><div class="row"><span>Antwort (Tokens erzeugt von max.)</span><span id="ansTxt">–</span></div>
-          <div class="bar"><span id="ansBar" style="background:var(--good);width:0"></span></div></div>
-        <div class="meter"><div class="row"><span>Prompt lesen</span><span id="promptTxt">–</span></div>
-          <div class="bar"><span id="promptBar" style="background:var(--warn);width:0"></span></div></div>
-        <div class="src" id="srcList"></div>
+<div class="wrap">
+  <div class="hdr-m">
+    <span class="badge js-state"><span class="dot" style="background:var(--muted)"></span><span>verbinde …</span></span>
+    <span class="model js-model">–</span>
+  </div>
+  <div class="meta" id="meta"></div>
+  <nav class="nav-chips" id="nav">
+    <a href="#live">Live</a><a href="#tempo">Tempo</a><a href="#kosten">Kosten</a><a href="#hardware">Hardware</a>
+    <a href="#speicher">Speicher</a><a href="#verlauf">Verlauf</a><a href="#requests">Requests</a>
+  </nav>
+  <div class="alarms" id="alarms"></div>
+
+  <!-- ===================== STATUS BAND ===================== -->
+  <div class="band" id="band">
+    <div class="cell">
+      <div class="cl">Phase</div>
+      <div class="phase" id="ansPhase">–</div>
+      <div class="sub" id="ansWhat"></div>
+    </div>
+    <div class="cell">
+      <div class="cl">Durchsatz jetzt</div>
+      <div class="tl" id="decLbl">Decode (C)</div>
+      <div class="hero" id="decNow">–</div>
+      <div class="sub" id="decSub">–</div>
+      <div class="thr"></div>
+      <div class="tl" id="preLbl">Prefill (P)</div>
+      <div class="pre-now" id="preNow">–</div>
+      <div class="sub" id="preSub">–</div>
+    </div>
+    <div class="cell">
+      <div class="cl">Batch-Slots</div>
+      <div class="tl">belegt</div>
+      <div class="cv" id="slotsBusy">–</div>
+      <div class="bar stack" id="slotsBar"></div>
+      <div class="leg" id="slotsLegend"></div>
+      <div class="sub" id="slotsSub">–</div>
+    </div>
+    <div class="cell" id="bandGpu">
+      <div class="cl">GPUs</div>
+      <div class="tl" id="gpuUtilLbl">GPU-Last Ø</div>
+      <div class="cv" id="gpuUtil">–</div>
+      <div class="bar t"><span id="utilBar" style="background:var(--s1);width:0"></span></div>
+      <div class="sub" id="gpuSub">–</div>
+    </div>
+    <div class="cell">
+      <div class="cl">Steckdose jetzt</div>
+      <div class="tl">geschätzt</div>
+      <div class="cv" id="wallNow">–</div>
+      <div class="bar stack" id="wallBar"></div>
+      <div class="leg" id="wallLegend"></div>
+    </div>
+    <div class="cell">
+      <div class="cl">Kosten</div>
+      <div class="tl">Strom seit Zählung</div>
+      <div class="cv" id="eur">–</div>
+      <div class="sub" id="eurSub">–</div>
+    </div>
+  </div>
+
+  <!-- ===================== P1 LIVE ===================== -->
+  <section class="panel" id="live">
+    <div class="ph"><h2>Was läuft gerade?</h2><span class="tag">Engine live</span><span class="pm" id="liveMeta">–</span></div>
+    <div class="card">
+      <div class="req3">
+        <div class="meter">
+          <div class="mh"><span class="l">Antwort</span><span class="r" id="ansTxt">–</span></div>
+          <div class="bar big"><span id="ansBar" class="anim" style="background:var(--good);width:0"></span></div>
+          <div class="ml" id="ansLine"></div>
+        </div>
+        <div class="meter" style="margin-top:0">
+          <div class="mh"><span class="l">Prompt lesen</span><span class="r" id="promptTxt">–</span></div>
+          <div class="bar big"><span id="promptBar" class="anim" style="background:var(--warn);width:0"></span></div>
+          <div class="ml" id="promptLine"></div>
+        </div>
+        <div>
+          <div class="mh"><span class="l">Quellen</span></div>
+          <div class="src" id="srcList"></div>
+        </div>
       </div>
-      <div class="card tile"><div class="label">Batch-Slots</div><div class="value" id="slotsBusy">–</div>
-        <div class="sub" id="slotsSub">–</div>
-        <div class="meter"><div class="bar" id="slotsBar"></div></div>
-        <div class="stack-legend"><span><i style="background:var(--warn)"></i>liest</span><span><i style="background:var(--good)"></i>schreibt</span><span><i style="background:var(--surface-2);outline:1px solid var(--axis)"></i>frei</span></div>
+      <details class="det" id="detSlots" open>
+        <summary>Slots im Einzelnen</summary>
+        <div class="slot-note" id="slotNote"></div>
+        <div class="slot-grid" id="slotGrid"></div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===================== P2 TEMPO ===================== -->
+  <section class="panel" id="tempo">
+    <div class="ph"><h2>Wie schnell?</h2><span class="tag">Geschwindigkeit</span></div>
+    <div class="g12">
+      <div class="card sp7 t-mx">
+        <div class="mx">
+          <div class="sp"></div><div class="ch">Ø</div><div class="ch">Spitze</div>
+          <div class="rh">Decode (C)</div>
+          <div class="cc"><div class="cvl">Ø</div><div class="lead" id="avgDec">–</div><div class="sub" id="avgDecSub">–</div></div>
+          <div class="cc"><div class="cvl">Spitze</div><div class="lead" id="decPeak">–</div><div class="sub" id="decPeakAt">–</div></div>
+          <div class="rh">Prefill (P)</div>
+          <div class="cc"><div class="cvl">Ø</div><div class="lead" id="avgPre">–</div><div class="sub" id="avgPreSub">–</div></div>
+          <div class="cc"><div class="cvl">Spitze</div><div class="lead" id="prePeak">–</div><div class="sub" id="prePeakAt">–</div></div>
+        </div>
+        <div class="hint">Prefill Ø: Cache-Treffer zählen nicht</div>
+      </div>
+      <div class="card sp5 t-eff">
+        <div class="eff2">
+          <div>
+            <div class="bh">Draft-Akzeptanz</div>
+            <div class="lead" id="acc">–</div>
+            <div class="bar t" style="margin-top:8px"><span id="accBar" style="background:var(--s1);width:0"></span></div>
+            <div class="sub" id="accSub" style="margin-top:6px">–</div>
+          </div>
+          <hr class="hr">
+          <div>
+            <div class="bh">Zeit pro Rechenschritt</div>
+            <div style="font-size:13px" id="tmTxt">–</div>
+            <div class="bar stack" id="tmBar" style="margin-top:8px"></div>
+            <div class="leg row" id="tmLegend"></div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="slots" id="slots"></div>
   </section>
 
-  <section>
-    <h2>Geschwindigkeit</h2>
-    <div class="grid g6">
-      <div class="card tile"><div class="label">Decode (C) jetzt</div><div class="value" id="decNow">–<small>tok/s</small></div><div class="sub" id="decSub">–</div></div>
-      <div class="card tile"><div class="label">Decode Ø</div><div class="value" id="avgDec">–<small>tok/s</small></div><div class="sub" id="avgDecSub">–</div></div>
-      <div class="card tile"><div class="label">Decode Spitze</div><div class="value" id="decPeak">–<small>tok/s</small></div><div class="sub" id="decPeakAt">–</div></div>
-      <div class="card tile"><div class="label">Prefill (P) jetzt</div><div class="value" id="preNow">–<small>tok/s</small></div><div class="sub" id="preSub">–</div></div>
-      <div class="card tile"><div class="label">Prefill Ø</div><div class="value" id="avgPre">–<small>tok/s</small></div><div class="sub" id="avgPreSub">–</div></div>
-      <div class="card tile"><div class="label">Prefill Spitze</div><div class="value" id="prePeak">–<small>tok/s</small></div><div class="sub" id="prePeakAt">–</div></div>
+  <!-- ===================== P3 KOSTEN ===================== -->
+  <section class="panel" id="kosten">
+    <div class="ph"><h2>Was kostet es?</h2><span class="tag">Strom &amp; Kosten (Steckdose geschätzt)</span>
+      <span class="pm" id="meterSince">–</span>
+      <button class="btn" id="setBtn" type="button" aria-haspopup="dialog" aria-controls="menu">Strompreis &amp; Verbrauch einstellen</button></div>
+    <div class="g12">
+      <div class="card sp5 k-en">
+        <div class="bh">Energie</div>
+        <div class="lead-row">
+          <div><div class="lead-l">Ø Leistung</div><div class="lead" id="wallAvg">–</div></div>
+          <div><div class="lead-l">Energie</div><div class="lead" id="kwh">–</div></div>
+        </div>
+        <div class="hint" id="eurPrice" style="margin-top:6px">–</div>
+        <table class="etbl" id="energyTbl" style="margin-top:8px"></table>
+        <dl class="kv stackable" id="peakWall"></dl>
+      </div>
+      <div class="card sp3 k-eur">
+        <div class="bh">€ pro 1 Mio Tokens</div>
+        <div class="lead-l">Output</div><div class="lead" id="eurOut">–</div>
+        <div class="hint" style="margin-top:2px">nur Decode-Strom</div>
+        <dl class="kv" id="eurOutKv"></dl>
+        <hr class="hr">
+        <div class="lead-l">Input (neu gelesen)</div><div class="lead" id="eurIn">–</div>
+        <div class="hint" style="margin-top:2px">nur Prefill-Strom</div>
+        <dl class="kv" id="eurInKv"></dl>
+      </div>
+      <div class="card sp4 k-lz">
+        <div class="bh">Laufzeit</div>
+        <div class="lz">
+          <div>
+            <div class="lead-l">Aktiv (liest oder schreibt)</div><div class="lead" id="tBusy">–</div>
+            <div class="mh" style="margin-top:12px"><span class="l">Wofür die Laufzeit verwendet wurde</span><span class="r" id="splitTxt">–</span></div>
+            <div class="bar stack big" id="splitBar"></div>
+            <div class="leg" id="splitLegend"></div>
+          </div>
+          <div>
+            <dl class="kv">
+              <dt>Zeitraum</dt><dd id="tSpan">–</dd>
+              <dt>System lief</dt><dd id="tRun">–</dd>
+              <dt>Engine online</dt><dd id="tOnline">–</dd>
+              <dt>Aktiv</dt><dd id="tBusySub">–</dd>
+            </dl>
+            <div class="hint">System lief: Rest = PC aus oder Dashboard aus</div>
+          </div>
+        </div>
+      </div>
+      <div class="card sp12">
+        <div class="mh" style="margin-bottom:8px"><span class="bh" style="margin:0">Hochrechnung auf 24 h</span><span class="r muted" id="projNote" style="font-size:12px"></span></div>
+        <table class="ptbl" id="projTbl">
+          <thead><tr><th></th><th>Output/Tag</th><th>Input neu/Tag</th><th>Prompt inkl. Cache/Tag</th><th>kWh/Tag</th><th>€/Tag</th></tr></thead>
+          <tbody>
+            <tr><td id="projNowLbl">bei bisheriger Auslastung</td><td class="k" data-l="Output/Tag" data-k="now_out">–</td><td data-l="Input neu/Tag" data-k="now_in">–</td><td data-l="Prompt inkl. Cache/Tag" data-k="now_in_prompt">–</td><td data-l="kWh/Tag" data-k="kwh_now">–</td><td class="k" data-l="€/Tag" data-k="eur_now">–</td></tr>
+            <tr><td>bei 100 % Auslastung (heutiger P/C-Mix)</td><td class="k" data-l="Output/Tag" data-k="full_out">–</td><td data-l="Input neu/Tag" data-k="full_in">–</td><td data-l="Prompt inkl. Cache/Tag" data-k="full_in_prompt"><span class="na">–</span></td><td data-l="kWh/Tag" data-k="kwh_full">–</td><td data-l="€/Tag" data-k="eur_full">–</td></tr>
+            <tr><td>nur Decode, 24 h am Stück</td><td class="k" data-l="Output/Tag" data-k="decode_only">–</td><td class="nx" data-l="Input neu/Tag"><span class="na">–</span></td><td class="nx" data-l="Prompt inkl. Cache/Tag"><span class="na">–</span></td><td class="nx" data-l="kWh/Tag"><span class="na">–</span></td><td class="nx" data-l="€/Tag"><span class="na">–</span></td></tr>
+          </tbody>
+        </table>
+        <div class="hint">100 % = Tokens pro aktiver Sekunde × 86.400 · nur Decode = Ø Decode × 86.400 s · – = nicht erhoben</div>
+      </div>
     </div>
   </section>
 
-  <section>
-    <div class="sec-head"><h2>Laufzeit &amp; Auslastung</h2><span class="meta" id="meterSince">–</span></div>
-    <div class="grid g4">
-      <div class="card tile"><div class="label">Zeitraum (seit Beginn der Zählung)</div><div class="value" id="tSpan">–</div><div class="sub" id="tSpanSub">–</div></div>
-      <div class="card tile"><div class="label">System lief (Dashboard zählte)</div><div class="value" id="tRun">–</div><div class="sub" id="tRunSub">–</div></div>
-      <div class="card tile"><div class="label">Engine online</div><div class="value" id="tOnline">–</div><div class="sub" id="tOnlineSub">–</div></div>
-      <div class="card tile"><div class="label">Aktiv (liest oder schreibt)</div><div class="value" id="tBusy">–<small>%</small></div><div class="sub" id="tBusySub">–</div></div>
-    </div>
-    <div class="card split" style="margin-top:12px">
-      <div class="row"><span>Wofür die Laufzeit verwendet wurde</span><span id="splitTxt">–</span></div>
-      <div class="bar" id="splitBar"></div>
-      <div class="stack-legend" id="splitLegend"></div>
+  <!-- ===================== P4 HARDWARE ===================== -->
+  <section class="panel" id="hardware">
+    <div class="ph"><h2>Ist die Hardware ok?</h2><span class="tag">Hardware</span><span class="pm" id="gpuMeta">–</span></div>
+    <div class="card">
+      <div class="agg">
+        <div><div class="lead-l" id="pwLbl">GPU-Leistung</div><div class="lead" id="pw">–</div>
+          <div class="bar t"><span id="pwBar" style="background:var(--s1);width:0"></span></div><div class="sub" id="pwSub">–</div></div>
+        <div><div class="lead-l">CPU</div><div class="lead" id="cpu">–</div>
+          <div class="bar t"><span id="cpuBar" style="background:var(--s1);width:0"></span></div><div class="sub" id="cpuSub">–</div></div>
+        <div><div class="lead-l" id="pcieLbl">PCIe (alle GPUs)</div><div class="lead" id="pcie">–</div>
+          <div class="sub" id="pcieSub" style="margin-top:8px">–</div></div>
+      </div>
+      <hr class="hr">
+      <div id="gpus"></div>
+      <hr class="hr">
+      <div id="disks"></div>
+      <div class="hint">* gesamt = seit das Dashboard zählt</div>
     </div>
   </section>
 
-  <section>
-    <div class="sec-head"><h2>Strom &amp; Kosten <span style="text-transform:none;letter-spacing:0">(Steckdose geschätzt)</span></h2>
-      <button class="btn" id="setBtn" type="button">Strompreis &amp; Verbrauch einstellen</button></div>
-    <div class="card settings" id="settings">
+  <!-- ===================== P5 SPEICHER ===================== -->
+  <section class="panel" id="speicher">
+    <div class="ph"><h2>Speicher &amp; Caches</h2></div>
+    <div class="g12 top">
+      <div class="card sp4 m-vram">
+        <div class="mh"><span class="bh" style="margin:0">VRAM</span><span class="r muted" id="vramFree" style="font-size:12px">–</span></div>
+        <div class="lead" id="vramTxt">–</div>
+        <div class="bar stack" id="vramBar" style="margin-top:8px"></div>
+        <div class="leg" id="vramLegend"></div>
+        <dl class="kv"><dt>Expert-Slots</dt><dd id="expertSlots">–</dd><dt>VRAM frei nach Laden</dt><dd id="vramFreeLoad">–</dd></dl>
+      </div>
+      <div class="card sp4 m-ram">
+        <div class="bh">RAM &amp; Commit</div>
+        <div class="meter"><div class="mh"><span class="l">RAM (physisch)</span><span class="r"><b id="ramTxt">–</b></span></div>
+          <div class="bar"><span id="ramBar" style="background:var(--s1);width:0"></span></div></div>
+        <div class="meter"><div class="mh"><span class="l" id="comLbl">Commit</span><span class="r"><b id="comTxt">–</b><span class="muted" id="comFree"></span></span></div>
+          <div class="bar"><span id="comBar" style="background:var(--s1);width:0"></span></div>
+          <div class="hint" id="comHint" style="margin-top:4px"></div></div>
+        <dl class="kv" id="memKv">
+          <dt id="swapLbl">Swap</dt><dd id="swap">–</dd>
+          <dt id="procLbl">Engine privat</dt><dd id="proc">–</dd>
+          <dt id="procWsLbl">RSS</dt><dd id="procWs">–</dd>
+          <dt id="cacheLbl">Page-Cache + Buffers</dt><dd id="syscache">–</dd>
+        </dl>
+      </div>
+      <div class="card sp4 m-kv">
+        <div class="bh">KV &amp; Konversationen</div>
+        <div class="kvcols">
+          <div>
+            <div class="meter"><div class="mh"><span class="l">KV-Cache (Kontext aktuell)</span><span class="r"><b id="kvTxt">–</b></span></div>
+              <div class="bar t"><span id="kvBar" style="background:var(--s1);width:0"></span></div></div>
+            <div class="meter"><div class="mh"><span class="l">Geparkte Konversationen (RAM)</span><span class="r"><b id="parkTxt">–</b></span></div>
+              <div class="bar t"><span id="parkBar" style="background:var(--s1);width:0"></span></div>
+              <div class="ml" id="parkSub"></div>
+              <div class="ml" id="parkTok"></div></div>
+            <dl class="kv stackable"><dt>KV-Format · im VRAM</dt><dd id="kvFmt">–</dd><dt>Session-Dateien (SSD)</dt><dd id="sess">–</dd></dl>
+          </div>
+          <div>
+            <dl class="kv" id="tierRows"></dl>
+            <div class="hint">SSD-Stufe: aus dem RAM verdrängte lange Konversationen auf der SSD (Notfall-Stufe, STRATA_CONV_TIER_DIR). Budget = heute geschrieben / Tagesbudget · Restores = von der SSD zurückgeholt · Budget-Drops = verworfen wegen Budget</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="cache2">
+      <div class="card"><div class="lead-l">Expert-Cache Trefferquote</div><div class="lead" id="hit">–</div><div class="sub" id="hitSub" style="margin-top:4px">–</div></div>
+      <div class="card"><div class="lead-l">Prompt-Cache (wiederverwendet)</div><div class="lead" id="reuse">–</div><div class="sub" id="reuseSub" style="margin-top:4px">–</div></div>
+    </div>
+  </section>
+
+  <!-- ===================== P6 VERLAUF ===================== -->
+  <section class="panel" id="verlauf">
+    <details class="det" id="detVerlauf" open>
+      <summary>Verlauf (10 min)</summary>
+      <div class="card" style="margin-top:8px">
+        <div class="charts">
+          <div class="cg">Durchsatz &amp; Strom</div>
+          <div class="chart-card"><div class="chh"><h3 id="c_decode_t">Decode tok/s</h3><span class="now" id="c_decode_now"></span></div>
+            <div class="chint">mit --batch: Σ aller Slots (= Durchsatz jetzt oben), sonst laufender Request</div><svg class="chart" id="c_decode"></svg></div>
+          <div class="chart-card"><div class="chh"><h3>Leistung W</h3></div><div class="lg" id="lg_power"></div><svg class="chart" id="c_power"></svg></div>
+          <div class="chart-card"><div class="chh"><h3>CPU %</h3><span class="now" id="c_cpu_now"></span></div><svg class="chart" id="c_cpu"></svg></div>
+          <div class="cg">GPUs</div>
+          <div class="chart-card"><div class="chh"><h3>GPU-Last %</h3><span class="now" id="c_util_now"></span></div><div class="lg" id="lg_util"></div><svg class="chart" id="c_util"></svg></div>
+          <div class="chart-card"><div class="chh"><h3>GPU-Temperatur °C</h3><span class="now" id="c_temp_now"></span></div><div class="lg" id="lg_temp"></div><svg class="chart" id="c_temp"></svg></div>
+          <div class="chart-card"><div class="chh"><h3>PCIe je GPU MB/s (zur + von GPU)</h3><span class="now" id="c_pcie_now"></span></div><div class="lg" id="lg_pcie"></div><svg class="chart" id="c_pcie"></svg></div>
+          <div class="cg">Datenträger &amp; RAM</div>
+          <div class="chart-card"><div class="chh"><h3>SSD lesen MB/s</h3></div><div class="lg" id="lg_read"></div><svg class="chart" id="c_read"></svg></div>
+          <div class="chart-card"><div class="chh"><h3>SSD schreiben MB/s</h3></div><div class="lg" id="lg_write"></div><svg class="chart" id="c_write"></svg></div>
+          <div class="chart-card"><div class="chh"><h3 id="c_commit_t">Commit belegt GB</h3><span class="now" id="c_commit_now"></span></div><svg class="chart" id="c_commit"></svg></div>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <!-- ===================== P7 REQUESTS ===================== -->
+  <section class="panel" id="requests">
+    <div class="ph"><h2>Requests</h2><span class="pm" id="tokSince">–</span></div>
+    <div class="card">
+      <div class="tot3">
+        <div><div class="lead-l">Requests</div><div class="lead" id="reqs">–</div><div class="sub" id="reqsSub" style="margin-top:4px">–</div></div>
+        <div><div class="lead-l">Tokens gelesen (Prompt)</div><div class="lead" id="tokIn">–</div>
+          <dl class="kv" id="tokInSub"></dl></div>
+        <div><div class="lead-l">Tokens geschrieben (Output)</div><div class="lead" id="tokOut">–</div></div>
+      </div>
+      <details class="det" id="detReq" open>
+        <summary>Letzte Requests</summary>
+        <div class="req-hint">wischen → für alle 11 Spalten</div>
+        <div class="req-scroll" id="reqScroll"><table class="rtbl">
+          <thead>
+            <tr class="grp"><th></th><th colspan="4">Prompt</th><th colspan="2">Output</th><th colspan="2">Qualität</th><th></th><th></th></tr>
+            <tr><th>Zeit</th><th>Tokens</th><th>wiederverw.</th><th>neu gelesen</th><th>Prefill tok/s</th><th>Tokens</th><th>Decode tok/s</th><th>Expert-Treffer</th><th>Drafts</th><th>SSD MB</th><th>Ende</th></tr>
+          </thead>
+          <tbody id="reqTbl"></tbody></table></div>
+      </details>
+    </div>
+  </section>
+
+  <footer>
+    <details class="det" id="detFoot" open>
+      <summary>Technik &amp; Hinweise</summary>
+      <dl class="kv" id="foot">
+        <dt>Quelle</dt><dd id="footSrc">–</dd>
+        <dt>Log</dt><dd class="mono" id="footLog">–</dd>
+        <dt>GPUs</dt><dd id="footGpu">–</dd>
+        <dt>Fehler</dt><dd id="footErr"><span class="na">–</span></dd>
+      </dl>
+      <p id="footNote">* gesamt = seit das Dashboard zählt. Strata-SSD = I/O-Zähler des Engine-Prozesses (Experten/PLE werden ungepuffert gelesen, das ist echter SSD-Verkehr; das Betriebssystem trennt ihn nicht nach Laufwerk).</p>
+      <p id="footLinux" hidden>Linux: nur ganze Laufwerke und RAID-/DM-Volumes (RAID-Mitglieder zählen im Volume).</p>
+      <div class="jserr" id="jsErr"></div>
+    </details>
+  </footer>
+</div>
+<div class="tip" id="tip"></div>
+
+<!-- ===================== EINSTELLUNGEN (Seitenleiste) ===================== -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="menu" id="menu" role="dialog" aria-modal="true" aria-labelledby="menuTitle" hidden>
+  <div class="mhd"><h2 id="menuTitle">Einstellungen</h2><button class="btn" type="button" id="menuClose" aria-label="Schließen">✕</button></div>
+  <div class="tabs" role="tablist">
+    <button role="tab" type="button" data-tab="t-strom" aria-selected="true">Strom &amp; Kosten</button>
+    <button role="tab" type="button" data-tab="t-power" aria-selected="false">GPU-Leistung</button>
+    <button role="tab" type="button" data-tab="t-fan" aria-selected="false">Lüfter</button>
+    <button role="tab" type="button" data-tab="t-api" aria-selected="false">API &amp; Nutzung</button>
+  </div>
+  <div class="mbody">
+    <section class="tab settings" id="t-strom">
+      <p class="mhint">Nur für die Rechnung im Monitor (Steckdose, Kosten, Hochrechnung). Ändert nichts an der Hardware.</p>
       <form id="setForm">
         <label>Strompreis €/kWh<input name="price_eur_kwh" type="number" step="any" min="0" max="10" required></label>
         <label>Steckdose im Leerlauf W (gemessen)<input name="wall_idle_w" type="number" step="any" min="0" max="3000" required></label>
         <label>GPU im Leerlauf W (dabei)<input name="gpu_idle_w" type="number" step="any" min="0" max="1000" required></label>
         <label>Netzteil-Faktor GPU (1,00 = aus)<input name="psu_factor" type="number" step="any" min="0.5" max="2" required></label>
         <label>CPU-Zuschlag W bei 100 % Last<input name="cpu_extra_w" type="number" step="any" min="0" max="1000" required></label>
-        <div class="hint" id="setHint">–</div>
+        <div class="shint" id="setHint">–</div>
         <div class="actions"><button class="btn primary" type="submit">Speichern</button>
-          <button class="btn" type="button" id="setClose">Schließen</button><span class="spacer"></span>
-          <span class="meta" id="setMsg"></span>
-          <button class="btn danger" type="button" id="resetBtn">Neue Zählung beginnen …</button></div>
+          <span class="msg" id="setMsg"></span>
+          <span class="rz"><button class="btn danger" type="button" id="resetBtn">Neue Zählung beginnen …</button></span></div>
       </form>
-    </div>
-    <div class="grid g6">
-      <div class="card tile"><div class="label">Steckdose jetzt</div><div class="value" id="wallNow">–<small>W</small></div><div class="sub" id="wallNowSub">–</div>
-        <div class="meter"><div class="bar" id="wallBar"></div></div></div>
-      <div class="card tile"><div class="label">Ø Leistung</div><div class="value" id="wallAvg">–<small>W</small></div><div class="sub" id="wallAvgSub">–</div></div>
-      <div class="card tile"><div class="label">Energie</div><div class="value" id="kwh">–<small>kWh</small></div><div class="sub" id="kwhSub">–</div></div>
-      <div class="card tile"><div class="label">Kosten</div><div class="value" id="eur">–<small>€</small></div><div class="sub" id="eurSub">–</div></div>
-      <div class="card tile"><div class="label">€ pro 1 Mio Output</div><div class="value" id="eurOut">–<small>€</small></div><div class="sub" id="eurOutSub">–</div></div>
-      <div class="card tile"><div class="label">€ pro 1 Mio Input (neu gelesen)</div><div class="value" id="eurIn">–<small>€</small></div><div class="sub" id="eurInSub">–</div></div>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-head"><h2>Hochrechnung auf 24 h</h2><span class="meta" id="projNote"></span></div>
-    <div class="grid g4">
-      <div class="card tile"><div class="label" id="projNowLbl">bei bisheriger Auslastung</div><div class="value" id="projNowOut">–<small>Output/Tag</small></div><div class="sub" id="projNowSub">–</div></div>
-      <div class="card tile"><div class="label">bei 100 % Auslastung (heutiger P/C-Mix)</div><div class="value" id="projFullOut">–<small>Output/Tag</small></div><div class="sub" id="projFullSub">–</div></div>
-      <div class="card tile"><div class="label">nur Decode, 24 h am Stück</div><div class="value" id="projDec">–<small>Output/Tag</small></div><div class="sub" id="projDecSub">–</div></div>
-      <div class="card tile"><div class="label">Strom pro Tag</div><div class="value" id="projEur">–<small>€</small></div><div class="sub" id="projEurSub">–</div></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Hardware</h2>
-    <div class="grid g4">
-      <div class="card tile"><div class="label" id="pwLbl">GPU-Leistung</div><div class="value" id="pw">–<small>W</small></div>
-        <div class="sub" id="pwSub">–</div>
-        <div class="meter"><div class="bar"><span id="pwBar" style="background:var(--s1);width:0"></span></div></div></div>
-      <div class="card tile"><div class="label" id="gpuUtilLbl">GPU-Last · Temperatur</div><div class="value" id="gpuUtil">–<small>%</small></div>
-        <div class="sub" id="gpuSub">–</div>
-        <div class="meter"><div class="bar"><span id="utilBar" style="background:var(--s1);width:0"></span></div></div></div>
-      <div class="card tile"><div class="label">CPU</div><div class="value" id="cpu">–<small>%</small></div>
-        <div class="sub" id="cpuSub">–</div>
-        <div class="meter"><div class="bar"><span id="cpuBar" style="background:var(--s1);width:0"></span></div></div></div>
-      <div class="card tile"><div class="label" id="pcieLbl">PCIe (GPU)</div><div class="value" id="pcie">–<small>GB/s</small></div>
-        <div class="sub" id="pcieSub">–</div></div>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-head"><h2>GPUs</h2><span class="meta" id="gpuMeta">–</span></div>
-    <div class="grid g4" id="gpus"></div>
-  </section>
-
-  <section>
-    <h2>Speicher</h2>
-    <div class="grid g3">
-      <div class="card">
-        <div class="meter"><div class="row"><span>VRAM</span><span id="vramTxt">–</span></div>
-          <div class="bar" id="vramBar"></div></div>
-        <div class="stack-legend"><span><i style="background:var(--s1)"></i>Experten-Cache</span><span><i style="background:var(--s2)"></i>Rest (KV, Gewichte, Puffer)</span><span><i style="background:var(--surface-2);outline:1px solid var(--axis)"></i>frei</span></div>
-        <div class="kv" style="margin-top:10px"><dt>Expert-Slots</dt><dd id="slots">–</dd><dt>VRAM frei nach Laden</dt><dd id="vramFree">–</dd></div>
-      </div>
-      <div class="card">
-        <div class="meter"><div class="row"><span>RAM (physisch)</span><span id="ramTxt">–</span></div>
-          <div class="bar"><span id="ramBar" style="background:var(--s1);width:0"></span></div></div>
-        <div class="meter"><div class="row"><span id="comLbl">Commit (die knappe Ressource)</span><span id="comTxt">–</span></div>
-          <div class="bar"><span id="comBar" style="background:var(--s1);width:0"></span></div></div>
-        <div class="kv" style="margin-top:10px"><dt id="procLbl">strata.exe privat · Working Set</dt><dd id="proc">–</dd><dt id="cacheLbl">Datei-Cache (Standby)</dt><dd id="syscache">–</dd></div>
-      </div>
-      <div class="card">
-        <div class="meter"><div class="row"><span>KV-Cache (Kontext aktuell)</span><span id="kvTxt">–</span></div>
-          <div class="bar"><span id="kvBar" style="background:var(--s1);width:0"></span></div></div>
-        <div class="meter"><div class="row"><span>Geparkte Konversationen (RAM)</span><span id="parkTxt">–</span></div>
-          <div class="bar"><span id="parkBar" style="background:var(--s1);width:0"></span></div></div>
-        <div class="kv" style="margin-top:10px"><dt>KV-Format · im VRAM</dt><dd id="kvFmt">–</dd><dt>Session-Dateien (SSD)</dt><dd id="sess">–</dd>
-          <dt title="STRATA_CONV_TIER_DIR: aus dem RAM verdrängte lange Konversationen auf der SSD (Notfall-Stufe)">SSD-Stufe (Konversationen)</dt><dd id="tierTxt">–</dd>
-          <dt title="heute geschrieben / Tagesbudget · Restores von der SSD · Fehlschläge · verworfen wegen Budget">SSD-Stufe Budget · Restores</dt><dd id="tierIo">–</dd></div>
-      </div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Caches &amp; Tokens</h2>
-    <div class="grid g6">
-      <div class="card tile"><div class="label">Expert-Cache Trefferquote</div><div class="value" id="hit">–<small>%</small></div><div class="sub" id="hitSub">–</div></div>
-      <div class="card tile"><div class="label">Prompt-Cache (wiederverwendet)</div><div class="value" id="reuse">–<small>%</small></div><div class="sub" id="reuseSub">–</div></div>
-      <div class="card tile"><div class="label">Draft-Akzeptanz</div><div class="value" id="acc">–<small>%</small></div><div class="sub" id="accSub">–</div></div>
-      <div class="card tile"><div class="label">Tokens gelesen (Prompt)</div><div class="value" id="tokIn">–</div><div class="sub" id="tokInSub">–</div></div>
-      <div class="card tile"><div class="label">Tokens geschrieben (Output)</div><div class="value" id="tokOut">–</div><div class="sub" id="tokOutSub">–</div></div>
-      <div class="card tile"><div class="label">Requests</div><div class="value" id="reqs">–</div><div class="sub" id="reqsSub">–</div></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>SSDs</h2>
-    <div class="grid g4" id="disks"></div>
-  </section>
-
-  <section>
-    <h2>Verlauf (10 min)</h2>
-    <div class="grid g3">
-      <div class="card chart-card"><div class="chart-head"><h3 id="c_decode_t">Decode tok/s</h3><span class="now" id="c_decode_now"></span></div><svg class="chart" id="c_decode"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>Leistung W</h3><span class="legend" id="lg_power"></span></div><svg class="chart" id="c_power"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>GPU-Last %</h3><span class="legend" id="lg_util"></span></div><svg class="chart" id="c_util"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>PCIe je GPU MB/s (zur + von GPU)</h3><span class="legend" id="lg_pcie"></span></div><svg class="chart" id="c_pcie"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>GPU-Temperatur °C</h3><span class="legend" id="lg_temp"></span></div><svg class="chart" id="c_temp"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>CPU %</h3><span class="now" id="c_cpu_now"></span></div><svg class="chart" id="c_cpu"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>SSD lesen MB/s</h3><span class="legend" id="lg_read"></span></div><svg class="chart" id="c_read"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3>SSD schreiben MB/s</h3><span class="legend" id="lg_write"></span></div><svg class="chart" id="c_write"></svg></div>
-      <div class="card chart-card"><div class="chart-head"><h3 id="c_commit_t">Commit belegt GB</h3><span class="now" id="c_commit_now"></span></div><svg class="chart" id="c_commit"></svg></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Zeit pro Rechenschritt (letzte Messung)</h2>
-    <div class="card">
-      <div class="meter"><div class="row"><span id="tmTitle">–</span><span id="tmTxt">–</span></div><div class="bar" id="tmBar" style="height:14px"></div></div>
-      <div class="stack-legend" id="tmLegend"></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Letzte Requests</h2>
-    <div class="card tbl"><table>
-      <thead><tr><th>Zeit</th><th>Prompt</th><th>wiederverw.</th><th>gelesen</th><th>Prefill tok/s</th><th>Output</th><th>Decode tok/s</th><th>Expert-Treffer</th><th>Drafts</th><th>SSD MB</th><th>Ende</th></tr></thead>
-      <tbody id="reqTbl"></tbody></table></div>
-  </section>
-  <p class="meta" id="foot"></p>
-</div>
-<div class="tip" id="tip"></div>
-
+    </section>
+    <section class="tab" id="t-power" hidden>
+      <div class="auth" data-auth></div>
+      <div class="mstat" id="pwStat">–</div>
+      <form id="pwForm">
+        <div class="frow"><label class="chk"><input type="checkbox" name="night_enabled"> Nachtmodus an</label>
+          <label>Nacht von<input type="time" name="start_time" required></label><label>bis<input type="time" name="end_time" required></label></div>
+        <table class="ctl"><thead><tr><th>GPU</th><th>Tag W</th><th>Nacht W</th><th>Grenze jetzt</th></tr></thead><tbody id="pwRows"></tbody></table>
+        <p class="mhint">0 W = diese GPU nicht anfassen. Erlaubter Bereich je Karte prüft G3 (RTX 3090: Treiber-Grenzen). G3 setzt die Grenze beim Wechsel Tag/Nacht und sofort nach dem Speichern.</p>
+        <div class="actions"><button class="btn primary" type="submit" data-need>Speichern &amp; anwenden</button><span class="msg" id="pwMsg"></span></div>
+      </form>
+    </section>
+    <section class="tab" id="t-fan" hidden>
+      <div class="auth" data-auth></div>
+      <div class="mstat" id="fanStat">–</div>
+      <form id="fanForm">
+        <div class="frow"><label>Mindestdrehzahl %<input type="number" name="min_percent" min="30" max="100" step="1" required></label>
+          <label>Hysterese °C<input type="number" name="hysteresis_c" min="3" max="10" step="1" required></label>
+          <label>100 % ab °C<input type="number" name="hard_limit_c" min="60" max="83" step="1" required></label></div>
+        <p class="mhint"><b>Nur mehr Lüftung:</b> eine Kurve darf nirgends unter der Grundkurve liegen (gestrichelt: 40 °C 30 % · 60 °C 45 % · 70 °C 65 % · 78 °C 85 % · 83 °C 100 %). „auto“ = Treiber regelt selbst (Standard ohne Einstellung). Ab der 100-%-Grenze immer 100 %; bei Fehlern gehen die Lüfter zurück an den Treiber.</p>
+        <div id="fanGpus"></div>
+        <div class="actions"><button class="btn primary" type="submit" data-need>Speichern &amp; anwenden</button><span class="msg" id="fanMsg"></span></div>
+      </form>
+    </section>
+    <section class="tab api" id="t-api" hidden>
+      <h3>Adresse &amp; Modell</h3>
+      <dl class="kv akv">
+        <dt>OpenAI-kompatibel (empfohlen, über G3)</dt><dd><code data-host>http://HOST:8000/v1</code></dd>
+        <dt>Modellname</dt><dd><code>Qwen3.8-Flash-Next</code> <span class="mhint">(ohne Namen geht es auch: der einzige Chat-Server)</span></dd>
+        <dt>Anthropic (Claude Code u. a.)</dt><dd><code data-host>http://HOST:8000</code> → <code>/v1/messages</code></dd>
+        <dt>Responses-API (Codex CLI)</dt><dd><code data-host>http://HOST:8000/v1/responses</code></dd>
+        <dt>Strata direkt (ohne G3)</dt><dd><code data-host>http://HOST:8090/v1</code> <span class="mhint">Modell-ID <code id="apiModel">–</code></span></dd>
+        <dt>API-Key</dt><dd>derzeit keiner nötig (beliebiger Wert geht)</dd>
+      </dl>
+      <h3>Kontext &amp; Länge</h3>
+      <dl class="kv akv">
+        <dt>Kontextfenster</dt><dd><b id="apiCtx">–</b> Tokens · Prompt + <code>max_tokens</code> müssen hineinpassen</dd>
+        <dt>Zu lang</dt><dd>wird mit HTTP 400 abgelehnt, nie still gekürzt</dd>
+        <dt><code>max_tokens</code> leer / 0</dt><dd>= alles, was der Prompt vom Kontext übrig lässt</dd>
+        <dt>Abfragen</dt><dd><code>GET /v1/models</code> → <code>max_model_len</code>, <code>context_length</code>, <code>meta.n_ctx</code>, <code>architecture.input_modalities</code></dd>
+        <dt>Parallel</dt><dd><span id="apiSlots">–</span> Requests gleichzeitig (Batch-Slots), weitere warten in der Schlange</dd>
+      </dl>
+      <h3>Denken (Thinking)</h3>
+      <table class="ctl"><thead><tr><th>Stufe</th><th>OpenAI (<code>/v1/chat/completions</code>, <code>/v1/responses</code>)</th><th>Anthropic (<code>/v1/messages</code>)</th></tr></thead><tbody>
+        <tr><td><b>aus</b> (sofort antworten)</td><td><code>"reasoning_effort": "none"</code><br><span class="mhint">oder</span> <code>"chat_template_kwargs": {"enable_thinking": false}</code></td><td><code>"thinking": {"type": "disabled"}</code></td></tr>
+        <tr><td><b>low</b></td><td><code>"reasoning_effort": "low"</code></td><td><code>"output_config": {"effort": "low"}</code></td></tr>
+        <tr><td><b>medium</b></td><td><code>"reasoning_effort": "medium"</code></td><td><code>"output_config": {"effort": "medium"}</code></td></tr>
+        <tr><td><b>high</b> (Standard)</td><td><code>"reasoning_effort": "high"</code> oder weglassen</td><td><code>"output_config": {"effort": "high"}</code> oder weglassen</td></tr>
+      </tbody></table>
+      <p class="mhint"><code>high</code> ist die höchste Stufe und gilt, wenn nichts angegeben ist; ein „xhigh“ gibt es nicht. Auch <code>"reasoning": {"effort": "low"}</code> wird verstanden. Anthropic <code>"thinking": {"type": "enabled", "budget_tokens": N}</code>: unter 2K = low, unter 8K = medium, mehr = high.
+        Harte Obergrenze fürs Denken: <code>"reasoning_budget_tokens": N</code> (danach wird das Denken geschlossen und geantwortet; 0 = keine Grenze).
+        Das Denken kommt als <code>reasoning_content</code> (OpenAI) bzw. <code>thinking</code>-Blöcke (Anthropic).</p>
+      <h3>Bilder senden</h3>
+      <p class="mhint">Als Teil der Nachricht, mehrere Bilder pro Nachricht möglich. JPEG, PNG, BMP, GIF direkt; WebP, TIFF, AVIF … werden automatisch nach PNG umgewandelt. Erlaubt: Base64 (<code>data:</code>-URL), http(s)-URL oder ein Dateipfad auf dem Server.</p>
+      <pre class="code" id="apiImg"></pre>
+      <p class="mhint">Anthropic: <code>{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "…"}}</code> im <code>content</code>-Array.</p>
+      <h3>Beispiele</h3>
+      <pre class="code" id="apiCurl"></pre>
+      <p class="mhint">Ausführlich: <code>Strata-143-prod/docs/DETAILS.md</code> (Abschnitt „Using it“) und <code>docs/AI_SETUP.md</code>.</p>
+    </section>
+  </div>
+</aside>
 <script>
 const $ = id => document.getElementById(id);
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
@@ -320,7 +862,8 @@ const fmt = (v, d = 0) => v == null || isNaN(v) ? '–' : Number(v).toLocaleStri
 const compact = v => { if (v == null) return '–'; const a = Math.abs(v);
   if (a >= 1e9) return fmt(v / 1e9, 2) + ' Mrd'; if (a >= 1e6) return fmt(v / 1e6, 2) + ' Mio'; if (a >= 1e4) return fmt(v / 1e3, 1) + ' K'; return fmt(v); };
 const bytes = v => { if (v == null) return '–'; const u = ['B','KB','MB','GB','TB']; let i = 0; while (v >= 1000 && i < 4) { v /= 1000; i++; } return fmt(v, i >= 3 ? 2 : 1) + ' ' + u[i]; };
-const gib = v => v == null ? '–' : fmt(v / 2 ** 30, 1) + ' GiB';
+const gib = v => v == null || isNaN(v) ? '–' : fmt(v / 2 ** 30, 1) + ' GiB';
+const gibN = v => v == null || isNaN(v) ? '–' : fmt(v / 2 ** 30, 1);
 const tm = t => t ? new Date(t * 1000).toLocaleTimeString('de-DE') : '–';
 const pct = (v, d = 1) => v == null ? '–' : fmt(v * 100, d);
 const setBar = (el, frac) => { el.style.width = Math.max(0, Math.min(100, (frac || 0) * 100)) + '%'; };
@@ -331,22 +874,47 @@ const dur = s => { if (s == null || isNaN(s)) return '–'; s = Math.max(0, s);
 const eur = v => v == null || isNaN(v) ? '–' : fmt(v, Math.abs(v) < 0.1 ? 3 : 2);
 const ago = t => t ? 'vor ' + dur(Date.now() / 1000 - t) : '–';
 const dt = t => t ? new Date(t * 1000).toLocaleString('de-DE', {dateStyle: 'short', timeStyle: 'short'}) : '–';
+const date = t => new Date((t || 0) * 1000).toLocaleDateString('de-DE');
 const share = (a, b) => b ? fmt(a / b * 100, 1) + ' %' : '–';
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+// value + unit (U+202F narrow no-break space), kept on one line
+const U = (v, u) => `<span class="v">${v}${u ? `<small class="u"> ${u}</small>` : ''}</span>`;
+const NA = v => v === '–' || v == null ? '<span class="na">–</span>' : v;
+const sw = c => `<i class="sw" style="background:${c.startsWith('--') ? `var(${c})` : c}"></i>`;
+const SWF = '<i class="sw free"></i>';
+const ONCE = location.search.includes('once');
+const params = new URLSearchParams(location.search);
 
-// ---- theme
-(() => { try { const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {} })();
+// ---- theme (?theme=light|dark overrides for this view only)
+(() => { try { const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+  const q = params.get('theme'); if (q === 'light' || q === 'dark') document.documentElement.dataset.theme = q; })();
 $('themeBtn').onclick = () => { const r = document.documentElement; r.dataset.theme = r.dataset.theme === 'light' ? 'dark' : 'light';
   try { localStorage.setItem('theme', r.dataset.theme); } catch (e) {} drawAll(); };
+
+// ---- <details>: open by default, remember collapse per viewer (ignored in ?once)
+for (const id of ['detSlots', 'detVerlauf', 'detReq', 'detFoot']) {
+  const el = $(id);
+  if (ONCE) { el.open = true; continue; }
+  try { if (localStorage.getItem('strata.det.' + id) === '0') el.open = false; } catch (e) {}
+  el.addEventListener('toggle', () => { try { localStorage.setItem('strata.det.' + id, el.open ? '1' : '0'); } catch (e) {}
+    if (id === 'detVerlauf' && el.open) drawAll(); });
+}
+
+// ---- badge + model (sticky row at L/M, mirrored below the row at phone width)
+const setBadge = html => { $('state').innerHTML = html; for (const el of document.querySelectorAll('.js-state')) el.innerHTML = html; };
+const setModel = txt => { $('model').textContent = txt; for (const el of document.querySelectorAll('.js-model')) el.textContent = txt; };
 
 // ---- history
 const H = {}; const MAX = 600;
 function pushHist(point) { for (const [k, arr] of Object.entries(point)) { H[k] = H[k] || []; for (const v of arr) { H[k].push(v); if (H[k].length > MAX) H[k].shift(); } } }
+const lastH = k => { const a = H[k] || []; return a.length ? a[a.length - 1] : null; };
 
 // ---- line chart (SVG, one axis, crosshair tooltip)
 const tip = $('tip');
 function lineChart(svgId, series, opts = {}) {
   const svg = $(svgId); if (!svg) return;
-  const W = svg.clientWidth || 400, Hh = svg.clientHeight || 140, L = 38, R = 8, T = 8, B = 18;
+  const W = svg.clientWidth, Hh = svg.clientHeight || 150, L = 38, R = 8, T = 8, B = 18;
+  if (!W) return;
   const t = H.t || []; const n = t.length;
   let max = opts.max || 0;
   for (const s of series) for (const v of (H[s.key] || [])) if (v != null && v > max) max = v;
@@ -354,312 +922,427 @@ function lineChart(svgId, series, opts = {}) {
   const x = i => L + (n <= 1 ? 0 : i * (W - L - R) / (MAX - 1)) + (MAX - n) * (W - L - R) / (MAX - 1);
   const y = v => T + (Hh - T - B) * (1 - (v || 0) / max);
   let out = '';
-  for (let k = 0; k <= 4; k++) { const v = max * k / 4, yy = y(v);
+  for (let k = 0; k <= 2; k++) { const v = max * k / 2, yy = y(v);
     out += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="${k ? css('--grid') : css('--axis')}" stroke-width="1"/>`;
     out += `<text x="${L - 6}" y="${yy + 3}" text-anchor="end">${fmt(v, max < 10 ? 1 : 0)}</text>`; }
   out += `<text x="${L}" y="${Hh - 4}">-10 min</text><text x="${W - R}" y="${Hh - 4}" text-anchor="end">jetzt</text>`;
   for (const s of series) { const vals = H[s.key] || []; if (!vals.length) continue;
     let d = ''; vals.forEach((v, i) => { d += (i ? 'L' : 'M') + x(i).toFixed(1) + ',' + y(v).toFixed(1); });
-    if (series.length === 1) out += `<path d="${d}L${x(vals.length - 1)},${y(0)}L${x(0)},${y(0)}Z" fill="${css(s.color)}" opacity="0.10"/>`;
+    if (series.length === 1) out += `<path d="${d}L${x(vals.length - 1)},${y(0)}L${x(0)},${y(0)}Z" fill="${css(s.color)}" opacity="0.12"/>`;
     out += `<path d="${d}" fill="none" stroke="${css(s.color)}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"${s.dash ? ' stroke-dasharray="4 3"' : ''}/>`;
-    const lv = vals[vals.length - 1]; out += `<circle cx="${x(vals.length - 1)}" cy="${y(lv)}" r="4" fill="${css(s.color)}" stroke="${css('--surface')}" stroke-width="2"/>`; }
+    const lv = vals[vals.length - 1]; out += `<circle cx="${x(vals.length - 1)}" cy="${y(lv)}" r="3" fill="${css(s.color)}" stroke="${css('--surface-2')}" stroke-width="2"/>`; }
   out += `<line id="${svgId}_x" x1="0" x2="0" y1="${T}" y2="${Hh - B}" stroke="${css('--muted')}" stroke-width="1" visibility="hidden"/>`;
-  out += `<rect x="${L}" y="0" width="${W - L - R}" height="${Hh}" fill="transparent"/>`;
+  out += `<rect x="${L}" y="0" width="${Math.max(0, W - L - R)}" height="${Hh}" fill="transparent"/>`;
   svg.innerHTML = out;
   svg.onmousemove = e => { const r = svg.getBoundingClientRect(); const px = e.clientX - r.left;
     const i = Math.round((px - x(0)) / ((W - L - R) / (MAX - 1))); if (i < 0 || i >= n) { tip.style.display = 'none'; return; }
     const cx = svg.querySelector(`#${svgId}_x`); cx.setAttribute('x1', x(i)); cx.setAttribute('x2', x(i)); cx.setAttribute('visibility', 'visible');
     let h = `<div style="color:var(--muted)">${tm(t[i])}</div>`;
-    for (const s of series) h += `<div><span class="dot" style="background:${css(s.color)}"></span> ${s.name ? s.name + ': ' : ''}<b>${fmt((H[s.key] || [])[i], opts.digits || 0)}</b> ${opts.unit || ''}</div>`;
-    tip.innerHTML = h; tip.style.display = 'block'; tip.style.left = (e.clientX + 14) + 'px'; tip.style.top = (e.clientY + 10) + 'px'; };
+    for (const s of series) h += `<div><span class="dot" style="background:${css(s.color)}"></span> ${s.name ? esc(s.name) + ': ' : ''}<b>${fmt((H[s.key] || [])[i], opts.digits || 0)}</b> ${opts.unit || ''}</div>`;
+    tip.innerHTML = h; tip.style.display = 'block';
+    const tw = tip.offsetWidth; let lx = e.clientX + 14; if (lx + tw > innerWidth - 8) lx = e.clientX - tw - 14;
+    tip.style.left = Math.max(8, lx) + 'px'; tip.style.top = (e.clientY + 10) + 'px'; };
   svg.onmouseleave = () => { tip.style.display = 'none'; const cx = svg.querySelector(`#${svgId}_x`); if (cx) cx.setAttribute('visibility', 'hidden'); };
 }
 function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))); for (const m of [1, 1.2, 1.6, 2, 3, 4, 6, 8, 10]) if (v <= m * p) return m * p; return 10 * p; }
 
 let diskLabels = [], gpuCount = 0;
-const gcol = i => ['--s1', '--s2', '--s3', '--s4'][i % 4] ;
+const gcol = i => ['--s1', '--s2', '--s3', '--s4'][i % 4];
+const lgItem = (color, name, val, dash) => `<span><i class="${dash ? 'dash' : ''}" style="${dash ? `border-color:${css(color)}` : `background:${css(color)}`}"></i>${esc(name)}${val != null ? ' ' + val : ''}</span>`;
 function drawAll() {
+  if (!$('detVerlauf').open) return;
   // derived series
   H.commit_gb = (H.commit_used || []).map(v => v == null ? null : v / 1e9);
   const gi = [...Array(gpuCount).keys()];
   for (const i of gi) H[`gpu${i}_pcie`] = (H[`gpu${i}_rx`] || []).map((v, k) => v == null ? null : v + ((H[`gpu${i}_tx`] || [])[k] || 0));
-  const gl = gi.map(i => `<span><i style="background:${css(gcol(i))}"></i>GPU ${i}</span>`).join('');
-  lineChart('c_decode', [{key: 'decode', color: '--s1'}], {unit: 'tok/s'});
+  const multi = gpuCount > 1;
+  lineChart('c_decode', [{key: 'decode', color: '--s1'}], {unit: 'tok/s', digits: 1});
+  $('c_decode_now').textContent = `jetzt ${fmt(lastH('decode'), 1)} tok/s`;
   lineChart('c_power', [{key: 'wall', color: '--s2', name: 'Steckdose'}, {key: 'power', color: '--s1', name: 'GPU'}], {unit: 'W'});
-  $('lg_power').innerHTML = `<span><i style="background:${css('--s2')}"></i>Steckdose (gesch.)</span><span><i style="background:${css('--s1')}"></i>GPU</span>`;
-  lineChart('c_util', gpuCount > 1 ? gi.map(i => ({key: `gpu${i}_util`, color: gcol(i), name: 'GPU ' + i})) : [{key: 'gpu_util', color: '--s1'}], {unit: '%', max: 100});
+  $('lg_power').innerHTML = lgItem('--s2', 'Steckdose (gesch.)', fmt(lastH('wall'))) + lgItem('--s1', 'GPU', fmt(lastH('power')));
+  lineChart('c_cpu', [{key: 'cpu', color: '--s1'}], {unit: '%', max: 100});
+  $('c_cpu_now').textContent = `jetzt ${fmt(lastH('cpu'))} %`;
+  lineChart('c_util', multi ? gi.map(i => ({key: `gpu${i}_util`, color: gcol(i), name: 'GPU ' + i})) : [{key: 'gpu_util', color: '--s1'}], {unit: '%', max: 100});
   lineChart('c_pcie', gi.map(i => ({key: `gpu${i}_pcie`, color: gcol(i), name: 'GPU ' + i})), {unit: 'MB/s', digits: 1});
   lineChart('c_temp', gi.map(i => ({key: `gpu${i}_temp`, color: gcol(i), name: 'GPU ' + i})), {unit: '°C'});
-  lineChart('c_cpu', [{key: 'cpu', color: '--s1'}], {unit: '%', max: 100});
-  for (const id of ['lg_util', 'lg_pcie', 'lg_temp']) $(id).innerHTML = gpuCount > 1 ? gl : '';
+  $('lg_util').innerHTML = multi ? gi.map(i => lgItem(gcol(i), 'GPU ' + i, fmt(lastH(`gpu${i}_util`)) + ' %')).join('') : '';
+  $('lg_temp').innerHTML = multi ? gi.map(i => lgItem(gcol(i), 'GPU ' + i, fmt(lastH(`gpu${i}_temp`)) + ' °C')).join('') : '';
+  $('lg_pcie').innerHTML = multi ? gi.map(i => lgItem(gcol(i), 'GPU ' + i, fmt(lastH(`gpu${i}_pcie`), 1))).join('') : '';
+  $('c_util_now').textContent = multi ? '' : `jetzt ${fmt(lastH('gpu_util'))} %`;
+  $('c_temp_now').textContent = !multi && gpuCount ? `jetzt ${fmt(lastH('gpu0_temp'))} °C` : '';
+  $('c_pcie_now').textContent = !multi && gpuCount ? `jetzt ${fmt(lastH('gpu0_pcie'), 1)} MB/s` : '';
   const cols = ['--s1', '--s3', '--s4', '--muted'];   // --s2 is Strata's
-  const strataS = (key) => ({key, color: '--s2', name: 'Strata', dash: true});
+  const strataS = key => ({key, color: '--s2', name: 'Strata', dash: true});
   lineChart('c_read', [...diskLabels.map((l, i) => ({key: 'disk_r_' + l, color: cols[i % 4], name: l})), strataS('strata_r')], {unit: 'MB/s', digits: 1});
   lineChart('c_write', [...diskLabels.map((l, i) => ({key: 'disk_w_' + l, color: cols[i % 4], name: l})), strataS('strata_w')], {unit: 'MB/s', digits: 1});
   lineChart('c_commit', [{key: 'commit_gb', color: '--s1'}], {unit: 'GB', digits: 1});
-  const lg = diskLabels.map((l, i) => `<span><i style="background:${css(cols[i % 4])}"></i>${l}</span>`).join('')
-    + `<span><i style="background:${css('--s2')}"></i>Strata</span>`;
-  $('lg_read').innerHTML = lg; $('lg_write').innerHTML = lg;
+  $('c_commit_now').textContent = `jetzt ${fmt(lastH('commit_gb'), 1)} GB`;
+  const lgd = p => diskLabels.map((l, i) => lgItem(cols[i % 4], l, fmt(lastH(`disk_${p}_${l}`), 1))).join('')
+    + lgItem('--s2', 'Strata', fmt(lastH(`strata_${p}`), 1), true);
+  $('lg_read').innerHTML = lgd('r'); $('lg_write').innerHTML = lgd('w');
+}
+
+// ---- alarms: only existing signals and thresholds (sev); VRAM never alarms (full by design)
+let lastSnap = null, sseDown = false;
+function renderAlarms() {
+  const a = [], s = lastSnap;
+  const chip = (txt, href, level = 'crit') => `<a class="alarm ${level}" role="alert" href="${href}"><i>${level === 'crit' ? '✕' : '▲'}</i>${esc(txt)}</a>`;
+  if (sseDown) a.push(chip('Dashboard getrennt – verbinde neu …', '#live'));
+  if (s) {
+    if (!s.online && s.error) a.push(chip(`Engine offline · Fehler: ${s.error}`, '#live'));
+    for (const g of s.gpus || []) if (g.error) a.push(chip(`GPU ${g.index}: ${g.error}`, '#hardware'));
+    if (!(s.gpus || []).length && s.gpu_error) a.push(chip(s.gpu_error, '#hardware'));
+    const mem = s.memory || {};
+    if (mem.phys_total) { const rf = (mem.phys_total - mem.phys_avail) / mem.phys_total;
+      if (rf > 0.88) a.push(chip(`RAM ${fmt(rf * 100)} % · ${rf > 0.95 ? 'kritisch' : 'hoch'}`, '#speicher', rf > 0.95 ? 'crit' : 'serious')); }
+    if (mem.commit_enforced && mem.commit_limit) { const cf = mem.commit_used / mem.commit_limit;
+      if (cf > 0.88) a.push(chip(`Commit ${fmt(cf * 100)} % · ${cf > 0.95 ? 'kritisch' : 'hoch'}`, '#speicher', cf > 0.95 ? 'crit' : 'serious')); }
+  }
+  $('alarms').innerHTML = a.join(''); $('alarms').classList.toggle('on', a.length > 0);
 }
 
 // ---- render snapshot
 function render(s) {
+  lastSnap = s;
+  try { menuTick(); } catch (e) {}
   const e = s.engine || {}, live = s.live || {}, hw = s.hardware || {}, tot = s.totals || {}, mem = s.memory || {};
-  $('model').textContent = e.model || 'kein Modell erreichbar';
+  setModel(e.model || 'kein Modell erreichbar');
   const st = !s.online ? ['offline', 'var(--crit)'] : live.state === 'generating' ? ['schreibt', 'var(--good)']
     : live.state === 'reading' ? ['liest Prompt', 'var(--warn)'] : live.state === 'unloaded' ? ['entladen', 'var(--muted)'] : ['bereit', 'var(--s1)'];
   const bt = s.batch && s.batch.busy ? ` · ${s.batch.busy}/${s.batch.slots} Slots` : '';
-  $('state').innerHTML = `<span class="dot" style="background:${st[1]}"></span><span>${st[0]}${bt}${live.queued ? ' · ' + live.queued + ' wartend' : ''}</span>`;
-  $('meta').textContent = e.version ? `Engine ${e.version} · Kontext ${compact(e.max_context)} · spec ${e.spec ?? '–'}`
-    + (s.online ? ` · ${s.source}` : ` · zuletzt gesehen ${tm(s.last_seen || s.stale_at)}`) : (s.online ? '' : 'GPU, CPU, RAM und SSD laufen weiter live');
+  setBadge(`<span class="dot" style="background:${st[1]}"></span><span>${st[0]}${bt}${live.queued ? ' · ' + live.queued + ' wartend' : ''}</span>`);
+  const mp = [];
+  if (e.version) mp.push(`Engine ${e.version}`, `Kontext ${compact(e.max_context)}`, `spec ${e.spec ?? '–'}`);
+  if (s.online) { if (s.source) mp.push(`Quelle ${s.source}`); }
+  else { if (s.last_seen || s.stale_at) mp.push(`zuletzt gesehen ${tm(s.last_seen || s.stale_at)}`); mp.push('GPU, CPU, RAM und SSD laufen weiter live'); }
+  $('meta').innerHTML = mp.map(x => `<span>${esc(x)}</span>`).join('');
   $('clock').textContent = tm(s.now);
 
-  // speed: "jetzt" while it runs, else the last request's value (grey).  A prefill takes ~1 s, so at 1 Hz it is
-  // mostly over before the dashboard sees it - the last request's rate is the useful number then.
+  // speed "jetzt": live while it runs, else the last request's value (muted)
   const lp = tot.last_prefill, ld = tot.last_decode;
-  const showNow = (id, live, last, d) => { const el = $(id);
-    el.classList.toggle('stale', live == null && last != null);
-    el.innerHTML = `${live != null ? fmt(live, d) : last ? fmt(last.tps, d) : '–'}<small>tok/s</small>`; };
+  const showNow = (id, lv, last, d) => { const el = $(id);
+    el.classList.toggle('stale', lv == null && last != null);
+    el.innerHTML = U(lv != null ? fmt(lv, d) : last ? fmt(last.tps, d) : '–', 'tok/s'); };
   const gen = live.state === 'generating', rd = live.state === 'reading';
   showNow('decNow', s.batch && s.batch.decoding ? s.batch.tok_s_sum : gen ? live.tok_s : null, ld, 1);
   $('decSub').textContent = s.batch && s.batch.decoding ? `Σ ${s.batch.decoding} Slots · neuester ${fmt(live.tok_s, 1)} tok/s`
     : gen ? `${fmt(live.generated)} von ${fmt(live.max_tokens)} Tokens · Ø ${fmt(live.tok_s_mean, 1)}`
     : rd ? 'liest gerade den Prompt' : ld ? `letzter Request · ${fmt(ld.tokens)} Tokens · ${ago(ld.at)}` : 'wartet auf Request';
   showNow('preNow', rd && live.prefill_tok_s_mean ? live.prefill_tok_s_mean : null, lp, 0);
+  const decStale = $('decNow').classList.contains('stale'), preStale = $('preNow').classList.contains('stale');
+  const preLead = !preStale && decStale && rd;
+  // a stale (last-request) value never carries the hero size; the label says so
+  $('decNow').classList.toggle('dim', decStale || preLead); $('preNow').classList.toggle('lift', preLead);
+  $('decLbl').textContent = decStale ? 'Decode (C) · zuletzt' : 'Decode (C)';
+  $('preLbl').textContent = preStale ? 'Prefill (P) · zuletzt' : 'Prefill (P)';
   $('preSub').textContent = rd ? `liest ${fmt(live.prompt_read)} / ${fmt(live.prompt_total || live.prompt_tokens)} Tokens · ${fmt(live.elapsed_s, 1)} s`
     : lp ? `letzter Request · ${fmt(lp.tokens)} neue Tokens · ${ago(lp.at)}` : '–';
-  $('decPeak').innerHTML = `${fmt(tot.peak_decode, 1)}<small>tok/s</small>`; $('decPeakAt').textContent = tot.peak_decode_at ? 'am ' + dt(tot.peak_decode_at) : '–';
-  $('prePeak').innerHTML = `${fmt(tot.peak_prefill)}<small>tok/s</small>`; $('prePeakAt').textContent = tot.peak_prefill_at ? 'am ' + dt(tot.peak_prefill_at) : '–';
-  $('avgDec').innerHTML = `${tot.decode_ms ? fmt(tot.output_tokens / (tot.decode_ms / 1000), 1) : '–'}<small>tok/s</small>`;
-  $('avgDecSub').textContent = tot.decode_ms ? `${compact(tot.output_tokens)} Tokens in ${dur(tot.decode_ms / 1000)} Rechenzeit` : '–';
-  $('avgPre').innerHTML = `${tot.prompt_ms ? fmt(tot.read / (tot.prompt_ms / 1000)) : '–'}<small>tok/s</small>`;
-  $('avgPreSub').textContent = tot.prompt_ms ? `${compact(tot.read)} neu gelesen in ${dur(tot.prompt_ms / 1000)} (Cache-Treffer zählen nicht)` : '–';
+
+  // P2 matrix
+  $('decPeak').innerHTML = U(fmt(tot.peak_decode, 1), 'tok/s'); $('decPeakAt').textContent = tot.peak_decode_at ? 'am ' + dt(tot.peak_decode_at) : '–';
+  $('prePeak').innerHTML = U(fmt(tot.peak_prefill), 'tok/s'); $('prePeakAt').textContent = tot.peak_prefill_at ? 'am ' + dt(tot.peak_prefill_at) : '–';
+  $('avgDec').innerHTML = U(tot.decode_ms ? fmt(tot.output_tokens / (tot.decode_ms / 1000), 1) : '–', 'tok/s');
+  $('avgDecSub').innerHTML = tot.decode_ms ? `<div>${compact(tot.output_tokens)} Tokens</div><div>in ${dur(tot.decode_ms / 1000)} Rechenzeit</div>` : '–';
+  $('avgPre').innerHTML = U(tot.prompt_ms ? fmt(tot.read / (tot.prompt_ms / 1000)) : '–', 'tok/s');
+  $('avgPreSub').innerHTML = tot.prompt_ms ? `<div>${compact(tot.read)} neu gelesen</div><div>in ${dur(tot.prompt_ms / 1000)}</div>` : '–';
 
   renderMeter(s);
   renderLive(s);
   renderGpus(s);
 
-  // hardware
+  // band GPUs + P4 aggregate
   const lim = hw.gpu_power_limit || 600, multi = (hw.gpu_count || 0) > 1;
-  $('pwLbl').textContent = multi ? `GPU-Leistung (Summe ${hw.gpu_count} Karten)` : 'GPU-Leistung';
-  $('gpuUtilLbl').textContent = multi ? 'GPU-Last Ø · heißeste Karte' : 'GPU-Last · Temperatur';
+  $('gpuUtil').innerHTML = U(fmt(hw.gpu_util), '%'); setBar($('utilBar'), (hw.gpu_util || 0) / 100);
+  $('gpuUtilLbl').textContent = multi ? 'GPU-Last Ø' : 'GPU-Last';
+  $('gpuSub').textContent = `${multi ? 'heißeste Karte' : 'Temperatur'} ${fmt(hw.gpu_temp)} °C`;
+  $('pwLbl').textContent = multi ? `GPU-Leistung (Σ ${hw.gpu_count} Karten)` : 'GPU-Leistung';
+  $('pw').innerHTML = U(fmt(hw.gpu_power), 'W'); setBar($('pwBar'), (hw.gpu_power || 0) / lim);
+  $('pwSub').innerHTML = `<div>Limit ${fmt(lim)} W · Spitze ${fmt(tot.peak_power)} W</div><div>${esc(hw.gpu_name || '–')}</div>`;
+  $('cpu').innerHTML = U(fmt(hw.cpu), '%'); setBar($('cpuBar'), (hw.cpu || 0) / 100);
+  $('cpuSub').innerHTML = hw.cpu_name ? `<div>${esc(hw.cpu_name.replace(/ \d+-Core Processor/, ''))}</div><div>${hw.cores}C/${hw.threads}T</div>` : '–';
   $('pcieLbl').textContent = multi ? 'PCIe (alle GPUs)' : 'PCIe (GPU)';
-  $('pw').innerHTML = `${fmt(hw.gpu_power)}<small>W</small>`; $('pwSub').textContent = `Limit ${fmt(lim)} W · Spitze ${fmt(tot.peak_power)} W`;
-  setBar($('pwBar'), (hw.gpu_power || 0) / lim);
-  $('gpuUtil').innerHTML = `${fmt(hw.gpu_util)}<small>%</small>`; $('gpuSub').textContent = `${fmt(hw.gpu_temp)} °C · ${hw.gpu_name || ''}`;
-  setBar($('utilBar'), (hw.gpu_util || 0) / 100);
-  $('cpu').innerHTML = `${fmt(hw.cpu)}<small>%</small>`; $('cpuSub').textContent = hw.cpu_name ? `${hw.cpu_name.replace(/ \d+-Core Processor/, '')} · ${hw.cores}C/${hw.threads}T` : '–';
-  setBar($('cpuBar'), (hw.cpu || 0) / 100);
-  $('pcie').innerHTML = `${hw.gpu_pcie_rx_mb != null ? fmt((hw.gpu_pcie_rx_mb + (hw.gpu_pcie_tx_mb || 0)) / 1000, 1) : '–'}<small>GB/s</small>`;
-  $('pcieSub').textContent = hw.gpu_pcie_rx_mb != null ? (multi ? 'Summe' : `Gen ${hw.gpu_pcie_gen} x${hw.gpu_pcie_width}`) + ` · zur GPU ${fmt((hw.gpu_pcie_rx_mb || 0) / 1000, 2)} / von GPU ${fmt((hw.gpu_pcie_tx_mb || 0) / 1000, 2)} GB/s` : '–';
+  $('pcie').innerHTML = U(hw.gpu_pcie_rx_mb != null ? fmt((hw.gpu_pcie_rx_mb + (hw.gpu_pcie_tx_mb || 0)) / 1000, 1) : '–', 'GB/s');
+  $('pcieSub').innerHTML = hw.gpu_pcie_rx_mb != null ? `<div>zur GPU ${fmt((hw.gpu_pcie_rx_mb || 0) / 1000, 2)} · von GPU ${fmt((hw.gpu_pcie_tx_mb || 0) / 1000, 2)} GB/s</div><div>${multi ? 'Summe' : `Gen ${hw.gpu_pcie_gen} x${hw.gpu_pcie_width}`}</div>` : '–';
 
-  // memory
+  // P5 memory
   const vt = hw.gpu_mem_total, vu = hw.gpu_mem_used, ec = (e.expert_cache_mib || 0) * 2 ** 20;
   if (vt) { const f1 = ec / vt, f2 = Math.max(0, (vu - ec) / vt);
-    $('vramBar').innerHTML = `<span style="width:${f1 * 100}%;background:var(--s1)"></span><span style="width:${f2 * 100}%;background:var(--s2)"></span>`;
-    $('vramTxt').textContent = `${gib(vu)} / ${gib(vt)} · frei ${fmt((vt - vu) / 2 ** 20)} MiB`; }
-  $('slots').textContent = e.expert_slots ? `${fmt(e.expert_slots)} (${fmt(e.expert_cache_mib / 1024, 1)} GiB)` : '–';
-  $('vramFree').textContent = e.vram_free_mib != null ? fmt(e.vram_free_mib) + ' MiB' : '–';
-  const ru = mem.phys_total - mem.phys_avail; $('ramTxt').textContent = `${gib(ru)} / ${gib(mem.phys_total)}`;
+    $('vramBar').innerHTML = `<span style="width:${f1 * 100}%;background:var(--s1)"></span><span style="width:${f2 * 100}%;background:var(--s2)"></span><span class="rest"></span>`;
+    $('vramTxt').innerHTML = U(`${gibN(vu)} / ${gibN(vt)}`, 'GiB');
+    $('vramFree').textContent = `frei ${fmt((vt - vu) / 2 ** 20)} MiB`;
+    $('vramLegend').innerHTML = `<span>${sw('--s1')}Experten-Cache ${gib(ec)}</span><span>${sw('--s2')}Rest (KV, Gewichte, Puffer) ${gib(Math.max(0, vu - ec))}</span><span>${SWF}frei ${gib(vt - vu)}</span>`;
+  } else { $('vramBar').innerHTML = ''; $('vramTxt').textContent = '–'; $('vramFree').textContent = '–'; $('vramLegend').innerHTML = ''; }
+  $('expertSlots').textContent = e.expert_slots ? `${fmt(e.expert_slots)} (${fmt(e.expert_cache_mib / 1024, 1)} GiB)` : '–';
+  $('vramFreeLoad').textContent = e.vram_free_mib != null ? fmt(e.vram_free_mib) + ' MiB' : '–';
+  const ru = mem.phys_total - mem.phys_avail; $('ramTxt').textContent = `${gibN(ru)} / ${gib(mem.phys_total)}`;
   const rf = ru / mem.phys_total; $('ramBar').style.background = sev(rf); setBar($('ramBar'), rf);
   const cf = mem.commit_used / mem.commit_limit, lin = mem.os === 'linux';
-  $('comLbl').textContent = lin ? (mem.commit_enforced ? 'Commit (Committed_AS / CommitLimit)' : 'Committed_AS / CommitLimit (nicht erzwungen, overcommit)') : 'Commit (die knappe Ressource)';
-  $('comTxt').textContent = `${gib(mem.commit_used)} / ${gib(mem.commit_limit)}` + (mem.commit_enforced ? ` · frei ${gib(mem.commit_limit - mem.commit_used)}` : '')
-    + (lin && mem.swap_total ? ` · Swap ${gib(mem.swap_used)} / ${gib(mem.swap_total)}` : '');
+  $('comLbl').textContent = lin && !mem.commit_enforced ? 'Committed_AS / CommitLimit' : 'Commit';
+  $('comHint').textContent = lin ? (mem.commit_enforced ? 'Committed_AS / CommitLimit' : 'nicht erzwungen, overcommit') : 'die knappe Ressource';
+  $('comTxt').textContent = `${gibN(mem.commit_used)} / ${gib(mem.commit_limit)}`;
+  $('comFree').textContent = mem.commit_enforced ? ` · frei ${gib(mem.commit_limit - mem.commit_used)}` : '';
   $('comBar').style.background = mem.commit_enforced ? sev(cf) : 'var(--s1)'; setBar($('comBar'), cf);
   $('c_commit_t').textContent = lin ? 'Committed_AS GB' : 'Commit belegt GB';
-  $('procLbl').textContent = mem.process ? `${mem.process.name || 'Engine'} privat · ${lin ? 'RSS' : 'Working Set'}` : (lin ? 'Engine-Prozess privat · RSS' : 'strata.exe privat · Working Set');
+  const hasSwap = lin && mem.swap_total; $('swapLbl').hidden = $('swap').hidden = !hasSwap;
+  $('swap').textContent = hasSwap ? `${gibN(mem.swap_used)} / ${gib(mem.swap_total)}` : '–';
+  $('procLbl').textContent = `${mem.process ? (mem.process.name || 'Engine') : (lin ? 'Engine-Prozess' : 'strata.exe')} privat`;
+  $('procWsLbl').textContent = lin ? 'RSS' : 'Working Set';
+  $('proc').textContent = mem.process ? gib(mem.process.private) : '–';
+  $('procWs').textContent = mem.process ? gib(mem.process.working_set) : '–';
   $('cacheLbl').textContent = lin ? 'Page-Cache + Buffers' : 'Datei-Cache (Standby)';
-  $('proc').textContent = mem.process ? `${gib(mem.process.private)} · ${gib(mem.process.working_set)}` : '–';
   $('syscache').textContent = gib(mem.system_cache);
   const ctxNow = live.prompt_tokens ? live.prompt_tokens + (live.generated || 0) : (s.requests && s.requests[0] ? s.requests[0].prompt + (s.requests[0].out || 0) : 0);
   $('kvTxt').textContent = `${compact(ctxNow)} / ${compact(e.max_context)} Tokens`; setBar($('kvBar'), ctxNow / (e.max_context || 1));
   const cc = s.conversation_cache || {};
-  if (cc.enabled) { $('parkTxt').textContent = `${cc.parked}/${cc.slots} · ${bytes(cc.bytes)} von ${fmt(cc.budget_mib / 1024, 1)} GiB`; setBar($('parkBar'), cc.bytes / (cc.budget_mib * 2 ** 20)); }
-  else { $('parkTxt').textContent = 'aus'; setBar($('parkBar'), 0); }
+  if (cc.enabled) { $('parkTxt').textContent = `${cc.parked}/${cc.slots}`; $('parkSub').textContent = `${bytes(cc.bytes)} von ${fmt(cc.budget_mib / 1024, 1)} GiB`;
+    setBar($('parkBar'), cc.bytes / (cc.budget_mib * 2 ** 20)); }
+  else { $('parkTxt').textContent = 'aus'; $('parkSub').textContent = ''; setBar($('parkBar'), 0); }
+  // tokens: estimated from the bytes per token of the last parks in the engine log (dashboard.py "park_bpt")
+  const bpt = cc.enabled && cc.park_bpt ? cc.park_bpt.bytes_per_token : null;
+  $('parkTok').textContent = !cc.enabled ? '' : bpt
+    ? `ca. ${compact(cc.bytes / bpt)} von ${compact(cc.budget_mib * 2 ** 20 / bpt)} Tokens · Ø ${fmt(bpt / 1e3)} KB/Token aus den letzten ${cc.park_bpt.samples} Parkvorgängen`
+    : 'Tokens: noch kein Parkvorgang im Log';
   const ct = cc.tier;
-  if (ct) {
-    $('tierTxt').textContent = `${ct.files} Konv. · ${bytes(ct.disk_bytes)} · ${ct.spills} geschrieben` + (ct.pending ? ` · ${ct.pending} wartend` : '');
-    $('tierIo').textContent = `${bytes(ct.written_today)} / ${bytes(ct.budget)} heute (frei ${bytes(ct.budget_left)}) · ${ct.restores} Restores · ${ct.misses} Fehlschläge · ${ct.drops_budget} Budget-Drops`;
-  } else { $('tierTxt').textContent = 'aus'; $('tierIo').textContent = '–'; }
+  $('tierRows').innerHTML = `<div class="grp" id="tierTxt">SSD-Stufe (Konversationen)${ct ? '' : ' <span class="na">aus</span>'}</div>` + (ct ? [
+      ['Konversationen', fmt(ct.files)], ['auf Disk', bytes(ct.disk_bytes)], ['geschrieben', fmt(ct.spills)],
+      ...(ct.pending ? [['wartend', fmt(ct.pending)]] : []),
+      ['Budget heute', `${bytes(ct.written_today)} / ${bytes(ct.budget)}`], ['Budget frei', bytes(ct.budget_left)],
+      ['Restores', fmt(ct.restores)], ['Fehlschläge', fmt(ct.misses)], ['Budget-Drops', fmt(ct.drops_budget)]
+    ].map(([k, v]) => `<dt class="ind">${k}</dt><dd>${v}</dd>`).join('') : '');
   $('kvFmt').textContent = `${e.kv || '–'} · ${e.kv_resident ? fmt(e.kv_resident) + ' Zellen (Streaming)' : 'komplett'}`;
   $('sess').textContent = s.sessions ? `${s.sessions.files} Dateien · ${bytes(s.sessions.bytes)}` : '–';
-
-  // caches & tokens
-  $('hit').innerHTML = `${pct(s.hit_rate)}<small>%</small>`; $('hitSub').textContent = s.pcie_share != null ? `PCIe ${pct(s.pcie_share)} % · Rest CPU · Ø über alle Requests` : '–';
+  $('hit').innerHTML = s.hit_rate == null ? '<span class="na">–</span>' : U(pct(s.hit_rate), '%'); $('hitSub').textContent = s.pcie_share != null ? `PCIe ${pct(s.pcie_share)} % · Rest CPU · Ø über alle Requests` : 'PCIe – · Rest CPU · Ø über alle Requests';
   const reuse = tot.prompt_tokens ? tot.reused / tot.prompt_tokens : null;
-  $('reuse').innerHTML = `${pct(reuse)}<small>%</small>`; $('reuseSub').textContent = `${compact(tot.reused)} von ${compact(tot.prompt_tokens)} Tokens aus dem Cache`;
+  $('reuse').innerHTML = reuse == null ? '<span class="na">–</span>' : U(pct(reuse), '%'); $('reuseSub').textContent = `${compact(tot.reused)} von ${compact(tot.prompt_tokens)} Tokens aus dem Cache`;
+
+  // P2 Effizienz
   const acc = tot.drafts_offered ? tot.drafts_accepted / tot.drafts_offered : null;
-  $('acc').innerHTML = `${pct(acc)}<small>%</small>`; $('accSub').textContent = s.timing ? `${fmt(s.timing.tokens_per_window, 2)} Tokens pro Schritt` : `${compact(tot.drafts_accepted)} von ${compact(tot.drafts_offered)}`;
-  $('tokIn').textContent = compact(tot.prompt_tokens); $('tokInSub').textContent = `neu gelesen ${compact(tot.read)} · längster ${compact(tot.longest_prompt)}`;
-  $('tokOut').textContent = compact(tot.output_tokens); $('tokOutSub').textContent = `seit ${new Date((tot.since || 0) * 1000).toLocaleDateString('de-DE')}`;
-  $('reqs').textContent = compact(tot.requests); $('reqsSub').textContent = `Engine-SSD-Reads ${bytes((tot.engine_file_mb || 0) * 1e6)}`;
+  $('acc').innerHTML = U(pct(acc), '%'); setBar($('accBar'), acc || 0);
+  $('accSub').textContent = `${compact(tot.drafts_accepted)} von ${compact(tot.drafts_offered)}`;
+  const t = s.timing;
+  if (t) { const parts = [['GPU warten', t.gpu_wait, '--s1'], ['CPU-Experten', t.cpu_experts, '--s2'], ['Host sonst', Math.max(0, t.host - t.cpu_experts), '--s3'], ['Staging', t.stage, '--s4'], ['Draft', t.draft, '--axis']];
+    const sum = parts.reduce((a, p) => a + p[1], 0) || 1;
+    $('tmTxt').innerHTML = `<b>${fmt(t.ms_per_window, 1)} ms pro Schritt</b> · ${fmt(t.tokens_per_window, 2)} Tokens pro Schritt <span class="muted">· ${fmt(t.windows)} Schritte gemessen</span>`;
+    $('tmBar').innerHTML = parts.map(p => `<span style="width:${p[1] / sum * 100}%;background:var(${p[2]})"></span>`).join('');
+    $('tmLegend').innerHTML = parts.map(p => `<span>${sw(p[2])}${p[0]} ${fmt(p[1], 1)} ms</span>`).join(''); $('tmBar').hidden = false; }
+  else { $('tmTxt').innerHTML = '<span class="muted">keine Messung (Engine ohne STRATA_DECODE_TIMING)</span>'; $('tmBar').innerHTML = ''; $('tmBar').hidden = true; $('tmLegend').innerHTML = ''; }
+
+  // P7 totals
+  $('tokSince').textContent = `seit ${date(tot.since)}`;
+  $('reqs').innerHTML = U(compact(tot.requests)); $('reqsSub').textContent = `Engine-SSD-Reads ${bytes((tot.engine_file_mb || 0) * 1e6)}`;
+  $('tokIn').innerHTML = U(compact(tot.prompt_tokens)); $('tokInSub').innerHTML = `<dt>neu gelesen</dt><dd>${compact(tot.read)}</dd><dt>längster Prompt</dt><dd>${compact(tot.longest_prompt)}</dd>`;
+  $('tokOut').innerHTML = U(compact(tot.output_tokens));
 
   // disks
-  const ds = s.disks || {}; diskLabels = Object.keys(ds).sort();
-  const sio = s.strata_io || {}, se = sio.engine || {}, sv = sio.server || {};
-  const strataCard = `<div class="card tile" style="border-color:var(--s2)"><div class="label">Strata-Engine (${(mem.process && mem.process.name) || (s.platform === 'linux' ? 'strata*' : 'strata.exe')}) – alle Laufwerke</div>
-    <div class="value">${fmt(se.read_mbs, 1)}<small>MB/s lesen</small></div>
-    <div class="sub">schreiben ${fmt(se.write_mbs, 1)} MB/s</div>
-    <dl class="kv" style="margin-top:8px"><dt>gelesen seit Zählung</dt><dd>${bytes(se.total_read)}</dd><dt>geschrieben seit Zählung</dt><dd>${bytes(se.total_write)}</dd>
-    <dt>Anteil am SSD-Lesen</dt><dd>${sio.share_read != null ? pct(sio.share_read) + ' %' : '–'}</dd><dt>Anteil am SSD-Schreiben</dt><dd>${sio.share_write != null ? pct(sio.share_write) + ' %' : '–'}</dd>
-    <dt title="Python-Server + vLLM-Fassade: überwiegend Pipe-, Netz- und Log-Verkehr, kaum SSD">Server/Fassade (meist Pipes)</dt><dd>${bytes(sv.total_read)} / ${bytes(sv.total_write)}</dd></dl></div>`;
-  $('disks').innerHTML = strataCard + diskLabels.map(l => { const d = ds[l]; return `<div class="card tile"><div class="label">Laufwerk ${l}</div>
-    <div class="value">${fmt(d.write_mbs, 1)}<small>MB/s schreiben</small></div>
-    <div class="sub">lesen ${fmt(d.read_mbs, 1)} MB/s</div>
-    <dl class="kv" style="margin-top:8px"><dt>geschrieben seit Boot</dt><dd>${bytes(d.boot_write)}</dd><dt>gelesen seit Boot</dt><dd>${bytes(d.boot_read)}</dd>
-    <dt>geschrieben gesamt*</dt><dd>${bytes(d.total_write)}</dd><dt>gelesen gesamt*</dt><dd>${bytes(d.total_read)}</dd></dl></div>`; }).join('');
-
-  // timing
-  const t = s.timing;
-  if (t) { const parts = [['GPU warten', t.gpu_wait, '--s1'], ['CPU-Experten', t.cpu_experts, '--s2'], ['Host sonst', Math.max(0, t.host - t.cpu_experts), '--s3'], ['Staging', t.stage, '--s4'], ['Draft', t.draft, '--muted']];
-    const sum = parts.reduce((a, p) => a + p[1], 0) || 1;
-    $('tmTitle').textContent = `${fmt(t.ms_per_window, 1)} ms pro Schritt · ${fmt(t.tokens_per_window, 2)} Tokens`;
-    $('tmTxt').textContent = `${fmt(t.windows)} Schritte gemessen`;
-    $('tmBar').innerHTML = parts.map(p => `<span title="${p[0]} ${fmt(p[1], 1)} ms" style="width:${p[1] / sum * 100}%;background:var(${p[2]})"></span>`).join('');
-    $('tmLegend').innerHTML = parts.map(p => `<span><i style="background:var(${p[2]})"></i>${p[0]} ${fmt(p[1], 1)} ms</span>`).join(''); }
-  else { $('tmTitle').textContent = 'keine Messung (Engine ohne STRATA_DECODE_TIMING)'; $('tmBar').innerHTML = ''; $('tmLegend').innerHTML = ''; $('tmTxt').textContent = ''; }
+  renderDisks(s);
 
   // requests
-  $('reqTbl').innerHTML = (s.requests || []).map(r => `<tr><td>${tm(r.time)}</td><td>${fmt(r.prompt)}</td><td>${fmt(r.reused)}</td><td>${fmt(r.read)}</td>
-    <td>${r.read >= 256 ? fmt(r.prefill_tps) : '–'}</td><td>${fmt(r.out)}</td><td>${fmt(r.decode_tps, 1)}</td><td>${r.hit != null ? pct(r.hit) + ' %' : '–'}</td>
-    <td>${r.accept != null ? pct(r.accept, 0) + ' %' : '–'}</td><td>${fmt(r.file_mb, 0)}</td><td>${r.finish || ''}</td></tr>`).join('');
-  $('foot').textContent = `* gesamt = seit das Dashboard zählt. Strata-SSD = I/O-Zähler des Engine-Prozesses (Experten/PLE werden ungepuffert gelesen, das ist echter SSD-Verkehr; das Betriebssystem trennt ihn nicht nach Laufwerk). `
-    + (s.platform === 'linux' ? 'Linux: nur ganze Laufwerke und RAID-/DM-Volumes (RAID-Mitglieder zählen im Volume). ' : '')
-    + `Quelle: ${s.source || 'offline'} · Log: ${s.log || '–'} · GPUs: ${s.gpu_backend || s.gpu_error || '–'}` + (s.error ? ` · Fehler: ${s.error}` : '');
+  const td = v => `<td>${NA(v)}</td>`;
+  $('reqTbl').innerHTML = (s.requests || []).map(r => `<tr><td>${tm(r.time)}</td>${td(fmt(r.prompt))}${td(fmt(r.reused))}${td(fmt(r.read))}
+    ${td(r.read >= 256 ? fmt(r.prefill_tps) : '–')}${td(fmt(r.out))}${td(fmt(r.decode_tps, 1))}${td(r.hit != null ? pct(r.hit) + ' %' : '–')}
+    ${td(r.accept != null ? pct(r.accept, 0) + ' %' : '–')}${td(fmt(r.file_mb, 0))}<td>${esc(r.finish || '')}</td></tr>`).join('');
+
+  // footer
+  $('footSrc').textContent = s.source || 'offline';
+  $('footLog').textContent = s.log || '–';
+  $('footGpu').textContent = s.gpu_backend || s.gpu_error || '–';
+  $('footErr').innerHTML = s.error ? `<span class="crit">${esc(s.error)}</span>` : '<span class="na">–</span>';
+  $('footLinux').hidden = s.platform !== 'linux';
+  renderAlarms();
 }
 
-// ---- engine live: the running request's answering / prompt-reading progress, batch slots, sources
+// ---- disks: one table (≥700 px) + cards (phone)
+function renderDisks(s) {
+  const ds = s.disks || {}, mem = s.memory || {}; diskLabels = Object.keys(ds).sort();
+  const sio = s.strata_io || {}, se = sio.engine || {}, sv = sio.server || {};
+  const pname = (mem.process && mem.process.name) || (s.platform === 'linux' ? 'strata*' : 'strata.exe');
+  const shr = sio.share_read != null || sio.share_write != null ? `${sio.share_read != null ? pct(sio.share_read) + ' %' : '–'} / ${sio.share_write != null ? pct(sio.share_write) + ' %' : '–'}` : '–';
+  const srv = `${bytes(sv.total_read)} / ${bytes(sv.total_write)}`;
+  const na = '<span class="na">–</span>';
+  const head = `<thead><tr><th style="width:24%">Laufwerk</th><th>lesen MB/s</th><th>schreiben MB/s</th><th>gelesen*</th><th>geschrieben*</th><th>gelesen seit Boot</th><th>geschrieben seit Boot</th><th>Anteil lesen / schreiben</th></tr></thead>`;
+  const rows = `<tr class="strata"><td><b>Strata-Engine (${esc(pname)})</b> – alle Laufwerke</td><td>${fmt(se.read_mbs, 1)}</td><td>${fmt(se.write_mbs, 1)}</td><td>${bytes(se.total_read)}</td><td>${bytes(se.total_write)}</td><td>${na}</td><td>${na}</td><td>${NA(shr)}</td></tr>
+    <tr class="strata-sub"><td colspan="8">↳ Server/Fassade (meist Pipes) <b>${srv}</b> · Python-Server + vLLM-Fassade: meist Pipe-, Netz- und Log-Verkehr, kaum SSD</td></tr>`
+    + diskLabels.map(l => { const d = ds[l]; return `<tr><td>${esc(l)}</td><td>${fmt(d.read_mbs, 1)}</td><td>${fmt(d.write_mbs, 1)}</td><td>${bytes(d.total_read)}</td><td>${bytes(d.total_write)}</td><td>${bytes(d.boot_read)}</td><td>${bytes(d.boot_write)}</td><td>${na}</td></tr>`; }).join('');
+  const card = (cls, title, r, w, kv, extra = '') => `<div class="ssd-card ${cls}"><div class="sh">${title}</div>
+    <div class="two"><span>${fmt(r, 1)} <small>MB/s lesen</small></span><span>${fmt(w, 1)} <small>MB/s schreiben</small></span></div>
+    <dl class="kv">${kv.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>${extra}</div>`;
+  const cards = card('strata', `Strata-Engine (${esc(pname)}) – alle Laufwerke`, se.read_mbs, se.write_mbs,
+      [['gelesen*', bytes(se.total_read)], ['geschrieben*', bytes(se.total_write)], ['Anteil lesen / schreiben', shr]],
+      `<dl class="kv srv"><dt>↳ Server/Fassade (meist Pipes)</dt><dd>${srv}</dd></dl><div class="hint">Python-Server + vLLM-Fassade: meist Pipe-, Netz- und Log-Verkehr, kaum SSD</div>`)
+    + diskLabels.map(l => { const d = ds[l]; return card('', esc(l), d.read_mbs, d.write_mbs,
+      [['gelesen*', bytes(d.total_read)], ['geschrieben*', bytes(d.total_write)], ['gelesen seit Boot', bytes(d.boot_read)], ['geschrieben seit Boot', bytes(d.boot_write)]]); }).join('');
+  $('disks').innerHTML = `<div class="stbl-wrap"><table class="stbl" id="ssdTbl">${head}<tbody>${rows}</tbody></table></div><div class="ssd-cards">${cards}</div>`;
+}
+
+// ---- engine live: phase, answering / prompt-reading progress, batch slots, sources
 const phaseDe = p => !p ? null : p === 'thinking' ? 'Denkt' : p === 'answering' ? 'Antwortet' : p === 'tool call complete' ? 'Tool-Aufruf fertig'
   : p.startsWith('writing a tool call') ? 'Schreibt Tool-Aufruf' + p.slice('writing a tool call'.length) : p[0].toUpperCase() + p.slice(1);
 function renderLive(s) {
   const live = s.live || {}, b = s.batch, e = s.engine || {}, last = (s.requests || [])[0];
-  $('srcList').innerHTML = (s.sources || []).map(x => `<span><span class="dot" style="background:${x.state === 'online' ? 'var(--good)' : x.state === 'offline' ? 'var(--muted)' : 'var(--warn)'}"></span> ${x.url}${x.origin === 'process' ? ' (Prozess)' : ''}${x.key ? ' · Key' : ''}: ${x.state}</span>`).join('');
-  $('liveMeta').textContent = s.online ? `${s.source}${live.queued ? ' · ' + live.queued + ' in der Warteschlange' : ''}` : (s.last_seen ? `offline · zuletzt gesehen ${dt(s.last_seen)}` : 'offline');
+  $('srcList').innerHTML = (s.sources || []).map(x => `<span><span class="dot" style="background:${x.state === 'online' ? 'var(--good)' : x.state === 'offline' ? 'var(--muted)' : 'var(--warn)'}"></span><span>${esc(x.url)}${x.origin === 'process' ? ' (Prozess)' : ''}${x.key ? ' · Key' : ''}: ${esc(x.state)}</span></span>`).join('') || '<span class="na">–</span>';
+  $('liveMeta').textContent = s.online ? `${fmt(live.queued || 0)} in der Warteschlange` : (s.last_seen ? `offline · zuletzt gesehen ${dt(s.last_seen)}` : 'offline');
   const gen = live.generated, max = live.max_tokens;
+  const phase = (txt, col) => { $('ansPhase').innerHTML = `<span class="dot" style="background:${col}"></span><span>${esc(txt)}</span>`; };
+  const lastTxt = last ? `letzter Request: ${fmt(last.out)} Tokens · ${fmt(last.decode_tps, 1)} tok/s` : '–';
   if (!s.online) {
-    $('ansPhase').textContent = 'Engine offline';
-    $('ansWhat').textContent = s.last_seen ? `zuletzt gesehen ${tm(s.last_seen)} (${ago(s.last_seen)})` : 'seit Start des Dashboards nicht erreichbar';
-    $('ansTxt').textContent = last ? `letzter Request: ${fmt(last.out)} Tokens · ${fmt(last.decode_tps, 1)} tok/s` : '–';
-    setBar($('ansBar'), 0); $('promptTxt').textContent = '–'; setBar($('promptBar'), 0);
+    phase('Engine offline', 'var(--crit)');
+    $('ansWhat').innerHTML = `<div>${s.last_seen ? `zuletzt gesehen ${tm(s.last_seen)} (${ago(s.last_seen)})` : 'seit Start des Dashboards nicht erreichbar'}</div>`;
+    $('ansTxt').innerHTML = `<span class="muted">${lastTxt}</span>`; $('ansLine').textContent = '';
+    setBar($('ansBar'), 0); $('promptTxt').innerHTML = '<span class="na">–</span>'; $('promptLine').textContent = ''; setBar($('promptBar'), 0);
   } else {
     const st = live.state;
-    $('ansPhase').textContent = st === 'reading' ? 'Liest Prompt' : st === 'generating' ? (phaseDe(live.phase) || 'Schreibt')
-      : st === 'unloaded' ? 'Modell entladen' : 'Bereit · wartet auf Request';
-    $('ansWhat').textContent = (b && live.running ? `neuester von ${live.running} laufenden Requests · ` : '') + (live.elapsed_s != null ? `läuft seit ${fmt(live.elapsed_s, 1)} s` : '');
+    const col = st === 'generating' ? 'var(--good)' : st === 'reading' ? 'var(--warn)' : st === 'unloaded' ? 'var(--muted)' : 'var(--s1)';
+    phase(st === 'reading' ? 'Liest Prompt' : st === 'generating' ? (phaseDe(live.phase) || 'Schreibt')
+      : st === 'unloaded' ? 'Modell entladen' : 'Bereit · wartet auf Request', col);
+    $('ansWhat').innerHTML = (b && live.running ? `<div>neuester von ${live.running} laufenden Requests</div>` : '')
+      + (live.elapsed_s != null ? `<div>läuft seit ${fmt(live.elapsed_s, 1)} s</div>` : '');
     if (gen != null && st !== 'reading') {
-      $('ansTxt').innerHTML = `<b>${fmt(gen)}</b> / ${max ? fmt(max) : '–'} Tokens · ${fmt(live.tok_s, 1)} tok/s · Ø ${fmt(live.tok_s_mean, 1)}`;
+      $('ansTxt').innerHTML = `<b>${fmt(gen)}</b> von max. ${max ? fmt(max) : '–'} Tokens`;
+      $('ansLine').textContent = `${fmt(live.tok_s, 1)} tok/s · Ø ${fmt(live.tok_s_mean, 1)}`;
       setBar($('ansBar'), max ? gen / max : 0);
     } else {
-      $('ansTxt').textContent = last ? `letzter Request: ${fmt(last.out)} Tokens · ${fmt(last.decode_tps, 1)} tok/s` : '–';
+      $('ansTxt').innerHTML = `<span class="muted">${lastTxt}</span>`; $('ansLine').textContent = '';
       setBar($('ansBar'), 0);
     }
     if (st === 'reading' && live.prompt_total) {
-      $('promptTxt').innerHTML = `<b>${fmt(live.prompt_read)}</b> / ${fmt(live.prompt_total)} Tokens · ${fmt(live.prompt_read / live.prompt_total * 100)} %` + (live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : '');
+      $('promptTxt').innerHTML = `<b>${fmt(live.prompt_read)}</b> / ${fmt(live.prompt_total)} Tokens`;
+      $('promptLine').textContent = `${fmt(live.prompt_read / live.prompt_total * 100)} %` + (live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : '');
       setBar($('promptBar'), live.prompt_read / live.prompt_total);
     } else if (live.prompt_tokens != null) {
-      $('promptTxt').textContent = `${fmt(live.prompt_tokens)} Tokens` + (st === 'reading' ? ' · liest …' : ' gelesen') + (live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : '');
+      $('promptTxt').innerHTML = `<b>${fmt(live.prompt_tokens)}</b> Tokens` + (st === 'reading' ? ' · liest …' : ' gelesen');
+      $('promptLine').textContent = live.prefill_tok_s_mean ? `${fmt(live.prefill_tok_s_mean)} tok/s` : '';
       setBar($('promptBar'), st === 'reading' ? 0 : 1);
-    } else { $('promptTxt').textContent = '–'; setBar($('promptBar'), 0); }
+    } else { $('promptTxt').innerHTML = '<span class="na">–</span>'; $('promptLine').textContent = ''; setBar($('promptBar'), 0); }
   }
-  // slots (--batch)
+  // band: batch slots
+  let note = '';
   if (b) {
-    $('slotsBusy').innerHTML = `${b.busy}<small>/ ${b.slots} belegt</small>`;
-    $('slotsSub').textContent = `${b.reading} lesen · ${b.decoding} schreiben · Σ ${fmt(b.tok_s_sum, 1)} tok/s · ${fmt(live.waiting || 0)} warten`
-      + (live.admitting ? ` · ${live.admitting} werden aufgenommen` : '') + (live.outside_slots ? ` · ${live.outside_slots} außerhalb` : '');
-    $('slotsBar').innerHTML = `<span style="width:${b.reading / b.slots * 100}%;background:var(--warn)"></span><span style="width:${b.decoding / b.slots * 100}%;background:var(--good)"></span>`;
+    $('slotsBusy').innerHTML = U(b.busy, `/ ${b.slots}`);
+    $('slotsBar').innerHTML = `<span style="width:${b.reading / b.slots * 100}%;background:var(--warn)"></span><span style="width:${b.decoding / b.slots * 100}%;background:var(--good)"></span><span class="rest"></span>`;
+    $('slotsLegend').innerHTML = `<span>${sw('--warn')}${b.reading} liest</span><span>${sw('--good')}${b.decoding} schreibt</span><span>${SWF}${b.slots - b.busy} frei</span>`;
+    $('slotsSub').textContent = (b.decoding ? '' : `Σ ${fmt(b.tok_s_sum || 0, 1)} tok/s · `) + `${fmt(live.waiting || 0)} warten` + (live.admitting ? ` · ${live.admitting} werden aufgenommen` : '') + (live.outside_slots ? ` · ${live.outside_slots} außerhalb` : '');
   } else {
-    $('slotsBusy').innerHTML = s.online ? (live.state === 'generating' || live.state === 'reading' ? '1<small>/ 1</small>' : '0<small>/ 1</small>') : `–<small>${e.batch_slots ? '/ ' + e.batch_slots : ''}</small>`;
-    $('slotsSub').textContent = s.online ? 'kein --batch: ein Request zur Zeit' + (live.queued ? ` · ${live.queued} wartend` : '') : 'Engine offline';
-    $('slotsBar').innerHTML = '';
+    $('slotsBusy').innerHTML = s.online ? U(live.state === 'generating' || live.state === 'reading' ? '1' : '0', '/ 1') : U('–', e.batch_slots ? '/ ' + e.batch_slots : '');
+    $('slotsBar').innerHTML = ''; $('slotsLegend').innerHTML = '';
+    note = s.online ? 'kein --batch: ein Request zur Zeit' + (live.queued ? ` · ${live.queued} wartend` : '') : 'Engine offline';
+    $('slotsSub').textContent = note;
   }
-  const ctx = e.max_context || 0;
-  $('slots').innerHTML = (live.slots || []).map(sl => {
-    const idle = sl.state === 'idle', rd = sl.state === 'reading';
-    const used = idle ? (sl.held_tokens || 0) : (sl.prompt_tokens || 0) + (sl.generated || 0);
+  // slot cards
+  const ctx = e.max_context || 0, sl = live.slots || [];
+  if (b && !sl.length) note = s.online ? '–' : 'Engine offline';
+  // every slot idle and empty: one line instead of 16 identical tiles (per-slot context is 0 everywhere)
+  const allFree = sl.length && sl.every(x => x.state === 'idle' && !x.held_tokens);
+  if (allFree) note = `alle ${sl.length} Slots frei · Kontext je 0 / ${compact(ctx)}`;
+  $('slotNote').textContent = note;
+  $('slotGrid').innerHTML = allFree ? '' : sl.map(x => {
+    const idle = x.state === 'idle', rd = x.state === 'reading';
+    const used = idle ? (x.held_tokens || 0) : (x.prompt_tokens || 0) + (x.generated || 0);
     const col = idle ? 'var(--axis)' : rd ? 'var(--warn)' : 'var(--good)';
-    const txt = idle ? `frei${sl.held_tokens ? ' · hält ' + compact(sl.held_tokens) + ' Tokens' : ''}`
-      : rd ? `liest ${compact(sl.prompt_tokens)} Tokens · ${fmt(sl.elapsed_s, 1)} s`
-      : `<b>${fmt(sl.generated)}</b> Tokens · <b>${fmt(sl.tok_s, 1)}</b> tok/s · ${fmt(sl.elapsed_s, 0)} s`;
-    return `<div class="slot${idle ? ' idle' : ''}"><div class="row"><span><span class="dot" style="background:${col}"></span> Slot ${sl.slot}</span><span>${txt}</span></div>
-      <div class="bar" title="Kontext ${compact(used)} / ${compact(ctx)} Tokens"><span style="width:${ctx ? Math.min(100, used / ctx * 100) : 0}%;background:${col}"></span></div></div>`; }).join('');
+    const word = idle ? 'frei' : rd ? 'liest' : 'schreibt';
+    const txt = idle ? (x.held_tokens ? `hält ${compact(x.held_tokens)} Tokens` : '')
+      : rd ? `liest ${compact(x.prompt_tokens)} Tokens · ${fmt(x.elapsed_s, 1)} s`
+      : `<b>${fmt(x.generated)}</b> Tok · <b>${fmt(x.tok_s, 1)}</b> tok/s · ${fmt(x.elapsed_s, 0)} s`;
+    return `<div class="slot${idle ? ' idle' : ''}"><div class="r1"><span><span class="dot" style="background:${col}"></span>Slot ${x.slot}</span><span>${word}</span></div>
+      ${txt ? `<div class="r2">${txt}</div>` : ''}
+      <div class="bar" title="Kontext ${compact(used)} / ${compact(ctx)} Tokens"><span style="width:${ctx ? Math.min(100, used / ctx * 100) : 0}%;background:${col}"></span></div>
+      <div class="r4">Kontext ${compact(used)} / ${compact(ctx)}</div></div>`; }).join('');
 }
 
-// ---- every GPU: load, VRAM, power, temperature, clocks, PCIe link and traffic
+// ---- every GPU: table at ≥1180 px, cards below
 function renderGpus(s) {
   const gs = s.gpus || [];
   gpuCount = gs.length;
   $('gpuMeta').textContent = gs.length ? `${gs.length} Karte${gs.length > 1 ? 'n' : ''} · ${s.gpu_backend || ''}` : (s.gpu_error || 'keine NVIDIA-GPU gefunden');
+  if (!gs.length) { $('gpus').innerHTML = `<div class="muted" style="font-size:13px">${esc(s.gpu_error || 'keine NVIDIA-GPU gefunden')}</div>`; return; }
   const mb = v => v == null ? '–' : fmt(v, v < 10 ? 1 : 0);
-  $('gpus').innerHTML = gs.map(g => {
-    const vf = g.mem_total ? g.mem_used / g.mem_total : 0, pf = g.power_limit ? g.power / g.power_limit : 0;
-    return `<div class="card gpu"><div class="head"><b>GPU ${g.index}</b><span class="meta">${g.name || ''}${g.bus ? ' · ' + g.bus.replace(/^0+(?=[0-9a-f]{4}:)/, '') : ''}</span></div>
-      <div class="meter"><div class="row"><span>Last</span><span>${fmt(g.util)} %</span></div><div class="bar"><span style="width:${Math.min(100, g.util || 0)}%;background:var(--s1)"></span></div></div>
-      <div class="meter"><div class="row"><span>VRAM</span><span>${gib(g.mem_used)} / ${gib(g.mem_total)}</span></div><div class="bar"><span style="width:${vf * 100}%;background:${sev(vf)}"></span></div></div>
-      <div class="meter"><div class="row"><span>Leistung</span><span>${fmt(g.power)} / ${fmt(g.power_limit)} W</span></div><div class="bar"><span style="width:${Math.min(100, pf * 100)}%;background:var(--s2)"></span></div></div>
-      <dl class="kv" style="margin-top:10px"><dt>Temperatur</dt><dd>${fmt(g.temp)} °C</dd>
-        <dt>SM-Takt</dt><dd>${fmt(g.sm_clock)}${g.sm_clock_max ? ' / ' + fmt(g.sm_clock_max) : ''} MHz</dd>
-        <dt>PCIe-Link (jetzt / max)</dt><dd>Gen ${g.pcie_gen ?? '–'} x${g.pcie_width ?? '–'} / Gen ${g.pcie_gen_max ?? '–'} x${g.pcie_width_max ?? '–'}</dd>
-        <dt>PCIe zur GPU (RX)</dt><dd>${mb(g.pcie_rx_mb)} MB/s</dd><dt>PCIe von GPU (TX)</dt><dd>${mb(g.pcie_tx_mb)} MB/s</dd></dl>
-      ${g.error ? `<div class="err">${g.error}</div>` : ''}</div>`; }).join('');
+  const bus = g => g.bus ? g.bus.replace(/^0+(?=[0-9a-f]{4}:)/, '') : '';
+  const sub = g => esc((g.name || '') + (g.bus ? ' · ' + bus(g) : ''));
+  const link = g => `Gen ${g.pcie_gen ?? '–'} x${g.pcie_width ?? '–'} / Gen ${g.pcie_gen_max ?? '–'} x${g.pcie_width_max ?? '–'}`;
+  const clk = g => `${fmt(g.sm_clock)}${g.sm_clock_max ? ' / ' + fmt(g.sm_clock_max) : ''}`;
+  const f = g => ({vf: g.mem_total ? g.mem_used / g.mem_total : 0, pf: g.power_limit ? g.power / g.power_limit : 0});
+  const ib = (frac, col, txt, track) => `<div class="ib"><div class="bar${track ? ' t' : ''}"><span style="width:${Math.min(100, frac * 100)}%;background:${col}"></span></div><span>${txt}</span></div>`;
+  const tbl = `<div class="gtbl-wrap"><table class="gtbl" id="gpuTbl"><colgroup><col style="width:18%"><col style="width:11%"><col style="width:15%"><col style="width:14%"><col style="width:6%"><col style="width:9%"><col style="width:13%"><col style="width:7%"><col style="width:7%"></colgroup>
+    <thead><tr><th>GPU</th><th>Last</th><th>VRAM</th><th>Leistung</th><th>Temp</th><th>SM-Takt<br>MHz</th><th>PCIe-Link<br>jetzt / max</th><th>zur GPU<br>MB/s</th><th>von GPU<br>MB/s</th></tr></thead><tbody>`
+    + gs.map((g, i) => { const {vf, pf} = f(g);
+      return `<tr><td><b>${sw(gcol(i))}GPU ${g.index}</b><div class="gsub">${sub(g)}</div></td>
+        <td>${ib((g.util || 0) / 100, 'var(--s1)', fmt(g.util) + ' %', true)}</td>
+        <td>${ib(vf, sev(vf), `${gibN(g.mem_used)} / ${gib(g.mem_total)}`)}</td>
+        <td>${ib(pf, 'var(--s1)', `${fmt(g.power)} / ${fmt(g.power_limit)} W`, true)}</td>
+        <td>${fmt(g.temp)} °C</td><td>${clk(g)}</td><td>${link(g)}</td><td>${mb(g.pcie_rx_mb)}</td><td>${mb(g.pcie_tx_mb)}</td></tr>`
+        + (g.error ? `<tr class="gerr"><td colspan="9">✕ Fehler: ${esc(g.error)}</td></tr>` : ''); }).join('') + '</tbody></table></div>';
+  const cards = '<div class="gpu-cards">' + gs.map((g, i) => { const {vf, pf} = f(g);
+    return `<div class="gpu-card"><div class="gh"><b>${sw(gcol(i))}GPU ${g.index}</b><span>${sub(g)}</span></div>
+      <div class="meter"><div class="mh"><span class="l">Last</span><span class="r">${fmt(g.util)} %</span></div><div class="bar t"><span style="width:${Math.min(100, g.util || 0)}%;background:var(--s1)"></span></div></div>
+      <div class="meter"><div class="mh"><span class="l">VRAM</span><span class="r">${gibN(g.mem_used)} / ${gib(g.mem_total)}</span></div><div class="bar"><span style="width:${vf * 100}%;background:${sev(vf)}"></span></div></div>
+      <div class="meter"><div class="mh"><span class="l">Leistung</span><span class="r">${fmt(g.power)} / ${fmt(g.power_limit)} W</span></div><div class="bar t"><span style="width:${Math.min(100, pf * 100)}%;background:var(--s1)"></span></div></div>
+      <dl class="kv"><dt>Temperatur</dt><dd>${fmt(g.temp)} °C</dd><dt>SM-Takt</dt><dd>${clk(g)} MHz</dd>
+        <dt>PCIe-Link jetzt / max</dt><dd>${link(g)}</dd><dt>zur GPU (RX)</dt><dd>${mb(g.pcie_rx_mb)} MB/s</dd><dt>von GPU (TX)</dt><dd>${mb(g.pcie_tx_mb)} MB/s</dd></dl>
+      ${g.error ? `<div class="err">✕ Fehler: ${esc(g.error)}</div>` : ''}</div>`; }).join('') + '</div>';
+  $('gpus').innerHTML = tbl + cards;
 }
 
 // ---- runtime, power, cost, 24 h projection
 let settingsLoaded = false;
 function renderMeter(s) {
   const en = s.energy; if (!en) return;
-  const p = en.per, run = en.run_t, span = s.now - en.since, pr = en.projection || {}, tk = en.tokens || {}, cfg = en.settings;
-  // runtime
+  const p = en.per, run = en.run_t, span = s.now - en.since, pr = en.projection || {}, tk = en.tokens || {}, cfg = en.settings, tot = s.totals || {};
   $('meterSince').textContent = `Zählung seit ${dt(en.since)}` + (Math.abs(en.since - en.tokens_since) > 60 ? ` · Token-Summen oben seit ${dt(en.tokens_since)}` : '');
-  $('tSpan').textContent = dur(span); $('tSpanSub').textContent = `seit ${dt(en.since)}`;
-  $('tRun').textContent = dur(run); $('tRunSub').textContent = `${share(run, span)} des Zeitraums (Rest: PC aus oder Dashboard aus)`;
-  $('tOnline').textContent = dur(en.online_t); $('tOnlineSub').textContent = `${share(en.online_t, run)} der Laufzeit`;
-  $('tBusy').innerHTML = `${run ? fmt(en.busy_t / run * 100, 1) : '–'}<small>%</small>`;
-  $('tBusySub').textContent = `${dur(en.busy_t)} von ${dur(run)} Laufzeit · ${share(en.busy_t, en.online_t)} der Online-Zeit`;
-  const parts = [['Prefill (liest)', p.prefill.t, '--warn'], ['Decode (schreibt)', p.decode.t, '--good'], ['Leerlauf (online)', p.idle.t, '--s1'], ['Engine offline', p.offline.t, '--muted']];
-  $('splitTxt').textContent = `${dur(run)} Laufzeit`;
-  $('splitBar').innerHTML = parts.map(x => `<span title="${x[0]} ${dur(x[1])}" style="width:${run ? x[1] / run * 100 : 0}%;background:var(${x[2]})"></span>`).join('');
-  $('splitLegend').innerHTML = parts.map(x => `<span><i style="background:var(${x[2]})"></i>${x[0]} ${dur(x[1])} · ${share(x[1], run)}</span>`).join('');
+  // runtime
+  $('tSpan').innerHTML = `${dur(span)}<span class="sub">seit ${dt(en.since)}</span>`;
+  $('tRun').innerHTML = `${dur(run)}<span class="sub">${share(run, span)} des Zeitraums</span>`;
+  $('tOnline').innerHTML = `${dur(en.online_t)}<span class="sub">${share(en.online_t, run)} der Laufzeit</span>`;
+  $('tBusy').innerHTML = U(run ? fmt(en.busy_t / run * 100, 1) : '–', '%');
+  $('tBusySub').innerHTML = `${dur(en.busy_t)} von ${dur(run)}<span class="sub">${share(en.busy_t, en.online_t)} der Online-Zeit</span>`;
+  const parts = [['Prefill (liest)', p.prefill.t, '--s4'], ['Decode (schreibt)', p.decode.t, '--s3'], ['Leerlauf (online)', p.idle.t, '--s1'], ['Engine offline', p.offline.t, '--axis']];
+  $('splitTxt').textContent = `= ${dur(run)} Laufzeit`;
+  $('splitBar').innerHTML = parts.map(x => `<span style="width:${run ? x[1] / run * 100 : 0}%;background:var(${x[2]})"></span>`).join('');
+  $('splitLegend').innerHTML = parts.map(x => `<span>${sw(x[2])}${x[0]}&nbsp;<b style="font-weight:500;color:var(--ink)">${dur(x[1])} · ${share(x[1], run)}</b></span>`).join('');
 
-  // power now: GPU (measured) + rest (measured once at idle) + CPU share
+  // power now: GPU (measured) × PSU factor + rest (measured once at idle) + CPU share
   const n = en.now, wall = n.wall || 0;
-  $('wallNow').innerHTML = `${fmt(wall)}<small>W</small>`;
-  $('wallNowSub').textContent = `GPU ${fmt(n.gpu)} W${cfg.psu_factor !== 1 ? ' ×' + fmt(cfg.psu_factor, 2) : ''} + Rest ${fmt(n.rest)} W` + (cfg.cpu_extra_w ? ` + CPU ${fmt(n.cpu_extra)} W` : '');
-  const sc = Math.max(wall, (s.totals || {}).peak_wall || 0, 1);
+  $('wallNow').innerHTML = U(fmt(wall), 'W');
+  const sc = Math.max(wall, tot.peak_wall || 0, 1);
   $('wallBar').innerHTML = `<span style="width:${(n.gpu || 0) * cfg.psu_factor / sc * 100}%;background:var(--s1)"></span><span style="width:${n.rest / sc * 100}%;background:var(--s2)"></span>`
-    + (n.cpu_extra ? `<span style="width:${n.cpu_extra / sc * 100}%;background:var(--s3)"></span>` : '');
-  $('wallAvg').innerHTML = `${fmt(en.avg_w)}<small>W</small>`;
+    + (n.cpu_extra ? `<span style="width:${n.cpu_extra / sc * 100}%;background:var(--s3)"></span>` : '') + '<span class="rest"></span>';
+  $('wallLegend').innerHTML = `<span>${sw('--s1')}GPU ${fmt(n.gpu)} W${cfg.psu_factor !== 1 ? ' ×' + fmt(cfg.psu_factor, 2) : ''}</span><span>${sw('--s2')}Rest ${fmt(n.rest)} W</span>`
+    + (cfg.cpu_extra_w ? `<span>${sw('--s3')}CPU ${fmt(n.cpu_extra)} W</span>` : '');
+  // band Kosten
+  $('eur').innerHTML = U(eur(en.eur), '€');
+  $('eurSub').innerHTML = `<div>${fmt(en.kwh, en.kwh < 10 ? 3 : 1)} kWh</div><div>bei ${fmt(cfg.price_eur_kwh, 3)} €/kWh</div><div>seit ${dt(en.since)}</div>`;
+
+  // Energie block
+  $('wallAvg').innerHTML = U(fmt(en.avg_w), 'W');
+  $('kwh').innerHTML = U(fmt(en.kwh, en.kwh < 10 ? 3 : 1), 'kWh');
+  $('eurPrice').textContent = `Strompreis ${fmt(cfg.price_eur_kwh, 3)} €/kWh`;
   const off = p.offline.t > 0;
-  $('wallAvgSub').textContent = `aktiv Ø ${fmt(en.avg_busy_w)} W · Leerlauf Ø ${fmt(en.avg_idle_w)} W` + (off ? ` · Engine offline Ø ${fmt(en.avg_offline_w)} W` : '') + ` · GPU Ø ${fmt(en.avg_gpu_w)} W`;
-  $('kwh').innerHTML = `${fmt(en.kwh, en.kwh < 10 ? 3 : 1)}<small>kWh</small>`;
-  $('kwhSub').textContent = `aktiv ${fmt(en.busy_kwh, 3)} · Leerlauf ${fmt(en.idle_kwh, 3)}` + (off ? ` · offline ${fmt(en.offline_kwh, 3)}` : '') + ` kWh · davon GPU ${fmt(en.gpu_kwh, 3)}`;
-  $('eur').innerHTML = `${eur(en.eur)}<small>€</small>`;
-  $('eurSub').textContent = `bei ${fmt(cfg.price_eur_kwh, 3)} €/kWh · aktiv ${eur(p.prefill.eur + p.decode.eur)} € · Leerlauf ${eur(p.idle.eur)} €` + (off ? ` · offline ${eur(p.offline.eur)} €` : '');
-  $('eurOut').innerHTML = `${eur(en.eur_per_m_out)}<small>€</small>`;
-  $('eurOutSub').textContent = `nur Decode-Strom · inkl. Leerlauf ${eur(en.eur_per_m_out_all)} € · ${compact(tk.out)} Tokens`;
-  $('eurIn').innerHTML = `${eur(en.eur_per_m_in)}<small>€</small>`;
-  $('eurInSub').textContent = `nur Prefill-Strom · inkl. Leerlauf ${eur(en.eur_per_m_in_all)} € · pro 1 Mio Prompt inkl. Cache ${eur(en.eur_per_m_prompt)} €`;
+  // € column: one decimal count for all rows so the commas line up (3 if any row is below 0,1, as eur() would)
+  const eurRows = [p.prefill.eur + p.decode.eur, p.idle.eur, ...(off ? [p.offline.eur] : [])].filter(v => v != null && !isNaN(v));
+  const eurD = eurRows.some(v => Math.abs(v) < 0.1) ? 3 : 2;
+  const er = (name, c, w, k, e2, cls = '') => `<tr class="${cls}"><td>${c ? sw(c) : ''}${name}</td><td>${fmt(w)}</td><td>${fmt(k, 3)}</td><td>${e2 == null || isNaN(e2) ? '<span class="na">–</span>' : fmt(e2, eurD)}</td></tr>`;
+  $('energyTbl').innerHTML = `<thead><tr><th></th><th>Ø W</th><th>kWh</th><th>€</th></tr></thead><tbody>`
+    + er('aktiv', '--s3', en.avg_busy_w, en.busy_kwh, p.prefill.eur + p.decode.eur)
+    + er('Leerlauf', '--s1', en.avg_idle_w, en.idle_kwh, p.idle.eur)
+    + (off ? er('Engine offline', '--axis', en.avg_offline_w, en.offline_kwh, p.offline.eur) : '')
+    + er('davon GPU', null, en.avg_gpu_w, en.gpu_kwh, null, 'sub') + '</tbody>';
+  $('peakWall').innerHTML = tot.peak_wall != null ? `<dt>Spitze Steckdose<span class="sub muted" style="display:block;font-size:12px;color:var(--muted)">= Skala des Steckdose-Balkens oben</span></dt><dd>${fmt(tot.peak_wall)} W<span class="sub">${tot.peak_wall_at ? 'am ' + dt(tot.peak_wall_at) : ''}</span></dd>` : '';
+  // € pro 1 Mio
+  $('eurOut').innerHTML = U(eur(en.eur_per_m_out), '€');
+  $('eurOutKv').innerHTML = `<dt>inkl. Leerlauf</dt><dd>${eur(en.eur_per_m_out_all)} €</dd><dt>Basis</dt><dd>${compact(tk.out)} Output-Tokens</dd>`;
+  $('eurIn').innerHTML = U(eur(en.eur_per_m_in), '€');
+  $('eurInKv').innerHTML = `<dt>inkl. Leerlauf</dt><dd>${eur(en.eur_per_m_in_all)} €</dd><dt>Prompt inkl. Cache<span style="display:block;font-size:12px;color:var(--muted)">nur Prefill-Strom</span></dt><dd>${eur(en.eur_per_m_prompt)} €</dd>`;
 
   // 24 h
   $('projNote').textContent = run < 600 ? `noch wenig Daten (${dur(run)}) – wird mit der Zeit belastbar` : `Basis: ${dur(run)} Laufzeit`;
   $('projNowLbl').textContent = `bei bisheriger Auslastung (${pr.util != null ? fmt(pr.util * 100, 1) : '–'} % aktiv)`;
-  $('projNowOut').innerHTML = `${compact(pr.now_out)}<small>Output/Tag</small>`;
-  $('projNowSub').textContent = `Input neu gelesen ${compact(pr.now_in)} · Prompt inkl. Cache ${compact(pr.now_in_prompt)}`;
-  $('projFullOut').innerHTML = `${compact(pr.full_out)}<small>Output/Tag</small>`;
-  $('projFullSub').textContent = `+ Input neu gelesen ${compact(pr.full_in)} · Tokens pro aktiver Sekunde × 86.400`;
-  $('projDec').innerHTML = `${compact(pr.decode_only)}<small>Output/Tag</small>`;
-  $('projDecSub').textContent = `Ø Decode ${s.totals && s.totals.decode_ms ? fmt(s.totals.output_tokens / (s.totals.decode_ms / 1000), 1) : '–'} tok/s × 86.400 s`;
-  $('projEur').innerHTML = `${eur(pr.eur_now)}<small>€</small>`;
-  $('projEurSub').textContent = `${fmt(pr.kwh_now, 2)} kWh bei bisheriger Auslastung · bei 100 %: ${fmt(pr.kwh_full, 2)} kWh = ${eur(pr.eur_full)} €`;
+  const pv = {now_out: compact(pr.now_out), now_in: compact(pr.now_in), now_in_prompt: compact(pr.now_in_prompt), kwh_now: fmt(pr.kwh_now, 2), eur_now: eur(pr.eur_now) + ' €',
+    full_out: compact(pr.full_out), full_in: compact(pr.full_in), kwh_full: fmt(pr.kwh_full, 2), eur_full: eur(pr.eur_full) + ' €', decode_only: compact(pr.decode_only)};
+  for (const el of document.querySelectorAll('#projTbl td[data-k]')) if (pv[el.dataset.k] != null) el.innerHTML = NA(pv[el.dataset.k]);
 
-  // settings form: fill once (and after saving), never while the user types
   if (!settingsLoaded) { fillSettings(cfg); settingsLoaded = true; }
   $('setHint').textContent = `Rest-System = Steckdose Leerlauf − GPU Leerlauf × Faktor = ${fmt(en.rest_w)} W (konstant gerechnet). `
     + `Steckdose ≈ Rest + GPU × Faktor + CPU-Zuschlag × CPU-Last. Änderungen gelten rückwirkend für die ganze Zählung (Zeit, GPU-Energie und CPU-Last werden getrennt gespeichert).`;
 }
 function fillSettings(cfg) { const f = $('setForm'); for (const [k, v] of Object.entries(cfg)) if (f.elements[k]) f.elements[k].value = v; }
-$('setBtn').onclick = () => $('settings').classList.toggle('open');
-$('setClose').onclick = () => $('settings').classList.remove('open');
 $('setForm').onsubmit = async ev => { ev.preventDefault(); const f = ev.target, body = {};
   for (const el of f.elements) if (el.name) body[el.name] = parseFloat(String(el.value).replace(',', '.'));
   try { const r = await fetch('api/settings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
@@ -672,16 +1355,210 @@ $('resetBtn').onclick = async () => {
     $('setMsg').textContent = 'neu begonnen · archiviert als ' + j.archived; }
   catch (e) { $('setMsg').textContent = 'Fehler: ' + e.message; } };
 
+
+// ---- Einstellungen: Seitenleiste (Strom & Kosten · GPU-Leistung · Lüfter)
+let ctl = null;
+const FLOOR_FB = [[40, 30], [60, 45], [70, 65], [78, 85], [83, 100]];
+function interp(curve, t) { const p = [...curve].sort((a, b) => a[0] - b[0]); if (t <= p[0][0]) return p[0][1];
+  for (let i = 1; i < p.length; i++) if (t <= p[i][0]) return p[i - 1][1] + (p[i][1] - p[i - 1][1]) * (t - p[i - 1][0]) / (p[i][0] - p[i - 1][0]);
+  return p[p.length - 1][1]; }
+function floorCurve() { return (ctl && ctl.floor && ctl.floor.curve) || FLOOR_FB; }
+function curveProblem(c) { if (c.length < 2) return 'mindestens 2 Punkte';
+  for (let i = 1; i < c.length; i++) { if (c[i][0] <= c[i - 1][0]) return 'Temperaturen müssen steigen'; if (c[i][1] < c[i - 1][1]) return 'Drehzahl darf mit steigender Temperatur nicht fallen'; }
+  for (let t = 0; t <= 100; t++) { const h = interp(c, t), n = interp(floorCurve(), t); if (h + 1e-9 < n) return `bei ${t} °C ${fmt(h, 1)} % – Grundkurve verlangt mind. ${fmt(n, 1)} %`; }
+  return null; }
+let menuTab = 't-strom';
+function menuOpen(tab) { $('menu').hidden = false; $('scrim').hidden = false; showTab(tab || menuTab); loadCtl(); $('menuClose').focus({preventScroll: true}); }
+function menuClose() { $('menu').hidden = true; $('scrim').hidden = true; $('menuBtn').focus({preventScroll: true}); }
+function showTab(id) { menuTab = id; for (const b of document.querySelectorAll('.menu .tabs button')) b.setAttribute('aria-selected', b.dataset.tab === id ? 'true' : 'false');
+  for (const t of document.querySelectorAll('.menu .tab')) t.hidden = t.id !== id;
+  if (id === 't-api') renderApi();
+  try { localStorage.setItem('menuTab', id); } catch (e) {} }
+try { menuTab = localStorage.getItem('menuTab') || menuTab; } catch (e) {}
+for (const b of document.querySelectorAll('.menu .tabs button')) b.onclick = () => showTab(b.dataset.tab);
+
+// ---- API & Nutzung: live values (host, context, slots, model id)
+function renderApi() {
+  const host = location.hostname || 'localhost', e = (lastSnap && lastSnap.engine) || {};
+  for (const el of document.querySelectorAll('#t-api [data-host]')) el.textContent = el.textContent.replace(/HOST|\/\/[^:/]+:/, m => m === 'HOST' ? host : '//' + host + ':');
+  $('apiCtx').textContent = e.max_context ? fmt(e.max_context) : '–';
+  $('apiSlots').textContent = e.batch_slots ? fmt(e.batch_slots) : (lastSnap && lastSnap.batch ? fmt(lastSnap.batch.slots) : '1');
+  $('apiModel').textContent = e.model || '–';
+  const base = `http://${host}:8000/v1`;
+  $('apiCurl').textContent = `# Denken aus, kurze Antwort
+curl ${base}/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen3.8-Flash-Next",
+  "messages": [{"role": "user", "content": "Sag Hallo in fünf Wörtern."}],
+  "reasoning_effort": "none",
+  "max_tokens": 64
+}'
+
+# Python (openai-Paket)
+from openai import OpenAI
+c = OpenAI(base_url="${base}", api_key="x")
+r = c.chat.completions.create(model="Qwen3.8-Flash-Next", reasoning_effort="low",
+                              messages=[{"role": "user", "content": "Erkläre KV-Cache in 2 Sätzen."}])
+print(r.choices[0].message.content)`;
+  $('apiImg').textContent = `{"model": "Qwen3.8-Flash-Next", "messages": [{"role": "user", "content": [
+  {"type": "text", "text": "Was ist auf dem Bild?"},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+]}]}
+
+# Bild-Datei als Base64 schicken (Linux/macOS)
+B64=$(base64 -w0 bild.png)
+curl ${base}/chat/completions -H "Content-Type: application/json" -d '{"model": "Qwen3.8-Flash-Next",
+  "messages": [{"role": "user", "content": [{"type": "text", "text": "Beschreibe das Bild."},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$B64"'"}}]}]}'`; }
+$('apiBtn').onclick = () => menuOpen('t-api');
+$('menuBtn').onclick = () => menuOpen();
+{ const q = new URLSearchParams(location.search).get('menu'); if (q) setTimeout(() => menuOpen(q), 0); }
+$('setBtn').onclick = () => menuOpen('t-strom');
+$('menuClose').onclick = menuClose; $('scrim').onclick = menuClose;
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('menu').hidden) menuClose(); });
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  if (!r.ok) { const err = new Error(j.error || ('HTTP ' + r.status)); err.status = r.status; throw err; }
+  return j; }
+async function loadCtl() {
+  try { ctl = await api('api/control'); }
+  catch (e) { ctl = {error: e.status === 404 ? 'Dieser Monitor-Server hat kein G3-Einstellungsmenü (dashboard.py zu alt oder --g3 off).' : e.message, logged_in: false}; }
+  renderAuth(); renderPower(); renderFan(); }
+let authShown = null;
+function renderAuth() {
+  const on = !!(ctl && ctl.logged_in);
+  if (authShown !== on) { authShown = on;      // rebuild the login box only when the state changes (keeps what is typed)
+    for (const el of document.querySelectorAll('[data-auth]')) el.innerHTML = on
+      ? `<span>✓ angemeldet bei G3 (${esc(ctl.g3_url)}) – Änderungen werden über G3 angewendet</span><span style="flex:1"></span><button class="btn" type="button" data-logout>Abmelden</button>`
+      : `<span>Ändern nur mit dem <b>G3-Admin-Passwort</b>. Anzeige geht ohne.</span><span style="flex:1"></span>
+         <input type="password" autocomplete="current-password" placeholder="G3-Admin-Passwort" data-pw><button class="btn primary" type="button" data-login>Anmelden</button><span class="msg" data-amsg></span>`;
+    for (const el of document.querySelectorAll('[data-login]')) el.onclick = () => doLogin(el.parentElement);
+    for (const el of document.querySelectorAll('[data-pw]')) el.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); doLogin(el.parentElement); } };
+    for (const el of document.querySelectorAll('[data-logout]')) el.onclick = async () => { try { await api('api/control/logout', {}); } catch (e) {} loadCtl(); }; }
+  // without a login the settings are shown but locked - never the login box itself
+  for (const el of document.querySelectorAll('#pwForm input, #fanForm input, #fanForm select, #fanForm [data-act], [data-need]')) el.disabled = !on; }
+async function doLogin(box) {
+  const pw = box.querySelector('[data-pw]').value, msg = box.querySelector('[data-amsg]');
+  msg.textContent = 'melde an …';
+  try { await api('api/control/login', {password: pw}); await loadCtl(); }
+  catch (e) { msg.textContent = e.message; } }
+
+function renderPower() {
+  const p = (ctl && ctl.power) || {}, st = p.settings, gs = (lastSnap && lastSnap.gpus) || [];
+  const mode = ctl && ctl.mode === 'night' ? 'Nacht' : 'Tag';
+  $('pwStat').innerHTML = ctl && ctl.error && !st ? `<span class="err">${esc(ctl.error)}</span>` : !st ? 'G3 hat noch keine Leistungs-Einstellung gespeichert – die GPUs laufen mit den Treiber-Grenzen.'
+    : `Jetzt: <b>${mode}</b>` + (st.night_enabled === false ? ' (Nachtmodus aus)' : ` · Nacht ${st.start_time}–${st.end_time}`)
+      + (p.applied === false ? ' · <span class="err">noch nicht angewendet</span>' : '') + (p.last_error ? ` · <span class="err">${esc(p.last_error)}</span>` : '')
+      + (ctl.error ? ` · <span class="err">${esc(ctl.error)}</span>` : '');
+  const f = $('pwForm');
+  if (st && !f.dataset.dirty) { f.elements.night_enabled.checked = st.night_enabled !== false; f.elements.start_time.value = st.start_time; f.elements.end_time.value = st.end_time; }
+  const n = Math.max(gs.length, (st && st.day_limits || []).length);
+  if (!f.dataset.dirty || !$('pwRows').children.length) $('pwRows').innerHTML = [...Array(n).keys()].map(i => { const g = gs[i] || {};
+    return `<tr><td><b>GPU ${i}</b> <span class="mhint">${esc(g.name || '')}</span></td>
+      <td><input type="number" min="0" max="1000" step="1" data-day="${i}" value="${st && st.day_limits ? st.day_limits[i] ?? '' : ''}"></td>
+      <td><input type="number" min="0" max="1000" step="1" data-night="${i}" value="${st && st.night_limits ? st.night_limits[i] ?? '' : ''}"></td>
+      <td id="pwNow${i}">–</td></tr>`; }).join('');
+  pwNow();
+  renderAuth(); }
+function pwNow() { const gs = (lastSnap && lastSnap.gpus) || [];
+  gs.forEach((g, i) => { const el = $('pwNow' + i); if (el) el.innerHTML = (g.power_limit != null ? fmt(g.power_limit) + ' W' : '–') + (g.power != null ? ` <span class="mhint">(zieht ${fmt(g.power)} W)</span>` : ''); }); }
+function menuTick() { if (!$('menu').hidden && menuTab === 't-api') renderApi(); if ($('menu').hidden || !ctl) return; const n = ((lastSnap && lastSnap.gpus) || []).length;
+  if (!$('pwForm').dataset.dirty && $('pwRows').children.length < n) renderPower(); else pwNow();
+  if (!$('fanForm').dataset.dirty && fanDraft && fanDraft.gpus.length < n) renderFan(); }
+$('pwForm').oninput = () => { $('pwForm').dataset.dirty = '1'; };
+$('pwForm').onsubmit = async ev => { ev.preventDefault(); const f = ev.target;
+  const nums = sel => [...f.querySelectorAll(sel)].map(el => Number(el.value || 0));
+  const body = {night_enabled: f.elements.night_enabled.checked, start_time: f.elements.start_time.value, end_time: f.elements.end_time.value,
+    day_limits: nums('[data-day]'), night_limits: nums('[data-night]')};
+  $('pwMsg').textContent = 'wende an …';
+  try { const j = await api('api/control/power', body);
+    const bad = (j.results || []).filter(r => !r.ok);
+    $('pwMsg').textContent = bad.length ? 'gespeichert, aber: ' + bad.map(r => `GPU ${r.gpu_index ?? r.index ?? '?'}: ${r.error || r.message || 'Fehler'}`).join(' · ')
+      : 'gespeichert & angewendet ' + new Date().toLocaleTimeString('de-DE');
+    delete f.dataset.dirty; await loadCtl(); }
+  catch (e) { $('pwMsg').textContent = 'Fehler: ' + e.message; if (e.status === 401) loadCtl(); } };
+
+let fanDraft = null;
+function renderFan() {
+  const fz = (ctl && ctl.fan) || {}, st = fz.settings, gs = (lastSnap && lastSnap.gpus) || [];
+  const h = fz.helper;
+  $('fanStat').innerHTML = (ctl && ctl.error && !st ? `<span class="err">${esc(ctl.error)}</span> · ` : '')
+    + (!st ? 'Keine Lüfter-Einstellung gespeichert – alle Lüfter regelt der Treiber (auto).' : `Jetzt gilt: <b>${ctl.mode === "night" ? "Nacht" : "Tag"}</b>-Einstellung`)
+    + (h ? (h.installed ? (h.sudo_ok === false ? ' · <span class="err">g3-fan ohne sudo-Recht</span>' : '') : ` · <span class="err">g3-fan nicht installiert (${esc(h.install_hint || '')})</span>`) : '')
+    + (fz.last_error ? ` · <span class="err">${esc(fz.last_error)}</span>` : '');
+  if (!fanDraft || !$('fanForm').dataset.dirty) {
+    const n = Math.max(gs.length, st && st.gpus ? st.gpus.length : 0);
+    const def = () => ({mode: 'auto', curve: floorCurve().map(p => [...p])});
+    fanDraft = {min_percent: st ? st.min_percent : 30, hysteresis_c: st ? st.hysteresis_c : 3, hard_limit_c: st ? st.hard_limit_c : 83,
+      gpus: [...Array(n).keys()].map(i => { const g = st && st.gpus && st.gpus[i]; return {day: g ? {mode: g.day.mode, curve: g.day.curve.map(p => [...p])} : def(), night: g ? {mode: g.night.mode, curve: g.night.curve.map(p => [...p])} : def()}; })};
+    const f = $('fanForm'); for (const k of ['min_percent', 'hysteresis_c', 'hard_limit_c']) f.elements[k].value = fanDraft[k];
+  }
+  drawFanGpus(); renderAuth(); }
+function fanLive(i) { const g = (ctl && ctl.fan && ctl.fan.gpus || []).find(x => x.index === i || x.gpu === i) || {};
+  return g.percent != null ? ` · Lüfter ${fmt(g.percent)} %` : g.fan_percent != null ? ` · Lüfter ${fmt(g.fan_percent)} %` : ''; }
+function drawFanGpus() {
+  const gs = (lastSnap && lastSnap.gpus) || [];
+  $('fanGpus').innerHTML = fanDraft.gpus.map((g, i) => `<div class="fan-gpu"><div class="fh"><b>GPU ${i}</b><span class="mhint">${gs[i] ? fmt(gs[i].temp) + ' °C' : ''}${fanLive(i)}</span>
+      <span style="flex:1"></span><button class="btn" type="button" data-act="copy" data-i="${i}">auf alle GPUs übertragen</button></div>
+    <div class="fm">${['day', 'night'].map(m => fanMode(i, m, g[m], gs[i])).join('')}</div></div>`).join('');
+  for (const el of document.querySelectorAll('#fanGpus [data-act]')) el.onclick = fanAct;
+  for (const el of document.querySelectorAll('#fanGpus select')) el.onchange = () => { fanDraft.gpus[el.dataset.i][el.dataset.m].mode = el.value; $('fanForm').dataset.dirty = '1'; drawFanGpus(); };
+  for (const el of document.querySelectorAll('#fanGpus .pts input')) el.onchange = () => { const c = fanDraft.gpus[el.dataset.i][el.dataset.m].curve;
+    c[el.dataset.k][el.dataset.c] = Number(el.value); $('fanForm').dataset.dirty = '1'; drawFanGpus(); };
+  renderAuth(); }
+function fanMode(i, m, cfg, g) {
+  const cur = cfg.mode === 'curve', bad = cur ? curveProblem(cfg.curve) : null;
+  const W = 300, H = 110, L = 24, B = 14, x = t => L + (t - 20) / 80 * (W - L - 4), y = v => 4 + (H - 4 - B) * (1 - v / 100);
+  const path = c => { let d = ''; for (let t = 20; t <= 100; t += 1) d += (t === 20 ? 'M' : 'L') + x(t).toFixed(1) + ',' + y(interp(c, t)).toFixed(1); return d; };
+  let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
+  for (const v of [0, 50, 100]) svg += `<line x1="${L}" x2="${W - 4}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/><text x="${L - 4}" y="${y(v) + 3}" text-anchor="end">${v}</text>`;
+  for (const t of [20, 40, 60, 80, 100]) svg += `<text x="${x(t)}" y="${H - 2}" text-anchor="middle">${t}°</text>`;
+  svg += `<path d="${path(floorCurve())}" fill="none" stroke="var(--muted)" stroke-dasharray="4 3"/>`;
+  if (cur) svg += `<path d="${path(cfg.curve)}" fill="none" stroke="${bad ? 'var(--crit)' : 'var(--s1)'}" stroke-width="2"/>` + cfg.curve.map(p => `<circle cx="${x(p[0])}" cy="${y(p[1])}" r="3" fill="var(--s1)"/>`).join('');
+  if (g && g.temp != null) svg += `<line x1="${x(g.temp)}" x2="${x(g.temp)}" y1="4" y2="${H - B}" stroke="var(--warn)" stroke-dasharray="2 2"/>`;
+  svg += '</svg>';
+  return `<div><div class="fmode">${m === 'day' ? 'Tag' : 'Nacht'}<select data-i="${i}" data-m="${m}"><option value="auto"${cur ? '' : ' selected'}>auto (Treiber)</option><option value="curve"${cur ? ' selected' : ''}>Kurve</option></select></div>
+    ${svg}${cur ? `<div class="pts${bad ? ' bad' : ''}">${cfg.curve.map((p, k) => `<span><input type="number" min="0" max="100" value="${p[0]}" data-i="${i}" data-m="${m}" data-k="${k}" data-c="0">°
+      <input type="number" min="30" max="100" value="${p[1]}" data-i="${i}" data-m="${m}" data-k="${k}" data-c="1">%</span>`).join('')}
+      <button class="btn" type="button" data-act="add" data-i="${i}" data-m="${m}"${cfg.curve.length >= 8 ? ' disabled' : ''}>+</button>
+      <button class="btn" type="button" data-act="del" data-i="${i}" data-m="${m}"${cfg.curve.length <= 2 ? ' disabled' : ''}>−</button></div>
+      ${bad ? `<div class="why">${esc(bad)}</div>` : ''}` : '<div class="mhint">Treiber regelt selbst (gestrichelt = Grundkurve, nur zum Vergleich)</div>'}</div>`; }
+function fanAct(ev) { const b = ev.currentTarget, i = +b.dataset.i, m = b.dataset.m, f = $('fanForm'); f.dataset.dirty = '1';
+  if (b.dataset.act === 'copy') { const src = fanDraft.gpus[i]; fanDraft.gpus = fanDraft.gpus.map(() => JSON.parse(JSON.stringify(src))); }
+  else { const c = fanDraft.gpus[i][m].curve;
+    if (b.dataset.act === 'add') { const l = c[c.length - 1]; c.push([Math.min(100, l[0] + 5), Math.min(100, l[1] + 5)]); } else c.pop(); }
+  drawFanGpus(); }
+$('fanForm').oninput = ev => { if (ev.target.name) { fanDraft[ev.target.name] = Number(ev.target.value); $('fanForm').dataset.dirty = '1'; } };
+$('fanForm').onsubmit = async ev => { ev.preventDefault();
+  for (const [i, g] of fanDraft.gpus.entries()) for (const m of ['day', 'night']) { const p = g[m].mode === 'curve' && curveProblem(g[m].curve);
+    if (p) { $('fanMsg').textContent = `GPU ${i} ${m === 'day' ? 'Tag' : 'Nacht'}: ${p}`; return; } }
+  $('fanMsg').textContent = 'wende an …';
+  try { const j = await api('api/control/fan', fanDraft);
+    $('fanMsg').textContent = j.status === 'error' ? 'gespeichert, aber: ' + (j.last_error || 'Fehler') : 'gespeichert & angewendet ' + new Date().toLocaleTimeString('de-DE');
+    delete $('fanForm').dataset.dirty; await loadCtl(); }
+  catch (e) { $('fanMsg').textContent = 'Fehler: ' + e.message; if (e.status === 401) loadCtl(); } };
+
 // ---- data
+function safeRender(d) {
+  try { render(d); $('jsErr').style.display = 'none'; }
+  catch (err) { console.error(err); const el = $('jsErr'); el.textContent = 'Anzeigefehler: ' + (err && err.stack || err); el.style.display = 'block'; }
+}
 async function boot() {
   try { const h = await (await fetch('api/history')).json(); pushHist(h); } catch (e) {}
-  if (location.search.includes('once')) { const d = await (await fetch('api/snapshot')).json(); render(d); drawAll(); return; }
+  if (ONCE) { const d = await (await fetch('api/snapshot')).json(); safeRender(d); drawAll(); return; }
   const es = new EventSource('api/stream');
   let n = 0;
-  es.onmessage = ev => { const d = JSON.parse(ev.data); pushHist(d.point); render(d.snap); if (n++ % 2 === 0) drawAll(); };
-  es.onerror = () => { $('state').innerHTML = '<span class="dot" style="background:var(--crit)"></span><span class="offline">Dashboard getrennt – verbinde neu …</span>'; };
+  es.onmessage = ev => { const d = JSON.parse(ev.data); if (sseDown) sseDown = false; pushHist(d.point); safeRender(d.snap); if (n++ % 2 === 0) drawAll(); };
+  es.onerror = () => { sseDown = true;
+    setBadge('<span class="dot" style="background:var(--crit)"></span><span style="color:var(--crit)">Dashboard getrennt – verbinde neu …</span>'); renderAlarms(); };
 }
-window.addEventListener('resize', drawAll);
+let rz; const redraw = () => { clearTimeout(rz); rz = setTimeout(drawAll, 60); };
+window.addEventListener('resize', redraw);
+// redraw when the chart grid changes width (resize, details toggle, late layout)
+if (window.ResizeObserver) { let lw = 0; new ResizeObserver(en => { const w = Math.round(en[0].contentRect.width); if (w && w !== lw) { lw = w; redraw(); } }).observe(document.querySelector('.charts')); }
+{ const rs = $('reqScroll'), upd = () => rs.classList.toggle('end', rs.scrollLeft + rs.clientWidth >= rs.scrollWidth - 4);
+  rs.addEventListener('scroll', upd, {passive: true}); window.addEventListener('resize', upd); setTimeout(upd, 0); }
 boot();
 </script>
 </body>
