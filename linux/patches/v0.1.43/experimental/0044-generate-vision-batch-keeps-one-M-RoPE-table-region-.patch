@@ -1,0 +1,1587 @@
+From 49d0d3e0e6c6ef0745e13bd89748316b1a763b27 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 02:31:46 +0200
+Subject: [PATCH] generate: --vision --batch keeps one M-RoPE table region per
+ slot (images share the batch)
+
+The image position table was one per device for all batch slots (see the vision guard), so an image request had to run
+alone.  Each device's table now has 1 + B regions: region 0 is the main sessions' table as before, region 1 + b
+belongs to batch slot b.  Every rope kernel already reads the value a caller passes as a table row, so a slot row
+passes its region's base + its cell, and no kernel changes (include/strata/program/mrope_regions.hpp).
+- Slot staging: verify.cpp stage_batch (serial windows and pipelined groups), the per-row indexer append every batch
+  window takes, the batch commit re-append, and the slot drafters' four position writers (mtp.cpp) add the base.
+- copy_to_slot copies region 0 into the slot's region when the request has pictures or the region is not the identity,
+  queued on each device before its final sync (host path and STRATA_SLOT_COPY_DIRECT), the slot marked only after.
+- Regions are allocated only with --vision, --serve and --batch >= 2, after every batch clamp (~51 MiB per GPU at 262K
+  and 16 slots); if they do not fit, the single table and the refusal stay.  Bases are 0 without --vision.
+- INFO ... mrope_slots=1: the server sends image requests through the batch (BGENI) only then; otherwise it keeps
+  running them alone.  The engine's mix refusal applies only without regions.  SYCL: --vision turns --batch off.
+- Image slots stay uncached (no checkpoints, no parking, never a slot source), so image state never moves between
+  slots; a follow-up turn sends its pictures again and gets a fresh region.  block_pos in text slot snapshots now holds
+  base + 4b (no kernel reads it).
+- STRATA_MROPE_REGION_SKIP=1: a negative control for tools/vision_batch_check.py only.
+
+Tests (CPU): mrope_regions_test (host model: text slots while an image is read and decodes, two images, reset,
+negative control), batch_rows_test staging check, serve/test_image_alone.py 17 tests incl. the handshake.  Reviewed
+for call-site completeness, state/ordering and text identity.  NOT yet run on a GPU: tools/vision_batch_check.py
+holds the validation (text slots and image requests equal to their solo runs, two images at once, follow-up turns,
+text A/B k5 vs v1 with --vision on/off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                           |   5 +
+ include/strata/core/batch_rows.hpp       |  15 +
+ include/strata/core/mtp.hpp              |   3 +
+ include/strata/core/session.hpp          |   5 +
+ include/strata/kernels/mrope.hpp         |  14 +-
+ include/strata/program/mrope_regions.hpp |  57 +++
+ serve/server.py                          |  24 +-
+ serve/test_image_alone.py                |  95 +++-
+ src/core/mtp.cpp                         |   9 +-
+ src/core/verify.cpp                      |  21 +-
+ src/program/generate.cpp                 | 126 ++++-
+ sycl/src/program/generate.cpp            |   7 +-
+ tests/core/batch_rows_test.cpp           |  21 +
+ tests/program/mrope_regions_test.cpp     | 196 ++++++++
+ tools/vision_batch_check.py              | 611 +++++++++++++++++++++++
+ 15 files changed, 1168 insertions(+), 41 deletions(-)
+ create mode 100644 include/strata/program/mrope_regions.hpp
+ create mode 100644 tests/program/mrope_regions_test.cpp
+ create mode 100644 tools/vision_batch_check.py
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c071f0a6..11b4eca9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -269,6 +269,11 @@ if(STRATA_BUILD_TESTS)
+   add_executable(batch_read_test tests/program/batch_read_test.cpp)
+   target_include_directories(batch_read_test PRIVATE include)
+   add_test(NAME batch_read_test COMMAND batch_read_test)
++  # --vision with --batch: the M-RoPE table's slot regions, their bases and when an admission copies the main region
++  # into a slot's, with a host model of the table as the rope kernels read it (header-only, CPU)
++  add_executable(mrope_regions_test tests/program/mrope_regions_test.cpp)
++  target_include_directories(mrope_regions_test PRIVATE include)
++  add_test(NAME mrope_regions_test COMMAND mrope_regions_test)
+ 
+   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
+   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
+diff --git a/include/strata/core/batch_rows.hpp b/include/strata/core/batch_rows.hpp
+index f51b233b..9552642a 100644
+--- a/include/strata/core/batch_rows.hpp
++++ b/include/strata/core/batch_rows.hpp
+@@ -6,6 +6,7 @@
+ // stage sees the same layout).  The rows travel between the stages of a layer split in hand-off buffers of
+ // `handoff_rows` rows, the window's group starting at row `hbase`.
+ 
++#include <cstddef>
+ #include <cstdint>
+ 
+ namespace strata::core {
+@@ -27,4 +28,18 @@ inline const char* batch_rows_error(const int* rows, int S, const int64_t* pos,
+     return nullptr;
+ }
+ 
++/// Row t's rope positions in the verifier's staging, [max_t][n_head] q rows, then [max_t][n_head_kv] K rows, then
++/// [max_t][idx_q_heads] indexer-query rows: every head of every group at `mrope_base + cell` (--vision with --batch:
++/// the slot's region of the M-RoPE table; base 0 otherwise, the cell itself).  The KV cell, the attention length and
++/// the QSA step are staged apart (qsa_step_fill) and keep the cell.
++inline void batch_rows_stage_rope(int32_t* h_pos, int max_t, int64_t n_head, int64_t n_head_kv, int64_t idx_q_heads,
++                                  int t, int64_t cell, int32_t mrope_base) {
++    const int32_t rp = (int32_t) (mrope_base + cell);
++    for (int64_t h = 0; h < n_head; ++h) h_pos[t * n_head + h] = rp;
++    int32_t* pk = h_pos + (size_t) max_t * n_head;
++    int32_t* pi = pk + (size_t) max_t * n_head_kv;
++    for (int64_t h = 0; h < n_head_kv; ++h) pk[t * n_head_kv + h] = rp;
++    for (int64_t h = 0; h < idx_q_heads; ++h) pi[t * idx_q_heads + h] = rp;
++}
++
+ }  // namespace strata::core
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index 5e6e97b6..50ce279a 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -257,6 +257,9 @@ private:
+     int32_t *h_tok_ = nullptr, *m_tok_ = nullptr, *h_step_ = nullptr, *m_step_ = nullptr;
+     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
+     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
++    // --vision with --batch: the M-RoPE table row of cell 0 for this drafter's rows (the session it was loaded with:
++    // a batch slot's region, 0 for the main drafter).  h_pos_ holds rope_base_ + cell, h_step_ keeps the cell.
++    int32_t rope_base_ = 0;
+     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
+     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
+     uint8_t* dhead_ = nullptr;
+diff --git a/include/strata/core/session.hpp b/include/strata/core/session.hpp
+index 4d633205..df43e957 100644
+--- a/include/strata/core/session.hpp
++++ b/include/strata/core/session.hpp
+@@ -30,6 +30,11 @@ namespace strata::core {
+ /// handoff between the GPU and the CPU expert pool.
+ struct SessionState {
+     int64_t max_cells = 0;
++    /// --vision with --batch: the M-RoPE table row of this session's cell 0 (strata/kernels/mrope.hpp).  A batch
++    /// slot's rows pass mrope_base + cell as their rope position, which reads the slot's own region of the table; the
++    /// cell itself (KV write, attention length, QSA step) is unchanged.  0 for the main sessions and whenever there is
++    /// no table (without --vision the position a kernel gets is the rotary position itself, so it must stay 0).
++    int32_t mrope_base = 0;
+ 
+     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
+     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
+diff --git a/include/strata/kernels/mrope.hpp b/include/strata/kernels/mrope.hpp
+index 18dbb685..5caa6d57 100644
+--- a/include/strata/kernels/mrope.hpp
++++ b/include/strata/kernels/mrope.hpp
+@@ -7,11 +7,15 @@
+ // p + max(nx, ny), not at its cell index.
+ //
+ // The table: nullptr (the default) keeps every kernel exactly as before - the position a caller passes is the
+-// rotary position.  Set, it is a DEVICE int32 [cells][3] (t, h, w) and the position a caller passes is read as a
+-// CELL index; pair i rotates by tab[cell * 3 + mrope_sector(i)].  Every caller in the engine passes cell indices
+-// (pos_base is 0 everywhere), so the table covers the prompt path, the verify window and the MTP drafter at once.
+-// The pointer must be set before any CUDA graph is captured (kernels take it as an argument); the contents may
+-// change between requests.
++// rotary position.  Set, it is a DEVICE int32 [rows][3] (t, h, w) and the position a caller passes is read as a
++// table ROW; pair i rotates by tab[row * 3 + mrope_sector(i)].  The main sessions pass their cell indices (base 0),
++// so the table covers the prompt path, the verify window and the MTP drafter at once.  With --batch the table holds
++// one region per batch slot after the main one (strata/program/mrope_regions.hpp): a slot's rows pass
++// SessionState::mrope_base + cell (the verifier's batch staging, the indexer's pos_base, the slot drafter), so image
++// and text slots decode side by side, each at its own positions.  A kernel that derives a rope position from a cell
++// must add that base too (the indexer's pooled key does, through pos_base); its block_pos then records base + 4b,
++// metadata no kernel reads.  The pointer must be set before any CUDA graph is captured (kernels take it as an
++// argument); the contents may change between requests.
+ #pragma once
+ 
+ #include <cstdint>
+diff --git a/include/strata/program/mrope_regions.hpp b/include/strata/program/mrope_regions.hpp
+new file mode 100644
+index 00000000..97520c84
+--- /dev/null
++++ b/include/strata/program/mrope_regions.hpp
+@@ -0,0 +1,57 @@
++// include/strata/program/mrope_regions.hpp - the M-RoPE table's regions with --vision and --batch (header-only: it is
++// arithmetic).
++//
++// The table (strata/kernels/mrope.hpp) is one per device.  With batch slots it holds 1 + B regions of `stride` rows:
++// region 0 is the main sessions' (rebuilt at every GEN/GENI, as before), region 1 + b is batch slot b's.  A slot row
++// passes slot_base(b) + cell as its rope position, so every rope kernel reads the slot's own region without a kernel
++// change.  A region starts as the identity; the main region is copied into slot b's when a request is admitted there
++// and either region holds an image layout (copy_needed), so text-only traffic never pays for a copy.
++#pragma once
++
++#include <cstdint>
++#include <limits>
++#include <vector>
++
++namespace strata::program::mrope_regions {
++
++/// Rows per region: the main table's cells (max_context + 64, as the table always had) rounded up to 64.  A multiple
++/// of the indexer's block (4) so a slot's base is a valid indexer pos_base (native_qsa_indexer requires pos_base % 4).
++inline int64_t stride(int64_t max_context) {
++    const int64_t cells = (max_context > 0 ? max_context : 0) + 64;
++    return (cells + 63) / 64 * 64;
++}
++
++/// The slot regions to allocate: the batch slots that run (after every clamp of --batch), only with --vision and
++/// --serve and 2 or more slots; 0 otherwise (then every base stays 0 and the table keeps its one region).
++inline int slot_regions(bool vision, bool serve, int batch) {
++    return vision && serve && batch >= 2 ? batch : 0;
++}
++
++/// The table's int32 entries for `slots` slot regions, or 0 when an index would not fit an int (the kernels index it
++/// with int row * 3 + pair).
++inline int64_t table_entries(int slots, int64_t stride_rows) {
++    if (slots < 0 || stride_rows <= 0) return 0;
++    const int64_t rows = (int64_t) (1 + slots) * stride_rows;
++    if (rows > std::numeric_limits<int32_t>::max() / 3) return 0;
++    return rows * 3;
++}
++
++/// The table row of slot b's cell 0 (region 1 + b).  The main sessions' base is 0.
++inline int32_t slot_base(int b, int64_t stride_rows) { return (int32_t) ((int64_t) (1 + b) * stride_rows); }
++
++/// The row a slot row passes as its rope position: its base plus its cell.
++inline int32_t rope_row(int32_t base, int64_t cell) { return (int32_t) (base + cell); }
++
++/// Whether an admission into a slot copies the main region into the slot's: the main region holds an image layout
++/// (the request has pictures), or the slot's region still holds one from an earlier image request (it must become
++/// the identity again).  Neither: both are the identity and the copy would change nothing.
++inline bool copy_needed(bool main_identity, bool slot_has_layout) { return !main_identity || slot_has_layout; }
++
++/// One region of the identity, `rows` rows of (t, h, w) = (c, c, c): what every region holds at startup.
++inline std::vector<int32_t> identity(int64_t rows) {
++    std::vector<int32_t> v((size_t) (rows > 0 ? rows : 0) * 3);
++    for (int64_t c = 0; c < rows; ++c) v[(size_t) c * 3] = v[(size_t) c * 3 + 1] = v[(size_t) c * 3 + 2] = (int32_t) c;
++    return v;
++}
++
++}  // namespace strata::program::mrope_regions
+diff --git a/serve/server.py b/serve/server.py
+index 2f09f8b6..059ca542 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -250,8 +250,9 @@ def _timeout_env(name: str, default: float) -> float | None:
+ # still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
+ # STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
+ ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
+-# --batch with images: how long an image request waits for the slots before it to finish (it runs alone, and new
+-# requests wait behind it) before it gives up with a 503 the client can retry.  STRATA_IMAGE_WAIT_S (0 = no limit).
++# --batch with images, on an engine without per-slot M-RoPE tables (no INFO mrope_slots=1): how long an image request
++# waits for the slots before it to finish (it runs alone, and new requests wait behind it) before it gives up with a 503
++# the client can retry.  STRATA_IMAGE_WAIT_S (0 = no limit).
+ IMAGE_WAIT_S = _timeout_env("STRATA_IMAGE_WAIT_S", 120.0) or 0.0
+ STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+ STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+@@ -903,6 +904,7 @@ class StrataEngine:
+         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
+         (PR #637)."""
+         info = dict(self.info)
++        info.pop("mrope_slots", None)            # the new engine says it again, or not (its slot tables may not fit)
+         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
+         try:
+             self.close()
+@@ -1359,11 +1361,19 @@ class StrataEngine:
+                 beat = time.monotonic()
+                 yield None
+ 
++    def image_alone(self) -> bool:
++        """--batch: whether an image request needs the engine alone (_generate_alone).  An engine that keeps one M-RoPE
++        position table per slot (INFO mrope_slots=1) decodes image and text slots side by side, so its image requests
++        go through the batch like any other (GENI alone, BGENI into a slot).  One without it (an older engine, the slot
++        tables did not fit, another backend) refuses an image beside other slots: the request then waits for the engine
++        alone."""
++        return not (self.info or {}).get("mrope_slots")
++
+     def _generate_alone(self, ids, max_new, sampling, cancel, embeddings):
+-        """--batch, a request with an image: the engine's M-RoPE table (the image's positions) is one per GPU and is
+-        rebuilt at every admission, while each batch row reads it at its own slot's position - an image decoding next
+-        to other slots gave them its positions, and itself theirs (silently wrong text).  Until the engine keeps one
+-        per slot, an image request has the engine alone for its whole run: it queues behind the image requests before
++        """--batch, a request with an image, on an engine without per-slot M-RoPE tables (image_alone): its table (the
++        image's positions) is one per GPU and is rebuilt at every admission, while each batch row reads it at its own
++        slot's position - an image decoding next to other slots gave them its positions, and itself theirs (silently
++        wrong text).  So an image request has the engine alone for its whole run: it queues behind the image requests before
+         it (image_line); from its arrival no new request is admitted, the ones in slots decode to their end, then it
+         takes the control lines with every slot free and keeps them to its DONE (GENI on the solo path; never moved
+         into a slot, since nothing it waits for STOPs it, and no read gives way to it)."""
+@@ -1443,7 +1453,7 @@ class StrataEngine:
+         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
+         if not self.alive():
+             raise EngineDied("the engine is unavailable; this request was not sent")
+-        if embeddings:                                  # an image: alone in the engine (see _generate_alone)
++        if embeddings and self.image_alone():           # an image: alone in the engine (see _generate_alone)
+             yield from self._generate_alone(ids, max_new, sampling, cancel, embeddings)
+             return
+         self.progress, self.progress_ms, self.reused = None, 0, 0
+diff --git a/serve/test_image_alone.py b/serve/test_image_alone.py
+index 10a53e64..94125ee8 100644
+--- a/serve/test_image_alone.py
++++ b/serve/test_image_alone.py
+@@ -1,11 +1,12 @@
+-"""--batch ("parallel"): a request with an image has the engine alone.
++"""--batch ("parallel"): a request with an image has the engine alone - unless the engine keeps one M-RoPE table per slot.
+ 
+-The engine's M-RoPE position table (an image's positions) is one per GPU and is rebuilt at every admission, while each
+-batch row reads it at its own slot's position: an image decoding next to other slots gave them its positions and took
+-theirs (silently wrong text).  Until the engine keeps one per slot, the server runs an image request on the solo path
+-(GENI) with no other slot active for its whole run: from its arrival no new request is admitted, the slots that decode
+-finish, then it runs; image requests queue one after another; a cancelled or failed one gives the turn back.  Also: a
+-dead image encoder fails only requests with images.
++An engine without per-slot tables keeps one M-RoPE position table (an image's positions) per GPU, rebuilt at every
++admission, while each batch row reads it at its own slot's position: an image decoding next to other slots gave them
++its positions and took theirs (silently wrong text).  With such an engine the server runs an image request on the solo
++path (GENI) with no other slot active for its whole run: from its arrival no new request is admitted, the slots that
++decode finish, then it runs; image requests queue one after another; a cancelled or failed one gives the turn back.
++An engine that says INFO mrope_slots=1 keeps a table region per slot: its image requests go through the batch like any
++other (BGENI beside the text slots).  Also: a dead image encoder fails only requests with images.
+ 
+ The admission logic is tested on an engine object without a process; the whole path over HTTP with the fake engine
+ of test_parallel (taught GENI, and to log the lines it receives).
+@@ -40,6 +41,9 @@ for old, new in (
+          '        with evl:\n'
+          '            evf.write(s + "\\n"); evf.flush()\n'),
+         ('        l = l.strip()\n', '        l = l.strip()\n        note("RECV " + l.split(" ", 1)[0])\n'),
++        # --mrope-slots: the engine keeps one M-RoPE table region per slot and says so
++        ('(" slot_cache=1" if "--slotcache" in args else "")',
++         '(" slot_cache=1" if "--slotcache" in args else "") + (" mrope_slots=1" if "--mrope-slots" in args else "")'),
+         ('if line.startswith(("GEN ", "BGEN ")):', 'if line.startswith(("GEN ", "BGEN ", "GENI ", "BGENI ")):'),
+         ('slot = int(f[1]) if f[0] == "BGEN" else None', 'slot = int(f[1]) if f[0] in ("BGEN", "BGENI") else None'),
+         ('max_new = int(f[2] if f[0] == "BGEN" else f[1])', 'max_new = int(f[2] if f[0] in ("BGEN", "BGENI") else f[1])'),
+@@ -293,6 +297,13 @@ class Admission(unittest.TestCase):
+         self.assertEqual(e.slot_busy, [False, False])
+         e.ctl.release()
+ 
++    def test_the_handshake_decides_whether_an_image_runs_alone(self):
++        e = engine_without_process()
++        for info, alone in (({}, True), (None, True), ({"mrope_slots": 0}, True), ({"slot_cache": 1}, True),
++                            ({"mrope_slots": 1}, False), ({"mrope_slots": 1, "batch_slots": 4}, False)):
++            e.info = info
++            self.assertEqual(e.image_alone(), alone, info)
++
+     def test_no_slot_goes_back_to_the_solo_path_while_an_image_waits(self):
+         e = engine_without_process()
+         e.info = {"slot_cache": 1}
+@@ -336,8 +347,8 @@ class OverHttp(unittest.TestCase):
+     start_engine, tearDown = test_parallel.ParallelService.start, test_parallel.ParallelService.tearDown
+     chat = test_parallel.ParallelService.chat
+ 
+-    def start(self, vision=LiveVision, slots=2):
+-        self.start_engine(slots)
++    def start(self, vision=LiveVision, slots=2, mrope=False):
++        self.start_engine(slots, more=["--mrope-slots"] if mrope else [])
+         script = Path(self.tmp.name) / "fake_strata.py"
+         script.write_text(FAKE, encoding="utf-8")
+         self.events = Path(self.tmp.name) / "events.log"
+@@ -414,6 +425,72 @@ class OverHttp(unittest.TestCase):
+         e = self.engine
+         self.assertEqual((e.image_line, e.waiting, e.wait_lens, any(e.slot_busy), e.ctl.locked()),
+                          ([], 0, [], False, False))
++        self.assertNotIn("mrope_slots", e.info)             # (an engine without per-slot tables)
++
++    def test_with_slot_tables_an_image_shares_the_batch(self):
++        """INFO mrope_slots=1: the image request is admitted into a slot (BGENI) while the text slots decode, and a text
++        request that comes after it is admitted while the image slot decodes; nothing waits for the engine alone."""
++        self.start(slots=4, mrope=True)
++        self.assertEqual(self.engine.info.get("mrope_slots"), 1)
++        out, errors = {}, []
++        threads = [self.go(self.chat, "first LONGREPLY", out, errors)]
++        time.sleep(0.1)
++        threads.append(self.go(self.chat, "second LONGREPLY", out, errors))
++        self.assertTrue(until(lambda: sum(self.engine.slot_busy) == 2))   # both decode in the slots
++        threads.append(self.go(self.image_chat, "the picture LONGREPLY", out, errors))
++        self.assertTrue(until(lambda: sum(self.engine.slot_busy) == 3))   # the image in a slot beside them
++        self.assertEqual(self.engine.image_line, [])
++        threads.append(self.go(self.chat, "late LONGREPLY", out, errors))
++        for th in threads:
++            th.join(60)
++        self.assertEqual(errors, [])
++        self.assertEqual(out, {"first LONGREPLY": LONG_REPLY, "second LONGREPLY": LONG_REPLY,
++                               "the picture LONGREPLY": LONG_REPLY, "late LONGREPLY": LONG_REPLY})
++        ev = self.recv()
++        self.assertNotIn("GENI", ev)                        # never the solo path alone
++        self.assertEqual(ev.count("BGENI"), 1, ev)
++        # the fake logged how many slots were active at each admission: the image came beside both text slots, and
++        # the late text request beside the image slot
++        adm = [x.split() for x in self.log.read_text().splitlines() if x.startswith(("BGEN", "BGENI"))]
++        kinds = [a[0] for a in adm]
++        i = kinds.index("BGENI")
++        self.assertGreaterEqual(int(adm[i][3]), 2, adm)
++        self.assertTrue([a for a in adm[i + 1:] if a[0] == "BGEN" and int(a[3]) >= 1], adm)
++        e = self.engine
++        self.assertTrue(until(lambda: not any(e.slot_busy)))
++        self.assertEqual((e.image_line, e.waiting, e.wait_lens, e.ctl.locked()), ([], 0, [], False))
++
++    def test_with_slot_tables_an_image_alone_takes_the_solo_path(self):
++        """INFO mrope_slots=1 and nothing else running: the image runs on the solo path (GENI), as a text request
++        would, and a text request that comes meanwhile does not wait for it to end."""
++        self.start(slots=3, mrope=True)
++        out, errors = {}, []
++        threads = [self.go(self.image_chat, "the picture LONGREPLY", out, errors)]
++        time.sleep(0.15)
++        threads.append(self.go(self.chat, "text LONGREPLY", out, errors))
++        for th in threads:
++            th.join(60)
++        self.assertEqual(errors, [])
++        self.assertEqual(set(out.values()), {LONG_REPLY})
++        ev = self.recv()
++        self.assertEqual(ev[:1], ["GENI"], ev)
++        # the text request arriving STOPped the image's solo run, which went on in a slot (BGENI with the reply so
++        # far), and the text request was admitted beside it (one slot active at its BGEN)
++        self.assertIn("BGENI", ev)
++        adm = [x.split() for x in self.log.read_text().splitlines() if x.startswith("BGEN ")]
++        self.assertTrue(adm and int(adm[0][3]) >= 1, adm)
++        self.assertEqual(self.engine.image_line, [])
++
++    def test_a_restarted_engine_says_its_slot_tables_again(self):
++        """mrope_slots is the running engine's: a restart into an engine that does not say it (its tables did not fit)
++        sends image requests alone again."""
++        self.start(slots=2, mrope=True)
++        self.assertEqual(self.engine.image_alone(), False)
++        exe, args, *rest = self.engine.spawn
++        self.engine.spawn = (exe, [a for a in args if a != "--mrope-slots"], *rest)
++        self.engine.restart()
++        self.assertNotIn("mrope_slots", self.engine.info)
++        self.assertEqual(self.engine.image_alone(), True)
+ 
+     def test_images_queue_one_after_another(self):
+         self.start()
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index b21beb5d..74d0fff6 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -246,6 +246,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
+     g_ = &g;
+     ss_ = &ss;
++    rope_base_ = ss.mrope_base;   // a batch slot's drafter rotates in the slot's region of the M-RoPE table
+     if (ple_ss_ == nullptr) ple_ss_ = &ss;
+     max_t_ = max_t;
+     rt_dir_ = rt_dir;
+@@ -1219,7 +1220,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
+             stp[i * 4 + 1] = (int32_t) (cell + 1);
+             stp[i * 4 + 2] = (int32_t) ((cell + 1) / 4);
+             stp[i * 4 + 3] = (int32_t) (cell + 1);
+-            for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) cell;
++            for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) (rope_base_ + cell);
+         }
+         if (cudaMemcpyAsync(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+             err = "mtp prefill: the input records upload failed";
+@@ -1265,7 +1266,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
+             h_step_[t * 4 + 1] = (int32_t) (cell + 1);
+             h_step_[t * 4 + 2] = (int32_t) ((cell + 1) / 4);
+             h_step_[t * 4 + 3] = (int32_t) (cell + 1);
+-            for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = (int32_t) cell;
++            for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = (int32_t) (rope_base_ + cell);
+         }
+         if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                             cs_) != cudaSuccess ||
+@@ -1301,7 +1302,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
++        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) (rope_base_ + cell);
+     };
+     for (int t = 0; t < T; ++t) {
+         h_tok_[t] = tokens[t];
+@@ -1460,7 +1461,7 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
+         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
++        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) (rope_base_ + cell);
+     };
+     for (int t = 0; t < T; ++t) {
+         h_tok_[t] = tokens[t];
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 789b1684..ffb9210e 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -1352,9 +1352,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     for (int t = tb; t < te; ++t) {
+                         const QsaState& sx = slot_ss(t).qsa_states[qi];
+                         const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
+-                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+-                                                  (const float*) wikn->data, EPS, ib, s, sx.max_cells,
+-                                                  rope_scaling(), cs);
++                        // the pooled key rotates at pos_base + 4b: a batch row's slot region (its mrope_base, a
++                        // constant of the captured layout), the main session's 0
++                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos,
++                                                  slot_ss(t).mrope_base, (const float*) wikn->data, EPS, ib, s,
++                                                  sx.max_cells, rope_scaling(), cs);
+                     }
+                 }
+                 stamp(l, 9, grp);
+@@ -2740,10 +2742,12 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
+                     copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS,
+                                      TS, cs_);
+                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
++                    // (the re-append rotates in the slot's own region of the M-RoPE table, as the window did)
++                    const int32_t rbase = slots_[(size_t) rows[first]]->mrope_base;
+                     for (int u = first; u < t; ++u)
+                         native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
+                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
+-                                                  0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
++                                                  rbase, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                   rope_scaling(), cs_);
+                 }
+                 ++qsa_index;
+@@ -2865,11 +2869,10 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+     for (int t = 0; t < S; ++t) {
+         h_tok_[t] = tokens[t];
+         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
+-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
+-        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
+-        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
+-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
+-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
++        // the rope rows read the slot's own region of the M-RoPE table (--vision: base + cell; 0 + cell otherwise);
++        // the step above keeps the cell
++        batch_rows_stage_rope(h_pos_, max_t_, g.n_head, g.n_head_kv, g.idx_q_heads, t, pos[t],
++                              slots_[(size_t) rows[t]]->mrope_base);
+     }
+     if (ss_->ple.ready() && ple_stage()) {
+         uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index c8a096d4..7ded3c65 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -77,6 +77,7 @@
+ #include "strata/spec/draft_source.hpp"
+ #include "strata/spec/suffix_drafter.hpp"
+ #include "strata/program/batch_groups.hpp"
++#include "strata/program/mrope_regions.hpp"
+ #include "strata/kernels/cvec.hpp"
+ #include "strata/core/progress.hpp"
+ #include "strata/core/device.hpp"
+@@ -192,6 +193,16 @@ bool admit_merge_first_env() {
+     }();
+     return on;
+ }
++// STRATA_MROPE_REGION_SKIP=1 (read once; a test's negative control, never for use): a batch admission does not copy the
++// main region of the M-RoPE table into its slot's, so an image slot decodes at the identity positions (wrong text).
++// tools/vision_batch_check.py --negative-control sets it to show that its comparisons catch a missing copy
++bool mrope_region_skip_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_MROPE_REGION_SKIP");
++        return v && v[0] != '\0' && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_CKPT_POOL=1 (read once; off by default): the serve loop keeps the running-state vectors of the conversation
+ // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
+ // resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
+@@ -4904,6 +4915,74 @@ int main(int argc, char** argv) {
+                          (double) bytes0 * o.batch / 1073741824.0);
+         }
+     }
++    // --vision with --batch: the M-RoPE table grows from one region to 1 + B, region 1 + b being batch slot b's
++    // (strata/program/mrope_regions.hpp), and each slot session's rows read their own region (mrope_base).  B is the
++    // slots that run, after every clamp above.  Before any CUDA graph is captured (the kernels take the table pointer
++    // as an argument; nothing has captured one yet), so the new allocation simply replaces the one-region table.
++    // When it does not fit, the slots keep base 0 and the engine keeps refusing image and text rows side by side.
++    int mrope_slot_n = 0;                                  // the slot regions in use (INFO mrope_slots)
++    int64_t mrope_stride = 0;
++    if (const int want = strata::program::mrope_regions::slot_regions(o.vision && d_mrope != nullptr, o.serve, o.batch);
++        want > 0 && (int) bslot_ss.size() == 1 + (int) stages.size()) {
++        namespace mr = strata::program::mrope_regions;
++        mrope_stride = mr::stride(o.max_context);
++        const int64_t entries = mr::table_entries(want, mrope_stride);
++        const std::vector<int32_t> ident = mr::identity(mrope_stride);
++        const size_t region_bytes = ident.size() * sizeof(int32_t);
++        // every device's new table first; the old ones are replaced only once all of them exist
++        std::vector<int32_t*> grown(1 + stages.size(), nullptr);
++        bool ok = entries > 0;
++        for (size_t k = 0; k < grown.size() && ok; ++k) {
++            const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
++            ok = cudaMalloc(&grown[k], (size_t) entries * sizeof(int32_t)) == cudaSuccess;
++            for (int r = 0; r <= want && ok; ++r)
++                ok = cudaMemcpy(grown[k] + (size_t) r * ident.size(), ident.data(), region_bytes,
++                                cudaMemcpyHostToDevice) == cudaSuccess;
++        }
++        if (!ok) {
++            cudaGetLastError();
++            for (size_t k = 0; k < grown.size(); ++k)
++                if (grown[k] != nullptr) {
++                    const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
++                    cudaFree(grown[k]);
++                }
++            std::fprintf(stderr, "strata generate: WARNING: --vision with --batch %d: the per-slot image position "
++                                 "tables (%.1f MiB per GPU) do not fit; an image request waits for the slots to be "
++                                 "idle (ERR vision: ...)\n", o.batch,
++                         (double) entries * sizeof(int32_t) / 1048576.0);
++        } else {
++            for (size_t k = 0; k < grown.size(); ++k) {
++                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
++                cudaDeviceSynchronize();
++                int32_t*& tab = k == 0 ? d_mrope : stages[k - 1]->mrope;
++                cudaFree(tab);
++                tab = grown[k];
++                strata::kernels::mrope_table_set(tab);
++            }
++            mrope_slot_n = want;
++            for (auto& per_stage : bslot_ss)
++                for (int b = 0; b < (int) per_stage.size(); ++b)
++                    per_stage[(size_t) b]->mrope_base = mr::slot_base(b, mrope_stride);
++            size_t fb = 0, tb = 0;
++            cudaMemGetInfo(&fb, &tb);
++            std::fprintf(stderr, "strata generate: --vision with --batch %d: the image position table holds %d regions "
++                                 "of %lld rows (the main sessions' and one per slot), %.1f MiB per GPU; image and text "
++                                 "requests share the batch\n", o.batch, 1 + want, (long long) mrope_stride,
++                         (double) entries * sizeof(int32_t) / 1048576.0);
++            if (mrope_region_skip_env())
++                std::fprintf(stderr, "strata generate: WARNING: STRATA_MROPE_REGION_SKIP=1 (a test's negative control): "
++                                     "image slots decode at the wrong positions\n");
++        }
++    }
++    // without the slot regions every session reads region 0 (or, without --vision, no table at all): a base other than
++    // 0 would rotate those rows by the wrong angle
++    for (const auto& per_stage : bslot_ss)
++        for (const auto& u : per_stage)
++            if (mrope_slot_n == 0 && u->mrope_base != 0) {
++                std::fprintf(stderr, "strata generate: internal error: a slot session has an M-RoPE base without the "
++                                     "slot regions\n");
++                return 1;
++            }
+ 
+     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
+     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
+@@ -9803,7 +9882,8 @@ int main(int argc, char** argv) {
+                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
++                                       " batch_groups=" + std::to_string(o.batch_groups) +
++                                       (mrope_slot_n > 0 ? " mrope_slots=1" : "")).c_str() : "");
+         }
+         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
+         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
+@@ -10032,6 +10112,9 @@ int main(int argc, char** argv) {
+             std::vector<ConvCheckpoint> chain;
+         };
+         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
++        // --vision with --batch (mrope_slot_n > 0): slot b's region of the M-RoPE table holds an image layout (it is not
++        // the identity).  Kept apart from BSlot, which an admission resets: this describes the table, not the request.
++        std::vector<char> slot_mrope_img(bs.size(), 0);
+         // timing of the batch windows since the slots were last all idle (one stderr line then)
+         double bt_run = 0, bt_commit = 0, bt_emit = 0;
+         double bt_wait0 = 0, bt_pool0 = 0;
+@@ -10067,7 +10150,19 @@ int main(int argc, char** argv) {
+             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
+             return v != nullptr && v[0] != '\0' && v[0] != '0';
+         }();
+-        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
++        // --vision with --batch: queue the copy of the main region of device k's M-RoPE table (the admitted request's
++        // positions, the decode tail included: the whole region) into slot b's region, on the device's default stream.
++        // The callers synchronise the device after it (each device's last cudaDeviceSynchronize, or sync_all), so it
++        // is done before the slot's first window or draft, which run on non-blocking streams.
++        auto queue_slot_region = [&](size_t k, int b) -> bool {
++            int32_t* tab = k == 0 ? d_mrope : stages[k - 1]->mrope;
++            const size_t rows = (size_t) mrope_stride;
++            return tab != nullptr &&
++                   cudaMemcpyAsync(tab + (size_t) strata::program::mrope_regions::slot_base(b, mrope_stride) * 3, tab,
++                                   rows * 3 * sizeof(int32_t), cudaMemcpyDeviceToDevice, 0) == cudaSuccess;
++        };
++        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e,
++                                    bool region = false) -> bool {
+             const int64_t upto = (int64_t) ids.size();
+             auto sync_all = [&]() {
+                 bool ok = true;
+@@ -10094,14 +10189,21 @@ int main(int argc, char** argv) {
+                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                             to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
+                         return failed();
++                if (region && !queue_slot_region(k, b)) { e = "batch slot copy: the image positions failed"; return failed(); }
+             }
+             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
+             return true;
+         };
+         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+             const int64_t upto = (int64_t) ids.size();
++            // --vision with --batch: the slot's region of the M-RoPE table becomes the main region (this request's
++            // positions) when either holds an image layout; text after text copies nothing.  Until the copy is done
++            // the region's contents are unknown (a failed copy leaves it marked, so the next admission copies again).
++            const bool region = mrope_slot_n > 0 && !mrope_region_skip_env() &&
++                                strata::program::mrope_regions::copy_needed(mrope_identity, slot_mrope_img[(size_t) b] != 0);
++            if (region) slot_mrope_img[(size_t) b] = 1;
+             if (slot_copy_direct) {
+-                if (!direct_slot_copy(true, b, ids, e)) return false;
++                if (!direct_slot_copy(true, b, ids, e, region)) return false;
+             } else
+             for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
+@@ -10121,8 +10223,12 @@ int main(int argc, char** argv) {
+                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                         return false;
+                 }
++                if (region && !queue_slot_region(k, b)) { e = "batch admission: the image positions failed"; return false; }
+                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+             }
++            // every device's region copy is done (synchronised above); the slot's drafter reads the table of its own
++            // device, which is one of them (the last stage's, or CUDA0's)
++            if (region) slot_mrope_img[(size_t) b] = mrope_identity ? 0 : 1;
+             if (batch_mtp) {
+                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
+                 // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
+@@ -11877,12 +11983,14 @@ int main(int argc, char** argv) {
+             const int64_t n = (int64_t) ids.size();
+             req_imgs.clear();
+             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+-            // --vision with --batch: the M-RoPE table below is one per device, indexed by a cell's position, and every
++            // --vision with --batch, without the slot regions (they did not fit: mrope_slot_n == 0, no INFO
++            // mrope_slots): the M-RoPE table below is one region per device, indexed by a cell's position, and every
+             // batch row reads it at its slot's own position.  An image request's table is not the identity a text
+             // slot needs (nor another image slot's), so image and text rows never decode together: a GENI / BGENI
+             // only while no slot decodes, a GEN / BGEN not while a slot that was admitted with pictures decodes.
+-            // (Before the table is touched; text-only traffic never meets either refusal.)
+-            if (o.vision && !bs.empty()) {
++            // (Before the table is touched; text-only traffic never meets either refusal.)  With the slot regions each
++            // slot reads its own region (copy_to_slot fills it) and neither refusal applies.
++            if (o.vision && !bs.empty() && mrope_slot_n == 0) {
+                 int busy = -1, busy_img = -1;
+                 for (size_t b = 0; b < bs.size(); ++b) {
+                     if (!bs[b].active) continue;
+@@ -14612,6 +14720,12 @@ int main(int argc, char** argv) {
+                     }
+                     sl.cvec = cvec_cached;
+                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
++                    // (--vision with --batch: this also keeps the slot's M-RoPE region with its state.  A slot's
++                    // sessions are only written by copy_to_slot, from the main sessions, right after the request that
++                    // decodes there was parsed and region 0 rebuilt for its cells; an image slot is never cached, has
++                    // no checkpoints, is not parked and gives way to nobody (BYIELD is text only), so its state never
++                    // moves to the main sessions or another slot, where it would read another region.  A later turn
++                    // of its conversation sends its pictures again (BGENI) and is laid out anew.)
+                     // STRATA_SLOT_PARK: the slot parks this conversation (with its reply), not the main sessions
+                     sl.parks = slot_park_on && !sl.img;
+                     if (sl.parks) main_slot = admit_slot;
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 0b23795d..82ba86a8 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -3873,8 +3873,13 @@ int main(int argc, char **argv) try {
+     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
+     if (o.batch != 0) {
+         const int cap = strata::kernels::kVerifyMaxT;
++        // --vision: this port keeps one M-RoPE table per device, which every batch row reads at its own cell, and
++        // has no per-slot regions (the CUDA engine's strata/program/mrope_regions.hpp): an image slot would give its
++        // positions to the text slots and take theirs.  So --vision runs without batch slots here.
+         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
+-                        : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
++                        : split_same ? "it needs each stage of a layer split on its own GPU"
++                        : o.vision ? "it does not run with --vision on this backend (image and text slots would share "
++                                     "one M-RoPE table)" : nullptr;
+         if (off != nullptr) {
+             std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
+             o.batch = 0;
+diff --git a/tests/core/batch_rows_test.cpp b/tests/core/batch_rows_test.cpp
+index f3493d15..046c0e2f 100644
+--- a/tests/core/batch_rows_test.cpp
++++ b/tests/core/batch_rows_test.cpp
+@@ -72,6 +72,27 @@ int main() {
+         check(run(rows, pos, 3, 1, 8, -1, false) != nullptr, "a negative hand-off base");
+         check(run(rows, pos, 3, 1, 8, 0, false) == nullptr, "three rows of one slot are a group");
+     }
++    // the rope rows of a window (--vision with --batch): every head group of row t at its slot's base + cell; the
++    // other rows untouched; base 0 stages the cell itself (text byte-identity without the slot regions)
++    {
++        const int max_t = 8;
++        const int64_t nh = 3, nkv = 2, iq = 4;
++        int32_t h_pos[max_t * (3 + 2 + 4)];
++        for (int32_t& v : h_pos) v = -7;
++        strata::core::batch_rows_stage_rope(h_pos, max_t, nh, nkv, iq, 2, 100, 0);
++        strata::core::batch_rows_stage_rope(h_pos, max_t, nh, nkv, iq, 5, 100, 262208);
++        const int32_t* q = h_pos;
++        const int32_t* k = h_pos + max_t * nh;
++        const int32_t* x = k + max_t * nkv;
++        bool ok = true;
++        for (int64_t h = 0; h < nh; ++h) ok = ok && q[2 * nh + h] == 100 && q[5 * nh + h] == 262308;
++        for (int64_t h = 0; h < nkv; ++h) ok = ok && k[2 * nkv + h] == 100 && k[5 * nkv + h] == 262308;
++        for (int64_t h = 0; h < iq; ++h) ok = ok && x[2 * iq + h] == 100 && x[5 * iq + h] == 262308;
++        check(ok, "every head group of a row at base + cell (base 0: the cell)");
++        int untouched = 0;
++        for (int32_t v : h_pos) untouched += v == -7;
++        check(untouched == max_t * (3 + 2 + 4) - 2 * (3 + 2 + 4), "the other rows are not written");
++    }
+     if (failures != 0) return EXIT_FAILURE;
+     std::printf("batch_rows_test: ok\n");
+     return EXIT_SUCCESS;
+diff --git a/tests/program/mrope_regions_test.cpp b/tests/program/mrope_regions_test.cpp
+new file mode 100644
+index 00000000..59c14b0d
+--- /dev/null
++++ b/tests/program/mrope_regions_test.cpp
+@@ -0,0 +1,196 @@
++// The M-RoPE table's slot regions (include/strata/program/mrope_regions.hpp): the layout, the bases, when an admission
++// copies the main region into a slot's, and a host model of the table as the rope kernels read it (mrope_pos: row *
++// 3 + pair % 3) - text slots keep their own positions while an image is read and decoded beside them.  Header-only,
++// CPU: no model, no GPU.
++#include "strata/program/mrope_regions.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <set>
++#include <string>
++#include <vector>
++
++namespace mr = strata::program::mrope_regions;
++
++namespace {
++int failures = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++// what a rope kernel rotates pair `pair` of a row by (mrope.hpp's mrope_pos, the table set)
++int32_t rot(const std::vector<int32_t>& tab, int64_t row, int pair) { return tab[(size_t) row * 3 + pair % 3]; }
++
++// the engine's image layout of one request (generate.cpp, the GENI parse): text at p, an image's cells at (p, p+y,
++// p+x), the text after it at p + max(nx, ny), every cell past the prompt continuing from there.  `img` holds the
++// first cell, nx and ny of each image.
++struct Img { int64_t at, nx, ny; };
++std::vector<int32_t> layout(int64_t n, const std::vector<Img>& imgs, int64_t cells) {
++    std::vector<int32_t> v((size_t) cells * 3);
++    auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
++        v[(size_t) c * 3] = (int32_t) t; v[(size_t) c * 3 + 1] = (int32_t) h; v[(size_t) c * 3 + 2] = (int32_t) w;
++    };
++    int64_t p = 0, i = 0;
++    size_t k = 0;
++    while (i < n) {
++        if (k < imgs.size() && imgs[k].at == i) {
++            const Img& im = imgs[k++];
++            for (int64_t j = 0; j < im.nx * im.ny; ++j) put(i + j, p, p + j / im.nx, p + j % im.nx);
++            i += im.nx * im.ny;
++            p += im.nx > im.ny ? im.nx : im.ny;
++            continue;
++        }
++        put(i, p, p, p);
++        ++p;
++        ++i;
++    }
++    for (int64_t c = n; c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
++    return v;
++}
++
++// A host model of one device's table and the engine's bookkeeping: region 0 rebuilt at a request's parse
++// (upload_mrope writes `cells` rows), copy_to_slot copying the main region into a slot's when copy_needed.
++struct Table {
++    int64_t stride, cells;
++    int slots;
++    std::vector<int32_t> tab;
++    std::vector<char> slot_img;
++    bool main_identity = true;
++    int copies = 0;
++    Table(int64_t max_context, int n) : stride(mr::stride(max_context)), cells(max_context + 64), slots(n) {
++        const std::vector<int32_t> id = mr::identity(stride);
++        for (int r = 0; r <= n; ++r) tab.insert(tab.end(), id.begin(), id.end());
++        slot_img.assign((size_t) n, 0);
++    }
++    void parse(const std::vector<int32_t>* img_layout) {   // a GEN (nullptr) or a GENI
++        if (img_layout == nullptr && main_identity) return;  // (`geni || !mrope_identity`)
++        const std::vector<int32_t> v = img_layout ? *img_layout : mr::identity(cells);
++        std::memcpy(tab.data(), v.data(), (size_t) cells * 3 * sizeof(int32_t));
++        main_identity = img_layout == nullptr;
++    }
++    void admit(int b, bool skip_copy = false) {             // copy_to_slot's region part
++        if (!mr::copy_needed(main_identity, slot_img[(size_t) b] != 0)) return;
++        if (!skip_copy) {
++            std::memcpy(tab.data() + (size_t) mr::slot_base(b, stride) * 3, tab.data(),
++                        (size_t) stride * 3 * sizeof(int32_t));
++            ++copies;
++        }
++        slot_img[(size_t) b] = main_identity ? 0 : 1;
++    }
++    // slot b's row for cell c as the rope kernels see it
++    int32_t slot_rot(int b, int64_t c, int pair) const { return rot(tab, mr::rope_row(mr::slot_base(b, stride), c), pair); }
++};
++}  // namespace
++
++int main() {
++    // the layout
++    check(mr::stride(262144) == 262208, "262K: max_context + 64, a multiple of 64");
++    check(mr::stride(1000) % 64 == 0 && mr::stride(1000) >= 1064, "a stride is a multiple of 64 and holds the cells");
++    for (int64_t ctx : {1, 4095, 4096, 32768, 131072, 262144, 1000000})
++        check(mr::stride(ctx) % 64 == 0 && mr::stride(ctx) >= ctx + 64 && mr::stride(ctx) - (ctx + 64) < 64,
++              "stride: the cells rounded up to 64");
++    check(mr::slot_base(0, 262208) % 4 == 0, "a base is a valid indexer pos_base (a multiple of 4)");
++    // the regions to allocate: only with --vision, --serve and 2 or more slots
++    check(mr::slot_regions(true, true, 16) == 16, "16 slots: 16 slot regions");
++    check(mr::slot_regions(false, true, 16) == 0, "no --vision: no slot region (every base 0)");
++    check(mr::slot_regions(true, false, 16) == 0, "no --serve: no slot region");
++    check(mr::slot_regions(true, true, 1) == 0 && mr::slot_regions(true, true, 0) == 0, "fewer than 2 slots: none");
++    check(mr::table_entries(16, 262208) == 17LL * 262208 * 3, "17 regions of 262208 rows");
++    check(mr::table_entries(16, 262208) * 4 < 52LL * 1048576, "about 51 MiB per GPU at 262K and 16 slots");
++    check(mr::table_entries(100000, 262208) == 0, "an index past an int is refused");
++    check(mr::table_entries(-1, 64) == 0 && mr::table_entries(2, 0) == 0, "bad arguments are refused");
++    // the bases: distinct, region-aligned, never overlapping the main region or each other
++    {
++        const int64_t st = mr::stride(262144);
++        std::set<int32_t> seen;
++        bool ok = true;
++        for (int b = 0; b < 16; ++b) {
++            const int32_t base = mr::slot_base(b, st);
++            ok = ok && base == (b + 1) * st && seen.insert(base).second && base >= st;
++            // the last cell a slot can reach stays inside its region
++            ok = ok && mr::rope_row(base, 262144 + 63) < base + st;
++        }
++        check(ok, "slot bases: region 1 + b, inside the slot's region, distinct");
++        check((int64_t) mr::slot_base(15, st) + st <= mr::table_entries(16, st) / 3, "the last region fits the table");
++    }
++    // the copy decision
++    check(!mr::copy_needed(true, false), "text after text: no copy (text-only traffic never copies)");
++    check(mr::copy_needed(false, false), "an image request: the copy");
++    check(mr::copy_needed(true, true), "text into a slot whose region still holds an image: the copy (back to identity)");
++    check(mr::copy_needed(false, true), "an image into an image slot: the copy");
++    // an identity region reads the cell back for every pair: the kernels see the integers of a run without --vision
++    {
++        Table t(4096, 4);
++        bool ok = true;
++        for (int b = 0; b < 4; ++b)
++            for (int64_t c : {0, 1, 7, 100, 4096, 4159})
++                for (int pair = 0; pair < 32; ++pair) ok = ok && t.slot_rot(b, c, pair) == c;
++        check(ok, "every region starts as the identity: row(base + c) = c for every pair");
++    }
++    // the bug and the fix: an image read and decoded while text slots decode
++    {
++        const int64_t ctx = 4096;
++        Table t(ctx, 4);
++        const std::vector<int32_t> img = layout(40, {{5, 4, 3}, {20, 2, 5}}, ctx + 64);   // two images, text between
++        // two text slots decode (slots 0 and 1)
++        t.parse(nullptr); t.admit(0);
++        t.parse(nullptr); t.admit(1);
++        check(t.copies == 0, "text admissions copy nothing");
++        // an image request is parsed (region 0 rebuilt) and read while they decode, then admitted into slot 2
++        t.parse(&img);
++        bool text_ok = true;
++        for (int b : {0, 1})
++            for (int64_t c = 0; c < 200; ++c)
++                for (int pair = 0; pair < 3; ++pair) text_ok = text_ok && t.slot_rot(b, c, pair) == c;
++        check(text_ok, "text slots keep their positions while the image's prompt is read (region 0 is not theirs)");
++        t.admit(2);
++        check(t.copies == 1 && t.slot_img[2] == 1, "the image admission copies the main region into its slot");
++        bool img_ok = true;
++        for (int64_t c = 0; c < ctx; ++c)
++            for (int pair = 0; pair < 3; ++pair) img_ok = img_ok && t.slot_rot(2, c, pair) == rot(img, c, pair);
++        check(img_ok, "the image slot reads the image's layout, the decode tail p + (c - n) included");
++        // what that layout is (mtmd): the first image starts at p = 5, so its cell (y = 1, x = 2) is (5, 6, 7)
++        check(t.slot_rot(2, 5 + 1 * 4 + 2, 0) == 5 && t.slot_rot(2, 5 + 1 * 4 + 2, 1) == 6 &&
++              t.slot_rot(2, 5 + 1 * 4 + 2, 2) == 7, "an image cell is (p, p + y, p + x) in its slot");
++        check(t.slot_rot(2, 40, 0) == rot(img, 39, 0) + 1, "the first decode cell continues the text after the prompt");
++        // a text request is admitted into slot 3 while the image slot decodes: region 0 back to the identity
++        t.parse(nullptr);
++        t.admit(3);
++        check(t.copies == 1, "a text admission beside an image slot copies nothing (slot 3 is the identity)");
++        bool both = true;
++        for (int64_t c = 0; c < 200; ++c) {
++            both = both && t.slot_rot(3, c, 1) == c && t.slot_rot(0, c, 2) == c;
++            both = both && t.slot_rot(2, c, 1) == rot(img, c, 1);
++        }
++        check(both, "the image slot keeps its layout after region 0 went back to the identity; text slots theirs");
++        // a second, different image into slot 0 at once (slot 0's text ended)
++        const std::vector<int32_t> img2 = layout(30, {{2, 6, 2}}, ctx + 64);
++        t.parse(&img2);
++        t.admit(0);
++        bool two = true;
++        for (int64_t c = 0; c < ctx; ++c)
++            two = two && t.slot_rot(0, c, 2) == rot(img2, c, 2) && t.slot_rot(2, c, 2) == rot(img, c, 2);
++        check(two, "two different images in two slots, each at its own positions");
++        // the image slot ends; text takes slot 2: its region goes back to the identity (the copy of an identity region 0)
++        t.parse(nullptr);
++        t.admit(2);
++        check(t.slot_img[2] == 0, "a text admission into an image slot resets its region");
++        bool reset = true;
++        for (int64_t c = 0; c < t.stride; ++c) reset = reset && t.slot_rot(2, c, 0) == c && t.slot_rot(2, c, 1) == c;
++        check(reset, "the whole region is the identity again (the rows past the main table's cells too)");
++        // negative control: an admission that skips the copy leaves the slot with another request's positions
++        Table u(ctx, 2);
++        u.parse(&img);
++        u.admit(1, /*skip_copy=*/true);
++        bool wrong = false;
++        for (int64_t c = 0; c < 40; ++c) wrong = wrong || u.slot_rot(1, c, 1) != rot(img, c, 1);
++        check(wrong, "negative control: without the copy the image slot reads the identity (the test sees it)");
++    }
++    if (failures != 0) return EXIT_FAILURE;
++    std::printf("mrope_regions_test: ok\n");
++    return EXIT_SUCCESS;
++}
+diff --git a/tools/vision_batch_check.py b/tools/vision_batch_check.py
+new file mode 100644
+index 00000000..ebc5b1f0
+--- /dev/null
++++ b/tools/vision_batch_check.py
+@@ -0,0 +1,611 @@
++#!/usr/bin/env python3
++"""--vision with --batch: image and text slots decoding side by side (the per-slot M-RoPE regions, INFO mrope_slots=1).
++
++GPU only: it starts the engine (and the image encoder) on the config's cards.  Every comparison is of greedy TOKENS
++(engine mode) or reply texts (server mode), never of snapshot bytes: a slot's indexer block_pos metadata holds its
++region's base, so a parked slot's bytes differ from a main-session capture while every token is the same.
++
++ENGINE MODE (the strong one): the engine binary and a strata-<model>.json with a "vision" block, spoken to over its
++stdin/stdout protocol (GEN/GENI solo, BGEN/BGENI into a slot), as tools/batch_test.py does.
++  process 1 (references): every request alone on the solo path (GEN / GENI), the image's turn 1 included
++  process 2 (checks): first the follow-up turn of the image conversation alone in a fresh engine (nothing cached:
++           its fresh solo reference), then
++    (i)   text slots == their solo tokens while a long image prompt is read beside them (its chunks interleave with
++          their windows) and while the image slot decodes (a text request admitted beside it)
++    (ii)  the image request in that busy batch == the same image request solo
++    (iii) two different images in two slots at once (and a text slot beside them), each == solo
++    reset a text request admitted into a slot an image request used == solo (its region back to the identity)
++    (iv)  the image conversation's follow-up turn after turn 1 decoded in a slot: into another slot beside a text
++          slot (from the live session), then after unrelated requests (from the conversation cache / slot park /
++          the SSD tier), then once more on the solo path - each == the fresh solo run of the same history
++  --text-ab OLD_EXE (v): text only, byte-identical tokens between OLD_EXE and --exe, each with --vision on and off
++          (4 engine runs; every run's solo and batch tokens must be the same in all four, and batch == solo)
++  --negative-control: process 2 with STRATA_MROPE_REGION_SKIP=1 (the engine skips the region copy): the image checks
++          must FAIL - proof that the comparisons see a missing copy.  Exit 0 only when they do.
++
++  python3 tools/vision_batch_check.py --exe ../Strata/engine/strata-g3-143v1 \\
++      --config ../linux/configs/T16-143-prod262r-vision-gpu.json --batch 16 --out vision_batch.json
++  python3 tools/vision_batch_check.py --exe ../Strata/engine/strata-g3-143v1 --config <same> --batch 16 \\
++      --text-ab ../Strata/engine/strata-g3-143k5
++  python3 tools/vision_batch_check.py --exe ../Strata/engine/strata-g3-143v1 --config <same> --batch 16 \\
++      --negative-control
++
++Exact comparisons need deterministic decoding: by default STRATA_IQ_MT_MIN=1 and --extra "--pcie-frac 0
++--adapt-every 1000000 --no-prefill-borrow" (as tools/batch_test.py and tools/batch_interleave_test.py; without
++--no-prefill-borrow the slots decoding during a long read see the experts that read borrowed run on the CPU, which
++rounds differently).  The config's own "env" is applied (--no-config-env leaves it out); STRATA_CONV_TIER_DIR points at
++a fresh directory per engine run so a disk tier from an earlier run cannot answer a "fresh" reference.
++
++SERVER MODE (--url http://127.0.0.1:8080/v1, a running server with "parallel" and "vision", nothing else using it): the
++same scenarios over /chat/completions at temperature 0, comparing reply texts.  A text-only control at the same
++concurrency runs first: if it already differs from solo (the production settings are not exact: adaptive tier, PCIe
++share, prompt borrowing), the image results are reported as inconclusive rather than failed.
++"""
++import argparse, base64, io, json, os, queue, shutil, subprocess, sys, tempfile, threading, time, urllib.error
++import urllib.request
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++
++IMAGE_PAD, VISION_START, VISION_END = 248056, 248053, 248054
++EOS = (248044, 248046)
++LINE_TIMEOUT_S = 900.0
++
++TEXTS = [
++    "Explain how a hash map handles collisions, with an example.",
++    "Write a short Python function that checks whether a string is a palindrome, then explain it.",
++    "What were the main causes of the First World War?",
++    "Describe the water cycle step by step.",
++    "Compare TCP and UDP in a few sentences.",
++    "Give a recipe for a simple tomato soup.",
++    "Explain what a B-tree is and why databases use it.",
++    "Describe the life cycle of a star like the Sun.",
++]
++Q_IMAGE = "Describe this picture: which shapes, which colours, and where are they?"
++Q_FOLLOW = "Now describe the same picture again, but list the colours first and then the shapes."
++FILLER = ("The committee reviewed item %d of the long agenda, noting the budget, the schedule and the open risks, and "
++          "asked the staff to report back next quarter. ")
++
++
++# ---------------------------------------------------------------------------------------------------------------- pictures
++def picture_png(kind, size=(640, 480)):
++    """A synthetic picture (needs Pillow): two different ones give two different image layouts and embeddings."""
++    from PIL import Image, ImageDraw
++    im = Image.new("RGB", size, "white")
++    d = ImageDraw.Draw(im)
++    w, h = size
++    if kind == "A":
++        d.rectangle([w * .1, h * .15, w * .45, h * .6], fill=(220, 20, 20))
++        d.ellipse([w * .55, h * .4, w * .9, h * .9], fill=(20, 50, 220))
++    else:
++        d.polygon([(w * .5, h * .05), (w * .9, h * .8), (w * .1, h * .8)], fill=(20, 160, 40))
++        d.rectangle([w * .65, h * .1, w * .95, h * .3], fill=(240, 200, 0))
++    buf = io.BytesIO()
++    im.save(buf, "PNG")
++    return buf.getvalue()
++
++
++class Encoder:
++    """The image encoder (the config's "vision" block, strata-vision): ENC <image> <out> -> OK <image tokens>."""
++
++    def __init__(self, vcfg, workdir, env, log):
++        args = [vcfg["exe"], "--mmproj", vcfg["mmproj"], "--model", vcfg["model"]]
++        if vcfg.get("gpu"):
++            args.append("--gpu")
++        if vcfg.get("threads"):
++            args += ["--threads", str(vcfg["threads"])]
++        if vcfg.get("max_tokens"):
++            args += ["--max-tokens", str(vcfg["max_tokens"])]
++        if vcfg.get("min_tokens"):
++            args += ["--min-tokens", str(vcfg["min_tokens"])]
++        self.dir = Path(workdir)
++        self.p = subprocess.Popen(args, cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
++                                  text=True, bufsize=1, env=env)
++        line = self.p.stdout.readline()
++        if not line.startswith("READY"):
++            raise SystemExit(f"the image encoder did not start: {line.strip()!r}")
++
++    def encode(self, png, name):
++        img, out = self.dir / f"{name}.png", self.dir / f"{name}.sve"
++        img.write_bytes(png)
++        self.p.stdin.write(f"ENC {img.name} {out.name}\n")
++        self.p.stdin.flush()
++        line = self.p.stdout.readline().strip()
++        if not line.startswith("OK"):
++            raise SystemExit(f"the image encoder failed: {line!r}")
++        return out, int(line.split()[1])
++
++    def close(self):
++        try:
++            self.p.stdin.write("QUIT\n")
++            self.p.stdin.flush()
++            self.p.wait(timeout=30)
++        except Exception:  # noqa: BLE001
++            self.p.kill()
++
++
++# ---------------------------------------------------------------------------------------------------------------- prompts
++class Prompts:
++    def __init__(self, tok, pics, n_text, long_tokens):
++        self.tok = tok
++        self.pics = pics                     # name -> (embeddings file, image tokens)
++        self.texts = [self.chat(q) for q in TEXTS[:n_text]]
++        per = max(1, len(tok.encode(FILLER % 100)))
++        self.filler = "".join(FILLER % i for i in range(long_tokens // per + 1)) if long_tokens else ""
++
++    def chat(self, text):
++        return self.tok.encode(f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
++                               parse_special=True)
++
++    def image(self, name, text, long=False):
++        """The prompt of one picture and a question (one <|image_pad|> per image token, as the server writes it)."""
++        body = (self.filler + "\n\n" if long else "") + text
++        ids = self.tok.encode(f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{body}<|im_end|>\n"
++                              f"<|im_start|>assistant\n<think>\n\n</think>\n\n", parse_special=True)
++        k = ids.index(IMAGE_PAD)
++        if k == 0 or ids[k - 1] != VISION_START:
++            raise SystemExit("the tokenizer did not give <|vision_start|><|image_pad|> as two special tokens")
++        return ids[:k] + [IMAGE_PAD] * self.pics[name][1] + ids[k + 1:]
++
++    def follow_up(self, turn1, reply, text):
++        """turn 1's prompt, its reply (end-of-turn tokens dropped) and a new user turn, as one history."""
++        r = list(reply)
++        while r and r[-1] in EOS:
++            r.pop()
++        return list(turn1) + r + self.tok.encode(
++            f"<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
++            parse_special=True)
++
++
++# ---------------------------------------------------------------------------------------------------------------- engine
++class Engine:
++    """The engine's --serve protocol: one line per request, its answers on stdout (tools/batch_test.py's Engine, with
++    the slots' tokens kept apart while admissions run)."""
++
++    def __init__(self, exe, cfg, batch, vision, extra_args, env, log_path):
++        args = [a for a in cfg["args"] if a != "--vision"]
++        if vision:
++            args.append("--vision")
++        if len(cfg.get("gpu") or []) > 1:
++            args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
++        if batch:
++            args += ["--batch", str(batch)]
++        args += extra_args
++        self.log_path = log_path
++        self.log = open(log_path, "w")
++        self.p = subprocess.Popen([exe, "--serve", *args], cwd=cfg.get("cwd"), stdin=subprocess.PIPE,
++                                  stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1, env=env)
++        self.q = queue.Queue()
++        threading.Thread(target=self._read, daemon=True).start()
++        self.info = {}
++        while True:
++            line = self.next()
++            if line.startswith("INFO "):
++                for kv in line.split()[1:]:
++                    k, _, v = kv.partition("=")
++                    self.info[k] = v
++            if line.startswith("READY"):
++                break
++        self.slot_tok = {}                   # slot -> its request's tokens (the admission's T, then its BT lines)
++        self.slot_done = {}                  # slot -> its BDONE line
++
++    def _read(self):
++        for line in self.p.stdout:
++            self.q.put(line.rstrip("\n"))
++        self.q.put(None)
++
++    def next(self):
++        try:
++            line = self.q.get(timeout=LINE_TIMEOUT_S)
++        except queue.Empty:
++            raise SystemExit(f"the engine said nothing for {LINE_TIMEOUT_S:.0f} s (see {self.log_path})") from None
++        if line is None:
++            raise SystemExit(f"the engine ended (see {self.log_path})")
++        return line
++
++    def send(self, line):
++        self.p.stdin.write(line + "\n")
++        self.p.stdin.flush()
++
++    def _slot_line(self, line):
++        if line.startswith("BT "):
++            _, s, y = line.split()
++            self.slot_tok.setdefault(int(s), []).append(int(y))
++            return True
++        if line.startswith("BDONE "):
++            self.slot_done[int(line.split()[1])] = line
++            return True
++        return False
++
++    @staticmethod
++    def _req(head, max_new, emb, ids):
++        return " ".join(x for x in (head, str(max_new), str(emb) if emb else "", ",".join(map(str, ids))) if x)
++
++    def solo(self, max_new, ids, emb=None):
++        """GEN / GENI alone (no slot may be active): its tokens."""
++        self.send(self._req("GENI" if emb else "GEN", max_new, emb, ids))
++        got = []
++        while True:
++            line = self.next()
++            if line.startswith("T "):
++                got.append(int(line.split()[1]))
++            elif line.startswith("DONE"):
++                return got
++            elif line.startswith("ERR"):
++                raise SystemExit(f"engine: {line}")
++            else:
++                self._slot_line(line)
++
++    def admit(self, slot, max_new, ids, emb=None):
++        """BGEN / BGENI into `slot`; the other slots' lines meanwhile are kept.  -> True when it decodes on."""
++        self.slot_done.pop(slot, None)
++        self.slot_tok[slot] = []
++        self.send(self._req(f"BGENI {slot}" if emb else f"BGEN {slot}", max_new, emb, ids))
++        while True:
++            line = self.next()
++            if line.startswith("T "):
++                self.slot_tok[slot].append(int(line.split()[1]))
++            elif line.startswith("BADM "):
++                if line.split()[2] != "1":
++                    self.slot_done[slot] = line
++                return line.split()[2] == "1"
++            elif line.startswith("ERR"):
++                raise SystemExit(f"engine: {line}")
++            else:
++                self._slot_line(line)
++
++    def drain(self, slots):
++        """Until every slot of `slots` has ended (BDONE)."""
++        while any(s not in self.slot_done for s in slots):
++            line = self.next()
++            if line.startswith("ERR"):
++                raise SystemExit(f"engine: {line}")
++            self._slot_line(line)
++        return {s: self.slot_tok.get(s, []) for s in slots}
++
++    def quit(self):
++        try:
++            self.send("QUIT")
++            self.p.wait(timeout=300)              # the next run needs the GPUs back
++        except Exception:  # noqa: BLE001
++            self.p.kill()
++            self.p.wait(timeout=60)
++        self.log.close()
++
++
++def tokenizer(path):
++    from batch_test import tokenizer as tk   # (tools/batch_test.py)
++    return tk(path)
++
++
++def slot_order(batch):
++    """Slots spread over the pipelined groups (half and half), so both groups hold image and text rows."""
++    if batch < 4:
++        return list(range(batch))
++    half = batch // 2
++    out = []
++    for a, b in zip(range(half), range(half, batch)):
++        out += [a, b]
++    return out + list(range(2 * half, batch))
++
++
++class Results:
++    def __init__(self):
++        self.rows = []
++
++    def check(self, name, got, want, kind=""):
++        same = got == want
++        diff = next((k for k in range(min(len(got), len(want))) if got[k] != want[k]),
++                    None if len(got) == len(want) else min(len(got), len(want)))
++        self.rows.append({"check": name, "kind": kind, "ok": same, "tokens": len(got), "ref_tokens": len(want),
++                          "first_diff": diff})
++        print(f"  {'OK  ' if same else 'FAIL'} {name}: {len(got)} tokens, reference {len(want)}"
++              f"{'' if same else f', differs at {diff}'}", flush=True)
++        return same
++
++    def ok(self, kind=None):
++        return all(r["ok"] for r in self.rows if kind is None or r["kind"] == kind)
++
++
++# ---------------------------------------------------------------------------------------------------------------- engine mode
++def engine_env(a, cfg, tier_root, extra=None):
++    env = dict(os.environ)
++    if not a.no_config_env:
++        env.update({k: str(v) for k, v in (cfg.get("env") or {}).items()})
++    env["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [env.get("LD_LIBRARY_PATH", "")])
++    if a.mt_min:
++        env["STRATA_IQ_MT_MIN"] = a.mt_min
++    if "STRATA_CONV_TIER_DIR" in env:       # a fresh disk tier per engine run: no earlier run answers a reference
++        d = Path(tempfile.mkdtemp(prefix="tier-", dir=tier_root))
++        env["STRATA_CONV_TIER_DIR"] = str(d)
++    env.pop("STRATA_MROPE_REGION_SKIP", None)
++    env.update(extra or {})
++    return env
++
++
++def start(a, cfg, exe, vision, tier_root, name, extra_env=None):
++    log = str(Path(a.logs) / f"{name}.log")
++    print(f"[{name}] starting {exe} ({'--vision' if vision else 'no --vision'}, --batch {a.batch}); log {log}",
++          flush=True)
++    e = Engine(exe, cfg, a.batch, vision, a.extra.split(), engine_env(a, cfg, tier_root, extra_env), log)
++    print(f"[{name}] ready: batch_slots={e.info.get('batch_slots')} batch_groups={e.info.get('batch_groups')} "
++          f"mrope_slots={e.info.get('mrope_slots', '-')}", flush=True)
++    return e
++
++
++def run_engine_mode(a, cfg, tok, res):
++    work = Path(tempfile.mkdtemp(prefix="vision-batch-check-"))
++    venv = dict(os.environ)
++    venv["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [venv.get("LD_LIBRARY_PATH", "")])
++    enc = Encoder(cfg["vision"], work, venv, open(Path(a.logs) / "encoder.log", "w"))
++    pics = {k: enc.encode(picture_png(k), f"pic{k}") for k in ("A", "B")}
++    enc.close()                             # (its VRAM back before the engine sizes its expert cache)
++    print(f"pictures: A {pics['A'][1]} image tokens, B {pics['B'][1]}", flush=True)
++    P = Prompts(tok, pics, a.texts, a.long_tokens)
++    img_a, img_b = P.image("A", Q_IMAGE), P.image("B", Q_IMAGE)
++    img_long = P.image("A", Q_IMAGE, long=True)
++    M = a.max_new
++    emb = {k: str(v[0]) for k, v in pics.items()}
++
++    # ---- process 1: the solo references
++    e = start(a, cfg, a.exe, True, work, "refs")
++    ref = {"text": [e.solo(M, ids) for ids in P.texts], "A": e.solo(M, img_a, emb["A"]),
++           "B": e.solo(M, img_b, emb["B"]), "long": e.solo(M, img_long, emb["A"])}
++    follow = P.follow_up(img_a, ref["A"], Q_FOLLOW)
++    e.quit()
++    print(f"references: {len(P.texts)} texts, images A/B/long; the follow-up turn is {len(follow)} tokens", flush=True)
++
++    # ---- process 2: the checks
++    skip = {"STRATA_MROPE_REGION_SKIP": "1"} if a.negative_control else None
++    e = start(a, cfg, a.exe, True, work, "checks" + ("-negative" if skip else ""), skip)
++    if e.info.get("mrope_slots") != "1":
++        print("WARNING: the engine does not say mrope_slots=1: it has no per-slot M-RoPE regions (an older engine, or "
++              "they did not fit) and refuses an image beside other slots", flush=True)
++    ref["follow"] = e.solo(M, follow, emb["A"])                 # a fresh engine: nothing of it is cached
++    order = slot_order(a.batch)
++    nt = len(P.texts)
++    if a.batch < 4 or nt < 3:
++        raise SystemExit("needs --batch 4 or more and --texts 3 or more")
++
++    # (i) + (ii): texts decode; a long image prompt is read beside them, then decodes beside a late text admission
++    print("(i)/(ii): a long image prompt read and decoded beside text slots", flush=True)
++    k = min(nt - 1, len(order) - 2)
++    text_slots = order[:k]
++    for s, ids in zip(text_slots, P.texts):
++        e.admit(s, M, ids)
++    img_slot, late_slot = order[k], order[k + 1]
++    e.admit(img_slot, M, img_long, emb["A"])
++    e.admit(late_slot, M, P.texts[k])
++    got = e.drain(text_slots + [img_slot, late_slot])
++    for j, s in enumerate(text_slots):
++        res.check(f"(i) text {j} in slot {s} while the image is read and decodes", got[s], ref["text"][j], "text")
++    res.check(f"(i) text {k} admitted in slot {late_slot} while the image slot decodes", got[late_slot],
++              ref["text"][k], "text")
++    res.check(f"(ii) the long image request in slot {img_slot}, in a busy batch", got[img_slot], ref["long"], "image")
++
++    # (iii): two different images at once, a text slot beside them
++    print("(iii): two different images in two slots at once", flush=True)
++    sa, sb, st = order[0], order[1], order[2]
++    e.admit(sa, M, img_a, emb["A"])
++    e.admit(sb, M, img_b, emb["B"])
++    e.admit(st, M, P.texts[0])
++    got = e.drain([sa, sb, st])
++    res.check(f"(iii) image A in slot {sa}", got[sa], ref["A"], "image")
++    res.check(f"(iii) image B in slot {sb}", got[sb], ref["B"], "image")
++    res.check(f"(iii) text 0 in slot {st} beside them", got[st], ref["text"][0], "text")
++
++    # reset: text into the slots the images used (their regions back to the identity)
++    print("reset: text requests into the slots the images used", flush=True)
++    e.admit(sa, M, P.texts[1])
++    e.admit(sb, M, P.texts[2])
++    got = e.drain([sa, sb])
++    res.check(f"reset: text 1 in slot {sa} (image A's before)", got[sa], ref["text"][1], "text")
++    res.check(f"reset: text 2 in slot {sb} (image B's before)", got[sb], ref["text"][2], "text")
++
++    # (iv): the follow-up turn of the image conversation
++    print("(iv): the image conversation's follow-up turn", flush=True)
++    s1, s2, s3, s4 = order[0], order[1], order[2], order[3]
++    e.admit(s1, M, img_a, emb["A"])                             # turn 1 decodes in a slot
++    e.admit(s2, M, P.texts[1])
++    got = e.drain([s1, s2])
++    res.check(f"(iv) turn 1 in slot {s1}", got[s1], ref["A"], "image")
++    e.admit(s3, M, P.texts[2])                                  # a text slot decodes ...
++    e.admit(s4, M, follow, emb["A"])                            # ... the follow-up beside it, in another slot
++    got = e.drain([s3, s4])
++    res.check(f"(iv) follow-up in slot {s4} beside a text slot, turn 1 having decoded in slot {s1}", got[s4],
++              ref["follow"], "image")
++    res.check(f"(iv) text 2 in slot {s3} beside it", got[s3], ref["text"][2], "text")
++    for j in range(a.flush):                                    # unrelated requests: the follow-up's start leaves the
++        e.solo(8, P.chat(f"Say a number between 1 and {100 + j}."))   # live session (cache / slot park / tier)
++    e.admit(s1, M, P.texts[0])
++    e.admit(s2, M, follow, emb["A"])
++    got = e.drain([s1, s2])
++    res.check(f"(iv) follow-up in slot {s2} after {a.flush} unrelated requests (the conversation cache)", got[s2],
++              ref["follow"], "image")
++    res.check(f"(iv) text 0 in slot {s1} beside it", got[s1], ref["text"][0], "text")
++    res.check("(iv) follow-up on the solo path once more", e.solo(M, follow, emb["A"]), ref["follow"], "image")
++    e.quit()
++    shutil.rmtree(work, ignore_errors=True)
++
++
++def text_run(a, cfg, tok, exe, vision, tier_root, name):
++    """A text-only run: solo references, then the batch (a long prompt read beside the slots, a late admission)."""
++    P = Prompts(tok, {}, a.texts, a.long_tokens)
++    long_ids = P.chat(P.filler + "\n\nSummarize the agenda above in three sentences.")
++    e = start(a, cfg, exe, vision, tier_root, name)
++    M = a.max_new
++    solo = [e.solo(M, ids) for ids in P.texts] + [e.solo(M, long_ids)]
++    order = slot_order(a.batch)
++    k = min(len(P.texts) - 1, len(order) - 2)
++    for s, ids in zip(order[:k], P.texts):
++        e.admit(s, M, ids)
++    e.admit(order[k], M, long_ids)
++    e.admit(order[k + 1], M, P.texts[k])
++    got = e.drain(order[:k + 2])
++    batch = [got[s] for s in order[:k]] + [got[order[k]], got[order[k + 1]]]
++    batch_ref = solo[:k] + [solo[-1], solo[k]]
++    e.quit()
++    return {"solo": solo, "batch": batch, "batch_ref": batch_ref}
++
++
++def run_text_ab(a, cfg, tok, res):
++    tier_root = Path(tempfile.mkdtemp(prefix="vision-batch-ab-"))
++    runs = {}
++    for exe, tag in ((a.text_ab, "old"), (a.exe, "new")):
++        for vision in (True, False):
++            name = f"text-{tag}-{'vision' if vision else 'novision'}"
++            runs[name] = text_run(a, cfg, tok, exe, vision, tier_root, name)
++            Path(a.logs, f"{name}.tokens.json").write_text(json.dumps(runs[name]))
++    base = "text-old-novision"
++    for name, r in runs.items():
++        for j, (b, s) in enumerate(zip(r["batch"], r["batch_ref"])):
++            res.check(f"(v) {name}: batch row {j} == its solo", b, s, "text")
++        if name != base:
++            for j, (x, y) in enumerate(zip(r["solo"], runs[base]["solo"])):
++                res.check(f"(v) {name} == {base}: solo {j}", x, y, "ab")
++            for j, (x, y) in enumerate(zip(r["batch"], runs[base]["batch"])):
++                res.check(f"(v) {name} == {base}: batch row {j}", x, y, "ab")
++    shutil.rmtree(tier_root, ignore_errors=True)
++
++
++# ---------------------------------------------------------------------------------------------------------------- server mode
++def post(base, body, timeout=1800):
++    req = urllib.request.Request(base.rstrip("/") + "/chat/completions", json.dumps(body).encode(),
++                                 {"Content-Type": "application/json", "Authorization": "Bearer dummy"})
++    with urllib.request.urlopen(req, timeout=timeout) as r:
++        j = json.load(r)
++    return j["choices"][0]["message"].get("content") or ""
++
++
++def run_server_mode(a, res):
++    def png_url(kind):
++        return "data:image/png;base64," + base64.b64encode(picture_png(kind)).decode()
++
++    def body(messages):
++        return {"model": a.model, "messages": messages, "max_tokens": a.max_new, "temperature": 0,
++                "chat_template_kwargs": {"enable_thinking": False}}
++
++    def text_msg(q):
++        return [{"role": "user", "content": q}]
++
++    def image_msg(kind, q):
++        return [{"role": "user", "content": [{"type": "text", "text": q},
++                                             {"type": "image_url", "image_url": {"url": png_url(kind)}}]}]
++
++    filler = "".join(FILLER % i for i in range(a.long_tokens // 30 + 1))
++    texts = [text_msg(q) for q in TEXTS[:a.texts]]
++    img_a, img_b = image_msg("A", Q_IMAGE), image_msg("B", Q_IMAGE)
++    img_long = image_msg("A", filler + "\n\n" + Q_IMAGE)
++
++    def together(named, stagger=0.3):
++        out, err = {}, []
++
++        def one(name, msgs):
++            try:
++                out[name] = post(a.url, body(msgs))
++            except Exception as x:  # noqa: BLE001
++                err.append((name, repr(x)))
++        th = []
++        for name, msgs in named:
++            th.append(threading.Thread(target=one, args=(name, msgs)))
++            th[-1].start()
++            time.sleep(stagger)
++        for t in th:
++            t.join()
++        if err:
++            raise SystemExit(f"requests failed: {err}")
++        return out
++
++    def cmp(name, got, want, kind):
++        g, w = list(got), list(want)            # (characters: a text comparison)
++        return res.check(name, g, w, kind)
++
++    print("references: every request alone", flush=True)
++    ref = {f"t{j}": post(a.url, body(m)) for j, m in enumerate(texts)}
++    ref.update({"A": post(a.url, body(img_a)), "B": post(a.url, body(img_b)), "long": post(a.url, body(img_long))})
++    follow = img_a + [{"role": "assistant", "content": ref["A"]}, {"role": "user", "content": Q_FOLLOW}]
++    ref["follow"] = post(a.url, body(follow))
++    k = min(len(texts) - 1, 6)
++    print("control: text only, at the same concurrency", flush=True)
++    ctl = together([(f"t{j}", texts[j]) for j in range(k)] + [("x", text_msg(filler + "\n\nSummarize the agenda."))])
++    control_ok = all(cmp(f"control: text {j}", ctl[f"t{j}"], ref[f"t{j}"], "control") for j in range(k))
++    print("(i)/(ii): a long image prompt beside text requests", flush=True)
++    got = together([(f"t{j}", texts[j]) for j in range(k)] + [("long", img_long), ("late", texts[k])])
++    for j in range(k):
++        cmp(f"(i) text {j} while the image is read and decodes", got[f"t{j}"], ref[f"t{j}"], "text")
++    cmp(f"(i) text {k} admitted while the image decodes", got["late"], ref[f"t{k}"], "text")
++    cmp("(ii) the long image request in a busy batch", got["long"], ref["long"], "image")
++    print("(iii): two images at once", flush=True)
++    got = together([("A", img_a), ("B", img_b), ("t0", texts[0])])
++    cmp("(iii) image A", got["A"], ref["A"], "image")
++    cmp("(iii) image B", got["B"], ref["B"], "image")
++    cmp("(iii) text 0 beside them", got["t0"], ref["t0"], "text")
++    print("(iv): the follow-up turn in a busy batch", flush=True)
++    got = together([("t1", texts[1]), ("follow", follow), ("t2", texts[2])])
++    cmp("(iv) follow-up beside text requests", got["follow"], ref["follow"], "image")
++    cmp("(iv) text 1 beside it", got["t1"], ref["t1"], "text")
++    if not control_ok:
++        print("NOTE: the text-only control already differs from solo at this concurrency: the server's settings are "
++              "not exact, so a difference below is INCONCLUSIVE, not a failure", flush=True)
++    return control_ok
++
++
++# ---------------------------------------------------------------------------------------------------------------- main
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--exe", help="the engine to check (engine mode)")
++    ap.add_argument("--config", help="strata-<model>.json with a \"vision\" block (engine mode)")
++    ap.add_argument("--url", help="server mode: a running server's /v1 base URL")
++    ap.add_argument("--model", default="strata", help="server mode: the model name to send")
++    ap.add_argument("--batch", type=int, default=16)
++    ap.add_argument("--texts", type=int, default=6, help="text prompts (at most %d)" % len(TEXTS))
++    ap.add_argument("--max-new", type=int, default=96)
++    ap.add_argument("--long-tokens", type=int, default=3000,
++                    help="filler tokens in the long image prompt: several prompt chunks, read beside the text slots")
++    ap.add_argument("--flush", type=int, default=6, help="(iv): unrelated solo requests before the follow-up again")
++    ap.add_argument("--extra", default="--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow",
++                    help="more engine arguments in one string")
++    ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
++    ap.add_argument("--no-config-env", action="store_true", help="leave the config's \"env\" out")
++    ap.add_argument("--text-ab", metavar="OLD_EXE", help="(v) only: text tokens of OLD_EXE vs --exe, --vision on and off")
++    ap.add_argument("--negative-control", action="store_true",
++                    help="STRATA_MROPE_REGION_SKIP=1: the image checks must fail (exit 0 only if they do)")
++    ap.add_argument("--logs", default="", help="directory for the engine logs and token dumps")
++    ap.add_argument("--out", default="", help="write the results as JSON")
++    a = ap.parse_args()
++    a.texts = max(3, min(a.texts, len(TEXTS)))
++    res = Results()
++    if a.url:
++        control_ok = run_server_mode(a, res)
++        ok = res.ok("text") and res.ok("image")
++        verdict = "PASS" if ok else ("INCONCLUSIVE" if not control_ok else "FAIL")
++    else:
++        if not (a.exe and a.config):
++            ap.error("engine mode needs --exe and --config (or --url for server mode)")
++        cfg = json.loads(Path(a.config).read_text())
++        a.logs = a.logs or tempfile.mkdtemp(prefix="vision-batch-logs-")
++        Path(a.logs).mkdir(parents=True, exist_ok=True)
++        tok = tokenizer(cfg["tokenizer"])
++        if a.text_ab:
++            run_text_ab(a, cfg, tok, res)
++            ok = res.ok()
++        else:
++            if not cfg.get("vision"):
++                raise SystemExit("the config has no \"vision\" block (the image encoder)")
++            run_engine_mode(a, cfg, tok, res)
++            ok = res.ok()
++            if a.negative_control:
++                # the control passes when the image checks FAIL (and the text slots stay right)
++                ok = not res.ok("image") and res.ok("text")
++                print(f"negative control: image checks {'failed as they must' if not res.ok('image') else 'PASSED'}"
++                      f" with the region copy skipped", flush=True)
++        verdict = "PASS" if ok else "FAIL"
++        print(f"engine logs: {a.logs}", flush=True)
++    print(f"{verdict}: {sum(r['ok'] for r in res.rows)} of {len(res.rows)} checks identical", flush=True)
++    if a.out:
++        Path(a.out).write_text(json.dumps({"verdict": verdict, "checks": res.rows}, indent=1))
++    return 0 if verdict == "PASS" else 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+

@@ -1,0 +1,61 @@
+From c7399438fa929351a8cbb7dc5f4a22481e746dab Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 02:29:09 +0200
+Subject: [PATCH 42/43] generate: --vision with --batch refuses to mix image
+ and text rows (one M-RoPE table per device)
+
+The image position table (mrope.hpp) is one per device and is rebuilt at every GEN/GENI admission, while every batch
+row reads it at its own slot's cell.  An image slot decoding next to text slots gave them its positions and took
+theirs: silently wrong text in both (upstream behaviour, any --batch > 1 with --vision).
+
+Until the table is kept per slot, the engine refuses the mix instead of decoding it wrong, with an ERR line and no
+state touched: a GENI/BGENI while any batch slot is active ("ERR vision: an image request is not taken while batch
+slot <b> decodes ..."), and a GEN/BGEN while an active slot was admitted with images (BSlot::img).  Without --vision,
+or with only text requests, nothing changes.  The server's image gate (next commit) keeps the refusal unreachable in
+normal operation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 8b295adf..c8a096d4 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -11877,6 +11877,32 @@ int main(int argc, char** argv) {
+             const int64_t n = (int64_t) ids.size();
+             req_imgs.clear();
+             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
++            // --vision with --batch: the M-RoPE table below is one per device, indexed by a cell's position, and every
++            // batch row reads it at its slot's own position.  An image request's table is not the identity a text
++            // slot needs (nor another image slot's), so image and text rows never decode together: a GENI / BGENI
++            // only while no slot decodes, a GEN / BGEN not while a slot that was admitted with pictures decodes.
++            // (Before the table is touched; text-only traffic never meets either refusal.)
++            if (o.vision && !bs.empty()) {
++                int busy = -1, busy_img = -1;
++                for (size_t b = 0; b < bs.size(); ++b) {
++                    if (!bs[b].active) continue;
++                    if (busy < 0) busy = (int) b;
++                    if (busy_img < 0 && bs[b].img) busy_img = (int) b;
++                }
++                if (geni && busy >= 0) {
++                    std::printf("ERR vision: an image request is not taken while batch slot %d decodes (image and text "
++                                "rows share one M-RoPE table); try again once the slots are idle\n", busy);
++                    std::fflush(stdout);
++                    continue;
++                }
++                if (!geni && busy_img >= 0) {
++                    std::printf("ERR vision: a text request is not taken while batch slot %d decodes an image "
++                                "request (image and text rows share one M-RoPE table); try again once it ends\n",
++                                busy_img);
++                    std::fflush(stdout);
++                    continue;
++                }
++            }
+             if (geni || !mrope_identity) {
+                 // positions for every cell this request can reach; the identity again for a text request
+                 std::string ve;
+-- 
+2.43.0
+

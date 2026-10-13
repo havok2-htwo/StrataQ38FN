@@ -484,6 +484,39 @@ to Strata and checks every service, `linux/rollback.sh` goes back. Boot without 
 day 380 W, night mode 280 W from 22:00 to 07:00 (`G3_VLLM/logs/genesis_power_settings.json`, NOPASSWD sudo rule
 for `nvidia-smi -pl`).
 
+## Images (vision)
+
+Clients send pictures the OpenAI way, as `image_url` parts of a user message (a `data:` URL with base64, an http(s)
+URL up to 32 MiB, or a file path on this machine); Anthropic image blocks work too. It is not a `chat_template_kwargs`
+option. Through G3 the model name stays `Qwen3.8-Flash-Next`:
+
+```json
+{"model": "Qwen3.8-Flash-Next",
+ "messages": [{"role": "user", "content": [
+   {"type": "text", "text": "What is in this picture?"},
+   {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}
+```
+
+What it needs: the model's image encoder `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
+at ed59f92, 907 MB, in `/media/raid0/Models/Strata-GGUF/mmproj/`), the encoder program `strata-vision` (built from
+`Strata-143/tools/vision` against the engine's llama.cpp, CPU and CUDA builds in `Strata/engine/`), `--vision` in the
+engine args and a `vision` section in the config: `configs/T16-143-prod262r-vision-cpu.json` (CPU encoder, no VRAM)
+and `-vision-gpu.json` (GPU encoder; it needs ~2.6 GB on CUDA0, which costs resident experts there, not measured).
+
+**One M-RoPE table for all batch slots (upstream).** The engine keeps the image position table once per GPU and
+rebuilds it at every admission, while each batch row reads it at its own slot's position. With `--batch` an image slot
+and text slots would decode with each other's positions: silently wrong text in both. Until the table is kept per slot
+(designed in `upstream/DESIGN-vision-batch-rope.md`, implemented as the experimental patch
+`patches/v0.1.43/experimental/0044-*.patch`, engine `strata-g3-143v1`, not yet checked on the GPUs), patches 0042/0043 make it safe: the server
+runs an image request alone (new requests wait from its arrival, the slots finish, then the picture runs on the solo
+path; `STRATA_IMAGE_WAIT_S`, default 120 s, then a 503 to retry), and the engine refuses the mix with an `ERR` should it
+ever be asked. Text-only traffic is unchanged.
+
+Measured (TESTLOG #75, CPU encoder): a 800×600 picture is answered in ~2.2 s, a 2400×1800 photo (cut to 1024 image
+tokens) in 5.1 s; the encoder needs 1.7 s for 475 image tokens and 10.7 s for 1900. Under 16 text users the pictures
+took 4.8–11.3 s and the text ran at 491 tok/s. Check a server with `vision_check.py --base http://127.0.0.1:8090/v1
+[--load 16]`.
+
 ## License notices
 
 The engine patches contain Strata source (MIT) and, in the pointer-table MMQ series, code mirrored from
@@ -503,8 +536,9 @@ llama.cpp/ggml (MIT); both notices are in [`THIRD_PARTY_NOTICES.md`](../THIRD_PA
 | `series_final.sh` | last measurement series (Q4_K_XL, 3 GPUs, MTP off, users 24–40, prefill) |
 | `configs/` | all measured Strata configs |
 | `results/sweep.jsonl`, `results/*.txt` | all measurement results |
-| `patches/` | Strata engine patches. **Current: `patches/v0.1.42/` (28 patches on v0.1.42, see Setup)**; the 0.1.41 series: `0001`/`0002` (more than 8 slots, direct slot copy), `mmq-tab/`, `overlap/`; `experimental/`: overlap prototype (measurement only) |
+| `patches/` | Strata engine patches. **Current: `patches/v0.1.43/` (43 patches on v0.1.43; 0041–0043: slot_turn fix, vision guard, image gate)**, the earlier `patches/v0.1.42/` (28 patches on v0.1.42, see Setup); the 0.1.41 series: `0001`/`0002` (more than 8 slots, direct slot copy), `mmq-tab/`, `overlap/`; `experimental/`: overlap prototype (measurement only) |
 | `bench_multiturn.py` | agent/multi-turn benchmark |
+| `vision_check.py` | image checks against a running server: pictures alone, two pictures behind one prefix (cache mix-ups), follow-up turns, repeat, optional load |
 | `eval/` | quality set (MMLU-Pro + GSM8K) with answers and results |
 | `upstream/` | issue/PR drafts for Niko1221/Strata (not yet posted; written for 0.1.41, to be redone on the current base), designs (`DESIGN-*.md`), code analyses (`ANALYSIS-*.md`), GPU profile and lever ranking (`PROFILE-next-levers.md`), methodology/patch review (`REVIEW-2026-10-12.md`) |
 | `quant-survey/` | evaluation of all 910 Flash-Next repos on Hugging Face |

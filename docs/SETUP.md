@@ -47,7 +47,8 @@ For the other models run `Strata\SETUP.bat` (= `START-HERE.bat --setup`). Choice
 | 2 | Qwen3.8-Flash-Next (Unsloth) | UD-Q4_K_XL | any | 111 GB |
 | 3 | Qwen3.8-Flash-Next Coder | IQ1_M | any | 58 GB |
 
-Images: off. Parallelism: one request after the other (batching is broken or slower on this configuration).
+Images: off (setup `--vision no`); to turn them on, run setup again with `--vision gpu` or `--vision cpu` (see the
+README, "Images"). Parallelism: one request after the other (batching is broken or slower on this configuration).
 
 If you only need the recommended model, run 1 is enough; the other two start scripts will then not work.
 

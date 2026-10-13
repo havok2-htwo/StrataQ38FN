@@ -26,7 +26,7 @@ users, with a measurably lower quality checkpoint ([linux/README.md](linux/READM
 
 **Is this a fork?** In substance, yes: a downstream fork. It is not a GitHub fork of the engine repository. This
 repository holds the deployment (configs, start scripts, a vLLM-compatible facade, a dashboard) and the engine patch
-series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.43/`, 40
+series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.43/`, 43
 patches). The patches are kept upstream-ready (opt-in switches, default path unchanged), so they can be offered back
 to Strata.
 
@@ -49,6 +49,10 @@ to Strata.
 
 - KV tiering so long agent conversations are never read twice: 64K–262K context per conversation, parked
   conversations in RAM (asynchronous, off the critical path) and an SSD emergency tier with a daily write budget.
+- Images (vision): OpenAI `image_url` parts through the API (CPU image encoder). Upstream keeps one image position
+  table for all batch slots, so an image request runs alone until the per-slot fix (experimental patch 0044) is
+  checked on the GPUs (TESTLOG #75,
+  [linux/README.md](linux/README.md#images-vision)).
 - Production setup: Strata behind the Genesis3 (G3_VLLM) OpenAI proxy, Open WebUI and a LAN dashboard (per-GPU load,
   PCIe throughput, live answering bars) as systemd services, day/night GPU power limits, `cutover.sh` / `rollback.sh`.
 
@@ -87,6 +91,11 @@ Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 | `Start-Coder.bat` | ISTA Coder IQ1_M (half the experts) | code / English only | 165–230 tok/s | 128K |
 
 `Stop-All.bat` stops the model and the facade. Starting a model stops the one that was running.
+
+**Images:** off in these configs (setup ran with `--vision no`). Here a request runs alone (no `parallel`), which is
+upstream's tested image path, so the batch issue of the Linux setup does not apply. To turn them on, run setup again
+with `--vision gpu` (fast, takes ~0.7–1 GB VRAM from the expert cache) or `--vision cpu` (no VRAM, a few seconds per
+picture); the vLLM facade passes `image_url` parts through. Not measured on this PC yet.
 
 `Start-Alles.bat [IQ4_XS|Q4_K_XL|Coder]` also starts SearXNG (web search) and Open WebUI. Services that are already
 running are left alone, and a loaded model is not reloaded. `Stop-Alles.bat` stops everything except the dashboard.

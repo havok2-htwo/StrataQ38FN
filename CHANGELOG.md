@@ -4,6 +4,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (Linux, images)
+- Images (vision) through the API: OpenAI `image_url` parts (base64 `data:` URL, http(s), local path) and Anthropic
+  image blocks, also through G3. Encoder `strata-vision` built for CPU and CUDA, mmproj from ISTA-DASLab (ed59f92),
+  configs `T16-143-prod262r-vision-cpu.json` / `-vision-gpu.json`, check script `linux/vision_check.py`. Measured on
+  the production config (TESTLOG #75): 15/15 checks (shapes, colours, exact text, no mix-up between two pictures
+  behind one prefix, follow-up turns, repeat), ~2.2 s per 800×600 picture, 5.1 s for a large photo; 16 text users +
+  pictures: 491 tok/s text, pictures right in 4.8–11.3 s. Not switched on in production yet.
+- Engine patches 0041–0043 (`linux/patches/v0.1.43/`, engine `strata-g3-143k5`, server Strata-143 fcd7ed8f):
+  - 0042: with `--vision --batch` the engine refuses to mix image and text rows (`ERR vision: ...`). Upstream keeps
+    ONE M-RoPE (image position) table per GPU for all batch slots and rebuilds it at every admission, so an image
+    slot and text slots decoded with each other's positions: silently wrong text (found by a code audit).
+  - 0043: the server runs an image request alone: new requests wait from its arrival, the slots finish, the picture
+    runs on the solo path; `STRATA_IMAGE_WAIT_S` (120 s, then a 503 to retry). A dead image encoder now fails
+    only image requests, not text.
+- Design for per-slot image positions, so pictures can share the batch without the wait:
+  `linux/upstream/DESIGN-vision-batch-rope.md` (one table region per slot, addressed through the position value; no
+  kernel change, ~51 MiB VRAM per GPU). Implemented as experimental patch 0044
+  (`linux/patches/v0.1.43/experimental/`, branch g3-143-vrope 49d0d3e0, engine `strata-g3-143v1`): CPU tests and three
+  reviews pass; the GPU check (`tools/vision_batch_check.py`) has not run yet, so it is not in production.
+
+### Fixed
+- 0041: `STRATA_CKPT_POOL` did not clear `slot_turn` on a recycled checkpoint (with `STRATA_SLOT_PARK`), so such a
+  checkpoint was left out of later slot chains. Tokens are unchanged.
+
 ### Added
 - Dashboard for Windows and Linux (`dashboard/`, `linux/start-dashboard.sh`): Strata's live view (answering progress of
   the running request, prompt-reading progress, every `--batch` slot, queue), one card per GPU (load, VRAM, power,
