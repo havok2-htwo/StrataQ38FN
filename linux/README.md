@@ -512,6 +512,10 @@ runs an image request alone (new requests wait from its arrival, the slots finis
 path; `STRATA_IMAGE_WAIT_S`, default 120 s, then a 503 to retry), and the engine refuses the mix with an `ERR` should it
 ever be asked. Text-only traffic is unchanged.
 
+**Live in production since 2026-10-13 02:40**: `configs/production.json` → `T16-143-prod262r-vision-cpu.json`, engine
+`strata-g3-143k5`, server code from the pinned worktree `Strata-143-prod` at fcd7ed8f (patches 0041–0043). Back:
+`ln -sfn T16-143-prod262r.json configs/production.json`, `Strata-143-prod` to ee67a078, restart `strata.service`.
+
 Measured (TESTLOG #75, CPU encoder): a 800×600 picture is answered in ~2.2 s, a 2400×1800 photo (cut to 1024 image
 tokens) in 5.1 s; the encoder needs 1.7 s for 475 image tokens and 10.7 s for 1900. Under 16 text users the pictures
 took 4.8–11.3 s and the text ran at 491 tok/s. Check a server with `vision_check.py --base http://127.0.0.1:8090/v1

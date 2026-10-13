@@ -10,7 +10,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   configs `T16-143-prod262r-vision-cpu.json` / `-vision-gpu.json`, check script `linux/vision_check.py`. Measured on
   the production config (TESTLOG #75): 15/15 checks (shapes, colours, exact text, no mix-up between two pictures
   behind one prefix, follow-up turns, repeat), ~2.2 s per 800×600 picture, 5.1 s for a large photo; 16 text users +
-  pictures: 491 tok/s text, pictures right in 4.8–11.3 s. Not switched on in production yet.
+  pictures: 491 tok/s text, pictures right in 4.8–11.3 s. **Live since 2026-10-13 02:40**: `production.json` →
+  `T16-143-prod262r-vision-cpu.json` (engine k5, server from `Strata-143-prod` at fcd7ed8f); text and images checked
+  through G3 after the switch.
 - Engine patches 0041–0043 (`linux/patches/v0.1.43/`, engine `strata-g3-143k5`, server Strata-143 fcd7ed8f):
   - 0042: with `--vision --batch` the engine refuses to mix image and text rows (`ERR vision: ...`). Upstream keeps
     ONE M-RoPE (image position) table per GPU for all batch slots and rebuilds it at every admission, so an image
