@@ -1,0 +1,686 @@
+From 0d162062e46004a0155d231a0f055813899a2465 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 00:56:11 +0200
+Subject: [PATCH 54/62] serve: STRATA_PREFIX_DIAG=1 logs where a long prompt
+ read parted from recent prompts (opt-in, no content)
+
+Long prompts read from 0 stall every slot, and the engine cannot say why nothing matched. With the env, the server
+keeps a keyed block/token fingerprint of the last 64 requests (no token ids) and, for each read of at least
+STRATA_PREFIX_DIAG_MIN tokens (8192), prints the longest shared start with any of them, which one, where it ran and
+where in the chat template the two part (system message, tool list, tool response, thinking...), never the text.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/prefix_diag.py      | 271 +++++++++++++++++++++++++++++++++++++
+ serve/server.py           |  31 +++++
+ serve/test_prefix_diag.py | 275 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 577 insertions(+)
+ create mode 100644 serve/prefix_diag.py
+ create mode 100644 serve/test_prefix_diag.py
+
+diff --git a/serve/prefix_diag.py b/serve/prefix_diag.py
+new file mode 100644
+index 00000000..7dbbac47
+--- /dev/null
++++ b/serve/prefix_diag.py
+@@ -0,0 +1,271 @@
++"""serve/prefix_diag.py - STRATA_PREFIX_DIAG=1: where a long prompt read parted from the prompts before it (opt-in).
++
++The engine says how many prompt tokens it reused from what it holds (its conversation cache, a slot, a parked slot), not
++where the new prompt differs from the ones it saw before - and prompts are not logged.  With STRATA_PREFIX_DIAG=1 the
++server keeps a fingerprint of each recent request (its prompt and what it generated), and when a request had to read at
++least STRATA_PREFIX_DIAG_MIN tokens (default 8192) it prints one line: the longest start it shares with any recent
++request, which request that was (how long ago it ended, its lengths, where it ran: solo, a batch slot, alone for an
++image), the token offset where the two part, and what is there in the chat template's terms (the message's role and
++index, the tokens into it, and its section: the tool list, a tool response, the thinking, a tool call) - never the text.
++
++    [strata] prefix-diag: read 119419 of 119419 (reused 0): shares 4113 tokens with a request 37 s ago (...)
++
++The fingerprint holds no token ids: a keyed 64-bit hash per 256-token block, chained (block k's hash covers tokens 0 up
++to the end of block k), a keyed 16-bit digest per token (to find the exact token inside the first block that differs; a
++digest collision moves the offset at most a token or two on, 1 in 65536 per token), and where each message starts
++with its role.  The key is random per process.  About 2.1 bytes per token: STRATA_PREFIX_DIAG_KEEP (default 64)
++requests and STRATA_PREFIX_DIAG_TOKENS (default 8M tokens, ~17 MB) at most, the oldest dropped first.
++
++Reading the line: `kind=diverged` - the engine reused all but at most a block (256 tokens) of what a recent request
++shared, so the prompt itself changed at that offset (the client rewrote, reordered or dropped something there, or it is
++a new conversation).  `kind=not-reused` (the engine reused under a block) and `kind=partly-reused` (it reused more, but
++over a block less than was shared, e.g. back to a checkpoint) - a recent request shared more than the engine reused: the
++engine did not have it (evicted, never parked, still being parked, held by a busy slot, only up to a checkpoint) or did
++not find it.  The server only sees what it sent: "shared" is the server's view, not what the engine holds.
++
++    python -m unittest serve.test_prefix_diag -v
++"""
++from __future__ import annotations
++
++import array
++import bisect
++import collections
++import hashlib
++import os
++import secrets
++import threading
++import time
++
++BLOCK = 256
++ROLES = ("system", "user", "assistant", "tool", "other")
++_ROLE_CODE = {r: i for i, r in enumerate(ROLES)}
++
++
++def env_int(env, name: str, default: int) -> int:
++    try:
++        v = int(str(env.get(name, "")).strip() or default)
++    except ValueError:
++        return default
++    return v if v > 0 else default
++
++
++class Entry:
++    """One finished request's fingerprint (no token ids, no text)."""
++    __slots__ = ("seq", "ended", "plen", "n", "chain", "digest", "starts", "roles", "where", "finish", "images",
++                 "reused")
++
++    def size(self) -> int:
++        return self.n
++
++
++class PrefixDiag:
++    def __init__(self, tok, keep: int = 64, max_tokens: int = 8_000_000, min_read: int = 8192, block: int = BLOCK,
++                 clock=time.time):
++        self.tok, self.keep, self.max_tokens, self.min_read, self.block = tok, keep, max_tokens, min_read, block
++        self.clock = clock
++        self.key = secrets.token_bytes(16)
++        self.salt = int.from_bytes(secrets.token_bytes(4), "little") | 1
++        self.entries: collections.deque[Entry] = collections.deque()
++        self.tokens = 0
++        self.seq = 0
++        self.lock = threading.Lock()
++        self.im_start = self._single(tok, "<|im_start|>")
++        self.lines = 0
++
++    @classmethod
++    def from_env(cls, tok, env=None) -> "PrefixDiag | None":
++        """None unless STRATA_PREFIX_DIAG is set (to anything but 0/off/false/no)."""
++        env = os.environ if env is None else env
++        if str(env.get("STRATA_PREFIX_DIAG", "")).strip().lower() in ("", "0", "off", "false", "no"):
++            return None
++        return cls(tok, keep=env_int(env, "STRATA_PREFIX_DIAG_KEEP", 64),
++                   max_tokens=env_int(env, "STRATA_PREFIX_DIAG_TOKENS", 8_000_000),
++                   min_read=env_int(env, "STRATA_PREFIX_DIAG_MIN", 8192))
++
++    @staticmethod
++    def _single(tok, text):
++        try:
++            ids = tok.encode(text, parse_special=True)
++        except Exception:                                # noqa: BLE001 - a tokenizer without specials: no roles
++            return None
++        return ids[0] if len(ids) == 1 else None
++
++    # ------------------------------------------------------------------------------------------- fingerprints
++    def _digests(self, ids) -> array.array:
++        s = self.salt
++        return array.array("H", [((((t ^ s) * 0x9E3779B1) & 0xFFFFFFFF) >> 16) for t in ids])
++
++    def _chain(self, ids) -> list[bytes]:
++        out, prev, b = [], b"", self.block
++        try:
++            raw = array.array("I", ids).tobytes()
++        except (OverflowError, TypeError):              # (not plain non-negative 32-bit ints)
++            raw = array.array("I", (int(t) & 0xFFFFFFFF for t in ids)).tobytes()
++        for k in range(len(ids) // b):
++            prev = hashlib.blake2b(prev + raw[4 * k * b:4 * (k + 1) * b], digest_size=8, key=self.key).digest()
++            out.append(prev)
++        return out
++
++    def _structure(self, ids):
++        """Where each message starts (its <|im_start|>) and its role; a user message that opens with a tool response is
++        the role `tool`.  Only the role words are read (a few tokens after each marker)."""
++        starts, roles = array.array("I"), bytearray()
++        if self.im_start is None:
++            return starts, bytes(roles)
++        im = self.im_start
++        for i, t in enumerate(ids):
++            if t != im:
++                continue
++            starts.append(i)
++            try:
++                head = self.tok.decode(list(ids[i + 1:i + 24]))      # the role word and what opens the message
++            except Exception:                            # noqa: BLE001
++                head = ""
++            role, _, rest = head.partition("\n")
++            role = role.strip()
++            if role == "user" and rest.lstrip().startswith("<tool_response>"):
++                role = "tool"
++            roles.append(_ROLE_CODE.get(role, _ROLE_CODE["other"]))
++        return starts, bytes(roles)
++
++    def fingerprint(self, prompt, output=()) -> Entry:
++        stream = list(prompt) + list(output or ())
++        e = Entry()
++        e.plen, e.n = len(prompt), len(stream)
++        e.chain, e.digest = self._chain(stream), self._digests(stream)
++        e.starts, e.roles = self._structure(prompt)
++        return e
++
++    def lcp(self, new: Entry, old: Entry) -> int:
++        """The tokens the new request's prompt shares from its start with the old request's prompt + output."""
++        limit = min(new.plen, old.n)
++        full = limit // self.block
++        lo, hi = 0, full                                 # the leading blocks that agree: chained, so a prefix property
++        while lo < hi:
++            mid = (lo + hi + 1) // 2
++            if new.chain[mid - 1] == old.chain[mid - 1]:
++                lo = mid
++            else:
++                hi = mid - 1
++        pos = lo * self.block
++        end = min(limit, pos + self.block) if lo < full else limit
++        nd, od = new.digest, old.digest
++        while pos < end and nd[pos] == od[pos]:
++            pos += 1
++        return pos
++
++    # ------------------------------------------------------------------------------------------- descriptions
++    def _msg_at(self, e: Entry, pos: int):
++        """(index, role, tokens into it) of the message holding token `pos` of e's prompt; None before the first."""
++        k = bisect.bisect_right(e.starts, pos) - 1
++        if k < 0:
++            return None
++        return k, ROLES[e.roles[k]], pos - e.starts[k]
++
++    def _section(self, prompt, start: int, pos: int, role: str) -> str:
++        """The part of the message (start: its <|im_start|>) where token `pos` is, from the template's markers only."""
++        if pos <= start + 1:
++            return "its role marker"
++        try:
++            text = self.tok.decode(list(prompt[start:pos]))
++        except Exception:                                # noqa: BLE001
++            return "?"
++        if role == "system":
++            if "<tools>" in text:
++                if "</tools>" not in text:
++                    return f"tool list, tool #{text.split('<tools>', 1)[1].count(chr(10))}"
++                return "after the tool list"
++            return "system text"
++        if role == "assistant":
++            marks = {m: text.rfind(m) for m in ("<think>", "</think>", "<tool_call>", "</tool_call>")}
++            last = max(marks, key=marks.get)
++            if marks[last] < 0:
++                return "answer text"
++            n = text.count("<tool_call>")
++            return {"<think>": "thinking", "</think>": "answer text", "<tool_call>": f"tool call #{n}",
++                    "</tool_call>": f"after tool call #{n}"}[last]
++        if role in ("user", "tool"):
++            a, b = text.rfind("<tool_response>"), text.rfind("</tool_response>")
++            n = text.count("<tool_response>")
++            if a > b:
++                return f"tool response #{n}"
++            if "<|vision_start|>" in text and text.rfind("<|vision_start|>") > text.rfind("<|vision_end|>"):
++                return "inside a picture"
++            return f"after tool response #{n}" if n else "user text"
++        return "?"
++
++    def _where_new(self, prompt, e: Entry, pos: int) -> str:
++        if pos >= e.plen:
++            return "its end"
++        m = self._msg_at(e, pos)
++        if m is None:
++            return f"token {pos} (before the first message)" if self.im_start is not None else f"token {pos}"
++        k, role, into = m
++        start = e.starts[k]
++        if into == 0:
++            return f"{role} msg #{k} starts here"
++        return f"{role} msg #{k} +{into} ({self._section(prompt, start, pos, role)})"
++
++    def _where_old(self, old: Entry, pos: int) -> str:
++        if pos >= old.n:
++            return "its end"
++        if pos >= old.plen:
++            return f"its output +{pos - old.plen}"
++        m = self._msg_at(old, pos)
++        if m is None:
++            return f"token {pos}"
++        k, role, into = m
++        return f"{role} msg #{k} starts here" if into == 0 else f"{role} msg #{k} +{into}"
++
++    @staticmethod
++    def _ran(where) -> str:
++        """where: (path, slot) as StrataEngine.diag_where() says it - ("solo", None), ("slot", 5), ("alone", None)."""
++        w, slot = where if isinstance(where, tuple) and len(where) == 2 else (where, None)
++        if w == "slot":
++            return f"slot {slot}"
++        return {"solo": "solo", "alone": "alone (image)", None: "?"}.get(w, str(w))
++
++    # ------------------------------------------------------------------------------------------- the request
++    def observe(self, prompt, output=(), reused=0, prompt_read=None, where=None, finish=None, images=False):
++        """A finished request: compare it with the recent ones when it read at least min_read tokens (-> the line to
++        print, else None), then keep its fingerprint.  Never raises for odd input; prints no content."""
++        prompt = list(prompt or ())
++        reused = int(reused or 0)
++        read = int(prompt_read) if prompt_read is not None else max(0, len(prompt) - reused)
++        new = self.fingerprint(prompt, output)
++        now = self.clock()
++        new.ended, new.where, new.finish, new.images, new.reused = now, where, finish, bool(images), reused
++        line = None
++        with self.lock:
++            if read >= self.min_read and prompt:
++                line = self._describe(prompt, new, read, reused, now)
++            self.seq += 1
++            new.seq = self.seq
++            self.entries.append(new)
++            self.tokens += new.n
++            while self.entries and (len(self.entries) > self.keep or
++                                    (self.tokens > self.max_tokens and len(self.entries) > 1)):
++                self.tokens -= self.entries.popleft().n
++        if line:
++            self.lines += 1
++        return line
++
++    def _describe(self, prompt, new: Entry, read: int, reused: int, now: float) -> str:
++        best, best_lcp = None, -1
++        for old in reversed(self.entries):              # newest first: a tie goes to the most recent
++            n = self.lcp(new, old)
++            if n > best_lcp:
++                best, best_lcp = old, n
++        head = f"[strata] prefix-diag: read {read} of {new.plen} (reused {reused})"
++        if best is None:
++            return head + ": no earlier request held"
++        back = self.seq - best.seq + 1
++        ago = max(0.0, now - best.ended)
++        about = (f"{back} back of {len(self.entries)}, {ago:.0f} s ago, {best.plen} prompt + {best.n - best.plen} "
++                 f"output, ran {self._ran(best.where)}, finish {best.finish or '?'}, "
++                 f"{'images' if best.images else 'no images'}, it reused {best.reused}")
++        gap = best_lcp - reused
++        kind = ("diverged" if gap <= self.block else "not-reused" if reused < self.block else "partly-reused")
++        return (f"{head}: shares {best_lcp} tokens with a request ({about}); parts at {best_lcp}: "
++                f"new {self._where_new(prompt, new, best_lcp)}, old {self._where_old(best, best_lcp)}; "
++                f"shared but not reused {max(0, gap)}; kind={kind}")
+diff --git a/serve/server.py b/serve/server.py
+index f4ab4347..cdb7dcb1 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -678,6 +678,16 @@ class StrataEngine:
+             tl = self.__dict__.setdefault("_tl", threading.local())
+             tl.last = value
+ 
++    def _note_where(self, path, slot=None):
++        """STRATA_PREFIX_DIAG: where this thread's request runs now ("solo", "slot" with its slot, "alone" for an image
++        on an engine without per-slot M-RoPE tables; None: not yet).  The last one noted is where it ended."""
++        self.__dict__.setdefault("_tl", threading.local()).where = (path, slot)
++
++    def diag_where(self):
++        """(path, slot) of this thread's last request (see _note_where); None when nothing was noted."""
++        tl = self.__dict__.get("_tl")
++        return getattr(tl, "where", None) if tl is not None else None
++
+     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
+                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None):
+         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+@@ -1478,6 +1488,7 @@ class StrataEngine:
+                 self._last_done = None                  # (#879: this request's DONE decides below)
+                 self._send(f"GENI {int(max_new)}{keys} {embeddings} {','.join(str(int(t)) for t in ids)}")
+                 phase = "solo"
++                self._note_where("alone")
+                 self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                 self._ctl_erred = False
+                 try:
+@@ -1535,6 +1546,7 @@ class StrataEngine:
+         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
+         if not self.alive():
+             raise EngineDied("the engine is unavailable; this request was not sent")
++        self._note_where(None)
+         if embeddings and self.image_alone():           # an image: alone in the engine (see _generate_alone)
+             yield from self._generate_alone(ids, max_new, sampling, cancel, embeddings)
+             return
+@@ -1570,6 +1582,7 @@ class StrataEngine:
+                     self._last_done = None                  # (#879: this request's DONE decides below)
+                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                     phase = "solo"
++                    self._note_where("solo")
+                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                     self._ctl_erred = False
+                     def others():
+@@ -1685,6 +1698,7 @@ class StrataEngine:
+                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                     self.slot_held[slot] = []               # the admission overwrites what the slot held
+                     phase = "admit"
++                    self._note_where("slot", slot)
+                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                     self._ctl_erred = False
+                     asked = False
+@@ -1889,6 +1903,7 @@ class StrataEngine:
+         if getattr(self, "batch", 0):
+             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+             return
++        self._note_where("solo")
+         self.progress, self.progress_ms, self.reused = None, 0, 0
+         self.prefill_tok_s_mean = None
+         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
+@@ -3090,6 +3105,9 @@ class Service:
+         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
+         self.request_trace = threading.local()
+         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
++        # STRATA_PREFIX_DIAG=1 (opt-in): a line on each long prompt read saying where it parted from recent prompts
++        from serve.prefix_diag import PrefixDiag
++        self.prefix_diag = PrefixDiag.from_env(tokenizer)
+         # since the server started (the Monitor's totals, issue #35)
+         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
+                        "prompt_ms": 0.0, "decode_ms": 0.0,
+@@ -4159,6 +4177,7 @@ class Service:
+         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
+         # so the generated reasoning must not become this request's cached input (#615).
+         segments = []
++        diag_job = None                                 # STRATA_PREFIX_DIAG: this request's figures, compared after the lock
+         trace = getattr(self.request_trace, "record", None)
+         waiting = time.perf_counter()
+         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
+@@ -4472,6 +4491,11 @@ class Service:
+                             pcie_share = round(last["offloaded"] / routed, 3) \
+                                 if last.get("offloaded") is not None and routed else None
+                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
++                            if getattr(self, "prefix_diag", None) is not None and segments:
++                                where = getattr(self.engine, "diag_where", None)
++                                diag_job = dict(reused=last.get("reused"), prompt_read=last.get("prompt_read"),
++                                                where=where() if callable(where) else ("solo", None),
++                                                finish=finish, images=bool(emb))
+                             self.history.append({
+                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
+                                 if loaded else None,
+@@ -4533,6 +4557,13 @@ class Service:
+                                 self.status.update(busy=False)
+                                 self.status.pop("tail", None)
+                                 self.status.pop("tool", None)
++                    if diag_job is not None:            # STRATA_PREFIX_DIAG (opt-in): never fails the request
++                        try:
++                            note = self.prefix_diag.observe(ids, raw_ids, **diag_job)
++                            if note:
++                                print(note, flush=True)
++                        except Exception as e:          # noqa: BLE001
++                            print(f"[strata] prefix-diag: skipped ({type(e).__name__}: {e})", flush=True)
+         finally:
+             if emb:
+                 Path(emb).unlink(missing_ok=True)
+diff --git a/serve/test_prefix_diag.py b/serve/test_prefix_diag.py
+new file mode 100644
+index 00000000..ea3dd99f
+--- /dev/null
++++ b/serve/test_prefix_diag.py
+@@ -0,0 +1,275 @@
++"""serve/test_prefix_diag.py - STRATA_PREFIX_DIAG=1: where a long prompt read parted from the recent prompts.
++
++The fingerprints (block hashes, token digests, message starts), the line they give (the shared start to the token,
++the request it was shared with, the template's role and section at the offset, never the text), the bounds on what is
++kept, the opt-in, and the whole path: Service._run over the fake batch engine of test_parallel (solo and slot).
++
++    python -m unittest serve.test_prefix_diag -v
++"""
++import contextlib
++import io
++import json
++import threading
++import unittest
++import urllib.request
++from unittest import mock
++
++from serve.frontend import ChatTemplate
++from serve.prefix_diag import PrefixDiag
++from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine
++from serve import test_parallel
++
++TOK = ByteTokenizer()
++SECRET = "hunter2-PLEASE-NEVER-LOG"
++
++
++def render(system_tools=("alpha", "beta", "gamma"), system="You are helpful.", turns=()):
++    """A prompt as the chat template lays it out (ByteTokenizer ids): a system message with a tool list, then turns of
++    (role, text) - role "tool" is a user message holding a tool response."""
++    tools = "".join("\n" + json.dumps({"type": "function", "function": {"name": n}}) for n in system_tools)
++    text = (f"<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>{tools}\n</tools>"
++            f"\n\n{system}<|im_end|>\n")
++    for role, body in turns:
++        if role == "tool":
++            text += f"<|im_start|>user\n<tool_response>\n{body}\n</tool_response><|im_end|>\n"
++        elif role == "assistant":
++            text += f"<|im_start|>assistant\n{body}<|im_end|>\n"
++        else:
++            text += f"<|im_start|>{role}\n{body}<|im_end|>\n"
++    return TOK.encode(text + "<|im_start|>assistant\n", parse_special=True)
++
++
++def long_turns(n=40, filler="x" * 300):
++    out = []
++    for i in range(n):
++        out += [("user", f"question {i} {filler}"), ("assistant", f"<think>\nhm {i}\n</think>\n\nanswer {i} {filler}"),
++                ("tool", f"result {i} {filler}")]
++    return out
++
++
++class Clock:
++    def __init__(self):
++        self.t = 1000.0
++
++    def __call__(self):
++        return self.t
++
++
++class Fingerprints(unittest.TestCase):
++    def test_the_shared_start_to_the_token(self):
++        d = PrefixDiag(TOK, min_read=1)
++        base = list(range(1, 3001))
++        old = d.fingerprint(base)
++        for cut in (0, 1, 255, 256, 257, 511, 512, 1000, 2999):
++            new = list(base)
++            new[cut] = 99999
++            self.assertEqual(d.lcp(d.fingerprint(new), old), cut, cut)
++        self.assertEqual(d.lcp(d.fingerprint(base + [7, 8, 9]), old), 3000)       # the old one is all its start
++        self.assertEqual(d.lcp(d.fingerprint(base[:1300]), old), 1300)            # the new one is a start of it
++        self.assertEqual(d.lcp(d.fingerprint([5]), d.fingerprint([])), 0)
++
++    def test_the_old_requests_output_counts(self):
++        d = PrefixDiag(TOK, min_read=1)
++        old = d.fingerprint(list(range(1, 1001)), output=list(range(5000, 5300)))
++        new = list(range(1, 1001)) + list(range(5000, 5100)) + [1, 2, 3]
++        self.assertEqual(d.lcp(d.fingerprint(new), old), 1100)
++
++    def test_no_token_ids_are_kept(self):
++        d = PrefixDiag(TOK, min_read=1)
++        e = d.fingerprint(TOK.encode(SECRET * 40))
++        kept = bytes(e.digest.tobytes()) + b"".join(e.chain) + bytes(e.roles) + e.starts.tobytes()
++        self.assertNotIn(SECRET.encode(), kept)
++        self.assertFalse(hasattr(e, "ids"))
++
++    def test_roles(self):
++        d = PrefixDiag(TOK)
++        p = render(turns=[("user", "hi"), ("assistant", "hello"), ("tool", "r")])
++        e = d.fingerprint(p)
++        self.assertEqual([("system", "user", "assistant", "tool", "other")[r] for r in e.roles],
++                         ["system", "user", "assistant", "tool", "assistant"])
++
++
++class Lines(unittest.TestCase):
++    def setUp(self):
++        self.clock = Clock()
++        self.d = PrefixDiag(TOK, min_read=2000, clock=self.clock)
++
++    def test_a_changed_tool_list_is_named_and_no_text_is_logged(self):
++        turns = long_turns()
++        a = render(system_tools=("alpha" * 60, "beta" * 60, "gamma"), turns=turns)
++        first = self.d.observe(a, TOK.encode("done"), reused=0, where=("slot", 5), finish="stop")
++        self.assertTrue(first.endswith(": no earlier request held"), first)
++        self.clock.t += 37
++        b = render(system_tools=("alpha" * 60, "beta" * 60, "gamma-" + SECRET), turns=turns + [("user", SECRET)])
++        line = self.d.observe(b, (), reused=0, where=("solo", None), finish="stop")
++        self.assertIsNotNone(line)
++        cut = next(i for i, (x, y) in enumerate(zip(a, b)) if x != y)
++        self.assertIn(f"read {len(b)} of {len(b)} (reused 0): shares {cut} tokens", line)
++        self.assertIn("1 back of 1, 37 s ago", line)
++        self.assertIn(f"{len(a)} prompt + 4 output, ran slot 5, finish stop, no images", line)
++        self.assertIn(f"parts at {cut}: new system msg #0 +{cut} (tool list, tool #3), old system msg #0 +{cut}", line)
++        self.assertIn(f"shared but not reused {cut}; kind=not-reused", line)   # the engine reused nothing of it
++        self.assertNotIn(SECRET, line)
++        self.assertNotIn("gamma", line)
++        self.assertNotIn("alpha", line)
++
++    def test_diverged_when_the_engine_reused_what_was_shared(self):
++        turns = long_turns()
++        a = render(turns=turns)
++        self.d.observe(a, (), reused=0)
++        b = render(system="You are helpful. Today is Tuesday.", turns=turns)
++        cut = next(i for i, (x, y) in enumerate(zip(a, b)) if x != y)
++        line = self.d.observe(b, (), reused=cut - 10)
++        self.assertIn("(after the tool list)", line)
++        self.assertIn("shared but not reused 10; kind=diverged", line)
++        line = self.d.observe(b, (), reused=4096)                  # back to a checkpoint
++        self.assertIn(f"shares {len(b)} tokens", line)
++        self.assertIn("kind=partly-reused", line)
++
++    def test_a_dropped_thinking_parts_in_the_old_output(self):
++        turns = long_turns(20)
++        a = render(turns=turns)
++        out = TOK.encode("<think>\nlong thoughts\n</think>\n\nthe answer<|im_end|>", parse_special=True)
++        self.d.observe(a, out, reused=0)
++        b = render(turns=turns + [("assistant", "the answer"), ("user", "next " + "y" * 3000)])
++        line = self.d.observe(b, (), reused=len(a))
++        self.assertIn(f"shares {len(a)} tokens", line)
++        self.assertIn(f"parts at {len(a)}: new assistant msg #", line)
++        self.assertIn("old its output +0", line)
++        self.assertIn("kind=diverged", line)
++
++    def test_the_best_match_among_several(self):
++        turns = long_turns()
++        a = render(turns=turns)
++        self.d.observe(a, (), reused=0)                            # the conversation
++        self.clock.t += 5
++        self.d.observe(render(system_tools=("other",), turns=[("user", "z" * 3000)]), (), reused=0)   # another one
++        self.clock.t += 5
++        line = self.d.observe(a + TOK.encode("more" * 600), (), reused=0)
++        self.assertIn(f"shares {len(a)} tokens with a request (2 back of 2, 10 s ago", line)
++        self.assertIn("parts at %d: new assistant msg" % len(a), line)
++        self.assertIn("old its end", line)
++
++    def test_a_tool_response_and_a_tool_call(self):
++        turns = long_turns(10)
++        a = render(turns=turns + [("tool", "q" * 2600)])
++        self.d.observe(a, (), reused=0)
++        b = render(turns=turns + [("tool", "q" * 2500 + "CHANGED")])
++        line = self.d.observe(b, (), reused=0)
++        self.assertRegex(line, r"new tool msg #\d+ \+\d+ \(tool response #1\)")
++        c = render(turns=turns + [("assistant", "<tool_call>\n" + "c" * 2400 + "</tool_call>")])
++        self.d.observe(c, (), reused=0)
++        d = render(turns=turns + [("assistant", "<tool_call>\n" + "c" * 2300 + "D</tool_call>")])
++        self.assertRegex(self.d.observe(d, (), reused=0), r"new assistant msg #\d+ \+\d+ \(tool call #1\)")
++
++    def test_short_reads_say_nothing_but_are_kept(self):
++        a = render(turns=long_turns())
++        self.assertIsNone(self.d.observe(a, (), reused=len(a) - 5))               # read 5 tokens
++        self.assertIsNone(self.d.observe(a + [1, 2], (), reused=len(a)))           # read 2 tokens
++        self.assertIsNone(self.d.observe(a, (), reused=0, prompt_read=100))        # the engine read 100 (a slot held it)
++        self.assertEqual(len(self.d.entries), 3)
++        self.assertEqual(self.d.lines, 0)
++
++    def test_first_request_and_where_it_ran(self):
++        line = self.d.observe(render(turns=long_turns()), (), reused=0)
++        self.assertTrue(line.endswith(": no earlier request held"), line)
++        self.assertEqual(PrefixDiag._ran(("alone", None)), "alone (image)")
++        self.assertEqual(PrefixDiag._ran(None), "?")
++
++
++class Bounds(unittest.TestCase):
++    def test_keep_and_tokens(self):
++        d = PrefixDiag(TOK, keep=3, max_tokens=10_000, min_read=10 ** 9)
++        for i in range(10):
++            d.observe([i] * 3000, ())
++        self.assertEqual(len(d.entries), 3)
++        self.assertLessEqual(d.tokens, 10_000)
++        d.observe([1] * 50_000, ())                            # one bigger than the budget: kept alone
++        self.assertEqual(len(d.entries), 1)
++        self.assertEqual(d.tokens, 50_000)
++
++    def test_off_by_default(self):
++        self.assertIsNone(PrefixDiag.from_env(TOK, {}))
++        self.assertIsNone(PrefixDiag.from_env(TOK, {"STRATA_PREFIX_DIAG": "0"}))
++        d = PrefixDiag.from_env(TOK, {"STRATA_PREFIX_DIAG": "1", "STRATA_PREFIX_DIAG_MIN": "4096",
++                                      "STRATA_PREFIX_DIAG_KEEP": "8", "STRATA_PREFIX_DIAG_TOKENS": "bad"})
++        self.assertEqual((d.min_read, d.keep, d.max_tokens), (4096, 8, 8_000_000))
++        with mock.patch.dict("os.environ", {}, clear=False):
++            import os
++            os.environ.pop("STRATA_PREFIX_DIAG", None)
++            svc = Service(MockEngine(TOK, "ok"), TOK, ChatTemplate(test_parallel.Path(test_parallel.__file__).parent /
++                                                                   "chat_template.jinja"))
++        self.assertIsNone(svc.prefix_diag)
++
++    def test_threads(self):
++        d = PrefixDiag(TOK, keep=16, min_read=100)
++        base = list(range(1, 2000))
++
++        def work(k):
++            for i in range(20):
++                d.observe(base + [k, i] * 100, (), reused=0)
++        ts = [threading.Thread(target=work, args=(k,)) for k in range(4)]
++        for t in ts:
++            t.start()
++        for t in ts:
++            t.join()
++        self.assertEqual(len(d.entries), 16)
++        self.assertEqual(d.seq, 80)
++
++
++class ServicePath(unittest.TestCase):
++    """Service._run over the real StrataEngine and the fake batch engine (which reuses nothing)."""
++    P = test_parallel.ParallelService           # its start / tearDown / chat (not its tests: they run in test_parallel)
++    start, tearDown, chat = P.start, P.tearDown, P.chat
++
++    def run_quiet(self, fn):
++        buf = io.StringIO()
++        with contextlib.redirect_stdout(buf):
++            fn()
++        return [x for x in buf.getvalue().splitlines() if "prefix-diag" in x]
++
++    def test_solo_then_a_full_read_of_the_same_start(self):
++        self.start(2)
++        self.svc.prefix_diag = PrefixDiag(TOK, min_read=40)
++        text = "tell me " + "p" * 300
++        said = self.run_quiet(lambda: (self.chat(text, max_tokens=8), self.chat(text + " and more", max_tokens=8)))
++        self.assertEqual(len(said), 2, said)
++        self.assertTrue(said[0].endswith("no earlier request held"), said[0])
++        self.assertIn("ran solo", said[1])
++        self.assertIn("kind=not-reused", said[1])
++        self.assertIn("new user msg #", said[1])
++        self.assertNotIn("ppp", " ".join(said))
++        self.assertEqual(self.engine.diag_where(), None)        # (the request threads noted theirs, not this one)
++
++    def test_a_request_in_a_slot_says_its_slot(self):
++        self.start(2)
++        self.svc.prefix_diag = PrefixDiag(TOK, min_read=10 ** 9)
++        errs = []
++
++        def one(t):
++            try:
++                self.chat(t, max_tokens=40)
++            except Exception as e:                              # noqa: BLE001
++                errs.append(e)
++        ts = [threading.Thread(target=one, args=(f"q{i} " + "w" * 200,)) for i in range(3)]
++        self.run_quiet(lambda: ([t.start() for t in ts], [t.join() for t in ts]))
++        self.assertEqual(errs, [])
++        wheres = [e.where for e in self.svc.prefix_diag.entries]
++        self.assertEqual(len(wheres), 3)
++        self.assertTrue(any(w and w[0] == "slot" and isinstance(w[1], int) for w in wheres), wheres)
++
++
++class EngineWhere(unittest.TestCase):
++    def test_noted_per_thread(self):
++        e = StrataEngine("missing-executable", [], lazy=True)
++        self.assertIsNone(e.diag_where())
++        e._note_where("slot", 3)
++        seen = []
++        t = threading.Thread(target=lambda: seen.append(e.diag_where()))
++        t.start()
++        t.join()
++        self.assertEqual((e.diag_where(), seen), (("slot", 3), [None]))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

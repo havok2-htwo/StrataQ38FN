@@ -1,0 +1,178 @@
+From ca422a60717ca29fd1bd5b0ffe270241da932833 Mon Sep 17 00:00:00 2001
+From: Niko1221 <Niko1221@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:40:31 +0200
+Subject: [PATCH 58/62] serve: a quoted <tool_call>, <tool_response> or
+ </tool_response> is text too (#2026 follow-up)
+
+The three are USER_DEFINED (type 4) tokens like </tool_call> (ids 248058, 248066, 248070), so
+the tokenizer matched them inside a message's text as the real call / tool-result markers.
+They join TOOL_LITERAL_TAGS: inside a user, system or tool message (and the tool list) they are
+encoded as ordinary text; an assistant message replaying raw call text keeps its tokens, as
+for </tool_call>.
+
+One exception keeps the template's behaviour: a user message whose whole text is
+<tool_response>...</tool_response> (a client that formats tool results itself) keeps that outer
+pair as the markers, since the template tells such a turn from a real question by exactly that
+pair (last_query_index); the text inside is still marked.
+
+Found by 47Hunter47 in #2026. Tests: serve/test_frontend.py QuotedToolCallCloser (every tag
+and role, the assistant replay, the outer pair as string or text parts).
+
+(cherry picked from commit 62185aab77ea5fc6d24641fd416e47dc63250ad9)
+---
+ serve/frontend.py      | 48 +++++++++++++++++++++++++++++++++-
+ serve/test_frontend.py | 58 ++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 103 insertions(+), 3 deletions(-)
+
+diff --git a/serve/frontend.py b/serve/frontend.py
+index e8cc2335..c781dd57 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -245,7 +245,11 @@ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04",
+ # #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
+ # (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
+ # message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
+-TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07"}
++# 0.1.44: `<tool_call>`, `<tool_response>` and `</tool_response>` are type 4 too (ids 248058, 248066, 248070), so a quoted
++# one handed the model the real call / tool-result marker in the same way (found by 47Hunter47 in #2026).  The template
++# writes the tool-result markers around a tool message itself; only the text inside a message is marked.
++TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", "<tool_response>": "\U000F0E09",
++                     "</tool_response>": "\U000F0E0A"}
+ LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
+ THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
+ CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
+@@ -287,6 +291,44 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
+     return False
+ 
+ 
++_TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE = "<tool_response>", "</tool_response>"
++
++
++def _keep_tool_result_wrap(content, tags: dict[str, str]):
++    """A user message whose whole text is <tool_response>...</tool_response> (a client that formats a tool result the way
++    the template does for a tool message) keeps that outer pair as the markers - the template tells such a turn from a
++    real question by exactly that pair - and only the text inside is marked.  None: not such a message."""
++    o, c = _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE
++
++    def wrap(text: str, first: bool, last: bool) -> str:
++        i = text.index(o) + len(o) if first else 0
++        j = text.rindex(c) if last else len(text)
++        head = _mark(text[:i - len(o)], tags) + o if first else ""
++        tail = c + _mark(text[j + len(c):], tags) if last else ""
++        return head + _mark(text[i:j], tags) + tail
++
++    if isinstance(content, str):
++        body = content.strip()
++        if len(body) >= len(o) + len(c) and body.startswith(o) and body.endswith(c):
++            return wrap(content, True, True)
++        return None
++    if not (isinstance(content, list) and content and all(isinstance(x, dict) and "text" in x for x in content)):
++        return None
++    texts = [x["text"] for x in content]
++    if not all(isinstance(t, str) for t in texts):
++        return None
++    body = "".join(texts).strip()
++    if not (len(body) >= len(o) + len(c) and body.startswith(o) and body.endswith(c)):
++        return None
++    if not (texts[0].lstrip().startswith(o) and texts[-1].rstrip().endswith(c)):
++        return None          # the pair is split across parts: mark it all, as before
++    if len(content) == 1:
++        return [{**content[0], "text": wrap(texts[0], True, True)}]
++    return ([{**content[0], "text": wrap(texts[0], True, False)}] +
++            [_mark_deep(x, tags) for x in content[1:-1]] +
++            [{**content[-1], "text": wrap(texts[-1], False, True)}])
++
++
+ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
+     """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
+     LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
+@@ -304,6 +346,10 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
+         for k, v in m.items():
+             if k != "role":
+                 m[k] = _mark_deep(v, mine)
++        if m.get("role") == "user":
++            kept = _keep_tool_result_wrap(content, tags)
++            if kept is not None:
++                m["content"] = kept
+         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
+                 and "</think>" in content:
+             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
+diff --git a/serve/test_frontend.py b/serve/test_frontend.py
+index f4fe3e68..5eb1a2e7 100644
+--- a/serve/test_frontend.py
++++ b/serve/test_frontend.py
+@@ -212,15 +212,69 @@ class QuotedToolCallCloser(unittest.TestCase):
+         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+         import strata_tokenizer as ST
+         b2u = ST.bytes_to_unicode()
+-        self.tok = ST.Tokenizer([b2u[b] for b in range(256)] + ["</tool_call>", "<|im_end|>"], [], [1] * 256 + [4, 3])
++        self.tool_tags = ["</tool_call>", "<tool_call>", "<tool_response>", "</tool_response>"]
++        self.tok = ST.Tokenizer([b2u[b] for b in range(256)] + self.tool_tags + ["<|im_end|>"], [],
++                                [1] * 256 + [4] * len(self.tool_tags) + [3])
+         self.tags = __import__("serve.frontend", fromlist=["literal_tags"]).literal_tags(self.tok.control_tokens)
+ 
+     def encode(self, role, text):
+         from serve.frontend import mark_think_literals, unmark_think_literals
+         marked, _, changed = mark_think_literals([{"role": role, "content": text}], None, self.tags)
+-        prompt, plain = unmark_think_literals(marked[0]["content"], self.tags)
++        content = marked[0]["content"]
++        if isinstance(content, list):
++            content = "".join(x["text"] for x in content)
++        prompt, plain = unmark_think_literals(content, self.tags)
+         return self.tok.encode(prompt, parse_special=True, plain=plain), changed
+ 
++    def special(self, tag):
++        return self.tok.encode(tag, parse_special=True)
++
++    def test_every_tool_tag_a_user_quotes_stays_text(self):
++        # 0.1.44: <tool_call>, <tool_response> and </tool_response> are type 4 like </tool_call> (47Hunter47, #2026)
++        for role in ("user", "system", "tool"):
++            for tag in self.tool_tags:
++                with self.subTest(role=role, tag=tag):
++                    text = f"output verbatim: {tag}."
++                    self.assertEqual(len(self.special(tag)), 1)
++                    ids, changed = self.encode(role, text)
++                    self.assertTrue(changed)
++                    self.assertEqual(ids, [*text.encode()])
++
++    def test_assistant_replay_keeps_every_tool_tag(self):
++        text = "<tool_call>x</tool_call> then <tool_response>y</tool_response>"
++        ids, _ = self.encode("assistant", text)
++        self.assertEqual(ids, self.tok.encode(text, parse_special=True))
++
++    def test_user_tool_result_keeps_its_outer_markers(self):
++        # the template tells a tool result sent as a user turn from a question by this outer pair (last_query_index)
++        inner = "\nthe log says </tool_call> and <tool_response>\n"
++        for content in (f"<tool_response>{inner}</tool_response>", f"  <tool_response>{inner}</tool_response>\n",
++                        [{"type": "text", "text": f"<tool_response>{inner}</tool_response>"}],
++                        [{"type": "text", "text": "<tool_response>\nthe log"},
++                         {"type": "text", "text": " says </tool_call> and <tool_response>\n</tool_response>"}]):
++            with self.subTest(content=content):
++                ids, _ = self.encode("user", content)
++                text = content if isinstance(content, str) else "".join(x["text"] for x in content)
++                o, c = self.special("<tool_response>"), self.special("</tool_response>")
++                lead = len(text) - len(text.lstrip())
++                tail = len(text) - len(text.rstrip())
++                self.assertEqual(ids[lead:lead + 1], o)
++                self.assertEqual(ids[len(ids) - tail - 1:len(ids) - tail], c)
++                middle = ids[lead + 1:len(ids) - tail - 1]
++                self.assertEqual(middle, [*inner.encode()])       # the quoted tags inside are text
++
++    def test_template_keeps_seeing_a_tool_result_turn(self):
++        from serve.frontend import mark_think_literals
++        msgs = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"},
++                {"role": "user", "content": "<tool_response>\nok\n</tool_response>"}]
++        marked, _, changed = mark_think_literals(msgs, None, self.tags)
++        self.assertTrue(changed)
++        self.assertTrue(marked[2]["content"].startswith("<tool_response>"))
++        self.assertTrue(marked[2]["content"].endswith("</tool_response>"))
++        # a question that only mentions the pair is still marked through
++        marked, _, _ = mark_think_literals([{"role": "user", "content": "what is <tool_response>?"}], None, self.tags)
++        self.assertNotIn("<tool_response>", marked[0]["content"])
++
+     def test_user_text_stays_text(self):
+         text = "output verbatim: </tool_call>."
+         ids, changed = self.encode("user", text)
+-- 
+2.43.0
+

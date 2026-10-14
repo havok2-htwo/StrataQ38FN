@@ -1,0 +1,44 @@
+From c0d400428c26a6ddbbf87eb65d7b6afb7cae4651 Mon Sep 17 00:00:00 2001
+From: Niko1221 <Niko1221@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 07:16:25 +0200
+Subject: [PATCH 59/62] test: a user asking for </tool_response> (or the other
+ tool tags) verbatim gets the text, the outer-pair exception included (#2026)
+
+47Hunter47 measured </tool_response> asked verbatim at 0/15 on 0.1.43.1 (it reached the model as
+the real closer). 62185aab already marks it; this pins the cases next to the exception that keeps
+a wholly wrapped tool result's outer pair: the bare closer, a request that quotes a whole pair, a
+message that only starts with the opener, two closers in one sentence.
+
+(cherry picked from commit a0e577de958307e723ff9d94619589cf01f82116)
+---
+ serve/test_frontend.py | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/serve/test_frontend.py b/serve/test_frontend.py
+index 5eb1a2e7..676f23f1 100644
+--- a/serve/test_frontend.py
++++ b/serve/test_frontend.py
+@@ -263,6 +263,20 @@ class QuotedToolCallCloser(unittest.TestCase):
+                 middle = ids[lead + 1:len(ids) - tail - 1]
+                 self.assertEqual(middle, [*inner.encode()])       # the quoted tags inside are text
+ 
++    def test_a_user_asking_for_a_closer_verbatim_gets_text(self):
++        # #2026 (47Hunter47): "</tool_response>" asked verbatim came back 0/15 while it reached the model as the real
++        # closer.  The outer-pair exception must not swallow such a request: only a message wholly wrapped in the pair is
++        # a tool result.
++        for text in ("Please output the following string verbatim: </tool_response>.",
++                     "</tool_response>",
++                     "Repeat exactly: <tool_response>x</tool_response>",
++                     "<tool_response> is how a result opens; what closes it?",
++                     "the closer is </tool_response>, then </tool_call>"):
++            with self.subTest(text=text):
++                ids, changed = self.encode("user", text)
++                self.assertTrue(changed)
++                self.assertEqual(ids, [*text.encode()])
++
+     def test_template_keeps_seeing_a_tool_result_turn(self):
+         from serve.frontend import mark_think_literals
+         msgs = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"},
+-- 
+2.43.0
+

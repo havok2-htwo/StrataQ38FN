@@ -1,0 +1,94 @@
+From 59266e479d93b2541de4f785a27054179c55516a Mon Sep 17 00:00:00 2001
+From: Niko1221 <Niko1221@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 09:47:34 +0200
+Subject: [PATCH 56/62] serve: a quoted </tool_call> in a message is text, not
+ the end-of-call token (#2026)
+
+(cherry picked from commit a683000875b0d701ec8d41e479741d16b145d73f)
+---
+ serve/frontend.py      | 14 ++++++++++----
+ serve/test_frontend.py | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/serve/frontend.py b/serve/frontend.py
+index 39fa317a..27c747ff 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -242,7 +242,11 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
+ # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
+ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
+                "<|video_pad|>": "\U000F0E06"}
+-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
++# #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
++# (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
++# message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
++TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07"}
++LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
+ THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
+ CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
+ 
+@@ -292,17 +296,19 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
+     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
+         return messages, tools, False
+     out = []
++    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
+     for m in messages:
+         m = dict(m)
+         content = m.get("content")
++        mine = own if m.get("role") == "assistant" else tags
+         for k, v in m.items():
+             if k != "role":
+-                m[k] = _mark_deep(v, tags)
++                m[k] = _mark_deep(v, mine)
+         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
+                 and "</think>" in content:
+             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
+-            m["content"] = (content[:i] + _mark(content[i:j], tags) + "</think>" +
+-                            _mark(content[j + len("</think>"):], tags))
++            m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
++                            _mark(content[j + len("</think>"):], own))
+         out.append(m)
+     return out, _mark_deep(tools, tags), True
+ 
+diff --git a/serve/test_frontend.py b/serve/test_frontend.py
+index fc7113e6..801ad8c9 100644
+--- a/serve/test_frontend.py
++++ b/serve/test_frontend.py
+@@ -201,3 +201,34 @@ class ForcedCallOpening(unittest.TestCase):
+         self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
+         self.assertTrue(forced_call("required", two).endswith("<function="))
+         self.assertIsNone(forced_call("auto", one))
++
++
++class QuotedToolCallCloser(unittest.TestCase):
++    """#2026: a `</tool_call>` a user quotes is text, not the end-of-call token (type 4: matched even without
++    parse_special); an assistant message replaying raw call text keeps the model's own tokens."""
++
++    def setUp(self):
++        import sys
++        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
++        import strata_tokenizer as ST
++        b2u = ST.bytes_to_unicode()
++        self.tok = ST.Tokenizer([b2u[b] for b in range(256)] + ["</tool_call>", "<|im_end|>"], [], [1] * 256 + [4, 3])
++        self.tags = __import__("serve.frontend", fromlist=["literal_tags"]).literal_tags(self.tok.control_tokens)
++
++    def encode(self, role, text):
++        from serve.frontend import mark_think_literals, unmark_think_literals
++        marked, _, changed = mark_think_literals([{"role": role, "content": text}], None, self.tags)
++        prompt, plain = unmark_think_literals(marked[0]["content"], self.tags)
++        return self.tok.encode(prompt, parse_special=True, plain=plain), changed
++
++    def test_user_text_stays_text(self):
++        text = "output verbatim: </tool_call>."
++        ids, changed = self.encode("user", text)
++        self.assertTrue(changed)
++        self.assertEqual(ids, [*text.encode()])
++        self.assertNotEqual(self.tok.encode(text, parse_special=True), ids)     # unmarked, it was the special token
++
++    def test_assistant_replay_keeps_its_token(self):
++        text = "<tool_call>x</tool_call>"
++        ids, _ = self.encode("assistant", text)
++        self.assertEqual(ids, self.tok.encode(text, parse_special=True))
+-- 
+2.43.0
+

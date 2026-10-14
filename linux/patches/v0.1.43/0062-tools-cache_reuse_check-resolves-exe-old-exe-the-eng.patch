@@ -1,0 +1,29 @@
+From 7a49445b4ac78ce4da2a930899377dd358239a12 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 05:06:15 +0200
+Subject: [PATCH 62/62] tools: cache_reuse_check resolves --exe/--old-exe (the
+ engine starts in the config's cwd)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/cache_reuse_check.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tools/cache_reuse_check.py b/tools/cache_reuse_check.py
+index b2700140..65f61fb5 100644
+--- a/tools/cache_reuse_check.py
++++ b/tools/cache_reuse_check.py
+@@ -621,6 +621,10 @@ def check(argv):
+     ap.add_argument("--line-timeout", type=float, default=300.0)
+     ap.add_argument("--start-timeout", type=float, default=900.0)
+     a = ap.parse_args(argv)
++    # the engine starts in the config's "cwd": a relative --exe / --old-exe would be looked up there
++    for k in ("exe", "old_exe"):
++        if getattr(a, k, None):
++            setattr(a, k, str(Path(getattr(a, k)).resolve()))
+     try:
+         cfg = json.loads(Path(a.config).read_text())
+     except (OSError, ValueError) as x:
+-- 
+2.43.0
+

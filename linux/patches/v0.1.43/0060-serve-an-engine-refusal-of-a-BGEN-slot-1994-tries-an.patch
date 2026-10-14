@@ -1,0 +1,171 @@
+From 97fd3f25275ba929627234cfbf1ac8cf7561c908 Mon Sep 17 00:00:00 2001
+From: Niko1221 <Niko1221@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 23:24:42 +0200
+Subject: [PATCH 60/62] serve: an engine refusal of a BGEN slot (#1994) tries
+ another slot instead of a permanent 400
+
+The engine answered 'ERR BGEN: no such free slot' when its view of a slot differed from the server's; the server turned the ERR into an HTTP 400 and the conversation, drawn to the same slot by its held prefix, got it again on every turn. Now the refused slot is parked (busy, no owner) for SLOT_PARK_S, the request waits for / takes another slot, and after BGEN_REFUSALS_MAX refusals it ends with a retryable 503.
+
+(cherry picked from commit c5fa1b58a72735a9a0b48c3871af6bb28c44f050)
+---
+ serve/server.py        | 63 ++++++++++++++++++++++++++++++++++--------
+ serve/test_parallel.py | 48 ++++++++++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+), 12 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index cdb7dcb1..ca798916 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1261,6 +1261,26 @@ class StrataEngine:
+                 self.slot_cv.notify_all()
+         threading.Thread(target=wait, daemon=True).start()
+ 
++    BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
++    SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
++
++    def _park_slot(self, slot: int) -> None:
++        """#1994: the engine refused a BGEN for `slot`.  Keep it busy here for SLOT_PARK_S (no request owns it), then
++        give it back: the engine's view has caught up, or the next refusal parks it again."""
++        with self.slot_cv:
++            self.slot_claims.discard(slot)
++            self.slot_busy[slot] = True
++        busy = self.slot_busy
++
++        def free():
++            with self.slot_cv:
++                if slot not in self.slot_claims and slot not in self.slot_releasing:
++                    busy[slot] = False
++                self.slot_cv.notify_all()
++        t = threading.Timer(self.SLOT_PARK_S, free)
++        t.daemon = True
++        t.start()
++
+     ORPHAN_SLOT_S = 3.0   # #1603: a busy flag nobody owns this long is a leak and is given back
+ 
+     def _reap_orphan_slots(self) -> list[int]:
+@@ -1566,7 +1586,7 @@ class StrataEngine:
+         slot, gen0, reserved = None, None, None
+         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
+         stop_sent = False
+-        yields, solo_again = 0, 0
++        yields, solo_again, refused = 0, 0, 0
+         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
+         try:
+             while True:   # a request in a slot that is left alone goes back to the solo path
+@@ -1702,17 +1722,36 @@ class StrataEngine:
+                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                     self._ctl_erred = False
+                     asked = False
+-                    for x in self._control(cancel, pending.append):
+-                        while pending:
+-                            t = pending.pop(0)
+-                            out.append(t)
+-                            yield t
+-                        if x is None:
+-                            if (not asked and not embeddings and yields < self.YIELDS_MAX and
+-                                    self._shorter_waiting(len(prompt))):
+-                                self._send(f"BYIELD {slot}")
+-                                asked = True
+-                            yield None
++                    try:
++                        for x in self._control(cancel, pending.append):
++                            while pending:
++                                t = pending.pop(0)
++                                out.append(t)
++                                yield t
++                            if x is None:
++                                if (not asked and not embeddings and yields < self.YIELDS_MAX and
++                                        self._shorter_waiting(len(prompt))):
++                                    self._send(f"BYIELD {slot}")
++                                    asked = True
++                                yield None
++                    except ValueError as e:
++                        # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
++                        # slot it still holds).  That is not the request's fault and nothing was read: park the slot
++                        # for a moment (busy here too), and wait for another one - never a 400 for the conversation.
++                        if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
++                            raise
++                        refused += 1
++                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
++                              f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
++                        if refused > self.BGEN_REFUSALS_MAX:
++                            raise GpuBusy("the engine's batch slots are not free right now; try again in a moment") from e
++                        self.slot_live[slot] = None
++                        self.slot_held[slot] = []
++                        phase = "none"
++                        self._ctl_erred = False
++                        self._park_slot(slot)
++                        slot = None
++                        continue
+                     cont = bool(self._ctl_result and self._ctl_result[1])
+                     phase = "slot" if cont else "none"
+                     while pending:
+diff --git a/serve/test_parallel.py b/serve/test_parallel.py
+index f7524796..fbc8fb1c 100644
+--- a/serve/test_parallel.py
++++ b/serve/test_parallel.py
+@@ -105,6 +105,14 @@ while True:
+         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # #1059: refused up front, then idle (no DONE)
+             print("ERR refused: images are not enabled", flush=True)
+             continue
++        # #1994: the engine's own view of its slots differs: BUSYSLOT is refused once, BUSYALL always
++        pbx = bytes(int(x) & 255 for x in ids)
++        if slot is not None and (b"BUSYALL" in pbx or (b"BUSYSLOT" in pbx and "busyslot" not in fired)):
++            fired.add("busyslot")
++            print(f"ERR BGEN: no such free slot (--batch {slots}) or a bad max_new", flush=True)
++            if log:
++                log.write(f"REFUSED {slot}\n"); log.flush()
++            continue
+         if log:
+             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
+         pb = bytes(int(x) & 255 for x in ids)
+@@ -314,6 +322,46 @@ class ParallelService(unittest.TestCase):
+         with urllib.request.urlopen(self.base + path, timeout=10) as r:
+             return json.loads(r.read().decode())
+ 
++    def _two_at_once(self, text_b):
++        """A long request first, then one that has to go to a batch slot (the engine is busy with the first)."""
++        out = {}
++        def go(k, text):
++            try:
++                out[k] = ("ok", self.chat(text, max_tokens=64))
++            except urllib.error.HTTPError as e:
++                out[k] = ("http", e.code, e.read().decode(), dict(e.headers))
++        ta = threading.Thread(target=go, args=("a", "LONGREPLY please"))
++        ta.start()
++        time.sleep(0.15)
++        tb = threading.Thread(target=go, args=("b", text_b))
++        tb.start()
++        ta.join(30); tb.join(30)
++        return out
++
++    def test_bgen_refused_by_the_engine_is_retried_not_a_400(self):
++        """#1994: the engine refuses a BGEN ("no such free slot") although the server saw the slot free: the request
++        goes to another slot (or waits) and is answered; the same conversation's next turn works too."""
++        self.start(2)
++        self.engine.SLOT_PARK_S = 0.2
++        out = self._two_at_once("BUSYSLOT hello")
++        self.assertEqual(out["b"][0], "ok", out["b"])
++        self.assertIn("REFUSED", self.log.read_text())
++        again = self.chat("BUSYSLOT hello")                     # the conversation is not poisoned
++        self.assertEqual(again["choices"][0]["message"]["content"], "ok, done.")
++        time.sleep(0.5)
++        self.assertEqual(self.engine.slot_busy, [False, False])
++
++    def test_bgen_refused_for_good_is_a_retryable_503_and_frees_the_slots(self):
++        """#1994: when the engine keeps refusing, the answer is a 503 (retryable), never a 400, and no slot stays busy."""
++        self.start(2)
++        self.engine.SLOT_PARK_S = 0.05
++        out = self._two_at_once("BUSYALL hello")
++        self.assertEqual(out["b"][0], "http", out["b"])
++        self.assertEqual(out["b"][1], 503, out["b"])
++        time.sleep(0.5)
++        self.assertEqual(self.engine.slot_busy, [False, False])
++        self.assertEqual(self.chat("fine again")["choices"][0]["message"]["content"], "ok, done.")
++
+     def test_engine_reports_fewer_slots(self):
+         self.start(4, fit=2)
+         self.assertEqual(self.engine.batch, 2)
+-- 
+2.43.0
+
