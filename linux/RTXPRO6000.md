@@ -63,6 +63,26 @@ them together at ~14,000 tok/s. The tok/s of the two vLLM rows differ by reply l
 in ~43 s), not by the tier. All 16 conversations also fit into vLLM's 492,612-token VRAM KV pool, so the RAM tier only
 shows its value with more open conversations than that.
 
+### Agentic coding traffic (bench_agentic.py defaults, greedy)
+
+2 sessions 20 s apart, 6K shared system prompt, 20K repository context, 10 main steps with a 2.5K ephemeral reminder
+each, 3 parallel sub-agents at steps 2 and 6 (3 steps each), a chat user beside it (~every 25 s). Strata with the
+production-style one-GPU config `S8-rtxpro6000-prod-agentic.json`: the cb144/prod262r args and `STRATA_*` switches minus
+the layer split, `--trim-stage-weights`, `--aux-cpus` and the SSD tier (its path is on the 3090 host); 262K context with
+32K K/V cells resident, 16 slots + `--batch-mtp`, conversation cache 32 GiB (RAM: 123 GiB), plus
+`STRATA_MSG_CKPT_TAIL=8192`; `STRATA_ADMIT_SHORT_FIRST=8192` set in the server's environment (a server-side switch).
+VRAM 81.5 GB.
+
+| Role | Requests | Prompt / cached (mean) | TTFT p50 / p95 / max | Decode p50 |
+|---|---|---|---|---|
+| main agent | 20 | 51,884 / 37,522 | 4.57 / 24.58 / 24.58 s | 53.8 tok/s |
+| sub-agents | 36 | 19,884 / 15,334 | 5.33 / 15.83 / 17.83 s | 35.5 tok/s |
+| chat | 9 | 1,293 / 425 | 0.57 / 4.61 / 4.61 s | 43.1 tok/s |
+
+Wall 206.5 s (sessions 206 s and 170 s), 9,414 output tokens (45.6 tok/s), 1,765,190 prompt tokens of which 1,306,336
+(74 %) came from the cache, 0 errors. **vLLM was not run on this workload** (stopped on request before its start;
+`vllm/agentic_1gpu.sh` runs both arms, vLLM with `MAX_LEN=131072`, since the main agent grows past 32K).
+
 ### Official benchmark (tools/strata_bench.py of Strata-1441, against the running server)
 
 | | `S1` solo | `S2` 8 slots, `--clients 8` |
@@ -134,6 +154,7 @@ LABEL=vllm031-1gpu VLLM=1 vllm/bench_1gpu.sh
 python3 -I bench_multiturn.py --url http://127.0.0.1:8090 --label strata-s3-mt --users 16 --turns 3 \
   --out results/multiturn-rtxpro6000.jsonl                          # add --vllm --model qwen3.8-flash-next for vLLM
 VLLM_MODEL=<W4A16 snapshot> vllm/slot_scaling_1gpu.sh               # 18/20/24/32 slots + vLLM at those user counts
+VLLM_MODEL=<W4A16 snapshot> vllm/agentic_1gpu.sh    # bench_agentic.py: Strata on :8090 (start S8 first), then vLLM
 (cd ../Strata-1441 && ../Strata/.venv/bin/python tools/strata_bench.py --url http://127.0.0.1:8090 [--clients 8])
 ```
 
