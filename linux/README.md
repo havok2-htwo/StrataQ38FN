@@ -6,6 +6,9 @@ Strata **v0.1.42 + our patch series** (`patches/v0.1.42/`, 28 patches, self-comp
 UD-IQ4_XS** (target); for comparison UD-Q4_K_XL, vLLM 0.29/0.31 and Qwen3.8-27B-FP8. Summary, Setup and Recommended
 configuration describe the current state; the sections after them are the chronological record (0.1.41 → 0.1.42).
 
+One RTX PRO 6000 Blackwell (96 GB) instead of the four 3090s, Strata 0.1.44.1 vs vLLM 0.31 on the same card and a
+2-card projection: [RTXPRO6000.md](RTXPRO6000.md) (2026-10-15).
+
 ## Summary
 
 Current default `configs/T16-142fcb.json` (CHANGELOG 0.12.0, TESTLOG #57). Protocol for the Strata numbers:
