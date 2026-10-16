@@ -1,0 +1,2671 @@
+[strata] 2026-10-16 18:29:19 engine started: /media/raid0/StrataQ38FN/Strata/engine/strata-g3-1441b --serve --pack /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs --native /media/raid0/Models/Strata-GGUF/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf --expert-profile /media/raid0/StrataQ38FN/Strata/data/expert-profile.bin --expert-cache auto --prefill 512 --spec 4 --spec-min-p 0.5 --mtp /media/raid0/StrataQ38FN/Strata-data/mtp/rt --max-context 262144 --kv int8 --resident-experts --trim-stage-weights --ple-io ram --aux-cpus 65-127 --conversation-cache-mib 131072 --conversation-cache-slots 448 --kv-resident 32768 --conversation-cache-min-free-mib 16384 --conversation-cache-min-tokens 1024 --vision --layer-split 12,25,37 --batch 16
+strata generate: memory guard: limit 200.0 GiB (source: cgroup), current 1.2 GiB, reclaimable cache credited 0.0 GiB; available 198.8 GiB (MemAvailable 240.9 GiB), floor 16384 MiB
+strata generate: layer split across 4 GPUs: CUDA0, then CUDA1,2,3 (split 12,25,37)
+strata generate: PCIe probe: 13.1 GB/s host->device (best of 13.1 13.0 13.0 13.0) -> pcie_frac 0.36 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs experts (largest blob 3.48 MB), token embedding Q8_0 in mapped host memory (644 MiB, 0.7 s)
+strata generate: layer split: CUDA0 loads the dense weights of layers 0-11 only
+strata trace: 22948 MiB free after the CUDA context and the weight arena
+strata generate: 463 MiB of weights loaded from /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs in 0.1 s (843 canonical tensors skipped: served natively)
+strata trace: 22948 MiB free after the pack weights
+strata generate: 76 native projection matrices, 763.67 MiB of weights, in 0.2 s
+strata generate: PLE table locked in RAM (--ple-io ram) in 1.2 s
+strata generate: layer split: CUDA1 loads the dense weights of layers 12-24 only
+strata generate: layer split: CUDA1 PCIe probe 13.1 GB/s (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36
+strata generate: layer split: CUDA1 holds its weights; 21.97 GiB free (its session follows the split search)
+strata generate: layer split: CUDA2 loads the dense weights of layers 25-36 only
+strata generate: layer split: CUDA2 PCIe probe 13.5 GB/s (best of 13.5 13.5 13.5 13.5) -> pcie_frac 0.37
+strata generate: layer split: CUDA2 holds its weights; 22.07 GiB free (its session follows the split search)
+strata generate: layer split: CUDA3 loads the dense weights of layers 37-47 only
+strata generate: layer split: CUDA3 PCIe probe 13.5 GB/s (best of 13.5 13.5 13.5 13.5) -> pcie_frac 0.37
+strata generate: layer split: CUDA3 holds its weights; 22.16 GiB free (its session follows the split search)
+strata generate: profile /media/raid0/StrataQ38FN/Strata/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: KV streaming: 32768 of 262144 cells per QSA layer in VRAM, the K/V in 0.77 GiB of pinned RAM
+strata generate: PLE on, table 320001536 rows of /media/raid0/Models/Strata-GGUF/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf
+strata trace: 21851 MiB free after the session (KV, GDN state, PLE history)
+strata generate: layer split: CUDA1 holds its weights, session [12, 25); 21.67 GiB free
+strata generate: layer split: CUDA2 holds its weights, session [25, 37); 21.77 GiB free
+strata generate: layer split: CUDA3 holds its weights, session [37, 48) and the head; 21.38 GiB free
+strata generate: --batch-groups auto: 4 groups of 4 slots
+strata generate: --batch: 16 slot sessions on CUDA0 (0.29 GiB each); 16.61 GiB free
+strata generate: --batch: 16 slot sessions on CUDA1 (0.29 GiB each); 16.90 GiB free
+strata generate: --batch: 16 slot sessions on CUDA2 (0.29 GiB each); 17.01 GiB free
+strata generate: --batch: 16 slot sessions on CUDA3 (0.29 GiB each); 16.65 GiB free
+strata generate: --batch 16: the slot sessions take 4.66 GiB of VRAM on CUDA0 that the expert cache would otherwise hold
+strata generate: --vision with --batch 16: the image position table holds 17 regions of 262208 rows (the main sessions' and one per slot), 51.0 MiB per GPU; image and text requests share the batch
+strata mtp: draft layer loaded, 835 MiB of VRAM (experts 675, dense 111), files read in 0.53 s (1495 MiB/s)
+strata trace: 16921 MiB free after the native head
+strata generate: GPU 0: NVIDIA GeForce RTX 3090, compute capability 8.6
+strata generate: experts via mmap (--mmap-experts; the GGUF shards in place, no experts.bin)
+strata generate: GPU host-callback thread started before host-core pinning
+strata generate: CPU pool tasks/phase: 192 (automatic), participating threads: 64
+strata generate: 63 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63, the host thread on 0 (draining too) (--host-core first)
+strata aux cpus: threads that are neither pool workers nor the host go to CPUs 65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127 (on; 10 threads placed so far)
+strata trace: 16919 MiB free after the weights, the session and the drafter
+strata generate: expert cache auto: 16.52 GiB free, 700 MiB reserved (+0 MiB for the draft head) -> 4884 slots
+strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): 48 of 48 layers
+strata: prompt MMQ sorts the full expert groups (STRATA_MMQ_GROUP_SORT=1): 48 of 48 layers
+strata generate: +256 B guard per sized slot (STRATA_MMQ_DIRECT)
+strata generate: expert cache 6144 slots, 14.27 GiB of VRAM; policy is
+strata trace: 2305 MiB free after opening the expert cache
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: the profile fill asks for 256 pairs ahead (STRATA_FILL_AHEAD)
+strata trace: 2303 MiB free after the profile fill
+strata generate: pre-filled 6144 of 6144 slots from the profile in 4.2 s (3624 MB/s); slot 0 verified
+strata generate: layer split, CUDA1: 16.81 GiB free of 23.56, room for experts 16.03 GiB
+strata generate: layer split: CUDA1 runs layers 12-24, expert cache 6656 slots (14.44 GiB), 6656 of its 6656 profiled pairs; slot 0 verified
+strata generate: layer split, CUDA2: 16.93 GiB free of 23.56, room for experts 16.16 GiB
+strata generate: layer split: CUDA2 runs layers 25-36, expert cache 6144 slots (13.72 GiB), 6144 of its 6144 profiled pairs; slot 0 verified
+strata generate: layer split, CUDA3: 15.78 GiB free of 23.56, room for experts 15.01 GiB
+strata generate: layer split: CUDA3 runs layers 37-47, expert cache 5632 slots (13.00 GiB), 5632 of its 5632 profiled pairs; slot 0 verified
+strata generate: layer split: CUDA0 runs layers 0-11
+strata generate: routing-aware prefetch on (the next layer's router, file tier)
+strata trace: 2299 MiB free after the R4 hit path
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 63 expert-pool workers + the host thread
+strata trace: 2299 MiB free after the expert cache and the graphs
+strata generate: session is up (engine 0.1.44.1)
+strata generate: token graph hit path: 24576 resident experts, decided on the device
+strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+FileExpertSource: copied cache complement through layer 8/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 16/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 24/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 32/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 40/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 48/48 (0.00 GiB, 0 s)
+FileExpertSource: locked resident cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s
+FileExpertSource: 18432 verified additional-GPU experts remain on the mmap fallback
+strata generate: resident RAM mode: 0.00 GiB of experts in RAM (pageable), 6144 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+strata serve:   CUDA0 keeps its own prompt buffers (0.68 GiB of 2.25 GiB free): no loan
+strata serve:   CUDA1 keeps its own prompt buffers (0.68 GiB of 2.36 GiB free): no loan
+strata serve:   CUDA2 keeps its own prompt buffers (0.68 GiB of 3.21 GiB free): no loan
+strata serve:   CUDA3 keeps its own prompt buffers (0.68 GiB of 2.78 GiB free): no loan
+strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)
+strata trace: 2299 MiB free after before the prompt path init
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+strata trace: 1419 MiB free after the head and the prompt path
+strata hc: CUDA1: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA2: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA3: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata serve: layer split: layers 0-11 (CUDA0), 12-24 (CUDA1), 25-36 (CUDA2), 37-47 (CUDA3), one hand-off per window
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata verify: batch windows of up to 16 sequences (layers [0, 12)), one-row windows keep their rows
+strata verify: batch windows of up to 16 sequences (layers [12, 25)), one-row windows keep their rows
+strata verify: batch windows of up to 16 sequences (layers [25, 37)), one-row windows keep their rows
+strata verify: batch windows of up to 16 sequences (layers [37, 48)), one-row windows keep their rows
+strata verify: STRATA_EARLY_SAMPLE=1: sampled rows are drawn right behind the window
+strata trace: 1317 MiB free after the verifier and the drafter's binding
+strata serve: conversation tier: on: /media/raid0/strata-kvspill-bench (warm); files=0 parts=0 disk_bytes=0 written_today=0 budget=300000000000 budget_left=300000000000 spills=0 written_bytes=0 restores=0 restores_queue=0 read_bytes=0 misses=0 drops_small=0 drops_budget=0 drops_busy=0 drops_ram=0 drops_cap=0 drops_io=0 kept=0 superseded=0 expired=0 evicted=0 pending=0 pending_bytes=0 foreign=0 verified=0
+strata serve: STRATA_PARK_ASYNC: a finished request's conversation is captured beside the slots on 4 threads (8 x 16 MiB pinned staging)
+strata serve: STRATA_MSG_CKPT_TAIL=8192: a prompt read also checkpoints in front of a last message of up to 8192 tokens (a prefix of 8192 or more)
+strata serve: adaptive overlap: off: not on a layer split
+strata serve: 1315 MiB of VRAM free with everything loaded
+strata serve: CUDA1: 1437 MiB of VRAM free with everything loaded
+strata serve: CUDA2: 2303 MiB of VRAM free with everything loaded
+strata serve: CUDA3: 1645 MiB of VRAM free with everything loaded
+strata serve: STRATA_SLOT_PARK: a pipelined slot's conversation is captured when it ends, on 4 threads (8 x 16 MiB pinned staging), and parked when the slot is overwritten
+strata trace: request 149 0
+strata trace: prompt start 148 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: draft layer prompt K/V batched on CUDA3 (E-9 on the layer split, K/V mode 2)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 142 tokens (batched) in 378.7 ms
+strata trace: checkpoint at 142: sync 0.0 ms, save 20.2 ms (4 stage(s) at once, each 18.0 19.5 18.4 16.2 ms, new vectors)
+strata verify: capturing the 6-token window (1273 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (1397 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (2265 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (1597 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata trace: read 6 tokens (windows) in 35.9 ms
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 148 1
+strata verify: capturing the 1-token window (1269 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1393 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2261 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1593 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata trace: window 149 1
+strata trace: window 150 4
+strata verify: capturing the 4-token window (1263 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1387 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (2255 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1587 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata trace: window 151 2
+strata verify: capturing the 2-token window (1259 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1383 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2251 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1581 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata trace: window 153 3
+strata verify: capturing the 3-token window (1253 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1375 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (2245 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1575 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata trace: window 156 1
+strata trace: window 157 4
+strata trace: window 161 3
+strata trace: window 162 4
+strata trace: window 164 3
+strata trace: window 166 4
+strata trace: window 169 4
+strata trace: window 173 4
+strata trace: window 175 1
+strata trace: window 176 3
+strata trace: window 177 4
+strata trace: window 181 3
+strata trace: window 183 1
+strata trace: window 184 4
+strata trace: window 188 4
+strata trace: window 192 3
+strata trace: window 195 2
+strata trace: window 197 4
+strata trace: window 201 4
+strata trace: window 202 3
+strata trace: window 204 4
+strata trace: window 207 2
+strata trace: window 209 4
+strata trace: window 213 2
+strata trace: window 215 2
+strata trace: window 217 2
+strata trace: window 219 3
+strata trace: window 220 4
+strata trace: window 221 4
+strata trace: window 225 2
+strata trace: window 227 1
+strata trace: window 228 2
+strata trace: window 230 3
+strata trace: window 232 4
+strata trace: window 235 1
+strata trace: window 236 4
+strata trace: window 240 4
+strata trace: window 242 4
+strata trace: window 244 4
+strata trace: window 248 4
+strata trace: window 249 3
+strata trace: window 252 4
+strata trace: window 256 4
+strata trace: window 258 2
+strata trace: window 260 2
+strata trace: window 262 4
+strata trace: window 263 4
+strata trace: window 267 4
+strata trace: window 268 2
+strata trace: window 269 1
+strata trace: window 270 2
+strata trace: window 272 1
+strata trace: window 273 4
+strata trace: window 275 1
+strata trace: window 276 2
+strata trace: window 278 1
+strata trace: window 279 4
+strata trace: window 282 3
+strata trace: window 285 3
+strata trace: window 286 1
+strata trace: window 287 4
+strata trace: window 290 1
+strata trace: window 291 4
+strata trace: window 295 3
+strata trace: window 298 4
+strata trace: window 299 1
+strata trace: window 300 2
+strata trace: window 302 4
+strata trace: window 305 4
+strata trace: window 307 1
+strata trace: window 308 2
+strata trace: window 309 1
+strata trace: window 310 4
+strata trace: window 311 3
+strata trace: window 314 3
+strata trace: window 315 2
+strata trace: window 316 4
+strata trace: window 320 2
+strata trace: window 322 4
+strata trace: window 325 2
+strata trace: window 327 4
+strata trace: window 331 4
+strata trace: window 335 4
+strata trace: window 338 2
+strata trace: window 339 4
+strata trace: window 343 4
+strata trace: window 347 2
+strata trace: window 349 4
+strata trace: window 353 4
+strata trace: window 357 4
+strata trace: window 361 4
+strata trace: window 364 2
+strata trace: window 365 4
+strata trace: window 369 4
+strata trace: window 372 4
+strata trace: window 373 4
+strata trace: window 376 4
+strata trace: window 380 3
+strata trace: window 381 3
+strata trace: window 384 1
+strata trace: window 385 1
+strata trace: window 386 3
+strata trace: window 388 3
+strata trace: window 391 3
+strata trace: window 394 1
+strata trace: window 395 4
+strata trace: window 396 2
+strata trace: window 398 1
+strata trace: window 399 1
+strata trace: window 400 1
+strata trace: window 401 4
+strata trace: window 403 4
+strata trace: window 406 4
+strata trace: window 408 2
+strata trace: window 410 2
+strata trace: window 412 4
+strata trace: window 416 4
+strata trace: window 420 4
+strata trace: window 423 4
+strata trace: window 426 4
+strata trace: window 430 2
+strata trace: window 432 1
+strata trace: window 433 3
+strata trace: window 436 1
+strata trace: window 437 1
+strata trace: window 438 3
+strata trace: window 439 2
+strata trace: window 440 4
+strata trace: window 444 4
+strata trace: window 446 2
+strata trace: window 448 1
+strata trace: window 449 4
+strata trace: window 451 4
+strata trace: window 454 2
+strata trace: window 455 4
+strata trace: window 457 4
+strata trace: window 458 3
+strata trace: window 461 4
+strata trace: window 465 3
+strata trace: window 468 3
+strata trace: window 469 3
+strata trace: window 472 4
+strata trace: window 474 4
+strata trace: window 477 4
+strata trace: window 479 4
+strata trace: window 483 1
+strata trace: window 484 4
+strata trace: window 488 1
+strata trace: window 489 4
+strata trace: window 492 1
+strata trace: window 493 1
+strata trace: window 494 3
+strata trace: window 497 4
+strata trace: window 498 4
+strata trace: window 501 4
+strata trace: window 505 4
+strata trace: window 506 4
+strata trace: window 507 4
+strata trace: window 511 2
+strata trace: window 513 4
+strata trace: window 514 2
+strata trace: window 516 4
+strata trace: window 518 4
+strata trace: window 519 4
+strata trace: window 522 4
+strata trace: window 525 2
+strata trace: window 527 4
+strata trace: window 528 4
+strata trace: window 532 4
+strata trace: window 536 4
+strata trace: window 540 4
+strata trace: window 544 4
+strata trace: window 548 3
+strata trace: window 549 4
+strata trace: window 551 4
+strata trace: window 552 4
+strata trace: window 556 4
+strata trace: window 557 1
+strata trace: window 558 4
+strata trace: window 562 1
+strata trace: window 563 4
+strata trace: window 565 1
+strata trace: window 566 4
+strata trace: window 569 3
+strata trace: window 571 4
+strata trace: window 573 4
+strata trace: window 577 4
+strata trace: window 578 4
+strata trace: window 580 4
+strata trace: window 582 3
+strata trace: window 585 4
+strata trace: window 589 3
+strata trace: window 592 4
+strata trace: window 593 4
+strata trace: window 597 3
+strata trace: window 600 2
+strata trace: window 602 4
+strata trace: window 606 4
+strata trace: window 607 3
+strata trace: window 610 4
+strata trace: window 611 3
+strata trace: window 612 3
+strata trace: window 615 4
+strata trace: window 616 2
+strata trace: window 618 1
+strata trace: window 619 4
+strata trace: window 622 4
+strata trace: window 624 4
+strata trace: window 626 3
+strata trace: window 629 4
+strata trace: window 630 4
+strata trace: window 633 4
+strata trace: window 636 4
+strata trace: window 640 1
+strata trace: window 641 4
+strata trace: window 643 2
+strata trace: window 645 2
+strata trace: window 646 4
+strata trace: window 649 2
+strata trace: window 650 4
+strata trace: window 654 4
+strata trace: window 657 1
+strata trace: window 658 4
+strata serve: prompt 149 tokens = 0 reused + 149 read in 437 ms (341.0 tok/s), 512 generated in 4348 ms (117.8 tok/s), drafts accepted 285 of 468, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 59529.9 MB of expert reads
+strata serve: KV streaming: 99.77% of 215823 block reads hit VRAM, 2.0 MiB read from RAM
+strata serve: conversation cache: skip parking (661 tokens, below the 1024 minimum; parked=0)
+strata trace: request 147 0
+strata trace: prompt start 146 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 140
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 140 tokens (batched) in 150.4 ms
+strata trace: checkpoint at 140: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.3 5.4 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 6 tokens (windows) in 26.1 ms
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 146 1
+strata serve: prompt 147 tokens = 0 reused + 147 read in 203 ms (723.1 tok/s), 1 generated in 13 ms (76.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: request 148 0
+strata trace: prompt start 147 -1
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 147 1
+strata batch: slot 0 takes 148 tokens (copied in 63.0 ms)
+strata trace: admission of slot 0: drain 0.0, prompt 0.5 (read 0.0, windows 0.0, 0 checkpoint(s) 0.0 = sync 0.0 + save 0.0 + evict 0.0, rest 0.5), first window 12.5, slot copy 1.4, slot freed 0.0, checkpoint copy 61.6
+strata serve: prompt 148 tokens = 147 reused + 1 read in 1 ms (1939.0 tok/s), 1 generated in 13 ms (79.8 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 87.33% of 876 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 148 tokens not parked here: slot 0 parks them with its reply
+strata trace: request 150 0
+strata trace: prompt start 149 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 143
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 143 tokens (batched) in 146.4 ms
+strata trace: checkpoint at 143: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.2 5.4 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 143 7
+strata verify: capturing the 7-token window (1247 MiB of VRAM free)
+strata verify: captured the 7-token window (upload no error, sync no error)
+strata verify: capturing the 7-token window (1371 MiB of VRAM free)
+strata verify: captured the 7-token window (upload no error, sync no error)
+strata verify: capturing the 7-token window (2229 MiB of VRAM free)
+strata verify: captured the 7-token window (upload no error, sync no error)
+strata verify: capturing the 7-token window (1569 MiB of VRAM free)
+strata verify: captured the 7-token window (upload no error, sync no error)
+strata batch: slot 4 takes 150 tokens (copied in 0.9 ms)
+strata trace: admission of slot 4: drain 0.0, prompt 172.8 (read 146.4, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 21.1), first window 39.4, slot copy 0.9, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 150 tokens = 0 reused + 150 read in 173 ms (868.1 tok/s), 1 generated in 39 ms (25.4 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 780 block reads hit VRAM, 0.5 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 150 tokens not parked here: slot 4 parks them with its reply
+strata trace: request 150 0
+strata trace: prompt start 149 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 143
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 143 tokens (batched) in 147.1 ms
+strata trace: checkpoint at 143: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.7 19.7 18.5 15.8 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 143 7
+strata batch: slot 8 takes 150 tokens (copied in 0.9 ms)
+strata trace: admission of slot 8: drain 0.0, prompt 168.8 (read 147.1, windows 0.0, 1 checkpoint(s) 19.8 = sync 0.0 + save 19.8 + evict 0.0, rest 1.9), first window 29.2, slot copy 0.9, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 150 tokens = 0 reused + 150 read in 169 ms (888.8 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 780 block reads hit VRAM, 0.5 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 150 tokens not parked here: slot 8 parks them with its reply
+strata trace: request 148 0
+strata trace: prompt start 147 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 141
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 141 tokens (batched) in 149.3 ms
+strata trace: checkpoint at 141: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.5 19.6 18.5 15.8 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 141 7
+strata batch: slot 12 takes 148 tokens (copied in 1.0 ms)
+strata trace: admission of slot 12: drain 0.0, prompt 170.8 (read 149.3, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 1.9), first window 29.1, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 171 ms (866.5 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 768 block reads hit VRAM, 0.4 MiB read from RAM
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0
+strata trace: first rows 22.6 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 19.3 ms
+strata serve: conversation cache: 148 tokens not parked here: slot 12 parks them with its reply
+strata trace: request 145 0
+strata trace: prompt start 144 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 138
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 138 tokens (batched) in 148.6 ms
+strata trace: checkpoint at 138: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.4 19.6 18.5 15.6 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 138 7
+strata batch: slot 1 takes 145 tokens (copied in 1.2 ms)
+strata trace: admission of slot 1: drain 19.3, prompt 170.2 (read 148.6, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 2.0), first window 28.9, slot copy 1.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 170 ms (851.8 tok/s), 1 generated in 29 ms (34.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 145 tokens not parked here: slot 1 parks them with its reply
+strata trace: request 143 0
+strata trace: prompt start 142 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 136
+strata trace: prompt chunk 0 of 136
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 136
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 136
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 136 tokens (batched) in 147.5 ms
+strata trace: checkpoint at 136: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.5 19.6 18.4 16.1 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 136 7
+strata batch: slot 5 takes 143 tokens (copied in 1.0 ms)
+strata trace: admission of slot 5: drain 0.0, prompt 169.0 (read 147.5, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 1.9), first window 29.1, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 143 tokens = 0 reused + 143 read in 169 ms (846.3 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.48% of 744 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 143 tokens not parked here: slot 5 parks them with its reply
+strata trace: request 145 0
+strata trace: prompt start 144 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 138
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 138 tokens (batched) in 148.2 ms
+strata trace: checkpoint at 138: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.3 19.6 18.5 15.7 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 138 7
+strata batch: slot 9 takes 145 tokens (copied in 1.0 ms)
+strata trace: admission of slot 9: drain 0.0, prompt 169.7 (read 148.2, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 1.9), first window 29.5, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 170 ms (854.3 tok/s), 1 generated in 29 ms (33.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 145 tokens not parked here: slot 9 parks them with its reply
+strata trace: request 148 0
+strata trace: prompt start 147 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 141
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 141 tokens (batched) in 149.2 ms
+strata trace: checkpoint at 141: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.4 19.6 18.4 15.7 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 141 7
+strata batch: slot 13 takes 148 tokens (copied in 1.0 ms)
+strata trace: admission of slot 13: drain 0.0, prompt 170.7 (read 149.2, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 1.9), first window 28.8, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 171 ms (867.0 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 768 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 148 tokens not parked here: slot 13 parks them with its reply
+strata trace: request 147 0
+strata trace: prompt start 146 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 140
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 140 tokens (batched) in 147.2 ms
+strata trace: checkpoint at 140: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.4 19.6 18.4 15.8 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 140 7
+strata batch: slot 2 takes 147 tokens (copied in 1.0 ms)
+strata trace: admission of slot 2: drain 0.0, prompt 168.7 (read 147.2, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 2.0), first window 29.1, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 169 ms (871.3 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata trace: first rows 26.3 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.7 ms
+strata serve: conversation cache: 147 tokens not parked here: slot 2 parks them with its reply
+strata trace: request 148 0
+strata trace: prompt start 147 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 141
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 141 tokens (batched) in 148.1 ms
+strata trace: checkpoint at 141: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.6 19.6 18.5 15.6 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 141 7
+strata batch: slot 6 takes 148 tokens (copied in 1.0 ms)
+strata trace: admission of slot 6: drain 22.7, prompt 169.8 (read 148.1, windows 0.0, 1 checkpoint(s) 19.7 = sync 0.0 + save 19.6 + evict 0.0, rest 2.1), first window 29.6, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 170 ms (871.7 tok/s), 1 generated in 30 ms (33.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 768 block reads hit VRAM, 0.4 MiB read from RAM
+strata verify: captured the batch window over slots 8,9
+strata verify: captured the batch window over slots 8,9
+strata verify: captured the batch window over slots 8,9
+strata verify: captured the batch window over slots 8,9
+strata trace: first rows 26.5 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.8 ms
+strata serve: conversation cache: 148 tokens not parked here: slot 6 parks them with its reply
+strata trace: request 145 0
+strata trace: prompt start 144 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 138
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 138 tokens (batched) in 148.8 ms
+strata trace: checkpoint at 138: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.7 19.8 18.6 16.4 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 138 7
+strata batch: slot 10 takes 145 tokens (copied in 1.0 ms)
+strata trace: admission of slot 10: drain 22.8, prompt 170.7 (read 148.8, windows 0.0, 1 checkpoint(s) 19.9 = sync 0.0 + save 19.8 + evict 0.0, rest 2.0), first window 28.8, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 171 ms (849.3 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata verify: captured the batch window over slots 12,13
+strata verify: captured the batch window over slots 12,13
+strata verify: captured the batch window over slots 12,13
+strata verify: captured the batch window over slots 12,13
+strata trace: first rows 25.4 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 21.9 ms
+strata serve: conversation cache: 145 tokens not parked here: slot 10 parks them with its reply
+strata trace: request 147 0
+strata trace: prompt start 146 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 140
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 140 tokens (batched) in 148.7 ms
+strata trace: checkpoint at 140: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.5 19.6 18.3 15.7 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 140 7
+strata batch: slot 14 takes 147 tokens (copied in 1.1 ms)
+strata trace: admission of slot 14: drain 21.9, prompt 170.4 (read 148.7, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 2.0), first window 29.0, slot copy 1.1, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 170 ms (862.9 tok/s), 1 generated in 29 ms (34.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 147 tokens not parked here: slot 14 parks them with its reply
+strata trace: request 146 0
+strata trace: prompt start 145 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 139
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 139 tokens (batched) in 147.6 ms
+strata trace: checkpoint at 139: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.3 19.6 18.4 15.6 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 139 7
+strata batch: slot 3 takes 146 tokens (copied in 1.0 ms)
+strata trace: admission of slot 3: drain 0.0, prompt 169.2 (read 147.6, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 1.9), first window 29.0, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 169 ms (863.0 tok/s), 1 generated in 29 ms (34.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 146 tokens not parked here: slot 3 parks them with its reply
+strata trace: request 145 0
+strata trace: prompt start 144 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 138
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 138 tokens (batched) in 148.8 ms
+strata trace: checkpoint at 138: sync 0.0 ms, save 19.5 ms (4 stage(s) at once, each 18.3 19.5 18.3 15.9 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 138 7
+strata batch: slot 7 takes 145 tokens (copied in 1.1 ms)
+strata trace: admission of slot 7: drain 0.0, prompt 170.2 (read 148.8, windows 0.0, 1 checkpoint(s) 19.5 = sync 0.0 + save 19.5 + evict 0.0, rest 1.9), first window 28.8, slot copy 1.1, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 170 ms (852.1 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 145 tokens not parked here: slot 7 parks them with its reply
+strata trace: request 148 0
+strata trace: prompt start 147 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 141
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 141
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 141 tokens (batched) in 149.9 ms
+strata trace: checkpoint at 141: sync 0.0 ms, save 19.5 ms (4 stage(s) at once, each 18.3 19.4 18.3 15.6 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 141 7
+strata batch: slot 11 takes 148 tokens (copied in 1.0 ms)
+strata trace: admission of slot 11: drain 0.0, prompt 171.3 (read 149.9, windows 0.0, 1 checkpoint(s) 19.5 = sync 0.0 + save 19.5 + evict 0.0, rest 1.9), first window 29.4, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 171 ms (863.8 tok/s), 1 generated in 29 ms (34.0 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 768 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 148 tokens not parked here: slot 11 parks them with its reply
+strata trace: request 145 0
+strata trace: prompt start 144 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 138
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 138 tokens (batched) in 147.4 ms
+strata trace: checkpoint at 138: sync 0.0 ms, save 19.6 ms (4 stage(s) at once, each 18.4 19.5 18.5 15.9 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 138 7
+strata batch: slot 15 takes 145 tokens (copied in 1.0 ms)
+strata trace: admission of slot 15: drain 0.0, prompt 168.9 (read 147.4, windows 0.0, 1 checkpoint(s) 19.6 = sync 0.0 + save 19.6 + evict 0.0, rest 1.9), first window 29.7, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 169 ms (858.7 tok/s), 1 generated in 30 ms (33.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata trace: first rows 39.6 ms after the admission
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata verify: captured the batch window over slots 12,13,14,15
+strata trace: drain for BGEN: 4 groups in flight, 20.0 ms
+strata serve: conversation cache: 145 tokens not parked here: slot 15 parks them with its reply
+strata trace: request 146 0
+strata trace: prompt start 145 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 139
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 139 tokens (batched) in 140.1 ms
+strata trace: checkpoint at 139: sync 0.0 ms, save 20.0 ms (4 stage(s) at once, each 18.5 20.0 18.4 15.7 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 139 7
+strata batch: slot 0 takes 146 tokens (copied in 11.8 ms)
+strata trace: admission of slot 0: drain 20.0, prompt 162.2 (read 140.1, windows 0.0, 1 checkpoint(s) 20.0 = sync 0.0 + save 20.0 + evict 0.0, rest 2.0), first window 27.4, slot copy 1.3, slot freed 10.5, checkpoint copy 0.0 (moved)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 162 ms (900.3 tok/s), 1 generated in 27 ms (36.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: first rows 20.9 ms after the admission
+strata trace: drain for BGEN: 4 groups in flight, 18.8 ms
+strata serve: conversation cache: 146 tokens not parked here: slot 0 parks them with its reply
+strata trace: request 149 0
+strata trace: prompt start 148 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 142
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 142 tokens (batched) in 140.7 ms
+strata trace: checkpoint at 142: sync 0.0 ms, save 5.5 ms (4 stage(s) at once, each 4.9 5.3 5.5 5.2 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 142 7
+strata batch: slot 4 takes 149 tokens (copied in 1.2 ms)
+strata trace: admission of slot 4: drain 18.8, prompt 148.4 (read 140.7, windows 0.0, 1 checkpoint(s) 5.5 = sync 0.0 + save 5.5 + evict 0.0, rest 2.2), first window 27.6, slot copy 1.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 148 ms (1004.0 tok/s), 1 generated in 28 ms (36.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 149 tokens not parked here: slot 4 parks them with its reply
+strata trace: request 146 0
+strata trace: prompt start 145 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 139
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 139 tokens (batched) in 138.7 ms
+strata trace: checkpoint at 139: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.9 5.2 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 139 7
+strata batch: slot 8 takes 146 tokens (copied in 1.0 ms)
+strata trace: admission of slot 8: drain 0.0, prompt 145.9 (read 138.7, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 1.8), first window 27.3, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 146 ms (1000.9 tok/s), 1 generated in 27 ms (36.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: first rows 21.4 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 21.1 ms
+strata serve: conversation cache: 146 tokens not parked here: slot 8 parks them with its reply
+strata trace: request 146 0
+strata trace: prompt start 145 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 139
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 139 tokens (batched) in 138.9 ms
+strata trace: checkpoint at 139: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.8 5.2 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 139 7
+strata batch: slot 12 takes 146 tokens (copied in 1.0 ms)
+strata trace: admission of slot 12: drain 21.1, prompt 146.2 (read 138.9, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 27.7, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 146 ms (998.7 tok/s), 1 generated in 28 ms (36.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 146 tokens not parked here: slot 12 parks them with its reply
+strata trace: request 146 0
+strata trace: prompt start 145 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 139
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 139 tokens (batched) in 139.4 ms
+strata trace: checkpoint at 139: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.7 5.3 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 139 7
+strata batch: slot 13 takes 146 tokens (copied in 1.0 ms)
+strata trace: admission of slot 13: drain 0.0, prompt 146.6 (read 139.4, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 27.9, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 147 ms (995.6 tok/s), 1 generated in 28 ms (35.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: first rows 20.7 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 20.4 ms
+strata serve: conversation cache: 146 tokens not parked here: slot 13 parks them with its reply
+strata trace: request 149 0
+strata trace: prompt start 148 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 142
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 142 tokens (batched) in 139.9 ms
+strata trace: checkpoint at 142: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.9 5.2 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 142 7
+strata batch: slot 1 takes 149 tokens (copied in 1.0 ms)
+strata trace: admission of slot 1: drain 20.4, prompt 147.1 (read 139.9, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 27.9, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 147 ms (1013.0 tok/s), 1 generated in 28 ms (35.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 149 tokens not parked here: slot 1 parks them with its reply
+strata trace: request 150 0
+strata trace: prompt start 149 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 143
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 143
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 143 tokens (batched) in 137.6 ms
+strata trace: checkpoint at 143: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.9 5.3 5.4 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 143 7
+strata batch: slot 5 takes 150 tokens (copied in 1.0 ms)
+strata trace: admission of slot 5: drain 0.0, prompt 144.8 (read 137.6, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 1.8), first window 27.3, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 150 tokens = 0 reused + 150 read in 145 ms (1035.7 tok/s), 1 generated in 27 ms (36.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 780 block reads hit VRAM, 0.5 MiB read from RAM
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata trace: first rows 25.8 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.4 ms
+strata serve: conversation cache: 150 tokens not parked here: slot 5 parks them with its reply
+strata trace: request 146 0
+strata trace: prompt start 145 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 139
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 139 tokens (batched) in 139.7 ms
+strata trace: checkpoint at 139: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.9 5.3 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 139 7
+strata batch: slot 9 takes 146 tokens (copied in 1.0 ms)
+strata trace: admission of slot 9: drain 22.4, prompt 147.0 (read 139.7, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 2.0), first window 27.1, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 147 ms (993.3 tok/s), 1 generated in 27 ms (36.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: first rows 14.7 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 14.4 ms
+strata serve: conversation cache: 146 tokens not parked here: slot 9 parks them with its reply
+strata trace: request 147 0
+strata trace: prompt start 146 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 140
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 140
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 140 tokens (batched) in 140.4 ms
+strata trace: checkpoint at 140: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.7 5.2 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 140 7
+strata batch: slot 2 takes 147 tokens (copied in 1.0 ms)
+strata trace: admission of slot 2: drain 14.4, prompt 147.7 (read 140.4, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 27.3, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 148 ms (995.5 tok/s), 1 generated in 27 ms (36.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: first rows 15.5 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 15.2 ms
+strata serve: conversation cache: 147 tokens not parked here: slot 2 parks them with its reply
+strata trace: request 153 0
+strata trace: prompt start 152 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 146
+strata trace: prompt chunk 0 of 146
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 146
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 146
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 146 tokens (batched) in 141.7 ms
+strata trace: checkpoint at 146: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.2 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 146 7
+strata batch: slot 6 takes 153 tokens (copied in 1.0 ms)
+strata trace: admission of slot 6: drain 15.2, prompt 149.0 (read 141.7, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 1.9), first window 29.8, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 153 tokens = 0 reused + 153 read in 149 ms (1026.8 tok/s), 1 generated in 30 ms (33.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.28% of 795 block reads hit VRAM, 0.5 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 153 tokens not parked here: slot 6 parks them with its reply
+strata trace: request 145 0
+strata trace: prompt start 144 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 138
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 138 tokens (batched) in 148.3 ms
+strata trace: checkpoint at 138: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.8 5.2 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 138 7
+strata batch: slot 10 takes 145 tokens (copied in 1.0 ms)
+strata trace: admission of slot 10: drain 0.0, prompt 155.5 (read 148.3, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 29.1, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 155 ms (932.8 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: first rows 16.1 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 15.8 ms
+strata serve: conversation cache: 145 tokens not parked here: slot 10 parks them with its reply
+strata trace: request 149 0
+strata trace: prompt start 148 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 142
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 142 tokens (batched) in 148.6 ms
+strata trace: checkpoint at 142: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.8 5.3 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 142 7
+strata batch: slot 14 takes 149 tokens (copied in 1.0 ms)
+strata trace: admission of slot 14: drain 15.8, prompt 155.8 (read 148.6, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 29.1, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 156 ms (956.3 tok/s), 1 generated in 29 ms (34.4 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata verify: captured the batch window over slots 0,1,2
+strata verify: captured the batch window over slots 0,1,2
+strata verify: captured the batch window over slots 0,1,2
+strata verify: captured the batch window over slots 0,1,2
+strata trace: first rows 30.4 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 26.8 ms
+strata serve: conversation cache: 149 tokens not parked here: slot 14 parks them with its reply
+strata trace: request 152 0
+strata trace: prompt start 151 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 145
+strata trace: prompt chunk 0 of 145
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 145
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 145
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 145 tokens (batched) in 146.4 ms
+strata trace: checkpoint at 145: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.2 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 145 7
+strata batch: slot 3 takes 152 tokens (copied in 1.0 ms)
+strata trace: admission of slot 3: drain 26.8, prompt 153.8 (read 146.4, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 2.0), first window 29.3, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 152 tokens = 0 reused + 152 read in 154 ms (988.6 tok/s), 1 generated in 29 ms (34.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 789 block reads hit VRAM, 0.5 MiB read from RAM
+strata verify: captured the batch window over slots 4,5,6
+strata verify: captured the batch window over slots 4,5,6
+strata verify: captured the batch window over slots 4,5,6
+strata verify: captured the batch window over slots 4,5,6
+strata trace: first rows 30.0 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 26.2 ms
+strata serve: conversation cache: 152 tokens not parked here: slot 3 parks them with its reply
+strata trace: request 145 0
+strata trace: prompt start 144 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 138
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 138
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 138 tokens (batched) in 147.2 ms
+strata trace: checkpoint at 138: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.9 5.3 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 138 7
+strata batch: slot 7 takes 145 tokens (copied in 1.0 ms)
+strata trace: admission of slot 7: drain 26.2, prompt 154.6 (read 147.2, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.3 + evict 0.0, rest 2.1), first window 29.0, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 155 ms (938.0 tok/s), 1 generated in 29 ms (34.4 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata verify: captured the batch window over slots 8,9,10
+strata verify: captured the batch window over slots 8,9,10
+strata verify: captured the batch window over slots 8,9,10
+strata verify: captured the batch window over slots 8,9,10
+strata trace: first rows 33.2 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 27.8 ms
+strata serve: conversation cache: 145 tokens not parked here: slot 7 parks them with its reply
+strata trace: request 149 0
+strata trace: prompt start 148 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 142
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 142
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 142 tokens (batched) in 149.2 ms
+strata trace: checkpoint at 142: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.8 5.3 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 142 7
+strata batch: slot 11 takes 149 tokens (copied in 1.1 ms)
+strata trace: admission of slot 11: drain 27.8, prompt 156.6 (read 149.2, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.3 + evict 0.0, rest 2.0), first window 29.2, slot copy 1.1, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 157 ms (951.7 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata verify: captured the batch window over slots 12,13,14
+strata verify: captured the batch window over slots 12,13,14
+strata verify: captured the batch window over slots 12,13,14
+strata verify: captured the batch window over slots 12,13,14
+strata trace: first rows 33.0 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 29.0 ms
+strata serve: conversation cache: 149 tokens not parked here: slot 11 parks them with its reply
+strata trace: request 146 0
+strata trace: prompt start 145 -1
+strata trace: lent 0 slots for 256 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 139
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 139
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: read 139 tokens (batched) in 147.0 ms
+strata trace: checkpoint at 139: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.8 5.2 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 139 7
+strata batch: slot 15 takes 146 tokens (copied in 1.0 ms)
+strata trace: admission of slot 15: drain 29.0, prompt 154.4 (read 147.0, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.3 + evict 0.0, rest 2.0), first window 29.6, slot copy 1.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 154 ms (945.8 tok/s), 1 generated in 30 ms (33.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata trace: first rows 21.3 ms after the admission
+strata batch (pipelined, 4 groups of 4): 4100 group-steps, 16351 rows in 29542 ms = 553.5 rows/s (admissions included)
+strata serve: conversation cache: skip parking (146 tokens, below the 1024 minimum; parked=0)
+strata trace: request 1217 0
+strata trace: prompt start 1216 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1210
+strata trace: prompt chunk 512 of 1210
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1210
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 186
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 186
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 186
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1210 tokens (batched) in 382.3 ms
+strata trace: checkpoint at 1210: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.2 5.4 5.2 ms, into a dropped checkpoint's vectors)
+strata trace: read 6 tokens (windows) in 25.7 ms
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1216 1
+strata serve: prompt 1217 tokens = 0 reused + 1217 read in 416 ms (2926.7 tok/s), 1 generated in 13 ms (74.4 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6381 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: request 1218 0
+strata trace: prompt start 1217 -1
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1217 1
+strata batch: slot 0 takes 1218 tokens (copied in 9.4 ms)
+strata trace: admission of slot 0: drain 0.0, prompt 48.8 (read 0.0, windows 0.0, 0 checkpoint(s) 0.0 = sync 0.0 + save 0.0 + evict 0.0, rest 48.8), first window 12.4, slot copy 2.3, slot freed 0.0, checkpoint copy 7.1
+strata serve: prompt 1218 tokens = 1217 reused + 1 read in 49 ms (20.5 tok/s), 1 generated in 12 ms (81.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 87.46% of 7296 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: drain for BGEN: 0 groups in flight, 0.0 ms
+strata serve: conversation cache: 1218 tokens not parked here: slot 0 parks them with its reply
+strata trace: request 1212 0
+strata trace: prompt start 1211 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1205
+strata trace: prompt chunk 512 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1205 tokens (batched) in 366.8 ms
+strata trace: checkpoint at 1205: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.2 5.4 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1205 7
+strata batch: slot 4 takes 1212 tokens (copied in 2.2 ms)
+strata trace: admission of slot 4: drain 0.0, prompt 393.3 (read 366.8, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 21.1), first window 28.3, slot copy 2.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 393 ms (3081.3 tok/s), 1 generated in 28 ms (35.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 13.6 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 13.1 ms
+strata serve: conversation cache: 1212 tokens not parked here: slot 4 parks them with its reply
+strata trace: request 1211 0
+strata trace: prompt start 1210 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1204
+strata trace: prompt chunk 512 of 1204
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1204
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1204 tokens (batched) in 366.4 ms
+strata trace: checkpoint at 1204: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.9 5.2 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1204 7
+strata batch: slot 8 takes 1211 tokens (copied in 2.5 ms)
+strata trace: admission of slot 8: drain 13.1, prompt 373.7 (read 366.4, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 28.8, slot copy 2.5, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 374 ms (3240.8 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata trace: first rows 25.0 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 21.7 ms
+strata serve: conversation cache: 1211 tokens not parked here: slot 8 parks them with its reply
+strata trace: request 1213 0
+strata trace: prompt start 1212 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1206
+strata trace: prompt chunk 512 of 1206
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1206
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1206 tokens (batched) in 369.8 ms
+strata trace: checkpoint at 1206: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.3 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1206 7
+strata batch: slot 12 takes 1213 tokens (copied in 2.2 ms)
+strata trace: admission of slot 12: drain 21.7, prompt 397.5 (read 369.8, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 22.3), first window 28.7, slot copy 2.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 398 ms (3051.4 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata trace: first rows 23.2 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 19.9 ms
+strata serve: conversation cache: 1213 tokens not parked here: slot 12 parks them with its reply
+strata trace: request 1214 0
+strata trace: prompt start 1213 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1207
+strata trace: prompt chunk 512 of 1207
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1207
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1207 tokens (batched) in 369.0 ms
+strata trace: checkpoint at 1207: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.2 5.4 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1207 7
+strata batch: slot 1 takes 1214 tokens (copied in 2.2 ms)
+strata trace: admission of slot 1: drain 19.9, prompt 376.4 (read 369.0, windows 0.0, 1 checkpoint(s) 5.5 = sync 0.0 + save 5.4 + evict 0.0, rest 2.0), first window 28.6, slot copy 2.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1214 tokens = 0 reused + 1214 read in 376 ms (3225.3 tok/s), 1 generated in 29 ms (34.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6366 block reads hit VRAM, 3.7 MiB read from RAM
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata trace: first rows 24.2 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 20.8 ms
+strata serve: conversation cache: 1214 tokens not parked here: slot 1 parks them with its reply
+strata trace: request 1210 0
+strata trace: prompt start 1209 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1203
+strata trace: prompt chunk 512 of 1203
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1203
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1203 tokens (batched) in 366.5 ms
+strata trace: checkpoint at 1203: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.8 5.3 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1203 7
+strata batch: slot 5 takes 1210 tokens (copied in 2.3 ms)
+strata trace: admission of slot 5: drain 20.8, prompt 373.8 (read 366.5, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.3 + evict 0.0, rest 2.0), first window 29.4, slot copy 2.3, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1210 tokens = 0 reused + 1210 read in 374 ms (3236.6 tok/s), 1 generated in 29 ms (34.0 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6345 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 16.7 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 16.2 ms
+strata serve: conversation cache: 1210 tokens not parked here: slot 5 parks them with its reply
+strata trace: request 1212 0
+strata trace: prompt start 1211 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1205
+strata trace: prompt chunk 512 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1205 tokens (batched) in 368.0 ms
+strata trace: checkpoint at 1205: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.3 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1205 7
+strata batch: slot 9 takes 1212 tokens (copied in 2.3 ms)
+strata trace: admission of slot 9: drain 16.2, prompt 375.3 (read 368.0, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 1.9), first window 28.9, slot copy 2.3, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 375 ms (3229.4 tok/s), 1 generated in 29 ms (34.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 16.6 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 16.0 ms
+strata serve: conversation cache: 1212 tokens not parked here: slot 9 parks them with its reply
+strata trace: request 1215 0
+strata trace: prompt start 1214 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1208
+strata trace: prompt chunk 512 of 1208
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1208
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1208 tokens (batched) in 368.0 ms
+strata trace: checkpoint at 1208: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.7 5.2 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1208 7
+strata batch: slot 13 takes 1215 tokens (copied in 2.2 ms)
+strata trace: admission of slot 13: drain 16.0, prompt 375.3 (read 368.0, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 29.4, slot copy 2.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 375 ms (3237.7 tok/s), 1 generated in 29 ms (34.0 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 16.8 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 16.4 ms
+strata serve: conversation cache: 1215 tokens not parked here: slot 13 parks them with its reply
+strata trace: request 1211 0
+strata trace: prompt start 1210 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1204
+strata trace: prompt chunk 512 of 1204
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1204
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1204 tokens (batched) in 368.5 ms
+strata trace: checkpoint at 1204: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.7 5.2 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1204 7
+strata batch: slot 2 takes 1211 tokens (copied in 2.2 ms)
+strata trace: admission of slot 2: drain 16.4, prompt 375.8 (read 368.5, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 28.5, slot copy 2.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 376 ms (3222.7 tok/s), 1 generated in 29 ms (35.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 16.7 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 16.1 ms
+strata serve: conversation cache: 1211 tokens not parked here: slot 2 parks them with its reply
+strata trace: request 1212 0
+strata trace: prompt start 1211 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1205
+strata trace: prompt chunk 512 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1205 tokens (batched) in 366.4 ms
+strata trace: checkpoint at 1205: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.7 5.2 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1205 7
+strata batch: slot 6 takes 1212 tokens (copied in 2.2 ms)
+strata trace: admission of slot 6: drain 16.1, prompt 373.6 (read 366.4, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 1.9), first window 29.2, slot copy 2.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 374 ms (3243.7 tok/s), 1 generated in 29 ms (34.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 19.8 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 19.3 ms
+strata serve: conversation cache: 1212 tokens not parked here: slot 6 parks them with its reply
+strata trace: request 1210 0
+strata trace: prompt start 1209 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1203
+strata trace: prompt chunk 512 of 1203
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1203
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1203 tokens (batched) in 367.5 ms
+strata trace: checkpoint at 1203: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.9 5.3 5.4 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1203 7
+strata batch: slot 10 takes 1210 tokens (copied in 2.3 ms)
+strata trace: admission of slot 10: drain 19.3, prompt 374.8 (read 367.5, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 1.9), first window 28.6, slot copy 2.3, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1210 tokens = 0 reused + 1210 read in 375 ms (3228.1 tok/s), 1 generated in 29 ms (34.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6345 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 18.9 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 18.3 ms
+strata serve: conversation cache: 1210 tokens not parked here: slot 10 parks them with its reply
+strata trace: request 1210 0
+strata trace: prompt start 1209 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1203
+strata trace: prompt chunk 512 of 1203
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1203
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1203 tokens (batched) in 368.0 ms
+strata trace: checkpoint at 1203: sync 0.0 ms, save 5.7 ms (4 stage(s) at once, each 4.9 5.3 5.6 5.2 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1203 7
+strata batch: slot 14 takes 1210 tokens (copied in 2.3 ms)
+strata trace: admission of slot 14: drain 18.3, prompt 375.6 (read 368.0, windows 0.0, 1 checkpoint(s) 5.7 = sync 0.0 + save 5.7 + evict 0.0, rest 1.9), first window 29.3, slot copy 2.3, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1210 tokens = 0 reused + 1210 read in 376 ms (3221.3 tok/s), 1 generated in 29 ms (34.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6345 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 19.0 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 18.5 ms
+strata serve: conversation cache: 1210 tokens not parked here: slot 14 parks them with its reply
+strata trace: request 1213 0
+strata trace: prompt start 1212 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1206
+strata trace: prompt chunk 512 of 1206
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1206
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1206 tokens (batched) in 368.3 ms
+strata trace: checkpoint at 1206: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.7 5.2 5.3 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1206 7
+strata batch: slot 3 takes 1213 tokens (copied in 2.3 ms)
+strata trace: admission of slot 3: drain 18.5, prompt 375.5 (read 368.3, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 29.2, slot copy 2.2, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 376 ms (3230.3 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 19.7 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 19.2 ms
+strata serve: conversation cache: 1213 tokens not parked here: slot 3 parks them with its reply
+strata trace: request 1214 0
+strata trace: prompt start 1213 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1207
+strata trace: prompt chunk 512 of 1207
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1207
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1207 tokens (batched) in 368.6 ms
+strata trace: checkpoint at 1207: sync 0.0 ms, save 5.4 ms (4 stage(s) at once, each 4.7 5.1 5.4 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1207 7
+strata batch: slot 7 takes 1214 tokens (copied in 2.4 ms)
+strata trace: admission of slot 7: drain 19.2, prompt 375.9 (read 368.6, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.4 + evict 0.0, rest 1.9), first window 29.2, slot copy 2.3, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1214 tokens = 0 reused + 1214 read in 376 ms (3229.9 tok/s), 1 generated in 29 ms (34.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6366 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 21.3 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 20.9 ms
+strata serve: conversation cache: 1214 tokens not parked here: slot 7 parks them with its reply
+strata trace: request 1211 0
+strata trace: prompt start 1210 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1204
+strata trace: prompt chunk 512 of 1204
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1204
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1204 tokens (batched) in 368.4 ms
+strata trace: checkpoint at 1204: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.7 5.3 5.2 5.0 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1204 7
+strata batch: slot 11 takes 1211 tokens (copied in 2.1 ms)
+strata trace: admission of slot 11: drain 20.9, prompt 375.6 (read 368.4, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 1.9), first window 28.7, slot copy 2.1, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 376 ms (3223.9 tok/s), 1 generated in 29 ms (34.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 22.2 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 21.8 ms
+strata serve: conversation cache: 1211 tokens not parked here: slot 11 parks them with its reply
+strata trace: request 1213 0
+strata trace: prompt start 1212 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1206
+strata trace: prompt chunk 512 of 1206
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1206
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1206 tokens (batched) in 368.4 ms
+strata trace: checkpoint at 1206: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.8 5.3 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1206 7
+strata batch: slot 15 takes 1213 tokens (copied in 2.3 ms)
+strata trace: admission of slot 15: drain 21.8, prompt 375.8 (read 368.4, windows 0.0, 1 checkpoint(s) 5.3 = sync 0.0 + save 5.3 + evict 0.0, rest 2.1), first window 28.9, slot copy 2.3, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 376 ms (3228.0 tok/s), 1 generated in 29 ms (34.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 22.1 ms after the admission
+strata trace: drain for BGEN: 3 groups in flight, 14.4 ms
+strata serve: conversation cache: 1213 tokens not parked here: slot 15 parks them with its reply
+strata trace: request 1215 0
+strata trace: prompt start 1214 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1208
+strata trace: prompt chunk 512 of 1208
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1208
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1208 tokens (batched) in 371.0 ms
+strata trace: checkpoint at 1208: sync 0.1 ms, save 5.4 ms (4 stage(s) at once, each 4.8 5.3 5.4 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1208 7
+strata serve: conversation cache: parked 1728 tokens in 1.7 ms; parked=1 bytes=262948416 evictions=0 snapshot_bytes=262948416 reused_kv_bytes=0 capture=slot 0 capture_ms=26.0 wait_ms=0.0
+strata batch: slot 0 takes 1215 tokens (copied in 3.9 ms)
+strata trace: admission of slot 0: drain 14.4, prompt 378.9 (read 371.0, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.1 + save 5.4 + evict 0.0, rest 2.5), first window 29.5, slot copy 3.9, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 379 ms (3206.3 tok/s), 1 generated in 30 ms (33.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.0 ms after the admission
+strata trace: drain for BGEN: 3 groups in flight, 15.4 ms
+strata serve: conversation cache: 1215 tokens not parked here: slot 0 parks them with its reply
+strata trace: request 1212 0
+strata trace: prompt start 1211 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1205
+strata trace: prompt chunk 512 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1205 tokens (batched) in 372.4 ms
+strata trace: checkpoint at 1205: sync 0.0 ms, save 5.3 ms (4 stage(s) at once, each 4.8 5.2 5.3 5.1 ms, into a dropped checkpoint's vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1205 7
+strata serve: conversation cache: parked 1723 tokens in 1.6 ms; parked=2 bytes=525833508 evictions=0 snapshot_bytes=262885092 reused_kv_bytes=0 capture=slot 4 capture_ms=25.7 wait_ms=0.0
+strata batch: slot 4 takes 1212 tokens (copied in 3.8 ms)
+strata trace: admission of slot 4: drain 15.4, prompt 379.9 (read 372.4, windows 0.0, 1 checkpoint(s) 5.4 = sync 0.0 + save 5.3 + evict 0.0, rest 2.1), first window 28.7, slot copy 3.7, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 380 ms (3190.1 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.0 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.5 ms
+strata serve: conversation cache: 1212 tokens not parked here: slot 4 parks them with its reply
+strata trace: request 1212 0
+strata trace: prompt start 1211 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1205
+strata trace: prompt chunk 512 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1205 tokens (batched) in 368.9 ms
+strata trace: checkpoint at 1205: sync 0.0 ms, save 20.0 ms (4 stage(s) at once, each 18.8 19.9 18.6 16.2 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1205 7
+strata serve: conversation cache: parked 1722 tokens in 1.6 ms; parked=3 bytes=788718548 evictions=0 snapshot_bytes=262885040 reused_kv_bytes=0 capture=slot 8 capture_ms=24.0 wait_ms=0.0
+strata batch: slot 8 takes 1212 tokens (copied in 3.8 ms)
+strata trace: admission of slot 8: drain 22.5, prompt 390.9 (read 368.9, windows 0.0, 1 checkpoint(s) 20.0 = sync 0.0 + save 20.0 + evict 0.0, rest 2.0), first window 28.8, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 391 ms (3100.9 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.4 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 23.0 ms
+strata serve: conversation cache: 1212 tokens not parked here: slot 8 parks them with its reply
+strata trace: request 1212 0
+strata trace: prompt start 1211 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1205
+strata trace: prompt chunk 512 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1205 tokens (batched) in 369.7 ms
+strata trace: checkpoint at 1205: sync 0.0 ms, save 20.1 ms (4 stage(s) at once, each 18.9 20.1 19.0 16.1 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1205 7
+strata serve: conversation cache: parked 1724 tokens in 1.6 ms; parked=4 bytes=1051609796 evictions=0 snapshot_bytes=262891248 reused_kv_bytes=0 capture=slot 12 capture_ms=23.6 wait_ms=0.0
+strata batch: slot 12 takes 1212 tokens (copied in 3.8 ms)
+strata trace: admission of slot 12: drain 23.0, prompt 391.8 (read 369.7, windows 0.0, 1 checkpoint(s) 20.2 = sync 0.0 + save 20.1 + evict 0.0, rest 2.0), first window 28.7, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 392 ms (3093.5 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.6 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 23.1 ms
+strata serve: conversation cache: 1212 tokens not parked here: slot 12 parks them with its reply
+strata trace: request 1216 0
+strata trace: prompt start 1215 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1209
+strata trace: prompt chunk 512 of 1209
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1209
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1209 tokens (batched) in 370.0 ms
+strata trace: checkpoint at 1209: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.5 19.7 18.6 15.9 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1209 7
+strata serve: conversation cache: parked 1725 tokens in 1.5 ms; parked=5 bytes=1314551764 evictions=0 snapshot_bytes=262941968 reused_kv_bytes=0 capture=slot 1 capture_ms=23.8 wait_ms=0.0
+strata batch: slot 1 takes 1216 tokens (copied in 3.8 ms)
+strata trace: admission of slot 1: drain 23.1, prompt 391.8 (read 370.0, windows 0.0, 1 checkpoint(s) 19.8 = sync 0.0 + save 19.8 + evict 0.0, rest 2.0), first window 28.5, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1216 tokens = 0 reused + 1216 read in 392 ms (3103.5 tok/s), 1 generated in 29 ms (35.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6375 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.3 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.8 ms
+strata serve: conversation cache: 1216 tokens not parked here: slot 1 parks them with its reply
+strata trace: request 1216 0
+strata trace: prompt start 1215 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1209
+strata trace: prompt chunk 512 of 1209
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1209
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1209 tokens (batched) in 368.1 ms
+strata trace: checkpoint at 1209: sync 0.0 ms, save 20.0 ms (4 stage(s) at once, each 18.8 19.9 18.8 16.0 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1209 7
+strata serve: conversation cache: parked 1721 tokens in 1.5 ms; parked=6 bytes=1577436772 evictions=0 snapshot_bytes=262885008 reused_kv_bytes=0 capture=slot 5 capture_ms=25.6 wait_ms=0.0
+strata batch: slot 5 takes 1216 tokens (copied in 3.8 ms)
+strata trace: admission of slot 5: drain 22.8, prompt 390.1 (read 368.1, windows 0.0, 1 checkpoint(s) 20.0 = sync 0.0 + save 20.0 + evict 0.0, rest 2.0), first window 28.7, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1216 tokens = 0 reused + 1216 read in 390 ms (3117.2 tok/s), 1 generated in 29 ms (34.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6375 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.5 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 23.1 ms
+strata serve: conversation cache: 1216 tokens not parked here: slot 5 parks them with its reply
+strata trace: request 1216 0
+strata trace: prompt start 1215 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1209
+strata trace: prompt chunk 512 of 1209
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1209
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1209 tokens (batched) in 368.5 ms
+strata trace: checkpoint at 1209: sync 0.0 ms, save 19.9 ms (4 stage(s) at once, each 18.7 19.9 18.7 16.0 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1209 7
+strata serve: conversation cache: parked 1723 tokens in 1.5 ms; parked=7 bytes=1840321844 evictions=0 snapshot_bytes=262885072 reused_kv_bytes=0 capture=slot 9 capture_ms=25.5 wait_ms=0.0
+strata batch: slot 9 takes 1216 tokens (copied in 3.8 ms)
+strata trace: admission of slot 9: drain 23.1, prompt 390.4 (read 368.5, windows 0.0, 1 checkpoint(s) 19.9 = sync 0.0 + save 19.9 + evict 0.0, rest 2.0), first window 29.2, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1216 tokens = 0 reused + 1216 read in 390 ms (3115.0 tok/s), 1 generated in 29 ms (34.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6375 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.4 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 23.0 ms
+strata serve: conversation cache: 1216 tokens not parked here: slot 9 parks them with its reply
+strata trace: request 1211 0
+strata trace: prompt start 1210 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1204
+strata trace: prompt chunk 512 of 1204
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1204
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 180
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1204 tokens (batched) in 368.5 ms
+strata trace: checkpoint at 1204: sync 0.0 ms, save 19.2 ms (4 stage(s) at once, each 17.9 19.2 18.0 15.5 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1204 7
+strata serve: conversation cache: parked 1726 tokens in 1.5 ms; parked=8 bytes=2103263844 evictions=0 snapshot_bytes=262942000 reused_kv_bytes=0 capture=slot 13 capture_ms=25.4 wait_ms=0.0
+strata batch: slot 13 takes 1211 tokens (copied in 4.1 ms)
+strata trace: admission of slot 13: drain 23.0, prompt 389.7 (read 368.5, windows 0.0, 1 checkpoint(s) 19.2 = sync 0.0 + save 19.2 + evict 0.0, rest 2.0), first window 29.1, slot copy 4.1, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 390 ms (3107.2 tok/s), 1 generated in 29 ms (34.4 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.1 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.6 ms
+strata serve: conversation cache: 1211 tokens not parked here: slot 13 parks them with its reply
+strata trace: request 1212 0
+strata trace: prompt start 1211 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1205
+strata trace: prompt chunk 512 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1205 tokens (batched) in 368.5 ms
+strata trace: checkpoint at 1205: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.7 19.8 18.7 15.9 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1205 7
+strata serve: conversation cache: parked 1722 tokens in 1.5 ms; parked=9 bytes=2366148884 evictions=0 snapshot_bytes=262885040 reused_kv_bytes=0 capture=slot 2 capture_ms=25.2 wait_ms=0.0
+strata batch: slot 2 takes 1212 tokens (copied in 3.8 ms)
+strata trace: admission of slot 2: drain 22.6, prompt 390.4 (read 368.5, windows 0.0, 1 checkpoint(s) 19.8 = sync 0.0 + save 19.8 + evict 0.0, rest 2.0), first window 28.8, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 390 ms (3104.8 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 22.6 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.0 ms
+strata serve: conversation cache: 1212 tokens not parked here: slot 2 parks them with its reply
+strata trace: request 1212 0
+strata trace: prompt start 1211 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1205
+strata trace: prompt chunk 512 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1205
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 181
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1205 tokens (batched) in 369.1 ms
+strata trace: checkpoint at 1205: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.7 19.8 18.8 16.0 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1205 7
+strata serve: conversation cache: parked 1723 tokens in 1.5 ms; parked=10 bytes=2629033956 evictions=0 snapshot_bytes=262885072 reused_kv_bytes=0 capture=slot 6 capture_ms=25.3 wait_ms=0.0
+strata batch: slot 6 takes 1212 tokens (copied in 3.7 ms)
+strata trace: admission of slot 6: drain 22.0, prompt 391.0 (read 369.1, windows 0.0, 1 checkpoint(s) 19.8 = sync 0.0 + save 19.8 + evict 0.0, rest 2.0), first window 29.3, slot copy 3.7, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 391 ms (3099.7 tok/s), 1 generated in 29 ms (34.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.2 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.8 ms
+strata serve: conversation cache: 1212 tokens not parked here: slot 6 parks them with its reply
+strata trace: request 1215 0
+strata trace: prompt start 1214 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1208
+strata trace: prompt chunk 512 of 1208
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1208
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 184
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1208 tokens (batched) in 368.1 ms
+strata trace: checkpoint at 1208: sync 0.0 ms, save 19.9 ms (4 stage(s) at once, each 19.0 19.9 18.6 16.2 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1208 7
+strata serve: conversation cache: parked 1721 tokens in 1.5 ms; parked=11 bytes=2891918964 evictions=0 snapshot_bytes=262885008 reused_kv_bytes=0 capture=slot 10 capture_ms=25.4 wait_ms=0.0
+strata batch: slot 10 takes 1215 tokens (copied in 3.7 ms)
+strata trace: admission of slot 10: drain 22.8, prompt 390.0 (read 368.1, windows 0.0, 1 checkpoint(s) 19.9 = sync 0.0 + save 19.9 + evict 0.0, rest 2.0), first window 29.4, slot copy 3.7, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 390 ms (3115.2 tok/s), 1 generated in 29 ms (34.0 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 22.7 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.2 ms
+strata serve: conversation cache: 1215 tokens not parked here: slot 10 parks them with its reply
+strata trace: request 1216 0
+strata trace: prompt start 1215 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1209
+strata trace: prompt chunk 512 of 1209
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1209
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 185
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1209 tokens (batched) in 370.1 ms
+strata trace: checkpoint at 1209: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.5 19.8 18.6 15.9 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1209 7
+strata serve: conversation cache: parked 1721 tokens in 1.5 ms; parked=12 bytes=3154803972 evictions=0 snapshot_bytes=262885008 reused_kv_bytes=0 capture=slot 14 capture_ms=25.3 wait_ms=0.0
+strata batch: slot 14 takes 1216 tokens (copied in 3.7 ms)
+strata trace: admission of slot 14: drain 22.2, prompt 391.8 (read 370.1, windows 0.0, 1 checkpoint(s) 19.8 = sync 0.0 + save 19.8 + evict 0.0, rest 2.0), first window 29.2, slot copy 3.7, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1216 tokens = 0 reused + 1216 read in 392 ms (3103.4 tok/s), 1 generated in 29 ms (34.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6375 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 23.1 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 22.6 ms
+strata serve: conversation cache: 1216 tokens not parked here: slot 14 parks them with its reply
+strata trace: request 1210 0
+strata trace: prompt start 1209 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1203
+strata trace: prompt chunk 512 of 1203
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1203
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 179
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1203 tokens (batched) in 367.8 ms
+strata trace: checkpoint at 1203: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.6 19.8 18.6 15.8 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1203 7
+strata serve: conversation cache: parked 1724 tokens in 1.5 ms; parked=13 bytes=3417695220 evictions=0 snapshot_bytes=262891248 reused_kv_bytes=0 capture=slot 3 capture_ms=25.1 wait_ms=0.0
+strata batch: slot 3 takes 1210 tokens (copied in 3.8 ms)
+strata trace: admission of slot 3: drain 22.6, prompt 389.6 (read 367.8, windows 0.0, 1 checkpoint(s) 19.8 = sync 0.0 + save 19.8 + evict 0.0, rest 2.0), first window 28.8, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1210 tokens = 0 reused + 1210 read in 390 ms (3106.1 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6345 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 21.8 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 21.3 ms
+strata serve: conversation cache: 1210 tokens not parked here: slot 3 parks them with its reply
+strata trace: request 1217 0
+strata trace: prompt start 1216 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1210
+strata trace: prompt chunk 512 of 1210
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1210
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 186
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 186
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 186
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1210 tokens (batched) in 370.0 ms
+strata trace: checkpoint at 1210: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.6 19.8 18.6 15.8 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1210 7
+strata serve: conversation cache: parked 1725 tokens in 1.4 ms; parked=14 bytes=3680637188 evictions=0 snapshot_bytes=262941968 reused_kv_bytes=0 capture=slot 7 capture_ms=25.4 wait_ms=0.0
+strata batch: slot 7 takes 1217 tokens (copied in 4.0 ms)
+strata trace: admission of slot 7: drain 21.3, prompt 392.0 (read 370.0, windows 0.0, 1 checkpoint(s) 19.8 = sync 0.0 + save 19.8 + evict 0.0, rest 2.1), first window 28.8, slot copy 4.0, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1217 tokens = 0 reused + 1217 read in 392 ms (3104.9 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6381 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 21.4 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 20.8 ms
+strata serve: conversation cache: 1217 tokens not parked here: slot 7 parks them with its reply
+strata trace: request 1214 0
+strata trace: prompt start 1213 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1207
+strata trace: prompt chunk 512 of 1207
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1207
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 183
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1207 tokens (batched) in 369.3 ms
+strata trace: checkpoint at 1207: sync 0.0 ms, save 19.9 ms (4 stage(s) at once, each 18.6 19.9 18.8 16.4 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1207 7
+strata serve: conversation cache: parked 1722 tokens in 1.6 ms; parked=15 bytes=3943522228 evictions=0 snapshot_bytes=262885040 reused_kv_bytes=0 capture=slot 11 capture_ms=25.3 wait_ms=0.0
+strata batch: slot 11 takes 1214 tokens (copied in 3.8 ms)
+strata trace: admission of slot 11: drain 20.8, prompt 391.2 (read 369.3, windows 0.0, 1 checkpoint(s) 19.9 = sync 0.0 + save 19.9 + evict 0.0, rest 2.0), first window 28.4, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1214 tokens = 0 reused + 1214 read in 391 ms (3103.6 tok/s), 1 generated in 28 ms (35.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6366 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 21.5 ms after the admission
+strata trace: drain for BGEN: 1 groups in flight, 21.1 ms
+strata serve: conversation cache: 1214 tokens not parked here: slot 11 parks them with its reply
+strata trace: request 1213 0
+strata trace: prompt start 1212 -1
+strata trace: lent 0 slots for 512 tokens in 0.0 ms
+strata trace: prompt chunk 0 of 1206
+strata trace: prompt chunk 512 of 1206
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 1024 of 1206
+strata trace: prompt chunk 0 of 512
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 512
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: prompt chunk 0 of 182
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata trace: read 1206 tokens (batched) in 368.1 ms
+strata trace: checkpoint at 1206: sync 0.0 ms, save 19.8 ms (4 stage(s) at once, each 18.6 19.8 18.6 15.9 ms, new vectors)
+strata trace: read 0 tokens (windows) in 0.0 ms
+strata trace: the first window takes the last 7 prompt tokens
+strata trace: prompt done (slots refilled) -1 -1
+strata trace: window 1206 7
+strata serve: conversation cache: parked 1724 tokens in 1.5 ms; parked=16 bytes=4206413476 evictions=0 snapshot_bytes=262891248 reused_kv_bytes=0 capture=slot 15 capture_ms=25.6 wait_ms=0.0
+strata batch: slot 15 takes 1213 tokens (copied in 3.8 ms)
+strata trace: admission of slot 15: drain 21.1, prompt 389.9 (read 368.1, windows 0.0, 1 checkpoint(s) 19.8 = sync 0.0 + save 19.8 + evict 0.0, rest 2.0), first window 29.2, slot copy 3.8, slot freed 0.0, checkpoint copy 0.0 (moved)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 390 ms (3110.8 tok/s), 1 generated in 29 ms (34.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata trace: first rows 21.6 ms after the admission
+strata batch (pipelined, 4 groups of 4): 4100 group-steps, 16351 rows in 37273 ms = 438.7 rows/s (admissions included)
+strata batch: STRATA_SLOT_PARK: 14 group starts waited for a slot's capture, 741.4 ms in all
