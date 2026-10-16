@@ -1,0 +1,305 @@
+From 15ccf0289843d751e02ccecc2390ddaf36eaf8cf Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:27:28 +0200
+Subject: [PATCH 1/4] pipe overlap: the overlapped prompt read also with a
+ streamed K/V cache, gate only (opt-in STRATA_PIPE_OVERLAP_KVS=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                         |  4 ++
+ include/strata/prefill/prefill.hpp     |  4 +-
+ include/strata/program/overlap_kvs.hpp | 57 +++++++++++++++++++++++
+ src/prefill/prefill.cpp                | 18 +++++++-
+ src/program/generate.cpp               | 62 +++++++++++++++++++++++++-
+ tests/program/overlap_kvs_test.cpp     | 47 +++++++++++++++++++
+ 6 files changed, 187 insertions(+), 5 deletions(-)
+ create mode 100644 include/strata/program/overlap_kvs.hpp
+ create mode 100644 tests/program/overlap_kvs_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ad1cb29a..52514f82 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -279,6 +279,10 @@ if(STRATA_BUILD_TESTS)
+   add_executable(batch_read_test tests/program/batch_read_test.cpp)
+   target_include_directories(batch_read_test PRIVATE include)
+   add_test(NAME batch_read_test COMMAND batch_read_test)
++  # STRATA_PIPE_OVERLAP_KVS: the overlap gate's K/V streaming part (env, buffer disjointness; synthetic)
++  add_executable(overlap_kvs_test tests/program/overlap_kvs_test.cpp)
++  target_include_directories(overlap_kvs_test PRIVATE include)
++  add_test(NAME overlap_kvs_test COMMAND overlap_kvs_test)
+   # the model's geometry from its metadata, and the check against the kernels' compiled shape (synthetic)
+   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
+   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 14189a15..bafa791f 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -201,7 +201,9 @@ public:
+     /// --peer-device peer or stage helper (STRATA_PREFILL_HELP), no CPU pool, buffers of its own (not lent cache
+     /// slots), no K/V streaming, and the PLE block batched (the per-token block writes the session's PLE scratch,
+     /// which the stage-0 windows use too).  False with `why`.
+-    bool overlap_safe(std::string& why) const;
++    /// `kv_stream_ok` (STRATA_PIPE_OVERLAP_KVS=1): a streamed K/V (--kv-resident) is accepted where this path stages it
++    /// in a staging pool and identity table of its own (not lent; the default: refused as before).
++    bool overlap_safe(std::string& why, bool kv_stream_ok = false) const;
+     /// The first CUDA error a later stage's thread had after one of its chunks since the last `run` (0: none).  A
+     /// stage's chunks run on threads of their own, which take their error state with them; only a sticky fault
+     /// (an illegal address, a trap) outlives the error paths, which read and clear the error they report.
+diff --git a/include/strata/program/overlap_kvs.hpp b/include/strata/program/overlap_kvs.hpp
+new file mode 100644
+index 00000000..32989fee
+--- /dev/null
++++ b/include/strata/program/overlap_kvs.hpp
+@@ -0,0 +1,57 @@
++// include/strata/program/overlap_kvs.hpp - STRATA_PIPE_OVERLAP_KVS: may an overlapped prompt read run with a streamed
++// K/V cache (--kv-resident)?  Header-only: it is the gate's arithmetic, tested without a model or a GPU.
++//
++// With --kv-resident every QSA state is streamed (kv_mode 1: a VRAM page pool, a page map and a pinned host copy per
++// state).  The prompt read writes the MAIN sessions' states (the host copy, and the VRAM slots of blocks its map holds
++// resident) and fills its own staging pool from that host copy; the decoding windows resolve and append in the SLOT
++// sessions' states only.  The read stays exact beside the windows as long as no buffer of a main state is a buffer of
++// a slot state (and the drafter's main ring is not a slot drafter's ring).  Each state is its own carve today
++// (session_init per slot, one cudaHostAlloc per host copy); the check below is the insurance against a future shared
++// carve.
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace strata::program {
++
++/// One buffer a K/V state owns: [lo, hi) in its address space (VRAM or the mapped host copy).  A buffer whose size is
++/// not known to the caller is a point (hi = lo + 1): it still catches a second state that carves the same pointer.
++struct KvSpan {
++    uintptr_t lo = 0, hi = 0;
++};
++inline KvSpan kv_span(const void* p, uint64_t bytes) {
++    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
++    return KvSpan{a, a + (bytes > 0 ? bytes : 1)};
++}
++
++/// True when no span of `a` intersects a span of `b` (null spans, lo == 0, are skipped).
++inline bool kv_spans_disjoint(const std::vector<KvSpan>& a, const std::vector<KvSpan>& b) {
++    for (const KvSpan& x : a) {
++        if (x.lo == 0) continue;
++        for (const KvSpan& y : b) {
++            if (y.lo == 0) continue;
++            if (x.lo < y.hi && y.lo < x.hi) return false;
++        }
++    }
++    return true;
++}
++
++/// The generate-side part of the overlap gate for K/V streaming.  `overlap_env`: STRATA_PIPE_OVERLAP=1;
++/// `kvs_env`: STRATA_PIPE_OVERLAP_KVS=1; `kv_resident`: --kv-resident > 0; `states_disjoint`: kv_spans_disjoint over
++/// every main state against every slot state (main sessions vs slot sessions, main drafter vs slot drafters).
++/// True: streaming does not refuse the read (the other conditions of the gate still apply).  False with `why`.
++/// Without KVS the answer and the text are today's: "K/V streaming (--kv-resident)".
++inline bool overlap_kvs_allows(bool overlap_env, bool kvs_env, bool kv_resident, bool states_disjoint,
++                               std::string& why) {
++    if (!kv_resident) return true;
++    if (!(overlap_env && kvs_env)) { why = "K/V streaming (--kv-resident)"; return false; }
++    if (!states_disjoint) {
++        why = "K/V streaming (--kv-resident): a main session's K/V state shares a buffer with a slot's";
++        return false;
++    }
++    return true;
++}
++
++}  // namespace strata::program
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 656d375a..8bc27b24 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -2247,7 +2247,7 @@ bool Prefill::ple_batched_() const {
+ 
+ int Prefill::device() const { return impl_->device; }
+ 
+-bool Prefill::overlap_safe(std::string& why) const {
++bool Prefill::overlap_safe(std::string& why, bool kv_stream_ok) const {
+     for (const Prefill* p = this; p != nullptr; p = p->next_) {
+         const Impl& m = *p->impl_;
+         const std::string dev = "CUDA" + std::to_string(m.device) + "'s prompt path";
+@@ -2257,8 +2257,22 @@ bool Prefill::overlap_safe(std::string& why) const {
+         if (p->cpu_pool_ != nullptr) { why = dev + " has the CPU expert pool"; return false; }
+         if (m.borrowed) { why = dev + " reads in lent expert cache slots"; return false; }
+         if (m.ss->qsa_states != nullptr && m.ss->qsa_states[m.ss->qsa_primary()].kv_mode == 1) {
+-            why = dev + " streams the K/V (--kv-resident)";
++            if (!kv_stream_ok) {
++                why = dev + " streams the K/V (--kv-resident)";
++                return false;
++            }
++            // STRATA_PIPE_OVERLAP_KVS=1: the read stages each layer's K/V [0, p0) from the main session's host copy
++            // into a staging pool of its own (take_stage from this path's own buffers: m.borrowed is refused above),
++            // on this path's streams, and appends to that host copy and pool.  The windows resolve, append and attend
++            // in the slot sessions' states only, so the read shares nothing with them (HIP: overlap is not built)
++#if defined(STRATA_USE_HIP)
++            why = dev + " streams the K/V (--kv-resident; not on HIP: STRATA_KV_HOST_DMA)";
+             return false;
++#endif
++            if (!m.stage.present() || m.ident_table == nullptr) {
++                why = dev + " streams the K/V (--kv-resident) without a staging pool of its own";
++                return false;
++            }
+         }
+         if (p->ple_on_() && !p->ple_batched_()) {
+             why = dev + " runs the PLE block token by token (STRATA_PLE_BATCH=0, or no native postops or key)";
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index b2e4cddb..c5d43953 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -68,6 +68,7 @@
+ #endif
+ #include "strata/core/native_dense.hpp"
+ #include "strata/program/batch_read.hpp"
++#include "strata/program/overlap_kvs.hpp"
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
+ #include "strata/program/split_rules.hpp"
+@@ -184,6 +185,16 @@ bool pipe_overlap_env() {
+     }();
+     return on;
+ }
++// STRATA_PIPE_OVERLAP_KVS=1 (read once; off by default; only with STRATA_PIPE_OVERLAP=1): the overlapped read also
++// with a streamed K/V cache (--kv-resident).  The read writes the main sessions' streamed states and its own staging
++// pool, the windows the slots' states: see overlap_kvs.hpp
++bool pipe_overlap_kvs_env() {
++    static const bool on = pipe_overlap_env() && [] {
++        const char* v = std::getenv("STRATA_PIPE_OVERLAP_KVS");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_PIPE_BYIELD_NODRAIN=1 (read once; off by default): with the pipelined groups, a BYIELD that reaches the main
+ // loop is dropped without draining the groups first.  A pipelined read never gives way (batch_read_piece), so the
+ // BYIELD is for a read that has ended, and the drain (and the refill after it) did nothing for it
+@@ -13819,6 +13830,52 @@ int main(int argc, char** argv) {
+             // decoding?  Checked live before each segment (with nothing in flight): only where the read and the windows
+             // share nothing that one writes and the other reads, so the slots' tokens and the prompt's are the ones
+             // they get with the slots drained.  False with `why` (the first condition that fails).
++            // STRATA_PIPE_OVERLAP_KVS=1 with --kv-resident: the streamed part of the gate (overlap_kvs.hpp).  Every
++            // main session's QSA states (what the read writes: VRAM pages, page map, indexer rows, host copy) against
++            // the slot sessions' of the same stage (what the windows resolve, append and attend), and the main
++            // drafter's ring against the slot drafters'.  Called only with the switch on (without it the gate refuses
++            // --kv-resident as before); the prompt path's own part is Prefill::overlap_safe(why, true).
++            auto overlap_kvs_check = [&](std::string& why) -> bool {
++                using strata::program::KvSpan;
++                using strata::program::kv_span;
++                const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
++                auto spans_of = [&](const strata::core::QsaState& st, bool sized, std::vector<KvSpan>& out) {
++                    const uint64_t bb = sized ? strata::kernels::kv_block_bytes(qs, strata::core::qsa_kv_format(st)) : 0;
++                    const void* pool = st.k_q != nullptr ? (const void*) st.k_q
++                                     : st.k_q4 != nullptr ? (const void*) st.k_q4 : (const void*) st.k_pool;
++                    const void* host = st.host.k_q != nullptr ? (const void*) st.host.k_q
++                                     : st.host.k_q4 != nullptr ? (const void*) st.host.k_q4 : (const void*) st.host.k_pool;
++                    out.push_back(kv_span(pool, (uint64_t) st.n_slots * bb));
++                    out.push_back(kv_span(host, (uint64_t) st.n_pages * bb));
++                    for (const void* p : {(const void*) st.page_table, (const void*) st.map.ctl, (const void*) st.map.slot_block,
++                                          (const void*) st.idx_pooled, (const void*) st.idx_tail, (const void*) st.step})
++                        out.push_back(kv_span(p, 0));
++                };
++                bool disjoint = true;
++                for (int k = 0; k < n_pipe && disjoint && k < (int) bslot_ss.size(); ++k) {
++                    const strata::core::SessionState& main_k = k == 0 ? ss : stages[(size_t) k - 1]->ss;
++                    std::vector<KvSpan> a, b;
++                    for (int64_t j = 0; j < main_k.qsa_alloc; ++j)
++                        spans_of(main_k.qsa_states[main_k.qsa_ord0 + j], true, a);
++                    for (const auto& u : bslot_ss[(size_t) k])
++                        for (int64_t j = 0; j < u->qsa_alloc; ++j) spans_of(u->qsa_states[u->qsa_ord0 + j], true, b);
++                    disjoint = strata::program::kv_spans_disjoint(a, b);
++                }
++                if (disjoint && !slot_mtp.empty()) {   // the drafter's own geometry: its buffers as points only
++                    std::vector<KvSpan> a, b;
++                    spans_of(mtp.kv_state(), false, a);
++                    for (const auto& d : slot_mtp) spans_of(d->kv_state(), false, b);
++                    disjoint = strata::program::kv_spans_disjoint(a, b);
++                }
++                if (!strata::program::overlap_kvs_allows(pipe_overlap_env(), pipe_overlap_kvs_env(), o.kv_resident > 0,
++                                                         disjoint, why))
++                    return false;
++                static std::atomic<bool> told{false};
++                if (!told.exchange(true))
++                    std::fprintf(stderr, "strata generate: STRATA_PIPE_OVERLAP_KVS=1: overlapped reads with a streamed K/V "
++                                         "cache (--kv-resident %lld)\n", (long long) o.kv_resident);
++                return true;
++            };
+             auto overlap_gate = [&](int64_t a0, int64_t b0, std::string& why) -> bool {
+                 if (admit_slot < 0) { why = "not a batch admission (a request beside the slots)"; return false; }
+                 if (pipe_inflight()) { why = "slot groups in flight"; return false; }
+@@ -13843,7 +13900,8 @@ int main(int argc, char** argv) {
+                         return false;
+                     }
+                 // what the read would share with the windows, or change under them
+-                if (o.kv_resident > 0) { why = "K/V streaming (--kv-resident)"; return false; }
++                if (o.kv_resident > 0 && !pipe_overlap_kvs_env()) { why = "K/V streaming (--kv-resident)"; return false; }
++                if (o.kv_resident > 0 && !overlap_kvs_check(why)) return false;   // STRATA_PIPE_OVERLAP_KVS=1
+                 if (!req_imgs.empty()) { why = "a picture in the prompt"; return false; }
+                 if (sp.embd_rows != nullptr)
+                     for (int64_t i = a0; i < b0; ++i)
+@@ -13865,7 +13923,7 @@ int main(int argc, char** argv) {
+                     why = "the prompt path's first stage is not on stage 1's card";
+                     return false;
+                 }
+-                return sp.overlap_safe(why);
++                return o.kv_resident > 0 ? sp.overlap_safe(why, true) : sp.overlap_safe(why);
+             };
+             // ... and with the gate passed (T_main, nothing in flight): what a read beside the windows may not do itself.
+             // Each stage captures the full-width layout of every group it lacks and, of each active group, every
+diff --git a/tests/program/overlap_kvs_test.cpp b/tests/program/overlap_kvs_test.cpp
+new file mode 100644
+index 00000000..afb8e3a6
+--- /dev/null
++++ b/tests/program/overlap_kvs_test.cpp
+@@ -0,0 +1,47 @@
++// overlap_kvs_allows / kv_spans_disjoint: the K/V streaming part of the STRATA_PIPE_OVERLAP gate (synthetic: no
++// model, no GPU).
++#include "strata/program/overlap_kvs.hpp"
++
++#include <cstdio>
++#include <string>
++#include <vector>
++
++using strata::program::KvSpan;
++using strata::program::kv_span;
++using strata::program::kv_spans_disjoint;
++using strata::program::overlap_kvs_allows;
++
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
++
++int main() {
++    std::string why;
++    // no --kv-resident: streaming never refuses, whatever the switches
++    CHECK(overlap_kvs_allows(false, false, false, true, why) && why.empty());
++    CHECK(overlap_kvs_allows(true, false, false, false, why) && why.empty());
++    // --kv-resident without the switch (or the switch without STRATA_PIPE_OVERLAP): today's refusal, today's text
++    for (int ov = 0; ov < 2; ++ov)
++        for (int kvs = 0; kvs < 2; ++kvs) {
++            if (ov && kvs) continue;
++            why.clear();
++            CHECK(!overlap_kvs_allows(ov != 0, kvs != 0, true, true, why));
++            CHECK(why == "K/V streaming (--kv-resident)");
++        }
++    // with both: allowed when the states are disjoint, refused (with its own reason) when they are not
++    why.clear();
++    CHECK(overlap_kvs_allows(true, true, true, true, why) && why.empty());
++    CHECK(!overlap_kvs_allows(true, true, true, false, why));
++    CHECK(why.find("shares a buffer") != std::string::npos);
++
++    // spans: half-open ranges, points, null skipped
++    alignas(64) static char buf[4096];
++    const std::vector<KvSpan> a = {kv_span(buf, 1024), kv_span(buf + 2048, 0), kv_span(nullptr, 99)};
++    CHECK(kv_spans_disjoint(a, {kv_span(buf + 1024, 512)}));            // touching, not overlapping
++    CHECK(!kv_spans_disjoint(a, {kv_span(buf + 1023, 1)}));             // last byte of the range
++    CHECK(!kv_spans_disjoint(a, {kv_span(buf + 2048, 0)}));             // the same point
++    CHECK(!kv_spans_disjoint(a, {kv_span(buf + 2000, 100)}));           // a range over a point
++    CHECK(kv_spans_disjoint(a, {kv_span(buf + 2049, 0), kv_span(nullptr, 4096)}));   // null never collides
++    CHECK(kv_spans_disjoint({}, a) && kv_spans_disjoint(a, {}));
++    std::printf(fails ? "overlap_kvs_test: %d failures\n" : "overlap_kvs_test: ok\n", fails);
++    return fails ? 1 : 0;
++}
+-- 
+2.43.0
+

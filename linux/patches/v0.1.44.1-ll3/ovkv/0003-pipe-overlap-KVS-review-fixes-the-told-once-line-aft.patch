@@ -1,0 +1,102 @@
+From aff75ebb8ad469c97ec02cedfa1e52befc699944 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:40:34 +0200
+Subject: [PATCH 3/4] pipe overlap: KVS review fixes, the told-once line after
+ the first prepared read with each card's free VRAM before and after the
+ captures, HIP refusal as #else (opt-in STRATA_PIPE_OVERLAP_KVS=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/prefill/prefill.cpp  |  5 +++--
+ src/program/generate.cpp | 40 ++++++++++++++++++++++++++++++++--------
+ 2 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 8bc27b24..e5c2bf63 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -2266,13 +2266,14 @@ bool Prefill::overlap_safe(std::string& why, bool kv_stream_ok) const {
+             // on this path's streams, and appends to that host copy and pool.  The windows resolve, append and attend
+             // in the slot sessions' states only, so the read shares nothing with them (HIP: overlap is not built)
+ #if defined(STRATA_USE_HIP)
+-            why = dev + " streams the K/V (--kv-resident; not on HIP: STRATA_KV_HOST_DMA)";
++            why = dev + " streams the K/V (--kv-resident; not on HIP: the overlapped read is not built)";
+             return false;
+-#endif
++#else
+             if (!m.stage.present() || m.ident_table == nullptr) {
+                 why = dev + " streams the K/V (--kv-resident) without a staging pool of its own";
+                 return false;
+             }
++#endif
+         }
+         if (p->ple_on_() && !p->ple_batched_()) {
+             why = dev + " runs the PLE block token by token (STRATA_PLE_BATCH=0, or no native postops or key)";
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index c5d43953..ea455e38 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -13867,14 +13867,22 @@ int main(int argc, char** argv) {
+                     for (const auto& d : slot_mtp) spans_of(d->kv_state(), false, b);
+                     disjoint = strata::program::kv_spans_disjoint(a, b);
+                 }
+-                if (!strata::program::overlap_kvs_allows(pipe_overlap_env(), pipe_overlap_kvs_env(), o.kv_resident > 0,
+-                                                         disjoint, why))
+-                    return false;
+-                static std::atomic<bool> told{false};
+-                if (!told.exchange(true))
+-                    std::fprintf(stderr, "strata generate: STRATA_PIPE_OVERLAP_KVS=1: overlapped reads with a streamed K/V "
+-                                         "cache (--kv-resident %lld)\n", (long long) o.kv_resident);
+-                return true;
++                return strata::program::overlap_kvs_allows(pipe_overlap_env(), pipe_overlap_kvs_env(), o.kv_resident > 0,
++                                                           disjoint, why);
++            };
++            // STRATA_PIPE_OVERLAP_KVS=1 with --kv-resident, once (the first read that is prepared to overlap): each
++            // stage card's free VRAM before and after overlap_prepare's captures, which stay allocated after the read
++            auto overlap_kvs_vram = [&](std::vector<size_t>& out) {
++                out.assign((size_t) n_pipe, 0);
++                int cur = 0;
++                if (cudaGetDevice(&cur) != cudaSuccess) { (void) cudaGetLastError(); return; }
++                for (int k = 0; k < n_pipe; ++k) {
++                    size_t fr = 0, tot = 0;
++                    if (cudaSetDevice(stage_verifier(k).device()) == cudaSuccess && cudaMemGetInfo(&fr, &tot) == cudaSuccess)
++                        out[(size_t) k] = fr;
++                    else (void) cudaGetLastError();
++                }
++                (void) cudaSetDevice(cur);
+             };
+             auto overlap_gate = [&](int64_t a0, int64_t b0, std::string& why) -> bool {
+                 if (admit_slot < 0) { why = "not a batch admission (a request beside the slots)"; return false; }
+@@ -13933,6 +13941,10 @@ int main(int argc, char** argv) {
+             auto overlap_prepare = [&](std::string& why) -> bool {
+                 const auto t0 = Clock::now();
+                 int captured = 0;
++                static std::atomic<bool> kvs_told{false};
++                const bool kvs_tell = o.kv_resident > 0 && !kvs_told.load();   // only with STRATA_PIPE_OVERLAP_KVS=1
++                std::vector<size_t> kvs_free0;
++                if (kvs_tell) overlap_kvs_vram(kvs_free0);
+                 std::vector<int> ov_narrow(pg.size(), 0);   // each group's own width now (the widest it may shrink to)
+                 for (int gi = 0; gi < (int) pg.size(); ++gi)
+                     for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) ov_narrow[(size_t) gi] = t + 1;
+@@ -13954,6 +13966,18 @@ int main(int argc, char** argv) {
+                     std::fprintf(stderr, "strata batch: overlapped read: captured %d group layout%s in %.1f ms\n",
+                                  captured, captured == 1 ? "" : "s",
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
++                if (kvs_tell && !kvs_told.exchange(true)) {
++                    std::vector<size_t> kvs_free1;
++                    overlap_kvs_vram(kvs_free1);
++                    std::string cards;
++                    for (int k = 0; k < n_pipe; ++k)
++                        cards += " CUDA" + std::to_string(stage_verifier(k).device()) + " " +
++                                 std::to_string(kvs_free0[(size_t) k] >> 20) + "->" +
++                                 std::to_string(kvs_free1[(size_t) k] >> 20) + " MiB";
++                    std::fprintf(stderr, "strata generate: STRATA_PIPE_OVERLAP_KVS=1: first overlapped read with a streamed "
++                                         "K/V cache (--kv-resident %lld) prepared; free VRAM before->after:%s\n",
++                                 (long long) o.kv_resident, cards.c_str());
++                }
+                 return true;
+             };
+             // ... and the read itself, gate passed and prepared: [a0, b0) is read by sp.run - the same run over the same
+-- 
+2.43.0
+

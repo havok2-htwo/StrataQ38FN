@@ -1,0 +1,249 @@
+From df7f0409b7f725035329a975e7e5047df5f4fbbb Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:40:34 +0200
+Subject: [PATCH 4/4] tests: kv_stream_overlap_parity checks the slot map's
+ invariants instead of its bytes, two layers share one staging pool with
+ prefetch ahead, described as a kernel concurrency check (opt-in
+ STRATA_PIPE_OVERLAP_KVS=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/kv_stream_overlap_parity.cpp | 122 ++++++++++++++++-------
+ 1 file changed, 85 insertions(+), 37 deletions(-)
+
+diff --git a/src/kernels/kv_stream_overlap_parity.cpp b/src/kernels/kv_stream_overlap_parity.cpp
+index b60de39c..82091f76 100644
+--- a/src/kernels/kv_stream_overlap_parity.cpp
++++ b/src/kernels/kv_stream_overlap_parity.cpp
+@@ -1,19 +1,30 @@
+ // src/kernels/kv_stream_overlap_parity.cpp - STRATA_PIPE_OVERLAP_KVS: a streamed prompt read beside streamed decode
+ // windows, serial vs concurrent, bitwise (GPU, synthetic, no model).
+ //
++// What this is: a KERNEL CONCURRENCY check.  Its two sides use separate allocations by construction, so it shows that
++// the streaming kernels (stage, append, resolve, copy, attention) give the same bytes when they run concurrently on
++// separate streams and stream priorities, with the read side's prefetch ordering.  It is NOT evidence that the
++// engine's read shares nothing with the windows (that is the gate's buffer check and the source audit) nor that the
++// engine's overlapped read is exact: that proof is the engine's token-identity runs (window-ovkv.sh, arms A/B/C).
++//
+ // The engine's overlapped read (generate.cpp, STRATA_PIPE_OVERLAP=1 + STRATA_PIPE_OVERLAP_KVS=1 with --kv-resident)
+ // runs the prompt path's chunks on their own thread and streams while the slot groups' windows decode on
+ // high-priority streams of their own.  This test does both sides with the engine's kernels and orderings:
+-//   A (the read, the MAIN state): per chunk, the layer's prefix [0, p0) staged from the main host copy into a
+-//     staging pool of its own on a copy stream (released/ready events as Prefill's KV prefetch), the chunk's K/V
+-//     appended to the host copy and the staging pool (prefill kv_append; the main map is all non-resident), then
+-//     attention of the chunk's last rows over the staging pool with the identity table;
++//   A (the read, two streamed MAIN layers sharing ONE staging pool, as Prefill): per chunk, layer 0's prefix [0, p0)
++//     staged from its host copy into the staging pool on a copy stream; per layer, the chunk's K/V appended to the
++//     layer's host copy and the staging pool (prefill kv_append; the main map is all non-resident), attention of the
++//     chunk's last rows over the staging pool with the identity table, and then (kv_prefetch_after) `released`
++//     recorded behind that attention and the next layer's prefix staged into the same pool on the copy stream, the
++//     next layer waiting on `ready`;
+ //   B (a window, a SLOT state): per step, the token's append into the slot's streamed state (host copy + resident
+ //     slots), then kv_stream_resolve and qsa_decode_attn_batch for 1-4 rows (the slot's evicting VRAM pool), and
+ //     every 5th step a pad row: a step append at position 0 of a second slot state (the admission's slot).
+ // Run serially (A then B) and concurrently (two threads, B on the highest-priority stream), three times.  Checks,
+-// bitwise: A's attention outputs, the main host copy and the staging pool; B's attention outputs, the slot's host
+-// copy, the slot's map (page_table and slot_block), the pad slot's host copy.  INT8 and FP16 (the streamed formats of
++// bitwise: A's attention outputs, both main host copies and the staging pool; B's attention outputs, the slot's host
++// copy, the pad slot's host copy.  The slot's map is NOT compared bitwise: resolve_kernel numbers the misses in
++// shared-atomic order, so which block lands in which victim slot (and later evictions, miss counts) depends on warp
++// order, serial runs included; values come from the host copy either way.  Instead, after every run: the map's
++// invariants (as kv_stream_parity), no overflow, and misses > 0.  INT8 and FP16 (the streamed formats of
+ // the prompt path's chunk append).  Exit 77 without a CUDA device.
+ #include "strata/kernels/kv_q8.hpp"
+ #include "strata/kernels/kv_stream.hpp"
+@@ -30,6 +41,7 @@
+ #include <cstring>
+ #include <random>
+ #include <set>
++#include <string>
+ #include <thread>
+ #include <type_traits>
+ #include <vector>
+@@ -173,16 +185,35 @@ template <typename T> T* upload(const std::vector<T>& v) {
+ struct Result {
+     std::vector<float> out_a, out_b;
+     std::vector<uint8_t> main_host, stage, slot_host, pad_host;
+-    std::vector<int32_t> slot_map;
++    std::string map_err;   // empty: the slot's map is consistent, no overflow, misses > 0
+ };
+ 
++// page_table[b] in [-1, n_slots) (and never -2 after a resolve), slot_block[page_table[b]] == b, and the inverse
++std::string map_check(const Streamed& st) {
++    const std::vector<int32_t> v = st.map_bytes();
++    const int64_t nb = st.m.n_blocks, ns = st.m.n_slots;
++    for (int64_t b = 0; b < nb; ++b) {
++        const int32_t sl = v[(size_t) b];
++        if (sl < -1 || sl >= ns || (sl >= 0 && v[(size_t) (nb + sl)] != b))
++            return "map broken at block " + std::to_string(b) + " (table " + std::to_string(sl) + ")";
++    }
++    for (int64_t sl = 0; sl < ns; ++sl) {
++        const int32_t b = v[(size_t) (nb + sl)];
++        if (b >= 0 && (b >= nb || v[(size_t) b] != sl)) return "slot " + std::to_string(sl) + " not in the table";
++    }
++    const k::KvStreamCounters c = k::kv_stream_counters(st.m);
++    if (c.overflow) return "resolve overflowed";
++    if (c.misses == 0) return "no misses (the slot never evicted)";
++    return {};
++}
++
+ bool run(int fmt) {
+     const char* name = fmt == k::kKvInt8 ? "int8" : "fp16";
+     const k::QsaShapes s = k::qsa_real_shapes();
+     const int64_t H = s.n_head_kv, D = s.head_dim, NH = s.n_head, KVW = H * D;
+     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
+     // A: a 32K prompt in 1K chunks (the prefix staged per chunk grows to ~32K cells: long DMAs beside B)
+-    const int64_t NA = 32768, TA = 1024, n_chunks = NA / TA, RA = 4, blocks_a = NA / s.page_size;
++    const int64_t NA = 32768, TA = 1024, n_chunks = NA / TA, RA = 4, blocks_a = NA / s.page_size, LA = 2;
+     // B: a slot at 24K cells decoding SB steps of 1-4 rows over fewer VRAM slots than blocks (it must evict); one
+     // resolve takes up to ~516 blocks a row, so 4 rows need 4 * 516 slots (kv_stream_parity: 8 rows, 8 * 516 + 700)
+     const int64_t RB = 4;
+@@ -196,7 +227,7 @@ bool run(int fmt) {
+     float* ka = upload(h);
+     for (auto& x : h) x = nd(rng);
+     float* va = upload(h);
+-    std::vector<float> hq((size_t) n_chunks * RA * NH * D);
++    std::vector<float> hq((size_t) LA * n_chunks * RA * NH * D);
+     for (auto& x : hq) x = nd(rng);
+     float* qa = upload(hq);
+     std::vector<int32_t> hids((size_t) n_chunks * RA * cap, 0), hst((size_t) n_chunks * RA * k::kStepCount, 0);
+@@ -228,8 +259,8 @@ bool run(int fmt) {
+ 
+     // the states: A's main (host copy, map never resolved, VRAM slots), its staging pool and identity table;
+     // B's slot and the pad row's slot
+-    Streamed main_a, slot_b, pad;
+-    main_a.alloc(blocks_a, 1024, s, fmt);
++    Streamed main_a[LA], slot_b, pad;
++    for (Streamed& ma : main_a) ma.alloc(blocks_a, 1024, s, fmt);
+     slot_b.alloc(blocks_b, slots_b, s, fmt);
+     pad.alloc(blocks_b, slots_b, s, fmt);
+     Pools stage;
+@@ -240,7 +271,8 @@ bool run(int fmt) {
+     const uint64_t scr = k::qsa_decode_attn_scratch_floats(cap, s);
+     float* scratch_a = dalloc<float>(RA * scr);
+     float* scratch_b = dalloc<float>(RB * scr);
+-    float* out_a = dalloc<float>((size_t) n_chunks * RA * NH * D);
++    const size_t out_a_n = (size_t) LA * n_chunks * RA * NH * D;   // [chunk][layer][row]
++    float* out_a = dalloc<float>(out_a_n);
+     float* out_b = dalloc<float>((size_t) SB * RB * NH * D);
+ 
+     int lo = 0, hi = 0;
+@@ -255,31 +287,43 @@ bool run(int fmt) {
+ 
+     auto reset = [&] {
+         ck(cudaDeviceSynchronize(), "reset sync");
+-        main_a.host.zero(); main_a.slots.zero(); stage.zero(); pad.host.zero(); pad.slots.zero();
++        for (const Streamed& ma : main_a) { ma.host.zero(); ma.slots.zero(); }
++        stage.zero(); pad.host.zero(); pad.slots.zero();
+         slot_b.host.zero(); slot_b.slots.zero();
+-        ck(cudaMemset(out_a, 0, (size_t) n_chunks * RA * NH * D * 4), "out a");
++        ck(cudaMemset(out_a, 0, out_a_n * 4), "out a");
+         ck(cudaMemset(out_b, 0, (size_t) SB * RB * NH * D * 4), "out b");
+-        k::kv_stream_reset(main_a.m, nullptr);
++        for (const Streamed& ma : main_a) k::kv_stream_reset(ma.m, nullptr);
+         k::kv_stream_reset(pad.m, nullptr);
+         k::kv_stream_reset(slot_b.m, nullptr);
+         // B's history [0, L0): appended to the host copy (no block resident), as a conversation restore leaves it
+         append_chunk(kb, vb, L0, 0, slot_b.m.page_table, slot_b.slots, s, nullptr, &slot_b.host.p, nullptr);
+         ck(cudaDeviceSynchronize(), "reset");
+     };
++    // Prefill's kv_prefetch_after: `released` behind the pool's last reader on cs_a, the layer's prefix staged on the
++    // copy stream, `ready` for the layer that consumes it (the staging pool is one per prompt path)
++    auto prefetch = [&](int layer, int64_t p0) {
++        ck(cudaEventRecord(released, cs_a), "released");
++        ck(cudaStreamWaitEvent(cp_a, released, 0), "wait released");
++        k::kv_stage_from_host(stage.attn(ident), main_a[layer].host.p, fmt, (p0 + s.page_size - 1) / s.page_size, s, cp_a);
++        ck(cudaEventRecord(ready, cp_a), "ready");
++    };
+     auto side_a = [&] {
+         for (int64_t c = 0; c < n_chunks; ++c) {
+             const int64_t p0 = c * TA;
+-            if (p0 > 0) {   // Prefill's KV prefetch: the staging pool reused after its last reader, on the copy stream
+-                ck(cudaEventRecord(released, cs_a), "released");
+-                ck(cudaStreamWaitEvent(cp_a, released, 0), "wait released");
+-                k::kv_stage_from_host(stage.attn(ident), main_a.host.p, fmt, (p0 + s.page_size - 1) / s.page_size, s, cp_a);
+-                ck(cudaEventRecord(ready, cp_a), "ready");
+-                ck(cudaStreamWaitEvent(cs_a, ready, 0), "wait ready");
++            if (p0 > 0) prefetch(0, p0);   // the chunk's first streamed layer, queued before the chunk's other work
++            for (int l = 0; l < LA; ++l) {
++                if (p0 > 0) ck(cudaStreamWaitEvent(cs_a, ready, 0), "wait ready");
++                const Streamed& ma = main_a[l];
++                // the layers' K/V differ: layer l reads the prompt's K/V offset by l rows (wrapping at the end)
++                const int64_t src = (p0 + l * 7) % (NA - TA);
++                append_chunk(ka + src * KVW, va + src * KVW, TA, p0, ma.m.page_table, ma.slots, s, cs_a, &ma.host.p,
++                             &stage.p);
++                const int64_t o = (c * LA + l) * RA;
++                k::qsa_decode_attn_batch(qa + o * NH * D, stage.attn(ident), ids_a + c * RA * cap,
++                                         st_a + c * RA * k::kStepCount, cap, s, scratch_a, out_a + o * NH * D, RA, cs_a);
++                // the next layer's prefix, staged into the same pool once this layer's attention has read it
++                if (p0 > 0 && l + 1 < LA) prefetch(l + 1, p0);
+             }
+-            append_chunk(ka + p0 * KVW, va + p0 * KVW, TA, p0, main_a.m.page_table, main_a.slots, s, cs_a, &main_a.host.p,
+-                         &stage.p);
+-            k::qsa_decode_attn_batch(qa + c * RA * NH * D, stage.attn(ident), ids_a + c * RA * cap,
+-                                     st_a + c * RA * k::kStepCount, cap, s, scratch_a, out_a + c * RA * NH * D, RA, cs_a);
+         }
+         ck(cudaStreamSynchronize(cs_a), "a");
+         ck(cudaStreamSynchronize(cp_a), "a copy");
+@@ -301,15 +345,18 @@ bool run(int fmt) {
+     auto collect = [&] {
+         ck(cudaDeviceSynchronize(), "collect");
+         Result r;
+-        r.out_a.resize((size_t) n_chunks * RA * NH * D);
++        r.out_a.resize(out_a_n);
+         r.out_b.resize((size_t) SB * RB * NH * D);
+         ck(cudaMemcpy(r.out_a.data(), out_a, r.out_a.size() * 4, cudaMemcpyDeviceToHost), "out a");
+         ck(cudaMemcpy(r.out_b.data(), out_b, r.out_b.size() * 4, cudaMemcpyDeviceToHost), "out b");
+-        r.main_host = main_a.host.bytes();
++        for (const Streamed& ma : main_a) {
++            const std::vector<uint8_t> b = ma.host.bytes();
++            r.main_host.insert(r.main_host.end(), b.begin(), b.end());
++        }
+         r.stage = stage.bytes();
+         r.slot_host = slot_b.host.bytes();
+         r.pad_host = pad.host.bytes();
+-        r.slot_map = slot_b.map_bytes();
++        r.map_err = map_check(slot_b);
+         return r;
+     };
+ 
+@@ -318,6 +365,7 @@ bool run(int fmt) {
+     side_b();
+     const Result ref = collect();
+     int bad = 0;
++    if (!ref.map_err.empty()) { ++bad; std::fprintf(stderr, "  %s serial run: the slot's map: %s\n", name, ref.map_err.c_str()); }
+     for (int rep = 0; rep < 3; ++rep) {
+         reset();
+         std::atomic<int> go{0};
+@@ -326,19 +374,19 @@ bool run(int fmt) {
+         ta.join();
+         tb.join();
+         const Result r = collect();
+-        const char* what[] = {"A's attention", "B's attention", "the main host copy", "the staging pool",
+-                              "the slot's host copy", "the pad slot's host copy", "the slot's map"};
++        const char* what[] = {"A's attention", "B's attention", "the main host copies", "the staging pool",
++                              "the slot's host copy", "the pad slot's host copy"};
+         const bool same[] = {r.out_a == ref.out_a, r.out_b == ref.out_b, r.main_host == ref.main_host,
+-                             r.stage == ref.stage, r.slot_host == ref.slot_host, r.pad_host == ref.pad_host,
+-                             r.slot_map == ref.slot_map};
+-        for (int i = 0; i < 7; ++i)
++                             r.stage == ref.stage, r.slot_host == ref.slot_host, r.pad_host == ref.pad_host};
++        for (int i = 0; i < 6; ++i)
+             if (!same[i]) { ++bad; std::fprintf(stderr, "  %s run %d: %s differs from the serial run\n", name, rep, what[i]); }
++        if (!r.map_err.empty()) { ++bad; std::fprintf(stderr, "  %s run %d: the slot's map: %s\n", name, rep, r.map_err.c_str()); }
+     }
+     const k::KvStreamCounters c = k::kv_stream_counters(slot_b.m);
+-    std::printf("  %s: %lld chunks of %lld beside %lld window steps, x3 concurrent: slot misses %llu of %llu lookups, "
+-                "overflow %d, %d failures\n", name, (long long) n_chunks, (long long) TA, (long long) SB,
+-                (unsigned long long) c.misses, (unsigned long long) c.lookups, (int) c.overflow, bad);
+-    if (c.overflow || c.misses == 0) ++bad;
++    std::printf("  %s: %lld chunks of %lld x %lld layers beside %lld window steps, x3 concurrent: slot misses %llu of "
++                "%llu lookups (last run), overflow %d, %d failures\n", name, (long long) n_chunks, (long long) TA,
++                (long long) LA, (long long) SB, (unsigned long long) c.misses, (unsigned long long) c.lookups,
++                (int) c.overflow, bad);
+     return bad == 0;
+ }
+ }  // namespace
+-- 
+2.43.0
+
