@@ -1,0 +1,134 @@
+From 0238f7f89aa208e69216fdc59189305622177115 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 20:03:55 +0200
+Subject: [PATCH 2/4] engine: solo pipeline review fixes (opt-in
+ STRATA_SOLO_PIPELINE=1)
+
+- STRATA_PIPELINE_AUTO=0 also keeps the switch from auto-enabling --pipeline-windows 2
+- the boot line names the drafter changes the switch brings to every path (8 rows,
+  forcing kernel, greatest stream priority; STRATA_MTP_PRIORITY=0 is the A/B knob)
+- a failed per-card pre-check says the reservations and drafter changes stay
+- pl_drain returns its error; the solo-pipeline teardown dies with it instead of
+  set_pl_mode's "a window is in flight"
+- STRATA_SOLO_PIPELINE_LOG=1: one line per solo request, pipelined=0/1 and why
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp             | 37 ++++++++++++++++++++++------
+ tests/program/solo_pipeline_test.cpp |  1 +
+ 2 files changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 79bb4f69..7710b94a 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4060,8 +4060,10 @@ int main(int argc, char** argv) {
+         if (on)
+             std::fprintf(stderr, "strata generate: --pipeline-windows 2 is on by default for a layer split of %zu stages "
+                                  "(--pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 turns it off)\n", split_devs.size() + 1);
+-        // STRATA_SOLO_PIPELINE=1 (opt-in): not asked for, --batch on: the solo path's decode pipelined (see solo_pipeline_env)
+-        o.pipeline_windows = strata::program::solo_pipeline::resolve_windows(o.pipeline_windows, true, o.batch,
++        // STRATA_SOLO_PIPELINE=1 (opt-in): not asked for, --batch on: the solo path's decode pipelined (see solo_pipeline_env);
++        // STRATA_PIPELINE_AUTO=0 keeps it off here too (an explicit --pipeline-windows 2 still turns it on)
++        o.pipeline_windows = strata::program::solo_pipeline::resolve_windows(o.pipeline_windows,
++                                                                             !(ae != nullptr && std::atoi(ae) == 0), o.batch,
+                                                                              solo_pipeline_env());
+     }
+     // STRATA_SOLO_PIPELINE=1: --pipeline-windows 2 beside --batch slots (the solo path only; see solo_pipeline_env)
+@@ -4092,7 +4094,10 @@ int main(int argc, char** argv) {
+     if (solo_pl)
+         std::fprintf(stderr, "strata generate: STRATA_SOLO_PIPELINE: --pipeline-windows 2 beside --batch %d: a request "
+                              "alone on the solo path decodes its windows pipelined across the %zu stages (the slots, "
+-                             "the admissions and the prompt reads as before)\n", o.batch, split_devs.size() + 1);
++                             "the admissions and the prompt reads as before; the drafter, which all of them share, is "
++                             "sized for %d rows, carries the forcing kernel and runs at its card's greatest priority - "
++                             "STRATA_MTP_PRIORITY=0: the default one)\n", o.batch, split_devs.size() + 1,
++                     (int) strata::kernels::kVerifyMaxT);
+     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
+     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
+     std::vector<std::unique_ptr<GpuStage>> stages;
+@@ -8502,6 +8507,11 @@ int main(int argc, char** argv) {
+                              (int64_t) fb >= need ? "" : " - too little room: the solo path stays serial");
+                 if ((int64_t) fb < need) ok_r = false;
+             }
++            if (!ok_r)   // what was sized for it before the caches stays: the env is better left off on this split
++                std::fprintf(stderr, "strata serve: STRATA_SOLO_PIPELINE: the solo path stays serial, but the room held "
++                                     "out of the expert caches (%lld MiB per card + the GDN snapshots) and the drafter's "
++                                     "changes (%d rows, forcing kernel, priority) stay - drop STRATA_SOLO_PIPELINE on "
++                                     "this split\n", (long long) kPipeWindowMib, (int) strata::kernels::kVerifyMaxT);
+             return ok_r;
+         };
+         const bool pipe = o.pipeline_windows > 0 && n_stages >= 2 && !split_same && (int) stages.size() == n_stages - 1 &&
+@@ -8860,7 +8870,7 @@ int main(int argc, char** argv) {
+         // here (a checkpoint, a park, the next request and the serial paths all find both stages and the drafter idle).
+         // Every window in flight is served to its end (its picks discarded), then both stages and the drafter idle.
+         // (--adapt-async: the decode loop then settles the asynchronous tier's round, a_pl_settle, see its end.)
+-        auto pl_drain = [&]() {
++        auto pl_drain = [&]() -> std::string {   // the error that stopped it ("" = drained)
+             std::string e2;
+             for (int round = 0; round < 10000000; ++round) {
+                 bool any = false;
+@@ -8869,9 +8879,9 @@ int main(int argc, char** argv) {
+                         strata::core::Verifier& v = stage_ver_p(st, par);
+                         if (!v.in_flight()) continue;
+                         any = true;
+-                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) return;
++                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) return e2.empty() ? std::string("a window's service failed") : e2;
+                         if (v.done(e2)) v.pl_finish(nullptr, e2);
+-                        else if (!e2.empty()) return;
++                        else if (!e2.empty()) return e2;
+                     }
+                 if (!any) break;
+             }
+@@ -8881,6 +8891,7 @@ int main(int argc, char** argv) {
+             }
+             const strata::core::OnDevice on(mtp.device());
+             cudaStreamSynchronize(mtp.stream());
++            return std::string();
+         };
+         std::vector<int64_t> cur;
+         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
+@@ -14676,6 +14687,16 @@ int main(int argc, char** argv) {
+                                      solo_pl_why.c_str());
+                 }
+             }
++            // STRATA_SOLO_PIPELINE_LOG=1 (testing): one line per solo request, pipelined or not and why
++            if (solo_pl && admit_slot < 0) {
++                static const bool solo_pl_log = [] { const char* v = std::getenv("STRATA_SOLO_PIPELINE_LOG");
++                                                     return v != nullptr && v[0] != '\0' && v[0] != '0'; }();
++                if (solo_pl_log)
++                    std::fprintf(stderr, "strata serve: STRATA_SOLO_PIPELINE: request pipelined=%d (%s)\n", solo_pl_on ? 1 : 0,
++                                 solo_pl_on ? "pipelined" : !pl_want ? "the pipeline is off for it (switch, snapshots)"
++                                 : pl_serial != nullptr ? pl_serial : cancelled ? "cancelled"
++                                 : produced_n >= max_new ? "nothing left to decode" : solo_pl_why.c_str());
++            }
+             if (pl_want && pl_serial == nullptr && solo_pl_why.empty() && !cancelled && produced_n < max_new) {
+                 pl_ran = true;
+                 std::vector<int64_t> solo_pl_cap0;   // STRATA_SOLO_PIPELINE: the graphs' VRAM, said at the first capture
+@@ -15278,8 +15299,10 @@ int main(int argc, char** argv) {
+                     if (!last && ajob && !adapt_tick(false)) return die("an adaptive refill failed");
+                     if (last) ending = true;
+                 }
+-                pl_drain();   // nothing in flight: both stages' commits and the drafter have landed
++                const std::string pl_drain_err = pl_drain();   // nothing in flight: both stages' commits and the drafter have landed
+                 if (solo_pl_on) {   // STRATA_SOLO_PIPELINE: the even verifiers' own graphs again (the batch's, the serial loop's)
++                    // (a drain that failed leaves a window in flight: its own error ends the engine, not set_pl_mode's)
++                    if (!pl_drain_err.empty()) return die("the pipelined windows did not drain: " + pl_drain_err);
+                     std::string pe;
+                     for (int st = 0; st < n_stages; ++st) {
+                         strata::core::Verifier& v0 = stage_ver_p(st, 0);
+diff --git a/tests/program/solo_pipeline_test.cpp b/tests/program/solo_pipeline_test.cpp
+index 86418296..2bade20f 100644
+--- a/tests/program/solo_pipeline_test.cpp
++++ b/tests/program/solo_pipeline_test.cpp
+@@ -32,6 +32,7 @@ int main() {
+     check(sp::resolve_windows(0, true, 16, false) == 0, "no switch: unchanged");
+     check(sp::resolve_windows(0, true, 0, true) == 0, "no batch: unchanged");
+     check(sp::resolve_windows(0, false, 16, true) == 0, "--pipeline-windows 0 given: unchanged");
++    check(sp::resolve_windows(0, false, 16, true) == 0, "STRATA_PIPELINE_AUTO=0 (auto_pw false): unchanged");
+     check(sp::resolve_windows(1, false, 16, true) == 1, "--pipeline-windows 1 given: unchanged");
+     check(sp::resolve_windows(2, true, 0, false) == 2, "auto on (HIP) stays on");
+ 
+-- 
+2.43.0
+

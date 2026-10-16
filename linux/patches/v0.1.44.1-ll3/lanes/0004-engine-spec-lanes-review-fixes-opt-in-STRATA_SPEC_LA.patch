@@ -1,0 +1,342 @@
+From 1edbfdb93f0f786ba383ba91b23a31b19e328f78 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:13:05 +0200
+Subject: [PATCH 4/4] engine: spec lanes review fixes (opt-in
+ STRATA_SPEC_LANES=2)
+
+- giveback copies only the cells the lane drafter holds for the slot's
+  conversation (below lane_dk; nothing when it is unknown)
+- a lane runs its own request's PCIe shares (stored per lane slot at
+  admission), not the last request's
+- catch-up: the row is copied on the batch window's stream into one of
+  two buffers per lane; the batch stream waits on the drafter only before
+  reusing a buffer (not on the previous prefill every time)
+- the lanes' window and commit graphs are captured at boot, so the boot
+  lines and the LOW check count them
+- lanes_asked includes the refusals known before the caches; the lane
+  reserve is left out of --layer-split auto's search
+- test knobs: STRATA_SPEC_LANES_NOSTART=1 (everything but lane starts:
+  batch-path byte identity, overhead A/B) and STRATA_SPEC_LANES_HOLD=1
+  (a lone fresh lane slot waits for the next line: exactness drive)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 153 ++++++++++++++++++++++++++++++++-------
+ 1 file changed, 125 insertions(+), 28 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index a9b0b007..5667dd95 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4320,10 +4320,17 @@ int main(int argc, char** argv) {
+     const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? 160 : 0;
+     // STRATA_SPEC_LANES=2 (asked: --serve, --batch, the MTP drafter, a layer split): two more verifiers on every stage
+     // (one per lane, sized like the solo verifier - 8 rows - so a lane's windows are the serial loop's; ~75 MiB of arena
+-    // each plus its window and commit graphs: 200 MiB per lane as an estimate, said per card at boot and at the first
+-    // lane start), allocated after the caches, so kept out of them.  The lanes' drafters load before the caches.
++    // each plus its window and commit graphs: 200 MiB per lane as an estimate, said per card at boot, where the graphs
++    // are captured too), allocated after the caches, so kept out of them.  The lanes' drafters load before the caches.  Not
++    // in `--layer-split auto`'s search: the split is the same with and without the lanes (an A/B stays like for like).
++    // (review: the refusals that are known here already count, so a configuration the lanes refuse later keeps nothing
++    // back; the rest - the slot groups, the slot sessions - is decided where the drafters load and said there)
++    const char* lanes_bmtp_env = std::getenv("STRATA_BATCH_MTP");
+     const bool lanes_asked = spec_lanes_env() == 2 && o.serve && o.batch > 0 && !o.mtp.empty() && o.spec >= 2 &&
+-                             !split_devs.empty();
++                             !split_devs.empty() && !split_same && !mtp_first && !remote_caches && !o.remote_expert_opt &&
++                             o.peer_device < 1 && !o.adapt_async && o.mtp_q4.empty() &&
++                             !strata::core::coupled_draft_env() && !o.batch_mtp &&
++                             !(lanes_bmtp_env != nullptr && lanes_bmtp_env[0] != '\0' && lanes_bmtp_env[0] != '0');
+     const int64_t kLaneVerMib = 200;
+     const int64_t kLaneMib = lanes_asked ? 2 * kLaneVerMib : 0;
+     if (spec_lanes_env() < 0)
+@@ -4331,7 +4338,9 @@ int main(int argc, char** argv) {
+                      std::getenv("STRATA_SPEC_LANES"));
+     else if (spec_lanes_env() == 2 && !lanes_asked)
+         std::fprintf(stderr, "strata generate: WARNING: STRATA_SPEC_LANES=2 is off: it needs --serve, --batch, the MTP "
+-                             "drafter (--mtp, --spec 2 or more) and a layer split\n");
++                             "drafter (--mtp, --spec 2 or more, not on the first card) and a layer split with one GPU per "
++                             "stage, and not --batch-mtp, --adapt-async, --mtp-q4, --peer-device, the helper caches, "
++                             "--remote-expert-opt or STRATA_SPEC_COUPLED / STRATA_SPEC_PROB\n");
+     const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? 96 : 0;   // ~3 MiB per GDN layer, twice, ~15 layers
+     auto gdn_snapshot_bytes = [&](const strata::core::SessionState& s0) -> size_t {
+         return (size_t) s0.gdn_alloc * ((size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+@@ -4387,7 +4396,7 @@ int main(int argc, char** argv) {
+         const int64_t base_reserve =
+             later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
+         const int64_t reserve = (base_reserve + pf + (later ? kWindowMib : kPipeSnapMib) +
+-                                 kPipeWindowMib + kLaneMib + (drafter ? kDrafterMib : 0)) << 20;
++                                 kPipeWindowMib + (search ? 0 : kLaneMib) + (drafter ? kDrafterMib : 0)) << 20;
+         return std::max<int64_t>((int64_t) fb - reserve, 0);
+     };
+     if (multi_gpu && split_auto) {
+@@ -8989,8 +8998,14 @@ int main(int argc, char** argv) {
+         std::vector<cudaStream_t> lane_stream;
+         SplitDrive lane_sd[2];
+         float* lane_R[2] = {nullptr, nullptr};     // the drafters' row buffers (their bound window rows)
+-        float* lane_cuR[2] = {nullptr, nullptr};   // a batch window's row of a lane slot, for its drafter (catch-up)
+-        cudaEvent_t lane_cu_ev[2] = {nullptr, nullptr};   // after that row's copy (the last stage's stream waits for it)
++        // a batch window's row of a lane slot, for its drafter (catch-up): two per lane, used in turn; after a row's copy
++        // (on the batch window's stream: the drafter's stream waits for it) and after the drafter's prefill read it (the
++        // copy into that buffer two catch-ups later waits for it)
++        float* lane_cuR[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
++        cudaEvent_t lane_cu_ev[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
++        cudaEvent_t lane_cu_rd[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
++        bool lane_cu_rd_live[2][2] = {{false, false}, {false, false}};
++        int lane_cu_k[2] = {0, 0};
+         cudaEvent_t lane_ch_ev[2] = {nullptr, nullptr};   // after a lane's chain (the drafter's card: one thing at a time)
+         cudaEvent_t lane_s3_ev = nullptr;                 // after the last lane window launched on the last stage
+         std::vector<cudaEvent_t> lane_cm_ev[2];           // per stage: after a lane's commit (a finished slot's capture)
+@@ -9106,7 +9121,7 @@ int main(int argc, char** argv) {
+                         v->set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                         lane_v[j].push_back(std::move(v));
+                     }
+-                    lane_sd[j] = split_drive;   // (the request's PCIe shares are copied at each lane start)
++                    lane_sd[j] = split_drive;   // (the slot's request's PCIe shares are copied at each lane start)
+                     for (int st = 0; st < n_stages; ++st) lane_sd[j].plan[st] = lane_ver(j, st).plan_sink();
+                     // the setters (sampling) reach the last stage; nothing chains a run or a commit
+                     for (int st = 0; st + 1 < n_stages; ++st) lane_ver(j, st).set_next(&lane_ver(j, st + 1), &lane_sd[j]);
+@@ -9117,18 +9132,45 @@ int main(int argc, char** argv) {
+                 const size_t row_b = (size_t) (g.hc * g.n_embd) * sizeof(float);
+                 for (int j = 0; j < 2; ++j) {
+                     if (cudaMalloc((void**) &lane_R[j], (size_t) o.spec * row_b) != cudaSuccess ||
+-                        cudaMalloc((void**) &lane_cuR[j], row_b) != cudaSuccess)
++                        cudaMalloc((void**) &lane_cuR[j][0], row_b) != cudaSuccess ||
++                        cudaMalloc((void**) &lane_cuR[j][1], row_b) != cudaSuccess)
+                         return fail("a drafter's row buffer does not fit");
+                     if (!lane_mtp[(size_t) j]->bind(last_st->wt, &last_st->head, lane_R[j], err, &mtp))
+                         return fail("lane " + std::to_string(j) + "'s drafter: " + err);
+                     if (!lane_mtp[(size_t) j]->prepare_prefill(err) || !lane_mtp[(size_t) j]->prepare_chain(err))
+                         return fail("lane " + std::to_string(j) + "'s drafter graphs: " + err);
+-                    if (cudaEventCreateWithFlags(&lane_cu_ev[j], cudaEventDisableTiming) != cudaSuccess ||
++                    if (cudaEventCreateWithFlags(&lane_cu_ev[j][0], cudaEventDisableTiming) != cudaSuccess ||
++                        cudaEventCreateWithFlags(&lane_cu_ev[j][1], cudaEventDisableTiming) != cudaSuccess ||
++                        cudaEventCreateWithFlags(&lane_cu_rd[j][0], cudaEventDisableTiming) != cudaSuccess ||
++                        cudaEventCreateWithFlags(&lane_cu_rd[j][1], cudaEventDisableTiming) != cudaSuccess ||
+                         cudaEventCreateWithFlags(&lane_ch_ev[j], cudaEventDisableTiming) != cudaSuccess)
+                         return fail("an event could not be created");
+                 }
+                 if (cudaEventCreateWithFlags(&lane_s3_ev, cudaEventDisableTiming) != cudaSuccess)
+                     return fail("an event could not be created");
++                // the lanes' window and commit graphs, here at boot (nothing is in flight; a capture waits for its
++                // stream), so the boot lines and the LOW check of "VRAM free with everything loaded" count them and the
++                // first two users that meet do not wait for eight captures (review of M1b: they were captured at the
++                // first lane start, live, and counted nowhere).  The graphs are the same: all_resident is fixed at init.
++                std::string gcost;
++                for (int st = 0; st < n_stages; ++st) {
++                    const strata::core::OnDevice on(lane_dev(st));
++                    size_t f0 = 0, f1 = 0, tb = 0;
++                    cudaMemGetInfo(&f0, &tb);
++                    for (int j = 0; j < 2; ++j) {
++                        std::string e2;
++                        if (!lane_ver(j, st).capture_all(e2, o.spec))
++                            return fail("lane " + std::to_string(j) + "'s graphs on CUDA" + std::to_string(lane_dev(st)) +
++                                        ": " + (e2.empty() ? std::string("a capture failed") : e2));
++                    }
++                    cudaMemGetInfo(&f1, &tb);
++                    char b[64];
++                    std::snprintf(b, sizeof b, "%sCUDA%d %lld MiB", st == 0 ? "" : ", ", lane_dev(st),
++                                  (long long) (((int64_t) f0 - (int64_t) f1) >> 20));
++                    gcost += b;
++                }
++                std::fprintf(stderr, "strata serve: STRATA_SPEC_LANES=2: the lanes' window and commit graphs took %s\n",
++                             gcost.c_str());
+                 return true;
+             };
+             if (!build()) {
+@@ -9148,9 +9190,8 @@ int main(int argc, char** argv) {
+                                   (long long) (lane_free0[(size_t) st] - (int64_t) (fb >> 20)), (long long) (fb >> 20));
+                     costs += b;
+                 }
+-                std::fprintf(stderr, "strata serve: STRATA_SPEC_LANES=2: the lane verifiers, hand-offs and the drafters' "
+-                                     "graphs took %s; their window graphs follow at the first lane start (said there)\n",
+-                             costs.c_str());
++                std::fprintf(stderr, "strata serve: STRATA_SPEC_LANES=2: the lane verifiers, hand-offs, the drafters' "
++                                     "graphs and the lanes' window graphs took %s\n", costs.c_str());
+                 std::printf("INFO spec_lanes=2 lane_slots=%d,%d\n", lane_slot[0], lane_slot[1]);
+             }
+         }
+@@ -11192,6 +11233,9 @@ int main(int argc, char** argv) {
+             int64_t draft_p = -1;
+             int draft_n = 0;
+             std::array<float, strata::kernels::kVerifyMaxT> dprob{};
++            // the request's PCIe shares per stage (its pcie_frac, as its prompt read ran them), so a lane runs the serial
++            // loop's (review of M1b: the lanes took the last request's); lane slots only
++            int pcie_num[SplitDrive::kMax] = {};
+         };
+         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+         // STRATA_SPEC_LANES: lane j's drafter holds its slot's conversation's draft K/V for the cells below lane_dk[j]
+@@ -11205,23 +11249,32 @@ int main(int argc, char** argv) {
+         // STRATA_SPEC_LANES: a batch window fed lane slot b's token at `cell` and picked `y` after it.  Its row `R_row`
+         // (the last stage's final residual, on the drafter's card) goes into the lane's drafter as one more cell - the
+         // T = 1 catch-up a lane's own chain makes - so a lane that starts later drafts from a K/V without a hole.  The
+-        // row is copied on the drafter's stream and the last stage's stream `cs` waits for that copy only (the next batch
+-        // window there rewrites the row); the cell's prefill follows on the drafter's stream.  Nothing here waits on the
+-        // host, and the batch window's own work is untouched.  STRATA_SPEC_LANES_CATCHUP=0: off (the A/B).
++        // row is copied on the last stage's stream `cs` itself (in order before the next batch window there rewrites it)
++        // into one of the lane's two row buffers, and the drafter's stream waits for that copy before the cell's prefill.
++        // `cs` waits on the drafter only before it reuses a buffer: for the prefill two catch-ups back (review of M1b:
++        // the copy on the drafter's stream made the next batch window wait for the previous prefill as well).  Nothing
++        // here waits on the host, and the batch window's own work is untouched.  STRATA_SPEC_LANES_CATCHUP=0: off.
+         static const bool lane_catchup_on = [] {
+             const char* v = std::getenv("STRATA_SPEC_LANES_CATCHUP");
+             return v == nullptr || std::atoi(v) != 0;
+         }();
+         auto lane_catchup = [&](int j, const float* R_row, cudaStream_t cs, int32_t y, int64_t cell) {
+-            if (!lane_catchup_on || j < 0 || lane_cuR[j] == nullptr) return;
++            if (!lane_catchup_on || j < 0 || lane_cuR[j][0] == nullptr) return;
+             strata::core::MtpDrafter& d = *lane_mtp[(size_t) j];
+             const strata::core::OnDevice on(d.device());
+             std::string e2;
+-            if (cudaMemcpyAsync(lane_cuR[j], R_row, (size_t) (g.hc * g.n_embd) * sizeof(float), cudaMemcpyDeviceToDevice,
+-                                d.stream()) != cudaSuccess ||
+-                cudaEventRecord(lane_cu_ev[j], d.stream()) != cudaSuccess ||
+-                cudaStreamWaitEvent(cs, lane_cu_ev[j], 0) != cudaSuccess ||
+-                !d.prefill(lane_cuR[j], &y, 1, cell, e2, false)) {
++            const int k = lane_cu_k[j];
++            lane_cu_k[j] ^= 1;
++            if ((lane_cu_rd_live[j][k] && cudaStreamWaitEvent(cs, lane_cu_rd[j][k], 0) != cudaSuccess) ||
++                cudaMemcpyAsync(lane_cuR[j][k], R_row, (size_t) (g.hc * g.n_embd) * sizeof(float), cudaMemcpyDeviceToDevice,
++                                cs) != cudaSuccess ||
++                cudaEventRecord(lane_cu_ev[j][k], cs) != cudaSuccess ||
++                cudaStreamWaitEvent(d.stream(), lane_cu_ev[j][k], 0) != cudaSuccess ||
++                !d.prefill(lane_cuR[j][k], &y, 1, cell, e2, false) ||
++                cudaEventRecord(lane_cu_rd[j][k], d.stream()) != cudaSuccess) {
++                (void) cudaGetLastError();
++                // (whatever of it was queued on the drafter's stream: the next copy into this buffer waits for it)
++                lane_cu_rd_live[j][k] = cudaEventRecord(lane_cu_rd[j][k], d.stream()) == cudaSuccess;
+                 (void) cudaGetLastError();
+                 static bool said = false;
+                 if (!said)
+@@ -11232,6 +11285,7 @@ int main(int argc, char** argv) {
+                 lane_dk[j] = -1;
+                 return;
+             }
++            lane_cu_rd_live[j][k] = true;
+             if (lane_dk[j] != cell) ++lane_cu_hole[j];
+             lane_dk[j] = cell + 1;
+             ++lane_cu_n[j];
+@@ -11442,12 +11496,16 @@ int main(int argc, char** argv) {
+                 const char* v = std::getenv("STRATA_SPEC_LANES_GIVEBACK");
+                 return v == nullptr || std::atoi(v) != 0;
+             }();
+-            if (const int j = lane_of(b); j >= 0 && lane_giveback) {
++            // Only the cells the lane drafter is known to hold for this conversation (below lane_dk: copy_to_slot, the
++            // one writer of a slot's sessions, sets it for each admission; -1 after a copy or catch-up that failed: then
++            // nothing is given back) (review of M1b: an unknown lane drafter overwrote the solo drafter's cells)
++            if (const int j = lane_of(b); j >= 0 && lane_giveback && lane_dk[j] > 0) {
+                 const strata::core::OnDevice on_mtp(mtp.device());
+                 strata::core::MtpDrafter& d = *lane_mtp[(size_t) j];
++                const int64_t give = std::min<int64_t>(upto, lane_dk[j]);
+                 std::string e2;
+                 if (d.idle(e2) && mtp.idle(e2) &&
+-                    strata::core::conversation_kv_copy(d.kv_state(), mtp.kv_state(), draft_geometry, upto, false, e2) &&
++                    strata::core::conversation_kv_copy(d.kv_state(), mtp.kv_state(), draft_geometry, give, false, e2) &&
+                     cudaDeviceSynchronize() == cudaSuccess) {
+                     mtp.set_prompt_len(upto);
+                 } else {
+@@ -12331,7 +12389,7 @@ int main(int argc, char** argv) {
+             int64_t windows = 0, tokens = 0, offered = 0, accepted = 0;
+         };
+         Lane lanes[2];
+-        bool lanes_live = false, lane_prepared = false;
++        bool lanes_live = false, lane_prepared = lanes_on;   // (the lanes' graphs: captured at boot)
+         bool lane_s3_live = false, lane_ch_live[2] = {false, false};
+         // STRATA_SPEC_LANES_ONE=1: a lane also runs alone (the other lane slot idle); default: both lane slots decoding
+         static const bool lanes_one = [] {
+@@ -12349,6 +12407,25 @@ int main(int argc, char** argv) {
+             const char* v = std::getenv("STRATA_SPEC_LANES_LOG");
+             return v != nullptr && v[0] != '\0' && v[0] != '0';
+         }();
++        // STRATA_SPEC_LANES_NOSTART=1 (testing, review of M1b): everything the lanes do beside the pump (the boot, the
++        // reserves, the admission's drafter copy and first drafts, the catch-ups, the giveback), but they never start -
++        // the batch path's byte-identity check and the overhead A/B with the switch on
++        static const bool lanes_nostart = [] {
++            const char* v = std::getenv("STRATA_SPEC_LANES_NOSTART");
++            return v != nullptr && v[0] != '\0' && v[0] != '0';
++        }();
++        // STRATA_SPEC_LANES_HOLD=1 (testing, review of M1b: the exactness drive): a lane slot that decodes alone and has
++        // only its admission's token so far waits for the next line instead of a pump turn, so the second user's BGEN
++        // finds it untouched and the slot runs admission -> lane windows only (the path whose tokens are serial solo
++        // spec's).  Never in production: a lone first user waits there until another line comes.
++        static const bool lanes_hold = [] {
++            const char* v = std::getenv("STRATA_SPEC_LANES_HOLD");
++            return v != nullptr && v[0] != '\0' && v[0] != '0';
++        }();
++        if (lanes_on && (lanes_nostart || lanes_hold))
++            std::fprintf(stderr, "strata serve: STRATA_SPEC_LANES=2:%s%s (testing knobs)\n",
++                         lanes_nostart ? " NOSTART - the lanes never start" : "",
++                         lanes_hold ? " HOLD - a lone, fresh lane slot waits for the next line" : "");
+         Clock::time_point lanes_t0{};
+         int64_t lanes_starts = 0;
+         std::string lanes_refused;   // why the lanes did not start the last time (said once per reason)
+@@ -12364,7 +12441,7 @@ int main(int argc, char** argv) {
+         // the gate (spec_lanes::gate): both lane slots (STRATA_SPEC_LANES_ONE: at least one) and nothing else decoding,
+         // each a request that may run in a lane
+         auto lanes_want = [&]() -> bool {
+-            if (!lanes_on) return false;
++            if (!lanes_on || lanes_nostart) return false;
+             strata::program::spec_lanes::Slot v[2];
+             bool others = false;
+             for (int b = 0; b < (int) bs.size(); ++b) {
+@@ -12379,6 +12456,20 @@ int main(int argc, char** argv) {
+             }
+             return strata::program::spec_lanes::gate(v, 2, others, lanes_one);
+         };
++        // STRATA_SPEC_LANES_HOLD: one lane slot decoding, nothing else, and it has only its admission's token
++        auto lanes_hold_now = [&]() -> bool {
++            if (!lanes_hold || !lanes_on || lanes_nostart || lanes_live) return false;
++            int n = 0;
++            bool fresh = false;
++            for (int b = 0; b < (int) bs.size(); ++b) {
++                const BSlot& sl = bs[(size_t) b];
++                if (!sl.active) continue;
++                if (lane_of(b) < 0) return false;
++                ++n;
++                fresh = sl.produced == 1;
++            }
++            return n == 1 && fresh;
++        };
+         // what must hold before they start (else the pump goes on): no expert swap pending, no overlapped read, and every
+         // lane stage whose graphs are the zero-doorbell ones still all in VRAM (they are captured that way)
+         auto lanes_may_begin = [&]() -> bool {
+@@ -12396,7 +12487,7 @@ int main(int argc, char** argv) {
+             return false;
+         };
+         // the lanes' window and commit graphs, once (a capture waits for its stream: nothing of the lanes is in flight);
+-        // what they took is said per card.  A capture that fails turns the lanes off for good (said), the pump goes on.
++        // what they took is said per card.  (Boot captures them now, so this only runs if that ever stops.)  A capture that fails turns the lanes off for good (said), the pump goes on.
+         auto lane_prepare = [&]() -> bool {
+             if (lane_prepared) return true;
+             std::vector<int64_t> f0;
+@@ -12456,7 +12547,7 @@ int main(int argc, char** argv) {
+                 v0.set_sampling(sl.sp);
+                 v0.set_history(nullptr, 0);
+                 v0.set_head_sampling(true);
+-                for (int st = 0; st < n_stages; ++st) lane_sd[j].pcie_num[st] = split_drive.pcie_num[st];
++                for (int st = 0; st < n_stages; ++st) lane_sd[j].pcie_num[st] = sl.pcie_num[st];   // (its request's)
+                 L.on = true;
+                 if (lanes_log) {
+                     char b[160];
+@@ -13105,6 +13196,10 @@ int main(int argc, char** argv) {
+                         if (lanes_want() && !lane_begin()) return 1;
+                         continue;
+                     }
++                    if (lanes_on && lanes_hold_now() && !(piped && pipe_inflight())) {   // (STRATA_SPEC_LANES_HOLD)
++                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                        continue;
++                    }
+                     if (!(piped ? pump(true) : batch_step())) return 1;
+                     continue;
+                 }
+@@ -16540,6 +16635,8 @@ int main(int argc, char** argv) {
+                     sl.sp = req_sp;
+                     sl.spec_min_p = req_spec_min_p;
+                     sl.lane_ok = hist_n == 0 && req_bias.empty() && live_imgs.empty() && req_imgs.empty();
++                    if (lane_of(admit_slot) >= 0)
++                        for (int st = 0; st < SplitDrive::kMax; ++st) sl.pcie_num[st] = split_drive.pcie_num[st];
+                     if (const int lj = lane_of(admit_slot); lj >= 0 && lane_dk[lj] == p - 1) {
+                         const int64_t row = (p - 1) - (merge_T > 0 ? merge_at : n - 1);
+                         strata::core::MtpDrafter& d = *lane_mtp[(size_t) lj];
+-- 
+2.43.0
+

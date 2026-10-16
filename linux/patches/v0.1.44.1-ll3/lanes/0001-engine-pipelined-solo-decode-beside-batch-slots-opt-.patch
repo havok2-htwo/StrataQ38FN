@@ -1,0 +1,722 @@
+From 810154956f0422b8448dc205b296e96a0b5e6f7e Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:46:31 +0200
+Subject: [PATCH 1/4] engine: pipelined solo decode beside --batch slots
+ (opt-in STRATA_SOLO_PIPELINE=1)
+
+With --batch, a request the server sends to the solo path (GEN) can run the
+pipelined decode loop (--pipeline-windows 2: two verifiers per stage, windows
+overlapped across the stages) instead of the serial solo loop.  Batch windows,
+admissions (BGEN's first token, incl. STRATA_ADMIT_MERGE_FIRST) and all prompt
+reads keep their serial windows.
+
+- gate: STRATA_SOLO_PIPELINE=1 lifts "not with --batch slots" for
+  --pipeline-windows 2 (auto -> 2 when --batch is on); refused with --batch-mtp.
+- the even verifiers stay the batch/serial ones: no set_always_publish; only
+  their stream is the stage's shared one.  Verifier::set_pl_mode gives their
+  pipelined windows own graphs (exec_pl_: publish every row, no one-token
+  self-commit); a T>=2 window of an all-resident stage shares its zero-doorbell
+  exec_ (identical recording).  Toggled on after the gate, off after pl_drain.
+- odd verifiers (ver_b) sized like the even ones (max_t 8) so both parities run
+  the serial loop's window shapes; capture_all(up_to = --spec).
+- VRAM: a later front stage also holds its GDN snapshots out of its cache; a
+  boot pre-check per card (verifier + snapshots + kVramSafeMib + 256 MiB) keeps
+  the solo path serial instead of loaning/paging; per-card cost of the second
+  verifiers/snapshots and of the first capture is logged.
+- a solo request stays serial (said once): images in context, batch slots
+  active, groups in flight, an all-resident stage out of VRAM, snapshot size
+  changed, penalties/coupled drafts (as before).
+- rules in include/strata/program/solo_pipeline.hpp, test solo_pipeline_test.
+Off (default): kernels SASS-identical, host default branches unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                           |   5 +
+ include/strata/core/verify.hpp           |  18 +-
+ include/strata/program/solo_pipeline.hpp |  55 +++++++
+ src/core/verify.cpp                      |  41 ++++-
+ src/program/generate.cpp                 | 200 +++++++++++++++++++++--
+ tests/program/solo_pipeline_test.cpp     |  81 +++++++++
+ 6 files changed, 379 insertions(+), 21 deletions(-)
+ create mode 100644 include/strata/program/solo_pipeline.hpp
+ create mode 100644 tests/program/solo_pipeline_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ad1cb29a..c469bea0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -288,6 +288,11 @@ if(STRATA_BUILD_TESTS)
+   add_executable(mrope_regions_test tests/program/mrope_regions_test.cpp)
+   target_include_directories(mrope_regions_test PRIVATE include)
+   add_test(NAME mrope_regions_test COMMAND mrope_regions_test)
++  # STRATA_SOLO_PIPELINE: --pipeline-windows 2 beside --batch (the switch, the room per card, which solo requests stay
++  # serial; header-only, CPU)
++  add_executable(solo_pipeline_test tests/program/solo_pipeline_test.cpp)
++  target_include_directories(solo_pipeline_test PRIVATE include)
++  add_test(NAME solo_pipeline_test COMMAND solo_pipeline_test)
+   # STRATA_SLOT_CHAIN_REUSE / STRATA_GIVEBACK_CHECKS: which checkpoints an idle batch slot hands to a request, the order
+   # of a slot's sources (against the loop as it was, switch off) and what a give-back does with the slot (header-only, CPU)
+   add_executable(slot_chain_test tests/program/slot_chain_test.cpp)
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index e34c1498..df8c2e77 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -277,6 +277,17 @@ public:
+     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
+     /// the device-planned layers (E-6) off.  Before `init`.
+     void set_always_publish(bool on) { always_publish_ = on; }
++    /// STRATA_SOLO_PIPELINE (opt-in; --pipeline-windows 2 beside --batch slots): this verifier (a stage's even one) also
++    /// runs the batch windows and the serial solo windows, so it is not set_always_publish.  On, its pipelined windows
++    /// (capture_all, pl_launch) run graphs recorded as set_always_publish would record them: every layer publishes its
++    /// rows, no one-token self-commit.  Those are its own graphs (exec_pl_), except a T >= 2 window of an all-resident
++    /// stage, whose zero-doorbell graph is the same either way (it shares exec_).  Refused (false, `err`) with a window
++    /// in flight, the device-planned layers (E-6) or an all-resident stage that has experts out of VRAM now.  Off:
++    /// everything as before.  Nothing in flight.
++    bool set_pl_mode(bool on, std::string& err);
++    bool pl_mode() const { return pl_mode_; }
++    /// All the stage's experts are in its VRAM cache (the zero-doorbell graph is its normal one; ar_live: right now)
++    bool all_resident() const { return all_resident_; }
+     /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
+     /// which never ask the host.  The pointer must outlive the verifier's windows.
+     bool set_adapt_gate(AdaptGate* g) {
+@@ -288,7 +299,8 @@ public:
+     cudaStream_t stream() const { return cs_; }
+     int device() const { return device_; }
+     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
+-    bool capture_all(std::string& err);
++    /// `up_to` > 0: the window sizes 1 .. up_to only (STRATA_SOLO_PIPELINE: the pipelined windows' largest).
++    bool capture_all(std::string& err, int up_to = 0);
+     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
+     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
+@@ -404,6 +416,10 @@ private:
+     // pipelined windows (pl_launch ...)
+     cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
+     bool always_publish_ = false;
++    bool pl_mode_ = false;                ///< set_pl_mode (STRATA_SOLO_PIPELINE)
++    cudaGraphExec_t exec_pl_[9] = {};     ///< set_pl_mode: the pipelined windows' own graphs
++    /// set_pl_mode: the graph a pipelined window of T tokens runs (see set_pl_mode)
++    cudaGraphExec_t& pl_exec(int T) { return all_resident_ && T >= 2 ? exec_[T] : exec_pl_[T]; }
+     bool adapt_gate_wait(int32_t layer, std::string& err);
+     AdaptGate* adapt_gate_ = nullptr;     ///< 0.1.43: STRATA_ADAPT_OVERLAP's gate (null: off)
+     void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
+diff --git a/include/strata/program/solo_pipeline.hpp b/include/strata/program/solo_pipeline.hpp
+new file mode 100644
+index 00000000..e06a5ca1
+--- /dev/null
++++ b/include/strata/program/solo_pipeline.hpp
+@@ -0,0 +1,55 @@
++// include/strata/program/solo_pipeline.hpp - STRATA_SOLO_PIPELINE (opt-in): --pipeline-windows 2 beside --batch slots
++// (header-only: the rules, no CUDA).
++//
++// With --batch the server sends a request that is alone to the solo path (GEN) and the engine decodes it with the serial
++// solo loop.  STRATA_SOLO_PIPELINE=1 lets that request run the pipelined decode loop instead (two verifiers per stage,
++// one conversation's windows overlapped across the stages; the same graphs, so the same tokens).  The batch windows,
++// the admissions (BGEN's first token) and every prompt read keep their serial windows.  These are the rules that decide
++// when it is on, for the engine and its test.
++#pragma once
++
++#include <cstdint>
++
++namespace strata::program::solo_pipeline {
++
++/// The switch's text: unset, empty and "0..." are off, anything else on.
++inline bool env_on(const char* v) { return v != nullptr && v[0] != '\0' && v[0] != '0'; }
++
++/// --pipeline-windows as the engine resolves it: not asked for (`auto_pw`), --batch on and the switch on: 2.
++inline int resolve_windows(int pipeline_windows, bool auto_pw, int batch, bool env) {
++    return auto_pw && pipeline_windows == 0 && batch > 0 && env ? 2 : pipeline_windows;
++}
++
++/// Is it asked for: the switch, --batch and --pipeline-windows 2 (1 stays refused beside --batch).
++inline bool asked(int pipeline_windows, int batch, bool env) { return env && batch > 0 && pipeline_windows >= 2; }
++
++/// What one card needs free before the second verifier is made: the verifier (`window_mib`, as the cache sizing holds
++/// it back), the stage's GDN snapshots (front stages; 0 on the last), and the engine's safe floor plus 256 MiB for the
++/// even verifier and the graphs still to come.  Less: the solo path stays serial (no loan, no paging).
++inline int64_t room_need_bytes(int64_t window_mib, int64_t snapshot_bytes, int64_t safe_mib) {
++    return ((window_mib + safe_mib + 256) << 20) + snapshot_bytes;
++}
++
++/// One solo request, as the decode loop sees it before it starts.
++struct Request {
++    bool admission = false;        ///< a batch admission's first token (BGEN): the batch path's, never pipelined
++    bool images = false;           ///< images in the request or the live session (the serial loop, as measured)
++    bool slots_active = false;     ///< batch slots decoding (nothing pumps them while a solo request runs)
++    bool groups_in_flight = false; ///< pipelined slot groups not drained
++    bool out_of_vram = false;      ///< an all-resident stage with experts out of VRAM now (its graphs were captured all-resident)
++    bool snapshot_resized = false; ///< a front stage's GDN state is no longer the size its snapshots were made for
++};
++
++/// Why `r` decodes serially (said once per reason), or nullptr: pipelined.  `silent`: an admission, not worth a line.
++inline const char* why_serial(const Request& r, bool& silent) {
++    silent = false;
++    if (r.admission) { silent = true; return "a batch admission"; }
++    if (r.images) return "images in its context";
++    if (r.slots_active) return "batch slots decoding";
++    if (r.groups_in_flight) return "slot groups in flight";
++    if (r.out_of_vram) return "experts out of VRAM (a loan, a shrink or a swap)";
++    if (r.snapshot_resized) return "a GDN state of another size";
++    return nullptr;
++}
++
++}  // namespace strata::program::solo_pipeline
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 4b7473c3..44abe7c8 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -530,6 +530,8 @@ Verifier::~Verifier() {
+         if (e) cudaGraphExecDestroy(e);
+     for (auto& e : exec_nr_)
+         if (e) cudaGraphExecDestroy(e);
++    for (auto& e : exec_pl_)
++        if (e) cudaGraphExecDestroy(e);
+     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+     for (auto& kv : exec_bm_)
+         if (kv.second) cudaGraphExecDestroy(kv.second);
+@@ -915,7 +917,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
+     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
+-    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
++    const bool self_commit = T == 1 && !always_publish_ && !pl_mode_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+     auto stamp = [&](int64_t l, int i, int grp) {
+         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
+@@ -1634,7 +1636,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+ #endif
+             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
+             // whatever the device's residency table says (pipelined windows)
+-            if (remote_opt_ || always_publish_)
++            if (remote_opt_ || always_publish_ || pl_mode_)
+                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+             else {
+@@ -1986,7 +1988,10 @@ void Verifier::refresh_ar() {
+ }
+ 
+ bool Verifier::capture(int T, std::string& err) {
+-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
++    // set_pl_mode: an all-resident stage records its pipelined windows only while it is all-resident (its exec_ is
++    // the zero-doorbell graph; set_pl_mode refuses it otherwise)
++    if (pl_mode_ && all_resident_ && ar_off_) { err = "verify: pipelined windows with experts out of VRAM"; return false; }
++    cudaGraphExec_t& exec_t = pl_mode_ ? pl_exec(T) : ar_off_ ? exec_nr_[T] : exec_[T];
+     if (exec_t != nullptr) return true;
+     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
+         size_t free_b = 0, total_b = 0;
+@@ -2354,6 +2359,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+     const ModelGeometry& g = *g_;
+     SessionState& ss = *ss_;
+     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
++    if (pl_mode_) { err = "verify: a serial window while set_pl_mode is on"; return false; }
+     refresh_ar();
+     if (!capture(T, err) || !capture_commit(err)) return false;
+     VDBG("captured; staging\n");
+@@ -2759,7 +2765,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
+     h_commit_[0] = n_keep;
+     h_commit_[1] = n_keep - 1;
+     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
++    if (last_t_ == 1 && !always_publish_ && !pl_mode_ && one_token_self_commit()) {
+         // a one-token window has advanced the state itself (record_window): no commit graph
+     } else {
+         std::atomic_thread_fence(std::memory_order_seq_cst);
+@@ -3576,12 +3582,12 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
+                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
+ }
+ 
+-bool Verifier::capture_all(std::string& err) {
++bool Verifier::capture_all(std::string& err, int up_to) {
+     const OnDevice on_device(device_);
+     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
+     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
+     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+-    for (int T = 1; T <= max_t_; ++T)
++    for (int T = 1; T <= (up_to > 0 ? std::min(up_to, max_t_) : max_t_); ++T)
+         if (!capture(T, err)) return false;
+     if (!capture_commit(err)) return false;
+     if ((ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) ||
+@@ -3637,7 +3643,8 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+     SessionState& ss = *ss_;
+     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+-    if (exec_[T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
++    cudaGraphExec_t const ex_t = pl_mode_ ? pl_exec(T) : exec_[T];   // (set_pl_mode: its own graphs)
++    if (ex_t == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
+         err = "verify: pipelined window not prepared (capture_all)";
+         return false;
+     }
+@@ -3658,7 +3665,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
+     ms_host += ms_since(t0);
+-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
++    const cudaError_t le = cudaGraphLaunch(ex_t, cs_);
+     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
+@@ -3837,6 +3844,24 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
+     return true;
+ }
+ 
++bool Verifier::set_pl_mode(bool on, std::string& err) {
++    if (fl_active_) { err = "verify: a window is in flight on this verifier"; return false; }
++    // a window staged ahead (prestage) and never launched: the batch and serial windows stage over its inputs between
++    pl_prestaged_ = false;
++    if (!on) {
++        pl_mode_ = false;
++        return true;
++    }
++    if (g_ == nullptr) { err = "verify: set_pl_mode before init"; return false; }
++    if (always_publish_) { pl_mode_ = false; return true; }   // its normal graphs are the pipelined ones already
++    if (device_plan_) { err = "the device-planned layers (STRATA_VERIFY_DEVICE_PLAN)"; return false; }
++    if (remote_opt_ != nullptr) { err = "--remote-expert-opt"; return false; }
++    refresh_ar();
++    if (all_resident_ && ar_off_) { err = "experts out of VRAM (a prompt loan, a shrink or a swap)"; return false; }
++    pl_mode_ = true;
++    return true;
++}
++
+ void Verifier::absorb_stats(Verifier& o) {
+     ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
+     windows += o.windows;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index b2e4cddb..79bb4f69 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -81,6 +81,7 @@
+ #include "strata/spec/suffix_drafter.hpp"
+ #include "strata/program/batch_groups.hpp"
+ #include "strata/program/mrope_regions.hpp"
++#include "strata/program/solo_pipeline.hpp"
+ #include "strata/program/slot_chain.hpp"
+ #include "strata/kernels/cvec.hpp"
+ #include "strata/core/progress.hpp"
+@@ -226,6 +227,14 @@ bool mrope_slots_env() {
+     }();
+     return on;
+ }
++// STRATA_SOLO_PIPELINE=1 (read once; off by default): --pipeline-windows 2 beside --batch slots.  A request the engine
++// decodes on the solo path (GEN: the server's lone request) runs the pipelined decode loop (two verifiers per stage,
++// its windows overlapped across the stages) instead of the serial one; batch admissions (BGEN's first token), the slots'
++// windows and every prompt read stay as they are.  Without --pipeline-windows it asks for 2 when --batch is on.
++bool solo_pipeline_env() {
++    static const bool on = strata::program::solo_pipeline::env_on(std::getenv("STRATA_SOLO_PIPELINE"));
++    return on;
++}
+ // STRATA_CKPT_POOL=1 (read once; off by default): the serve loop keeps the running-state vectors of the conversation
+ // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
+ // resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
+@@ -4051,7 +4060,12 @@ int main(int argc, char** argv) {
+         if (on)
+             std::fprintf(stderr, "strata generate: --pipeline-windows 2 is on by default for a layer split of %zu stages "
+                                  "(--pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 turns it off)\n", split_devs.size() + 1);
++        // STRATA_SOLO_PIPELINE=1 (opt-in): not asked for, --batch on: the solo path's decode pipelined (see solo_pipeline_env)
++        o.pipeline_windows = strata::program::solo_pipeline::resolve_windows(o.pipeline_windows, true, o.batch,
++                                                                             solo_pipeline_env());
+     }
++    // STRATA_SOLO_PIPELINE=1: --pipeline-windows 2 beside --batch slots (the solo path only; see solo_pipeline_env)
++    const bool solo_pl_asked = strata::program::solo_pipeline::asked(o.pipeline_windows, o.batch, solo_pipeline_env());
+     if (o.pipeline_windows > 0) {
+         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+         const char* off = !o.serve ? "it needs --serve"
+@@ -4061,7 +4075,10 @@ int main(int argc, char** argv) {
+                         : split_devs.size() > 1 && o.pipeline_windows == 1 ? "--pipeline-windows 1 needs exactly two stages"
+                         : split_devs.size() > 1 && o.adapt_async ? "not with --adapt-async on three or more stages"
+                         : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
+-                        : o.batch != 0 ? "not with --batch slots"
++                        : o.batch != 0 && !solo_pl_asked ? "not with --batch slots"
++                        : solo_pl_asked && (o.batch_mtp || [] { const char* v = std::getenv("STRATA_BATCH_MTP");
++                                                                return v != nullptr && v[0] != '\0' && v[0] != '0'; }())
++                            ? "STRATA_SOLO_PIPELINE: not with --batch-mtp"
+                         : o.peer_device >= 1 ? "not with --peer-device"
+                         : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
+                         : nullptr;
+@@ -4070,6 +4087,12 @@ int main(int argc, char** argv) {
+             o.pipeline_windows = 0;
+         }
+     }
++    // STRATA_SOLO_PIPELINE: on from here (the batch path, the admissions and the prompt reads keep their serial windows)
++    const bool solo_pl = solo_pl_asked && o.pipeline_windows >= 2;
++    if (solo_pl)
++        std::fprintf(stderr, "strata generate: STRATA_SOLO_PIPELINE: --pipeline-windows 2 beside --batch %d: a request "
++                             "alone on the solo path decodes its windows pipelined across the %zu stages (the slots, "
++                             "the admissions and the prompt reads as before)\n", o.batch, split_devs.size() + 1);
+     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
+     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
+     std::vector<std::unique_ptr<GpuStage>> stages;
+@@ -6195,7 +6218,17 @@ int main(int argc, char** argv) {
+         const auto& lay = strata::kernels::cpu::expert_layout();
+         // the drafter and the head are already allocated by now (they load above, before this), so what is left
+         // to hold back is the windows - and `free_b` has already lost the drafter.
+-        const int64_t room = stage_room(st.dev, true, false);
++        // STRATA_SOLO_PIPELINE: a front stage (all but the last) also keeps two copies of its GDN state for the pipelined
++        // decode (allocated after the caches, like the second verifier kPipeWindowMib already holds back)
++        const int64_t solo_pl_snap = solo_pl && stp.get() != stages.back().get() ? 2 * (int64_t) gdn_snapshot_bytes(st.ss) : 0;
++        const int64_t room = std::max<int64_t>(stage_room(st.dev, true, false) - solo_pl_snap, 0);
++        if (solo_pl_snap > 0)
++            std::fprintf(stderr, "strata generate: STRATA_SOLO_PIPELINE: CUDA%d keeps %lld MiB (the second verifier) + %.1f MiB "
++                                 "(its GDN snapshots) out of the expert cache\n", st.dev, (long long) kPipeWindowMib,
++                         (double) solo_pl_snap / 1048576.0);
++        else if (solo_pl)
++            std::fprintf(stderr, "strata generate: STRATA_SOLO_PIPELINE: CUDA%d keeps %lld MiB (the second verifier) out of "
++                                 "the expert cache\n", st.dev, (long long) kPipeWindowMib);
+         const strata::core::OnDevice on(st.dev);
+         {
+             size_t fb = 0, tb = 0;
+@@ -8448,7 +8481,31 @@ int main(int argc, char** argv) {
+         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
+         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
+         // stage: window K+1 follows window K through them one card behind, and only the last stage waits for K's verdict
+-        const bool pipe = o.pipeline_windows > 0 && n_stages >= 2 && !split_same && (int) stages.size() == n_stages - 1;
++        // STRATA_SOLO_PIPELINE (--batch): the even verifiers are the ones the batch windows and the serial solo windows
++        // run on; they keep their graphs (set_pl_mode gives their pipelined windows their own), only their stream is the
++        // stage's shared one.  The second verifier and the snapshots come out of the room the caches left: a card that
++        // would end below kVramSafeMib (+ 256 MiB for the even verifier and the graphs still to come) keeps the solo
++        // path serial, said per card, rather than borrowing or paging.
++        auto solo_pl_room = [&]() -> bool {
++            bool ok_r = true;
++            for (int st = 0; st < n_stages; ++st) {
++                const int dev = st == 0 ? 0 : stages[(size_t) st - 1]->dev;
++                const strata::core::SessionState& sst = st == 0 ? ss : stages[(size_t) st - 1]->ss;
++                const strata::core::OnDevice on(dev);
++                size_t fb = 0, tb = 0;
++                if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); return false; }
++                const int64_t snap = st + 1 < n_stages ? 2 * (int64_t) gdn_snapshot_bytes(sst) : 0;
++                const int64_t need = strata::program::solo_pipeline::room_need_bytes(kPipeWindowMib, snap, kVramSafeMib);
++                std::fprintf(stderr, "strata serve: STRATA_SOLO_PIPELINE: CUDA%d: %lld MiB free, the second verifier ~%lld "
++                                     "MiB + the GDN snapshots %.1f MiB%s\n", dev, (long long) (fb >> 20),
++                             (long long) kPipeWindowMib, (double) snap / 1048576.0,
++                             (int64_t) fb >= need ? "" : " - too little room: the solo path stays serial");
++                if ((int64_t) fb < need) ok_r = false;
++            }
++            return ok_r;
++        };
++        const bool pipe = o.pipeline_windows > 0 && n_stages >= 2 && !split_same && (int) stages.size() == n_stages - 1 &&
++                          (!solo_pl || solo_pl_room());
+         strata::core::Verifier ver_b;
+         SplitDrive split_drive_b;
+         std::vector<cudaStream_t> pl_stream(pipe ? (size_t) n_stages : 0, nullptr);
+@@ -8459,16 +8516,31 @@ int main(int argc, char** argv) {
+         };
+         if (pipe) {
+             bool ok_p = true;
+-            ok_p = cudaStreamCreateWithFlags(&pl_stream[0], cudaStreamNonBlocking) == cudaSuccess;   // the current card
++            // STRATA_SOLO_PIPELINE: the even verifiers' windows stream as their own would be (STRATA_PIPE_OVERLAP_PRIO:
++            // at the greatest priority, see Verifier::set_stream_priority_high)
++            auto make_pl_stream = [&](cudaStream_t& s_) -> bool {
++#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
++                if (solo_pl && pipe_overlap_prio) {
++                    int lo = 0, hi = 0;
++                    if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
++                        cudaStreamCreateWithPriority(&s_, cudaStreamNonBlocking, hi) == cudaSuccess)
++                        return true;
++                    (void) cudaGetLastError();
++                }
++#endif
++                return cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking) == cudaSuccess;
++            };
++            ok_p = make_pl_stream(pl_stream[0]);   // the current card
+             for (int st = 1; st < n_stages && ok_p; ++st) {
+                 const strata::core::OnDevice on(stages[(size_t) st - 1]->dev);
+-                ok_p = cudaStreamCreateWithFlags(&pl_stream[(size_t) st], cudaStreamNonBlocking) == cudaSuccess;
++                ok_p = make_pl_stream(pl_stream[(size_t) st]);
+             }
+             if (!ok_p) { std::fprintf(stderr, "strata serve: --pipeline-windows: stream creation failed\n"); return 1; }
+             for (int st = 0; st < n_stages; ++st)
+                 for (int par = 0; par < 2; ++par) {
+                     stage_ver_p(st, par).set_stream(pl_stream[(size_t) st]);
+-                    stage_ver_p(st, par).set_always_publish(true);
++                    // STRATA_SOLO_PIPELINE: not the even ones, which the batch and the serial windows share (set_pl_mode)
++                    if (!(solo_pl && par == 0)) stage_ver_p(st, par).set_always_publish(true);
+                 }
+         }
+         if (n_stages > 1) {
+@@ -8539,6 +8611,20 @@ int main(int argc, char** argv) {
+         // --pipeline-windows: the odd windows' verifiers and their hand-off (initialized before `ver`, which stays the
+         // watchdog's verifier), and the drafter's own row buffer, which either parity's rows are copied into
+         float* pl_mtp_R = nullptr;
++        // STRATA_SOLO_PIPELINE: what the second verifier, its hand-off and the GDN snapshots take on each card (said once
++        // the snapshots are allocated; the graphs follow at the first pipelined request, said there)
++        auto card_free_mib = [&](int st) -> int64_t {
++            const strata::core::OnDevice on(st == 0 ? 0 : stages[(size_t) st - 1]->dev);
++            size_t fb = 0, tb = 0;
++            if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); return -1; }
++            return (int64_t) (fb >> 20);
++        };
++        std::vector<int64_t> solo_pl_free[3];   // before the second verifiers, after them, before the snapshots
++        auto solo_pl_mark = [&](int k) {
++            if (pipe && solo_pl)
++                for (int st = 0; st < n_stages; ++st) solo_pl_free[k].push_back(card_free_mib(st));
++        };
++        solo_pl_mark(0);
+         if (pipe) {
+             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+@@ -8566,7 +8652,9 @@ int main(int argc, char** argv) {
+                 vs.blob = thits.blob;
+                 vs.slot_off = gs.cache.slot_offsets();
+                 vs.n_slots = gs.cache.slots();
+-                if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err)) {
++                // (STRATA_SOLO_PIPELINE: the even verifier's size, so both parities' windows are the serial loop's)
++                if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
++                                   solo_pl ? std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)) : o.spec, err)) {
+                     std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA%d (stage %d): %s "
+                                          "(raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n",
+                                  gs.dev, st + 1, err.c_str());
+@@ -8586,7 +8674,8 @@ int main(int argc, char** argv) {
+                     return 1;
+                 }
+             }
+-            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
++            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
++                            solo_pl ? std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)) : o.spec, err)) {
+                 std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
+                                      "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
+                 return 1;
+@@ -8594,6 +8683,7 @@ int main(int argc, char** argv) {
+             // the setters reach the later stages; the pipeline never chains run/commit
+             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
+         }
++        solo_pl_mark(1);
+         ver.set_remote_expert_opt(remote_opt.get());
+         ver.set_stream_priority_high(pipe_overlap_prio);
+         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+@@ -8684,6 +8774,7 @@ int main(int argc, char** argv) {
+         const int pl_nf = pipe ? n_stages - 1 : 0;   // the front stages
+         std::vector<PlSnap> pl_snaps((size_t) pl_nf);
+         bool pl_snap_ok = false, pl_snap_overlap = false;
++        solo_pl_mark(2);
+         if (pipe && o.pipeline_windows >= 2) {
+             pl_snap_ok = true;
+             pl_snap_overlap = [] { const char* v = pipe_dbg_env("STRATA_PIPELINE_SNAP_OVERLAP"); return v == nullptr || std::atoi(v) != 0; }();
+@@ -8715,6 +8806,22 @@ int main(int argc, char** argv) {
+                 }
+             }
+         }
++        if (pipe && solo_pl) {
++            // (CUDA0's even verifier is made between the two steps: not counted)
++            std::string costs;
++            for (int st = 0; st < n_stages; ++st) {
++                const size_t i = (size_t) st;
++                const int64_t f3 = card_free_mib(st);
++                char b[112];
++                std::snprintf(b, sizeof b, "%sCUDA%d %lld + %lld MiB (%lld MiB free)", st == 0 ? "" : ", ",
++                              st == 0 ? 0 : stages[i - 1]->dev, (long long) (solo_pl_free[0][i] - solo_pl_free[1][i]),
++                              (long long) (solo_pl_free[2][i] - f3), (long long) f3);
++                costs += b;
++            }
++            std::fprintf(stderr, "strata serve: STRATA_SOLO_PIPELINE: the second verifiers, hand-offs and GDN snapshots "
++                                 "took (verifier + snapshots) %s%s\n", costs.c_str(), pl_snap_ok ? "" : "; the snapshots did not fit: the solo "
++                                 "path stays serial");
++        }
+         if (pipe)
+             std::fprintf(stderr, "strata serve: --pipeline-windows %d: two verifiers per stage, %d stages overlap across "
+                                  "windows%s\n", o.pipeline_windows, n_stages,
+@@ -8735,7 +8842,8 @@ int main(int argc, char** argv) {
+                 for (int par = 0; par < 2; ++par) {
+                     strata::core::Verifier& v = stage_ver_p(st, par);
+                     const strata::core::OnDevice on(v.device());
+-                    if (!v.capture_all(e)) return false;
++                    // (STRATA_SOLO_PIPELINE: up to the pipelined windows' largest, o.spec; the even verifiers hold 8)
++                    if (!v.capture_all(e, solo_pl ? o.spec : 0)) return false;
+                 }
+             if (!mtp.prepare_prefill(e)) return false;
+             if (o.pipeline_windows >= 2 && pl_snap_ok && !mtp.prepare_chain(e)) return false;
+@@ -13595,7 +13703,8 @@ int main(int argc, char** argv) {
+             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
+                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
+                 // the pipelined prompt read stays two-stage (three or more stages read serially; only the decode overlaps)
+-                if (pipe && n_stages == 2 && pl_pw >= 1 && std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
++                // (STRATA_SOLO_PIPELINE: the prompt reads stay serial, as the admissions' are)
++                if (pipe && !solo_pl && n_stages == 2 && pl_pw >= 1 && std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
+                 strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
+                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
+                 struct NoHeadSampling {
+@@ -14334,7 +14443,8 @@ int main(int argc, char** argv) {
+             // and the serial loop with nothing else reading its windows
+             int64_t merge_at = -1;
+             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
+-                if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
++                // (STRATA_SOLO_PIPELINE: the even verifiers keep their graphs for the admissions, see set_pl_mode)
++                if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || (pipe && !solo_pl)) return -1;
+                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
+                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
+                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
+@@ -14525,12 +14635,69 @@ int main(int argc, char** argv) {
+                     std::fprintf(stderr, "strata serve: --pipeline-windows: a request with %s decodes serially\n",
+                                  pl_serial);
+             }
+-            if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new) {
++            // STRATA_SOLO_PIPELINE: beside the batch slots a solo request is pipelined only with nothing else running
++            // and every stage's graphs as they were captured; the even verifiers then run their pipelined graphs
++            // (set_pl_mode) until the loop has drained.  Anything else: the serial loop, said once per reason.
++            std::string solo_pl_why;
++            bool solo_pl_on = false, solo_pl_quiet = false;
++            if (solo_pl && pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new) {
++                strata::program::solo_pipeline::Request rq;
++                rq.admission = admit_slot >= 0;   // BGEN's first token: the batch path's
++                rq.images = !req_imgs.empty() || !live_imgs.empty();
++                rq.slots_active = batch_on();
++                rq.groups_in_flight = piped && pipe_inflight();
++                for (int st = 0; st < n_stages && !rq.out_of_vram; ++st) {   // the odd verifiers' graphs: all-resident
++                    strata::core::Verifier& vb = stage_ver_p(st, 1);
++                    const strata::core::OnDevice on(vb.device());
++                    rq.out_of_vram = vb.all_resident() && !vb.ar_live();
++                }
++                for (int st = 0; st < pl_nf; ++st) {   // the snapshots follow the sessions' state
++                    const strata::core::SessionState& sst = st == 0 ? ss : stages[(size_t) st - 1]->ss;
++                    if (gdn_snapshot_bytes(sst) != pl_snaps[(size_t) st].bytes) rq.snapshot_resized = true;
++                }
++                if (const char* w = strata::program::solo_pipeline::why_serial(rq, solo_pl_quiet)) solo_pl_why = w;
++                for (int st = 0; st < pl_nf && solo_pl_why.empty(); ++st)
++                    pl_snaps[(size_t) st].state = (void*) (st == 0 ? ss : stages[(size_t) st - 1]->ss).gdn_state;
++                int pl_mode_n = 0;   // the even verifiers switched so far
++                std::string pe;
++                while (solo_pl_why.empty() && pl_mode_n < n_stages) {
++                    strata::core::Verifier& v0 = stage_ver_p(pl_mode_n, 0);
++                    const strata::core::OnDevice on(v0.device());
++                    if (!v0.set_pl_mode(true, pe)) solo_pl_why = pe;
++                    else ++pl_mode_n;
++                }
++                if (solo_pl_why.empty()) {
++                    solo_pl_on = true;
++                } else {
++                    for (int st = 0; st < pl_mode_n; ++st) (void) stage_ver_p(st, 0).set_pl_mode(false, pe);
++                    static std::set<std::string> said;
++                    if (!solo_pl_quiet && said.insert(solo_pl_why).second)
++                        std::fprintf(stderr, "strata serve: STRATA_SOLO_PIPELINE: a solo request with %s decodes serially\n",
++                                     solo_pl_why.c_str());
++                }
++            }
++            if (pl_want && pl_serial == nullptr && solo_pl_why.empty() && !cancelled && produced_n < max_new) {
+                 pl_ran = true;
++                std::vector<int64_t> solo_pl_cap0;   // STRATA_SOLO_PIPELINE: the graphs' VRAM, said at the first capture
++                if (solo_pl && !pl_prepared)
++                    for (int st = 0; st < n_stages; ++st) solo_pl_cap0.push_back(card_free_mib(st));
+                 if (!pl_prepare(err)) {
+                     std::printf("ERR %s\n", err.c_str());
+                     return 1;
+                 }
++                if (!solo_pl_cap0.empty()) {
++                    std::string caps;
++                    for (int st = 0; st < n_stages; ++st) {
++                        const int64_t f1 = card_free_mib(st);
++                        char b[96];
++                        std::snprintf(b, sizeof b, "%sCUDA%d %lld MiB (%lld MiB free)", st == 0 ? "" : ", ",
++                                      st == 0 ? 0 : stages[(size_t) st - 1]->dev,
++                                      (long long) (solo_pl_cap0[(size_t) st] - f1), (long long) f1);
++                        caps += b;
++                    }
++                    std::fprintf(stderr, "strata serve: STRATA_SOLO_PIPELINE: the pipelined windows' graphs (both verifiers "
++                                         "per stage, the drafter's chain) took %s\n", caps.c_str());
++                }
+                 struct PW {
+                     int T = 0, seq = 0;
+                     int64_t p = 0;
+@@ -15112,6 +15279,15 @@ int main(int argc, char** argv) {
+                     if (last) ending = true;
+                 }
+                 pl_drain();   // nothing in flight: both stages' commits and the drafter have landed
++                if (solo_pl_on) {   // STRATA_SOLO_PIPELINE: the even verifiers' own graphs again (the batch's, the serial loop's)
++                    std::string pe;
++                    for (int st = 0; st < n_stages; ++st) {
++                        strata::core::Verifier& v0 = stage_ver_p(st, 0);
++                        const strata::core::OnDevice on(v0.device());
++                        if (!v0.set_pl_mode(false, pe)) return die(pe);
++                    }
++                    solo_pl_on = false;
++                }
+                 strata::core::diag_pipeline_fn().store(nullptr);
+                 if (pl_adapt_thr.joinable()) pl_adapt_thr.join();   // its copies waited only for finished work
+                 adapt_fence = nullptr;
+diff --git a/tests/program/solo_pipeline_test.cpp b/tests/program/solo_pipeline_test.cpp
+new file mode 100644
+index 00000000..86418296
+--- /dev/null
++++ b/tests/program/solo_pipeline_test.cpp
+@@ -0,0 +1,81 @@
++// STRATA_SOLO_PIPELINE's rules (include/strata/program/solo_pipeline.hpp): the switch, how --pipeline-windows resolves
++// beside --batch, the room a card needs before the second verifier, and which solo requests stay serial.  Header-only,
++// CPU: no model, no GPU.
++#include "strata/program/solo_pipeline.hpp"
++
++#include <cstdio>
++#include <cstring>
++
++namespace sp = strata::program::solo_pipeline;
++
++namespace {
++int failures = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++}  // namespace
++
++int main() {
++    // the switch: unset, empty and 0 are off (the default path), anything else on
++    check(!sp::env_on(nullptr), "unset is off");
++    check(!sp::env_on(""), "empty is off");
++    check(!sp::env_on("0"), "0 is off");
++    check(sp::env_on("1"), "1 is on");
++    check(sp::env_on("yes"), "text is on");
++
++    // --pipeline-windows: only a value that was not asked for (auto, resolved to 0 on CUDA) becomes 2, and only with
++    // --batch and the switch; an explicit 0 or 1 stays, batch 0 stays (the single-stream server's own rule)
++    check(sp::resolve_windows(0, true, 16, true) == 2, "auto + batch + switch -> 2");
++    check(sp::resolve_windows(0, true, 16, false) == 0, "no switch: unchanged");
++    check(sp::resolve_windows(0, true, 0, true) == 0, "no batch: unchanged");
++    check(sp::resolve_windows(0, false, 16, true) == 0, "--pipeline-windows 0 given: unchanged");
++    check(sp::resolve_windows(1, false, 16, true) == 1, "--pipeline-windows 1 given: unchanged");
++    check(sp::resolve_windows(2, true, 0, false) == 2, "auto on (HIP) stays on");
++
++    // asked: switch, batch slots, two windows; --pipeline-windows 1 stays refused beside --batch
++    check(sp::asked(2, 16, true), "pw 2 + batch + switch");
++    check(!sp::asked(2, 16, false), "no switch: refused as before");
++    check(!sp::asked(1, 16, true), "pw 1 beside batch: refused");
++    check(!sp::asked(2, 0, true), "no batch: the batch-0 pipeline, not this");
++
++    // the room: verifier + snapshots + floor + 256 MiB
++    check(sp::room_need_bytes(160, 0, 512) == (int64_t) (160 + 512 + 256) << 20, "last stage: no snapshots");
++    check(sp::room_need_bytes(160, 56ll << 20, 512) == (int64_t) (160 + 56 + 512 + 256) << 20, "front stage: snapshots");
++    // the production split after load (12,25,37, 2026-10-16): CUDA0 ~1570 MiB free before the verifiers - fits; the s28r
++    // split's CUDA1 (~920 MiB) does not
++    check(((int64_t) 1570 << 20) >= sp::room_need_bytes(160, 56ll << 20, 512), "prod CUDA0 fits");
++    check(((int64_t) 920 << 20) < sp::room_need_bytes(160, 56ll << 20, 512), "s28r CUDA1 stays serial");
++
++    // the requests: a plain lone request is pipelined; every other kind decodes serially, an admission silently
++    bool quiet = true;
++    sp::Request r;
++    check(sp::why_serial(r, quiet) == nullptr && !quiet, "a plain solo request is pipelined");
++    r.admission = true;
++    check(sp::why_serial(r, quiet) != nullptr && quiet, "an admission's first token: serial, silent");
++    r = sp::Request{};
++    r.images = true;
++    check(sp::why_serial(r, quiet) != nullptr && !quiet, "images: serial, said");
++    r = sp::Request{};
++    r.slots_active = true;
++    check(sp::why_serial(r, quiet) != nullptr, "slots decoding: serial");
++    r = sp::Request{};
++    r.groups_in_flight = true;
++    check(sp::why_serial(r, quiet) != nullptr, "groups in flight: serial");
++    r = sp::Request{};
++    r.out_of_vram = true;
++    check(sp::why_serial(r, quiet) != nullptr, "experts out of VRAM: serial");
++    r = sp::Request{};
++    r.snapshot_resized = true;
++    check(sp::why_serial(r, quiet) != nullptr, "snapshot size changed: serial");
++    // an admission wins over everything (never said)
++    r = sp::Request{};
++    r.admission = r.images = r.slots_active = true;
++    check(sp::why_serial(r, quiet) != nullptr && quiet && std::strcmp(sp::why_serial(r, quiet), "a batch admission") == 0,
++          "an admission first");
++
++    if (failures == 0) std::printf("solo_pipeline_test: all checks passed\n");
++    return failures == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+
