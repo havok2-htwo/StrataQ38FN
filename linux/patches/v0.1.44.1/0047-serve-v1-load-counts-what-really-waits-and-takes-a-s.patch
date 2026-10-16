@@ -1,0 +1,593 @@
+From 3850a79ea1e407fbd2faf5a009a99501bafde4d9 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:52:18 +0200
+Subject: [PATCH 47/58] serve: /v1/load counts what really waits and takes a
+ sustained rate as its 100 %
+
+The first /v1/load reported "free 15, idle, run now" while an image request had the engine alone, counted
+requests waiting for the control lines twice and missed those waiting for a slot. It now reads the admission
+state in one place (StrataEngine.load_counts: slots taken, waiting, admitting, standing back behind an image
+request, the image line) and reports would_wait / image_alone. The 100 % mark is the token count over 10 s while
+half the slots or more decode (a one-second figure could be a burst and the peak only rises); the peak file is
+written atomically with the config it was measured with (STRATA_LOAD_PEAK_FILE moves it), bad values are not
+taken, and GET /load also answers vLLM's server_load figure.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py    | 185 ++++++++++++++++++++++++++--------
+ serve/test_load.py | 246 +++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 382 insertions(+), 49 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 58e9c57d..f6f75162 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -247,6 +247,34 @@ def _timeout_env(name: str, default: float) -> float | None:
+     return None if v <= 0 else v
+ 
+ 
++def positive_float(value) -> float:
++    """A finite number above 0, else 0.0 (a bad env value or file entry is "not set", never nan or inf)."""
++    try:
++        v = float(value)
++    except (TypeError, ValueError):
++        return 0.0
++    return v if math.isfinite(v) and v > 0 else 0.0
++
++
++def load_peak_key(cfg: dict) -> str:
++    """GET /v1/load: what a load peak was measured with - the engine, its arguments and environment, the slots and the
++    cards.  A peak measured with another engine or config (production.json pointed elsewhere) is not this one's 100 %."""
++    keep = {k: cfg.get(k) for k in ("exe", "args", "env", "parallel", "gpu", "layer_split")}
++    return hashlib.sha256(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()[:16]
++
++
++def read_load_peak(path, key: str | None) -> float:
++    """The peak a file keeps, 0.0 when there is none: unreadable, not a number above 0, or measured with another
++    config (a file without "config" - one written by hand - is taken)."""
++    try:
++        d = json.loads(Path(path).read_text(encoding="utf-8"))
++        peak = positive_float(d["peak_tok_s"])
++        other = d.get("config") not in (None, key)
++    except (OSError, ValueError, KeyError, TypeError, AttributeError):
++        return 0.0
++    return 0.0 if other else peak
++
++
+ # #1317 part 2: the quick watchdog for a FROZEN engine.  engine_silence_s (above) is generous on purpose: a slow PC reads a
+ # prompt chunk for minutes without a line.  But an engine that prints nothing for ENGINE_STALL_S and also uses no CPU time and
+ # moves no bytes of I/O in that time is not slow, it is idle or frozen (a deadlock in a CUDA call, a driver stall, a lost
+@@ -767,6 +795,7 @@ class StrataEngine:
+     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
+     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
+     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
++    standing = 0                         # new requests standing back while an image request has the engine (/v1/load)
+ 
+     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
+     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
+@@ -1445,12 +1474,15 @@ class StrataEngine:
+         the image request waits for).  `quiet`: the image request itself, never counted as waiting (a solo request is
+         not moved into a slot for it, and no read gives way to it)."""
+         entry = [plen]
+-        counted = False
++        counted = stood = False                         # stood: standing back for an image request (/v1/load counts it)
+         with self.slot_cv:
+             if not quiet and not (new and self.image_line):
+                 self.waiting += 1
+                 self.wait_lens.append(entry)
+                 counted = True
++            elif not quiet:
++                self.standing += 1
++                stood = True
+         beat = time.monotonic()
+         try:
+             while True:
+@@ -1466,11 +1498,16 @@ class StrataEngine:
+                             if entry in self.wait_lens:
+                                 self.wait_lens.remove(entry)
+                             counted = False
++                            self.standing += 1
++                            stood = True
+                             self.slot_cv.notify_all()
+                         elif not self.image_line and not counted:
+                             self.waiting += 1
+                             self.wait_lens.append(entry)
+                             counted = True
++                            if stood:
++                                self.standing = max(0, self.standing - 1)
++                                stood = False
+                 with self.slot_cv:
+                     turn = (counted or quiet) and (after_epoch is None or self.ctl_epoch > after_epoch or
+                                                    self.waiting <= 1)
+@@ -1494,11 +1531,25 @@ class StrataEngine:
+                     self.waiting = max(0, self.waiting - 1)
+                     if entry in self.wait_lens:
+                         self.wait_lens.remove(entry)
++                if stood:
++                    self.standing = max(0, self.standing - 1)
+         with self.slot_cv:
+             self.ctl_epoch += 1
+             self.slot_cv.notify_all()
+         return True
+ 
++    def load_counts(self) -> dict:
++        """GET /v1/load: the admission state in one read - slots taken (a reserved or ending one included), requests
++        waiting for the control lines, for a slot, standing back for an image request, and the image requests in
++        line (the first one has, or waits for, the engine alone)."""
++        cv = self.__dict__.get("slot_cv")
++        if cv is None:                                  # never started
++            return {"slots_busy": 0, "waiting": 0, "admitting": 0, "standing": 0, "image_line": 0}
++        with cv:
++            return {"slots_busy": sum(1 for b in self.slot_busy if b), "waiting": int(self.waiting),
++                    "admitting": int(self.admitting), "standing": int(self.standing),
++                    "image_line": len(self.image_line)}
++
+     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
+     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
+ 
+@@ -3236,7 +3287,7 @@ class Service:
+         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
+                        "prompt_ms": 0.0, "decode_ms": 0.0,
+                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
+-        self.load_peak = 0.0                             # GET /v1/load: the highest summed tok/s seen (the 100 % mark)
++        self.load_peak = 0.0                             # GET /v1/load: the highest SUSTAINED tok/s (the 100 % mark)
+         self.load_peak_path = None                       # ... kept here between runs (set from the run config)
+         self._load_peak_saved = (0.0, 0.0)               # (value, time) of the last write
+         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+@@ -3760,49 +3811,100 @@ class Service:
+                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+ 
+     LOAD_PEAK_SAVE_S = 60.0     # the peak file is written at most this often, and only when the peak rose by 2 %
++    LOAD_SUSTAIN_S = 10.0       # the 100 % mark: the highest token rate HELD this long (a 1-s figure can be a burst)
++    LOAD_NOW_S = 3.0            # load_pct's tok/s: the same count over the last few seconds
++    tokens_out = 0              # every token a request got, all requests together (_note adds them)
++    load_peak_key = None        # what the peak was measured with (main(): the run config's engine keys)
++    load_rate = None            # the counted tok/s over LOAD_NOW_S (None: no telemetry sample yet)
+ 
+     def _load_sample(self) -> float:
+-        """The summed tok/s now (the telemetry calls this once a second); raises the load peak when it is a new high."""
+-        rate = self._tok_s()
+-        if rate > self.load_peak:
+-            self.load_peak = rate
+-            saved, at = self._load_peak_saved
+-            if self.load_peak_path and rate > saved * 1.02 and time.time() - at >= self.LOAD_PEAK_SAVE_S:
+-                try:
+-                    Path(self.load_peak_path).write_text(json.dumps({"peak_tok_s": round(rate, 1), "at": time.time()}))
+-                except OSError:
+-                    pass
+-                self._load_peak_saved = (rate, time.time())
+-        return rate
++        """The telemetry calls this once a second: returns the live tok/s (the Monitor's series, as before) and raises
++        the load peak from the token count over the last LOAD_SUSTAIN_S - only while at least half the slots decoded
++        the whole time (one request's speed is not the server's capacity), so a burst a stalled consumer reads at once
++        is spread over the window instead of being taken as a rate."""
++        now = time.time()
++        with self.status_lock:
++            out = self.tokens_out
++            many = [st for st, _ in self.live_reqs.values()] or [self.status]
++            dec = sum(1 for st in many if st.get("busy") and st.get("first_token"))
++            win = self.__dict__.setdefault("_load_win", collections.deque())
++            win.append((now, out, dec))
++            while now - win[0][0] > self.LOAD_SUSTAIN_S + 0.5:
++                win.popleft()
++            recent = next((w for w in win if now - w[0] <= self.LOAD_NOW_S + 0.5), win[-1])
++            self.load_rate = (out - recent[1]) / (now - recent[0]) if now - recent[0] >= 1.0 else self.load_rate
++            span = now - win[0][0]
++            need = max(1, (int(getattr(self.engine, "batch", 0) or 0) + 1) // 2)
++            sustained = (out - win[0][1]) / span if span >= self.LOAD_SUSTAIN_S - 1.5 and \
++                min(w[2] for w in win) >= need else 0.0
++        if sustained > self.load_peak:
++            self.load_peak = sustained
++        saved, at = self._load_peak_saved
++        if self.load_peak_path and self.load_peak > saved * 1.02 and now - at >= self.LOAD_PEAK_SAVE_S:
++            self._save_load_peak(now)       # (checked every second: a rise inside the 60 s is written later, not lost)
++        return self._tok_s()
++
++    def _save_load_peak(self, now: float) -> None:
++        path = Path(self.load_peak_path)
++        tmp = path.with_name(path.name + ".tmp")
++        try:
++            path.parent.mkdir(parents=True, exist_ok=True)      # (STRATA_LOAD_PEAK_FILE may name a new folder)
++            tmp.write_text(json.dumps({"peak_tok_s": round(self.load_peak, 1), "at": round(now),
++                                       "config": self.load_peak_key}))
++            os.replace(tmp, path)           # whole or not at all: a stop during the write must not leave half a file
++        except OSError:
++            pass
++        self._load_peak_saved = (self.load_peak, now)
+ 
+     def load_view(self) -> dict:
+         """GET /v1/load: how busy the server is, for clients that can hold back work that is not urgent.
+-        `load_pct` is the larger of the two shares: tok/s against the highest rate seen (or STRATA_LOAD_REF_TOK_S), and
+-        slots in use against all slots.  `level`: idle < 25 %, low < 50 %, busy < 80 %, saturated from there."""
+-        ref_env = os.environ.get("STRATA_LOAD_REF_TOK_S")
+-        try:
+-            ref = float(ref_env) if ref_env else 0.0
+-        except ValueError:
+-            ref = 0.0
++        `load_pct` is the larger of two shares: the counted tok/s against the highest rate held for LOAD_SUSTAIN_S with
++        half the slots or more decoding (or STRATA_LOAD_REF_TOK_S; none known yet: not used), and the slots taken
++        against all slots - all of them while an image request has, or waits for, the engine alone (nothing new is
++        admitted then).  `level`: idle < 25 %, low < 50 %, busy < 80 %, saturated from there.  `slots.waiting`: the
++        requests that wait - for the control lines, for a slot, behind an image request, or before they are
++        registered - each counted once; `would_wait`: a new request would wait now."""
++        ref = positive_float(os.environ.get("STRATA_LOAD_REF_TOK_S"))
+         rate = self._tok_s()
+-        peak = ref if ref > 0 else max(self.load_peak, rate)
+-        total = int(getattr(self.engine, "batch", 0) or 0) or 1
++        e = self.engine
++        par = int(getattr(e, "batch", 0) or 0)
++        total = par or 1
+         with self.status_lock:
+             live = [dict(st) for st, _ in self.live_reqs.values()] or ([dict(self.status)] if self.status.get("busy") else [])
+-        decoding = sum(1 for st in live if st.get("first_token"))
+-        reading = len(live) - decoding
+-        busy = min(total, len(live))
+-        waiting = int(getattr(self.engine, "waiting", 0) or 0)
+-        tok_share = rate / peak if peak > 0 else 0.0
+-        slot_share = busy / total
++            before = int(self.status.get("queued") or 0)         # not registered yet: the single turn, a model load
++        # (looked up on the class: ReplicaEngine would hand a GET thread replica 0's; it sums `waiting` itself)
++        c = e.load_counts() if par and hasattr(type(e), "load_counts") else \
++            {"waiting": int(getattr(e, "waiting", 0) or 0)}
++        image_line, slots_busy = int(c.get("image_line", 0)), int(c.get("slots_busy", 0))
++        exclusive = image_line > 0
++        # registered requests that wait (each is in live_reqs from before engine.generate, first_token None): for the
++        # control lines, for a slot, standing back, the image requests behind the first - and the first one too while
++        # the slots before it still decode (it takes the engine only once every slot is free)
++        queued = (int(c.get("waiting", 0)) + int(c.get("admitting", 0)) + int(c.get("standing", 0)) +
++                  max(0, image_line - 1) + int(exclusive and slots_busy > 0))
++        running = min(total, max(0, len(live) - queued))         # in a slot, or the one on the solo path
++        decoding = min(running, sum(1 for st in live if st.get("first_token")))
++        taken = max(running, min(total, slots_busy))           # (a reserved or ending slot is taken too)
++        free = 0 if exclusive else max(0, total - taken)
++        waiting = queued + before
++        peak = ref or self.load_peak
++        counted = self.load_rate if self.load_rate is not None else rate
++        tok_share = min(1.0, counted / peak) if peak else 0.0
++        slot_share = 1.0 if exclusive else taken / total
+         load = min(1.0, max(tok_share, slot_share))
+         level = "idle" if load < 0.25 else "low" if load < 0.5 else "busy" if load < 0.8 else "saturated"
+-        return {"load_pct": round(100 * load), "level": level,
+-                "slots": {"total": total, "busy": busy, "decoding": decoding, "reading_prompt": reading,
+-                          "free": max(0, total - busy), "waiting": waiting},
+-                "tok_s": {"now": round(rate, 1), "peak": round(peak, 1), "share_pct": round(100 * min(1.0, tok_share))},
+-                "advice": ("run now" if level in ("idle", "low") else
+-                           "defer non-urgent work" if level == "busy" or waiting == 0 else "defer, requests are queueing"),
++        loaded = self.loaded()                                 # unloaded: a request waits for the model load first
++        would_wait = exclusive or waiting > 0 or free == 0 or not loaded
++        return {"load_pct": round(100 * load), "level": level, "would_wait": would_wait, "image_alone": exclusive,
++                "loaded": loaded,
++                "slots": {"total": total, "busy": running, "decoding": decoding, "reading_prompt": running - decoding,
++                          "free": free, "waiting": waiting},
++                "tok_s": {"now": round(rate, 1), "peak": round(peak, 1) if peak else None,
++                          "share_pct": round(100 * tok_share) if peak else None},
++                "server_load": len(live) + before,            # vLLM's GET /load figure: requests in flight, queued too
++                "advice": ("defer, an image request has the engine alone" if exclusive else
++                           "defer, requests are queueing" if waiting else
++                           "run now" if level in ("idle", "low") and not would_wait else "defer non-urgent work"),
+                 "time": time.time()}
+ 
+     def _tok_s(self):
+@@ -4280,6 +4382,7 @@ class Service:
+     def _note(self, n, evs, st=None, rate=None):
+         with self.status_lock:
+             s = self.status if st is None else st
++            self.tokens_out += max(0, n - (s.get("generated") or 0))   # GET /v1/load: every request's tokens, counted
+             s["generated"] = n
+             if s.get("first_token") is None:
+                 s["first_token"] = time.time()
+@@ -7158,13 +7261,13 @@ def main() -> int:
+     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
+     if a.config:
+         svc.config_path = a.config                      # #564: the web page's Settings view
++        # GET /v1/load's 100 % mark from last time (STRATA_LOAD_PEAK_FILE: kept elsewhere, e.g. out of a git checkout)
++        svc.load_peak_path = os.environ.get("STRATA_LOAD_PEAK_FILE") or \
++            str(Path(a.config).with_suffix("")) + ".load-peak.json"
++        svc.load_peak_key = load_peak_key(cfg)
++        svc.load_peak = read_load_peak(svc.load_peak_path, svc.load_peak_key)
++        svc._load_peak_saved = (svc.load_peak, time.time())
+     if a.config:                                        # the Chat settings shared with other apps, from last time
+-        svc.load_peak_path = str(Path(a.config).with_suffix("")) + ".load-peak.json"
+-        try:
+-            svc.load_peak = svc._load_peak_saved = float(json.loads(Path(svc.load_peak_path).read_text())["peak_tok_s"])
+-            svc._load_peak_saved = (svc.load_peak, time.time())
+-        except (OSError, ValueError, KeyError, TypeError):
+-            pass
+         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
+         try:
+             svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
+diff --git a/serve/test_load.py b/serve/test_load.py
+index c6500661..ced576c3 100644
+--- a/serve/test_load.py
++++ b/serve/test_load.py
+@@ -4,16 +4,23 @@
+ """
+ from __future__ import annotations
+ 
++import collections
++import json
+ import sys
+ import tempfile
+ import threading
+ import time
+ import unittest
++import urllib.error
++import urllib.request
+ from pathlib import Path
+ from types import SimpleNamespace
++from unittest import mock
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+-from serve.server import Service  # noqa: E402
++import serve.server as server  # noqa: E402
++from serve.server import Service, read_load_peak  # noqa: E402
++from serve.test_image_alone import engine_without_process, run  # noqa: E402
+ 
+ 
+ def service(batch=16, decoding=0, reading=0, peak=660.0, waiting=0):
+@@ -33,11 +40,36 @@ def service(batch=16, decoding=0, reading=0, peak=660.0, waiting=0):
+     return s
+ 
+ 
++def on(e, peak=660.0):
++    """A Service over an engine with the real admission state (test_image_alone's engine without a process)."""
++    s = object.__new__(Service)
++    s.engine = e
++    s.status_lock = threading.Lock()
++    s.status = {"busy": False, "queued": 0}
++    s.live_reqs, s.rate = {}, []
++    s.load_peak, s.load_peak_path, s._load_peak_saved = peak, None, (0.0, 0.0)
++    return s
++
++
++def register(s, tok_s=None):
++    """A request as Service._run registers it - before engine.generate, so one that waits is in live_reqs too."""
++    now = time.time()
++    st = {"busy": True, "started": now - 30, "first_token": (now - 20) if tok_s else None,
++          "generated": int(20 * tok_s) if tok_s else 0}
++    rate = collections.deque(maxlen=32)
++    if tok_s:
++        for k in range(32):
++            rate.append((now - (31 - k) / tok_s, st["generated"] - 31 + k))
++    s.live_reqs[id(st)] = (st, rate)
++    return st
++
++
+ class LoadTest(unittest.TestCase):
+     def test_idle(self):
+         v = service().load_view()
+         self.assertEqual((v["load_pct"], v["level"]), (0, "idle"))
+         self.assertEqual(v["slots"]["free"], 16)
++        self.assertFalse(v["would_wait"])
+ 
+     def test_mixed(self):
+         v = service(decoding=10, reading=2).load_view()
+@@ -47,20 +79,218 @@ class LoadTest(unittest.TestCase):
+         self.assertEqual(v["level"], "busy")
+ 
+     def test_saturated_with_queue(self):
+-        v = service(decoding=16, waiting=3).load_view()
++        # the 3 that wait are registered too (as _run does), so 16 + 3 requests are live
++        v = service(decoding=16, reading=3, waiting=3).load_view()
++        self.assertEqual((v["load_pct"], v["level"]), (100, "saturated"))
++        self.assertEqual((v["slots"]["busy"], v["slots"]["reading_prompt"], v["slots"]["waiting"]), (16, 0, 3))
++        self.assertIn("queueing", v["advice"])
++
++
++class AdmissionStateTest(unittest.TestCase):
++    """The states the batched server really has (the gate code of StrataEngine itself)."""
++
++    def setUp(self):
++        self.cancels = []
++
++    def tearDown(self):
++        for c in self.cancels:
++            c.set()
++
++    def take(self, e, plen, **kw):
++        c = threading.Event()
++        threading.Thread(target=lambda: run(e._take_control(c, plen, **kw)), daemon=True).start()
++        self.cancels.append(c)
++
++    def image(self, e, me, plen):
++        c = threading.Event()
++        threading.Thread(target=lambda: run(e._take_engine_alone(c, me, plen)), daemon=True).start()
++        self.cancels.append(c)
++
++    def until(self, cond):
++        end = time.time() + 5
++        while time.time() < end and not cond():
++            time.sleep(0.01)
++        self.assertTrue(cond())
++
++    def test_an_image_request_alone_leaves_no_slot_and_the_ones_behind_it_wait(self):
++        e = engine_without_process(16)
++        s = on(e)
++        a, b = object(), object()
++        e.image_line += [a, b]
++        self.assertTrue(e.ctl.acquire(timeout=1))           # `a` runs alone on the solo path to its DONE
++        register(s, tok_s=103.0)
++        register(s)                                         # b, behind it
++        self.image(e, b, 499)
++        for _ in range(2):                                  # two text requests: they stand back
++            register(s)
++            self.take(e, 2000, new=True)
++        self.until(lambda: e.standing == 2)
++        v = s.load_view()
++        e.ctl.release()
++        self.assertEqual(e.waiting, 0)                      # (not counted as waiting by the engine)
++        self.assertTrue(v["image_alone"] and v["would_wait"])
++        self.assertEqual((v["slots"]["free"], v["slots"]["waiting"], v["slots"]["busy"]), (0, 3, 1))
+         self.assertEqual((v["load_pct"], v["level"]), (100, "saturated"))
++        self.assertIn("image", v["advice"])
++
++    def test_a_request_waiting_for_the_control_lines_is_counted_once(self):
++        e = engine_without_process(16)
++        s = on(e)
++        self.assertTrue(e.ctl.acquire(timeout=1))           # a long read on the control lines
++        register(s)
++        for _ in range(3):
++            register(s)
++            self.take(e, 1500, new=True)
++        self.until(lambda: e.waiting == 3)
++        v = s.load_view()
++        e.ctl.release()
++        self.assertEqual(v["slots"], {"total": 16, "busy": 1, "decoding": 0, "reading_prompt": 1, "free": 15,
++                                      "waiting": 3})
++        self.assertTrue(v["would_wait"])
+         self.assertIn("queueing", v["advice"])
+ 
+-    def test_peak_rises_and_is_kept(self):
++    def test_requests_waiting_for_a_slot_are_waiting(self):
++        e = engine_without_process(16)
++        s = on(e)
++        with e.slot_cv:
++            e.slot_busy = [True] * 16
++            e.admitting = 2
++        for _ in range(16):
++            register(s, tok_s=37.5)
++        register(s)
++        register(s)
++        v = s.load_view()
++        self.assertEqual((v["slots"]["busy"], v["slots"]["decoding"], v["slots"]["reading_prompt"],
++                          v["slots"]["waiting"], v["slots"]["free"]), (16, 16, 0, 2, 0))
++        self.assertIn("queueing", v["advice"])
++
++    def test_an_image_request_draining_the_slots_admits_nothing_new(self):
++        e = engine_without_process(16)
++        s = on(e)
++        me = object()
++        with e.slot_cv:
++            for b in range(4):
++                e.slot_busy[b] = True
++            e.image_line.append(me)
++        for _ in range(4):
++            register(s, tok_s=40.0)
++        register(s)
++        self.image(e, me, 220000)
++        v = s.load_view()
++        self.assertEqual((v["slots"]["busy"], v["slots"]["decoding"], v["slots"]["free"], v["slots"]["waiting"]),
++                         (4, 4, 0, 1))
++        self.assertEqual(v["level"], "saturated")
++
++
++class PeakTest(unittest.TestCase):
++    """The 100 % mark: the token count over LOAD_SUSTAIN_S with half the slots decoding, never one second's figure."""
++
++    def drive(self, s, seconds, per_s, start=1000.0, burst_at=None):
++        """One telemetry sample a second; tokens_out grows per_s a second (at burst_at: a consumer stalled for a
++        second and read its backlog the next one)."""
++        clock = [start]
++        with mock.patch.object(server.time, "time", lambda: clock[0]):
++            for k in range(seconds):
++                if burst_at is None or k not in (burst_at, burst_at + 1):
++                    s.tokens_out += per_s
++                elif k == burst_at + 1:
++                    s.tokens_out += 2 * per_s
++                s._load_sample()
++                clock[0] += 1.0
++        return clock[0]
++
++    def test_cold_start_one_request_is_not_the_100_mark(self):
++        s = on(engine_without_process(16), peak=0.0)
++        register(s, tok_s=103.0)
++        self.drive(s, 30, 103)
++        v = s.load_view()
++        self.assertEqual(s.load_peak, 0.0)                  # one request is not the server's capacity
++        self.assertIsNone(v["tok_s"]["peak"])
++        self.assertEqual((v["load_pct"], v["level"]), (6, "idle"))
++
++    def test_a_burst_does_not_raise_the_peak(self):
++        s = on(engine_without_process(16), peak=0.0)
++        for _ in range(16):
++            register(s, tok_s=37.5)
++        self.drive(s, 40, 600, burst_at=20)
++        self.assertGreaterEqual(s.load_peak, 590)
++        self.assertLessEqual(s.load_peak, 600 * 1.11)       # (a 1 s backlog in a 10 s window: at most +10 %)
++
++    def test_a_rise_inside_the_save_interval_is_written_later(self):
+         with tempfile.TemporaryDirectory() as d:
+-            s = service(decoding=4, peak=10.0)
++            s = on(engine_without_process(16), peak=0.0)
+             s.load_peak_path = str(Path(d) / "p.json")
+-            s.LOAD_PEAK_SAVE_S = 0
+-            s._load_sample()
+-            self.assertGreater(s.load_peak, 10.0)
+-            self.assertTrue(Path(s.load_peak_path).exists())
++            s._load_peak_saved = (0.0, 1000.0)              # written at start (main() does this)
++            for _ in range(16):
++                register(s, tok_s=37.5)
++            t = self.drive(s, 15, 600)                      # the peak rises 10-15 s after the last write
++            self.assertFalse(Path(s.load_peak_path).exists())
++            self.drive(s, 60, 300, start=t)                 # never as high again
++            self.assertEqual(json.loads(Path(s.load_peak_path).read_text())["peak_tok_s"], 600.0)
++            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["p.json"])   # no .tmp left
++
++    def test_peak_file_validation(self):
++        with tempfile.TemporaryDirectory() as d:
++            p = Path(d) / "p.json"
++            for text, want in (('{"peak_tok_s": 660.0, "at": 0}', 660.0),             # written by hand: taken
++                               ('{"peak_tok_s": 700, "config": "k"}', 700.0),
++                               ('{"peak_tok_s": 700, "config": "other"}', 0.0),       # another config's
++                               ('{"peak_tok_s": NaN}', 0.0), ('{"peak_tok_s": Infinity}', 0.0),
++                               ('{"peak_tok_s": -5}', 0.0), ('{"peak_tok_s": "x"}', 0.0), ('[1]', 0.0),
++                               ('{"peak_tok_s": 6', 0.0), ('', 0.0)):
++                p.write_text(text)
++                self.assertEqual(read_load_peak(p, "k"), want, text)
++            self.assertEqual(read_load_peak(Path(d) / "missing.json", "k"), 0.0)
++
++    def test_ref_env_must_be_a_finite_number(self):
++        s = service(decoding=16)
++        for value in ("nan", "inf", "-1", "x"):
++            with mock.patch.dict("os.environ", {"STRATA_LOAD_REF_TOK_S": value}):
++                self.assertEqual(s.load_view()["tok_s"]["peak"], 660.0, value)
++        with mock.patch.dict("os.environ", {"STRATA_LOAD_REF_TOK_S": "320"}):
++            self.assertEqual(s.load_view()["tok_s"]["peak"], 320.0)
++
+ 
++class RouteTest(unittest.TestCase):
++    """GET /v1/load and /load beside POST /load and /v1/load (which load the model)."""
++
++    def setUp(self):
++        from serve.frontend import ChatTemplate
++        from serve.server import ByteTokenizer, MockEngine, Server, api_key_of, host_names_for, make_handler
++        tok = ByteTokenizer()
++        self.svc = Service(MockEngine(tok, "Hello."), tok, ChatTemplate(Path(server.__file__).parent / "chat_template.jinja"))
++        self.svc.api_key = api_key_of("secret")
++        self.svc.host_names = host_names_for("127.0.0.1", self.svc.allowed_hosts, self.svc.trusted_origins)
++        self.httpd = Server(("127.0.0.1", 0), make_handler(self.svc))     # (no telemetry: serve() would start it)
++        self.httpd.svc = self.svc
++        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
++        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
++
++    def tearDown(self):
++        self.httpd.shutdown()
++        self.httpd.server_close()
++
++    def call(self, method, path, key=None, body=None):
++        headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}
++        req = urllib.request.Request(self.base + path, method=method, headers=headers,
++                                     data=json.dumps(body).encode() if body is not None else None)
++        try:
++            r = urllib.request.urlopen(req, timeout=10)
++        except urllib.error.HTTPError as err:
++            r = err
++        with r:
++            return r.status, json.loads(r.read() or b"null")
+ 
++    def test_get_load_needs_the_key_and_post_still_loads_the_model(self):
++        self.assertEqual(self.call("GET", "/v1/load")[0], 401)
++        code, v = self.call("GET", "/v1/load", "secret")
++        self.assertEqual(code, 200)
++        self.assertIn("load_pct", v)
++        code, v = self.call("GET", "/load/", "secret")      # vLLM's path: its server_load figure is there too
++        self.assertEqual((code, v["server_load"]), (200, 0))
++        code, v = self.call("POST", "/v1/load", "secret", {})
++        self.assertEqual((code, v["status"]), (200, "loaded"))
++        self.assertNotIn("load_pct", v)
+ 
+ 
+ class AgeOutTest(unittest.TestCase):
+-- 
+2.43.0
+

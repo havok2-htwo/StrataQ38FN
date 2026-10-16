@@ -1,0 +1,248 @@
+From 68e018d923b76e134c150826dfd774d92efcfc71 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 22:37:05 +0200
+Subject: [PATCH 24/58] generate: STRATA_ADMIT_MERGE_FIRST=1 reads a batch
+ admission's last prompt tokens and its first token in one window
+
+A batch admission read its header through the verify windows (T=4 + T=2 for the
+usual 6 tokens) and then its first token in a window of the last prompt token
+alone. With the switch the last windowed part leaves its last tokens (up to the
+verifier's max_t, 8, the last prompt token included) to the first window: the
+part's earlier tokens are read as before, the first window commits every row,
+the drafter gets the rows of the prompt tokens in it as the prompt windows give
+them, and only row T-1's output is emitted. Row T-1 sits at the first window's
+position with the same history and Philox draw, and a row computes what it
+computes in any window while every expert is in VRAM, so the token and the
+state are the same.
+
+Only for a BGEN admission with every expert of every stage in VRAM (no loan,
+no swap pending, the zero-doorbell graphs), and not with --batch-mtp, the
+pipelined windows, pictures, the elastic K/V, a peer device, remote caches,
+foresight swaps, STRATA_LOGPOS or a checkpoint at the last token. The merged
+window takes no drafter q (STRATA_SPEC_PROB), adds nothing to the draft
+counts, and the "PP <n-1>" line is printed before it. Verifier::max_t() is new.
+
+Off by default: the same path as before. Tokens (4x RTX 3090, split
+12,24,36, 16 slots, STRATA_IQ_MT_MIN=1): 24 admissions of prompts of 3 to 65
+tokens and chat headers with and without an assistant prefill (merged T 3 to
+8), greedy, seeded and with penalties, on vs off identical; batch_test16 16/16
+and equal to the earlier dump; batch_overlap_test token- and RESUME-identical;
+batch_interleave_test equal; 47 sampled driver requests equal.
+
+Measured (24 admissions, ~131 and ~1195 tokens): header windows 23.5 plus
+first window 11.5 ms become one 7-token window of 27.6 ms, 7.4 ms less per
+admission (send to first batch token 246.8 -> 239.4 ms short, 656.1 -> 648.5
+long). A window row costs ~2.4 ms up to T=6 and ~4 ms at T=7 and 8 (T=1 11.4,
+T=7 28.6, T=8 32.1 ms).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/verify.hpp |  2 +
+ src/program/generate.cpp       | 91 ++++++++++++++++++++++++++++------
+ 2 files changed, 78 insertions(+), 15 deletions(-)
+
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 169b6a41..8047ec2b 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -120,6 +120,8 @@ public:
+         return t >= 0 && t < 32 && ((nf_mask_ >> t) & 1u) != 0;
+     }
+     static bool nan_guard_on();
++    /// The most tokens one window holds (`init`'s `max_t`; 0 before it).
++    int max_t() const { return max_t_; }
+     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
+     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
+     /// parameters would otherwise be baked forever - so this can change between requests freely.
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 050af9ee..8adf5731 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -190,6 +190,18 @@ bool pipe_byield_nodrain_env() {
+     }();
+     return on;
+ }
++// STRATA_ADMIT_MERGE_FIRST=1 (read once; off by default): a batch admission reads the last prompt tokens of its last
++// windowed part (up to a window's max_t, the last prompt token included) and its first token in ONE window instead of
++// the part's last windows and a window of the last token alone.  A row computes what it computes in any window while
++// every expert is in VRAM, and row T-1 is the first window's position with its history and its Philox draw, so the
++// token and the state are the same; the rows before it commit as the prompt windows commit them
++bool admit_merge_first_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_ADMIT_MERGE_FIRST");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
+ // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+ // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+@@ -12438,6 +12450,28 @@ int main(int argc, char** argv) {
+                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
+             }
+             int64_t at = read_from;
++            // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
++            // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
++            // holds the last prompt token alone).  Only where every window row is the same in any window: a batch
++            // admission's first token, every expert of every stage in VRAM (the zero-doorbell graphs, no loan, no swap)
++            // and the serial loop with nothing else reading its windows
++            int64_t merge_at = -1;
++            auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
++                if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
++                if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
++                if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
++                if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
++                if (host_res.empty() || !pending.empty() ||
++                    std::any_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; }))
++                    return -1;
++                int mt = strata::kernels::kVerifyMaxT;
++                for (int k = 0; k < n_pipe; ++k) {
++                    if (!stage_verifier(k).ar_live()) return -1;
++                    mt = std::min(mt, stage_verifier(k).max_t());
++                }
++                if (mt < 2) return -1;
++                return std::max(a0, n - mt);
++            };
+             for (const int64_t to : cuts) {
+                 if (to <= at) continue;
+                 err.clear();
+@@ -12450,21 +12484,32 @@ int main(int argc, char** argv) {
+                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                     return 1;
+                 }
++                if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)
++                const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
+                 const auto tsp = Clock::now();
+                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
+-                const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
++                const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
+                 if (sp_ok) pp_exact = true;
+                 if (trace) {
+                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
+                     (win ? req_times.windows_ms : req_times.read_ms) += ms;
+-                    std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
++                    std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (read_to - at),
+                                  win ? "windows" : "batched", ms);
++                    if (merge_at >= 0)
++                        std::fprintf(stderr, "strata trace: the first window takes the last %lld prompt tokens\n",
++                                     (long long) (n - merge_at));
+                     std::fflush(stderr);
+                 }
+                 if (!sp_ok && nf_hit) {   // #879: DONE nonfinite (the lent slots are refilled below)
+                     cancelled = true;
+                     break;
+                 }
++                if (sp_ok && merge_at >= 0) {   // the server's progress reaches the prompt's end, as after its last window
++                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
++                    std::printf("PP %lld %lld %.0f %.1f\n", (long long) to, (long long) pp_total, ms,
++                                ms > 0.0 ? 1000.0 * (double) (to - pp_from) / ms : 0.0);
++                    std::fflush(stdout);
++                }
+                 if (!sp_ok) {
+                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
+                         if (!ov_err_printed) {   // (an overlapped read's failed window: pump answered ERR already)
+@@ -12524,12 +12569,15 @@ int main(int argc, char** argv) {
+             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
+             std::fflush(stdout);
+-            // the verify windows: the first holds the last prompt token alone
+-            int64_t p = n - 1;
+-            int32_t x = (int32_t) ids[(size_t) (n - 1)];
++            // the verify windows: the first holds the last prompt token alone (STRATA_ADMIT_MERGE_FIRST: the prompt
++            // tokens from merge_at on, the last one's output its first token)
++            const int merge_T = merge_at >= 0 && !cancelled ? (int) (n - merge_at) : 0;
++            int64_t p = merge_T > 0 ? merge_at : n - 1;
++            int32_t x = (int32_t) ids[(size_t) p];
+             // (the drafter writes max_t - 1 drafts: 8 rows with --pipeline-windows 2)
+             const size_t DS = (size_t) std::max(S, use_mtp ? mtp.max_t() : 0);
+-            std::vector<int32_t> drafts(DS, 0), window((size_t) S), outv((size_t) S);
++            const size_t WS = (size_t) std::max(S, merge_T);
++            std::vector<int32_t> drafts(DS, 0), window(WS), outv(WS);
+             std::vector<float> dprob(DS, 0.0f);
+             std::vector<int32_t> sbuf((size_t) S, 0);
+             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
+@@ -12553,7 +12601,7 @@ int main(int argc, char** argv) {
+             // what the session holds once this request is done: the prompt read so far, then every committed token
+             std::vector<int32_t> consumed;
+             consumed.reserve((size_t) (n + max_new + S));
+-            for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
++            for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+             const char* finish = "length";
+             const Clock::time_point d0 = Clock::now();
+             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
+@@ -13243,7 +13291,8 @@ int main(int argc, char** argv) {
+                     T = 1;
+                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                 }
+-                if (first_window) T = 1;
++                if (first_window) T = merge_T > 0 ? merge_T : 1;
++                const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
+                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
+                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
+                 bool from_sfx = false;
+@@ -13277,7 +13326,10 @@ int main(int argc, char** argv) {
+                 const Clock::time_point round0 = Clock::now();
+                 if (p + T > o.max_context) break;
+                 window[0] = x;
+-                for (int i = 1; i < T_mtp; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
++                for (int i = 1; i < T_mtp; ++i)
++                    window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
++                                         : from_sfx ? sbuf[(size_t) i - 1]
++                                                    : drafts[(size_t) i - 1];
+                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                 drive.d.layers = 0;
+                 drive.d.experts = 0;
+@@ -13329,7 +13381,8 @@ int main(int argc, char** argv) {
+                 const Clock::time_point tw0 = Clock::now();
+                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
+                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
+-                if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
++                // (never on a first window: a merged one holds prompt tokens, not drafts)
++                if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                     return 1;
+@@ -13343,13 +13396,13 @@ int main(int argc, char** argv) {
+                     if (fl != nullptr) {
+                         std::vector<float> row((size_t) ver.vocab());
+                         const std::string path = std::string(fl) + "." + std::to_string(fl_n++);
+-                        std::FILE* f = ver.copy_logits(0, row.data()) ? std::fopen(path.c_str(), "wb") : nullptr;
++                        std::FILE* f = ver.copy_logits(merged ? T - 1 : 0, row.data()) ? std::fopen(path.c_str(), "wb") : nullptr;
+                         if (f == nullptr || std::fwrite(row.data(), sizeof(float), row.size(), f) != row.size())
+                             std::fprintf(stderr, "strata serve: STRATA_DUMP_FIRST_LOGITS: cannot write %s\n", path.c_str());
+                         if (f) std::fclose(f);
+                     }
+                 }
+-                int a = 0;
++                int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
+                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
+@@ -13379,13 +13432,21 @@ int main(int argc, char** argv) {
+                     finish = "nonfinite";
+                     break;
+                 }
++                // a merged window: the drafter's rows of the prompt tokens in it, as the prompt windows give them
++                if (merged && use_mtp && !mtp.prefill(ver.final_R_all(), window.data() + 1, T - 1, p, err)) {
++                    if (adapt_thr.joinable()) adapt_thr.join();
++                    std::printf("ERR %s\n", err.c_str());
++                    return 1;
++                }
+                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
+                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+-                draft_offered += T - 1;
+-                draft_accepted += a;
++                if (!merged) {   // (a merged window's rows are prompt tokens, not drafts)
++                    draft_offered += T - 1;
++                    draft_accepted += a;
++                }
+                 first_window = false;
+                 bool eos = false;
+-                for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
++                for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
+                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                     strata::core::progress_beat();
+                     ++produced_n;
+-- 
+2.43.0
+

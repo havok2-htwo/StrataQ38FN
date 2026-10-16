@@ -1,0 +1,220 @@
+From d9a8cfdf89ceccb4bc8748e18409ff8ae1eca5dc Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:06:30 +0200
+Subject: [PATCH 04/58] expert cache: a slot guard for STRATA_MMQ_DIRECT
+ (set_slot_guard), the sizing sites use slot_stride
+
+ExpertCache gets inline set_slot_guard / slot_guard / slot_stride / slot_room / slot_tail; the
+4-argument open_sized declaration is unchanged (the SYCL engine defines it out of line against
+the same header and ignores the guard). open_sized lays slots out at slot_stride(blob, guard);
+blob_ stays the largest blob, so fills, verify_slot and the HIP staging read no further.
+slot_tail works on uniform caches too (through slot_offset).
+
+generate.cpp: slot_guard = Prefill::slot_guard_bytes() (mmq::direct_slot_guard(): 256 when
+STRATA_MMQ_DIRECT is 1 or 2 on a pointer-table build, else 0) for native packs; the seven
+round-256 slot costs (split-skip-if-fits, split placement, per-layer sum, profile sizing,
+shrink_to, cache_bytes, stage sizing) use ExpertCache::slot_stride(b, slot_guard), and the
+primary and stage caches get set_slot_guard before they open. Guard 0: the same arithmetic as
+before, so the default layout is unchanged byte for byte.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/expert_cache.hpp | 18 ++++++++++++++++++
+ include/strata/prefill/prefill.hpp   |  5 +++++
+ src/core/expert_cache.cpp            |  5 +++--
+ src/prefill/prefill.cpp              |  1 +
+ src/program/generate.cpp             | 28 ++++++++++++++++++++--------
+ 5 files changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/include/strata/core/expert_cache.hpp b/include/strata/core/expert_cache.hpp
+index 17e277de..4ec789b7 100644
+--- a/include/strata/core/expert_cache.hpp
++++ b/include/strata/core/expert_cache.hpp
+@@ -119,6 +119,15 @@ public:
+     /// always.  CUDA only: a HIP build refuses it at open.  The slots past `slots()` after a shrink must hold no
+     /// resident expert and no loan: the CALLER evicts them first (they become CPU misses).
+     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
++    /// STRATA_MMQ_DIRECT: `open_sized` leaves at least `g` bytes of room after each slot's blob (the prompt MMQ
++    /// reads a little past a down matrix when it reads an expert in its slot).  Set before opening, like
++    /// `set_segment_bytes`; `close` keeps it.  0 (the default): no guard.  The uniform `open` ignores it, and so does
++    /// the SYCL engine's open_sized (its slots then have no guard, and `slot_tail` finds no room).
++    void set_slot_guard(int64_t g) { guard_req_ = g > 0 ? g : 0; }
++    /// The guard the open slots have (0 for uniform slots).
++    int64_t slot_guard() const { return off_.empty() ? 0 : guard_req_; }
++    /// A sized slot's arena bytes: the blob plus the guard, 256-byte aligned.
++    static int64_t slot_stride(int64_t blob, int64_t guard = 0) { return (blob + guard + 255) / 256 * 256; }
+     bool segmented() const { return !segs_.empty(); }
+     int64_t segment_bytes() const { return seg_; }
+     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
+@@ -208,6 +217,14 @@ public:
+     VmmRange* vmm_range() { return vmm_.get(); }
+     /// Byte offset of slot `s` in the arena (s == slots(): the end).
+     uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
++    /// The arena bytes of slot `s` (its blob, any slack and the guard).
++    uint64_t slot_room(int32_t s) const { return slot_offset(s + 1) - slot_offset(s); }
++    /// STRATA_MMQ_DIRECT: the address `blob` bytes into slot `s` when the slot has room for `need` more bytes there
++    /// (null otherwise, or for a bad slot).  Uniform slots too: their stride is the largest blob.
++    uint8_t* slot_tail(int32_t s, uint64_t blob, uint64_t need) const {
++        if (s < 0 || s >= slots_ || base_ == nullptr) return nullptr;
++        return slot_room(s) >= blob + need ? base_ + slot_offset(s) + blob : nullptr;
++    }
+ 
+ private:
+ #if defined(STRATA_USE_HIP)
+@@ -221,6 +238,7 @@ private:
+     uint8_t* base_ = nullptr;
+     int64_t live_slots_ = 0;            ///< #533: slots() - all of them unless shrunk
+     int64_t seg_req_ = 0;               ///< #533: the segment size asked for (0: one cudaMalloc)
++    int64_t guard_req_ = 0;             ///< STRATA_MMQ_DIRECT: bytes kept after each sized slot's blob (set_slot_guard)
+     int64_t seg_ = 0;                   ///< #533: the segment size used (a multiple of the driver's granularity)
+     uint64_t reserved_ = 0;             ///< #533: the reserved address range's size
+     std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index b4f100df..92c26148 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -124,6 +124,11 @@ public:
+     /// keeps the ring full.  STRATA_RING_BYTES=0: 0.1.39's ring, loan and chunk list.
+     static bool ring_bytes_enabled();
+ 
++    /// STRATA_MMQ_DIRECT: the guard each sized expert-cache slot keeps after its blob (ExpertCache::set_slot_guard),
++    /// so the prompt MMQ can read a resident expert in its slot.  0 unless STRATA_MMQ_DIRECT is 1 or 2 on a CUDA
++    /// build with the pointer-table MMQ (STRATA_MMQ_TAB).
++    static size_t slot_guard_bytes();
++
+     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
+     /// first, -1 for none) and is advanced to the last two of these.
+     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+diff --git a/src/core/expert_cache.cpp b/src/core/expert_cache.cpp
+index 1920fdb7..1500f2b2 100644
+--- a/src/core/expert_cache.cpp
++++ b/src/core/expert_cache.cpp
+@@ -564,8 +564,9 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
+     int64_t mx = 0;
+     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
+     for (size_t i = 0; i < slot_bytes.size(); ++i) {
+-        // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
+-        off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
++        // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it (and the
++        // STRATA_MMQ_DIRECT guard after each blob, 0 by default)
++        off[i + 1] = off[i] + (uint64_t) slot_stride(slot_bytes[i], guard_req_);
+         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
+     }
+     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index e68855b7..b7651c73 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1978,6 +1978,7 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
+ }
+ 
+ bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
++size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }
+ 
+ namespace {
+ 
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1536d16a..c1873e70 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -2831,6 +2831,9 @@ int main(int argc, char** argv) {
+         }
+     }
+     const bool native_pack = strata::kernels::cpu::expert_layout().native;
++    // STRATA_MMQ_DIRECT: the room each sized expert slot keeps after its blob (0 unless it is on: the slot costs and
++    // the arena are then today's, byte for byte)
++    const int64_t slot_guard = native_pack ? (int64_t) strata::prefill::Prefill::slot_guard_bytes() : 0;
+     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
+     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
+     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
+@@ -3459,7 +3462,8 @@ int main(int argc, char** argv) {
+             const auto& lay = strata::kernels::cpu::expert_layout();
+             int64_t pairs_bytes = 0;
+             for (const auto& pr : prof)
+-                pairs_bytes += native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
++                pairs_bytes += native_pack ? strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard)
++                                           : (int64_t) lay.max_blob;
+             size_t fb = 0, tb = 0;
+             cudaMemGetInfo(&fb, &tb);
+             const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
+@@ -3896,7 +3900,8 @@ int main(int argc, char** argv) {
+             total_mass += (mass[r] = hi - lo);
+         }
+         auto cost = [&](int64_t l) -> int64_t {
+-            return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
++            return native_pack ? strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(l), slot_guard)
++                               : (int64_t) lay.max_blob;
+         };
+         // the predicted window time (ms) of a placement, and the routed mass its caches hold
+         std::vector<int64_t> held_cnt((size_t) ns, 0);   // per-stage fill count, for the startability gate
+@@ -5275,7 +5280,7 @@ int main(int argc, char** argv) {
+         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+         uint64_t sum = 0;
+         for (int64_t l = 0; l < g.n_layers; ++l)
+-            sum += (lay.blob_bytes(l) + 255) / 256 * 256;
++            sum += (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(l), slot_guard);
+         int64_t q = sum > 0 ? (int64_t) (cap / sum) : 0;
+         if (q > g.n_expert) q = g.n_expert;
+         if (q > 0) {
+@@ -5304,7 +5309,7 @@ int main(int argc, char** argv) {
+         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
+         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+         for (const auto& pr : profile) {
+-            const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
++            const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard);
+             if (used + b > cap) break;
+             used += b;
+             sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
+@@ -5336,6 +5341,10 @@ int main(int argc, char** argv) {
+             xcache.set_segment_bytes(o.vram_segment_mib << 20);
+         }
+     }
++    // STRATA_MMQ_DIRECT: the guard after each sized slot (kept across the retry loop's close/open)
++    xcache.set_slot_guard(slot_guard);
++    if (slot_guard > 0)
++        std::fprintf(stderr, "strata generate: +%lld B guard per sized slot (STRATA_MMQ_DIRECT)\n", (long long) slot_guard);
+     if (o.expert_cache > 0) {
+         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
+         auto shrink_to = [&](int64_t keep_bytes) -> bool {
+@@ -5357,8 +5366,9 @@ int main(int argc, char** argv) {
+             if (!sized_slots.empty()) {
+                 int64_t used = 0;
+                 size_t keep = 0;
+-                while (keep < sized_slots.size() && used + (sized_slots[keep] + 255) / 256 * 256 <= keep_bytes)
+-                    used += (sized_slots[keep++] + 255) / 256 * 256;
++                while (keep < sized_slots.size() &&
++                       used + strata::core::ExpertCache::slot_stride(sized_slots[keep], slot_guard) <= keep_bytes)
++                    used += strata::core::ExpertCache::slot_stride(sized_slots[keep++], slot_guard);
+                 sized_slots.resize(keep);
+                 o.expert_cache = (int) keep;
+             } else {
+@@ -5370,7 +5380,7 @@ int main(int argc, char** argv) {
+         auto cache_bytes = [&]() -> int64_t {
+             if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+             int64_t b = 0;
+-            for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
++            for (const int64_t s : sized_slots) b += strata::core::ExpertCache::slot_stride(s, slot_guard);
+             return b;
+         };
+         // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: under WDDM an
+@@ -5580,7 +5590,8 @@ int main(int argc, char** argv) {
+         std::vector<int64_t> sized;
+         int64_t used = 0;
+         for (const auto& pr : st.profile) {
+-            const int64_t b = native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
++            const int64_t b = native_pack ? strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard)
++                                          : (int64_t) lay.max_blob;
+             if (used + b > room) break;
+             used += b;
+             sized.push_back((int64_t) lay.blob_bytes(pr.first));
+@@ -5589,6 +5600,7 @@ int main(int argc, char** argv) {
+         // Windows commit, or the free figure ran high): it is tried again with 90% of the slots, up to 3 times, each
+         // try said.  Nothing changes when the first open works.
+         bool stage_open = false;
++        st.cache.set_slot_guard(slot_guard);   // STRATA_MMQ_DIRECT: the stages' prompt MMQ reads their own slots
+         for (int attempt = 0; !sized.empty(); ++attempt) {
+             stage_open = native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
+                                      : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err);
+-- 
+2.43.0
+

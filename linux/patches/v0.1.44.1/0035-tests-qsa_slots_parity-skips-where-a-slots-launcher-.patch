@@ -1,0 +1,118 @@
+From c0329532770852c91eb149d64666ca8f554926b1 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 06:26:25 +0200
+Subject: [PATCH 35/58] tests: qsa_slots_parity skips where a slots launcher
+ declines by design
+
+STRATA_SCORES_MULTI=0, the pre-sm_75 attention (STRATA_EXPERIMENTAL_SM60 builds on a
+V100/P100) and the gfx906 query swizzle make qsa_block_scores_slots or
+qsa_decode_attn_slots decline; the engine keeps its per-row calls there, so a decline
+is no failure. A declined case prints SKIP, the test exits 77 when every case was
+declined, and STRATA_SCORES_MULTI=0 skips up front.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/qsa_slots_parity.cpp | 48 +++++++++++++++++++++-----------
+ 1 file changed, 32 insertions(+), 16 deletions(-)
+
+diff --git a/src/kernels/qsa_slots_parity.cpp b/src/kernels/qsa_slots_parity.cpp
+index d204a699..bd804cb2 100644
+--- a/src/kernels/qsa_slots_parity.cpp
++++ b/src/kernels/qsa_slots_parity.cpp
+@@ -3,7 +3,8 @@
+ // against one call per row, as verify.cpp makes them without the switch.  Every slot has its own indexer keys, page
+ // table and K/V pools (fp16, int8, q4_0 and int8-K/q4_0-V) and its own context length; scores, selected ids and the
+ // attention output must be bitwise identical.  Synthetic data, no model.  Run it once more with
+-// STRATA_ATTN_LANECELL=1 for the lane-cell kernels.
++// STRATA_ATTN_LANECELL=1 for the lane-cell kernels.  Where a launcher declines by design (STRATA_SCORES_MULTI=0, the
++// pre-sm_75 attention, the gfx906 query swizzle) the engine keeps its per-row calls and the test skips (77).
+ #include "strata/kernels/kv_q4.hpp"
+ #include "strata/kernels/kv_q8.hpp"
+ #include "strata/kernels/qsa.hpp"
+@@ -107,8 +108,10 @@ void free_slot(Slot& sl) {
+     for (void* b : sl.bufs) if (b) ck(cudaFree(b));
+ }
+ 
++enum Result { kPass, kFail, kSkip };
++
+ // one case: `m` rows of different slots, KV format `fmt`, contexts `ctx[i]`
+-bool check(int fmt, int m, const int64_t* ctx, uint32_t seed) {
++Result check(int fmt, int m, const int64_t* ctx, uint32_t seed) {
+     const k::QsaShapes s = k::qsa_real_shapes();
+     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
+     const int64_t max_blocks = kMaxCells / s.idx_block + 2;
+@@ -151,17 +154,22 @@ bool check(int fmt, int m, const int64_t* ctx, uint32_t seed) {
+     const float* dead[k::kQsaAttnMaxSlots];
+     k::QsaAttnSlotPools px;
+     for (int t = 0; t < m; ++t) { pooled[t] = slots[t].pooled; dead[t] = slots[t].dead; px.p[t] = slots[t].pools; }
++    // a declined launch is no failure: the engine runs the per-row calls there (STRATA_SCORES_MULTI=0, the pre-sm_75
++    // attention, the gfx906 query swizzle)
++    Result res = kPass;
+     if (!k::qsa_block_scores_slots(pooled, dead, d_qidx, d_steps, m, max_blocks, s, sc[1], nullptr)) {
+-        std::fprintf(stderr, "FAIL: qsa_block_scores_slots declined (STRATA_SCORES_MULTI=0?)\n");
+-        return false;
+-    }
+-    k::qsa_block_topk(sc[1], d_steps, m, max_blocks, cap, s, sel[1], nullptr);
+-    if (!k::qsa_decode_attn_slots(d_qcur, px, sel[1], d_steps, cap, s, scratch[1], attn[1], m, nullptr)) {
+-        std::fprintf(stderr, "FAIL: qsa_decode_attn_slots declined (a pre-sm_75 card or STRATA_ATTN_PRE75=1?)\n");
+-        return false;
++        std::puts("SKIP: qsa_block_scores_slots declined (STRATA_SCORES_MULTI=0); the engine keeps the per-row calls");
++        res = kSkip;
++    } else {
++        k::qsa_block_topk(sc[1], d_steps, m, max_blocks, cap, s, sel[1], nullptr);
++        if (!k::qsa_decode_attn_slots(d_qcur, px, sel[1], d_steps, cap, s, scratch[1], attn[1], m, nullptr)) {
++            std::puts("SKIP: qsa_decode_attn_slots declined (the pre-sm_75 or gfx906 query-swizzle attention); the "
++                      "engine keeps the per-row calls");
++            res = kSkip;
++        }
+     }
+     ck(cudaDeviceSynchronize());
+-    bool ok = true;
++    bool ok = res == kPass;
+     const auto s0 = down(sc[0], (size_t) (m * max_blocks)), s1 = down(sc[1], (size_t) (m * max_blocks));
+     const auto i0 = down(sel[0], (size_t) (m * cap)), i1 = down(sel[1], (size_t) (m * cap));
+     const auto a0 = down(attn[0], (size_t) (m * NH * HD)), a1 = down(attn[1], (size_t) (m * NH * HD));
+@@ -181,10 +189,11 @@ bool check(int fmt, int m, const int64_t* ctx, uint32_t seed) {
+     double mag = 0;   // the attention output is not trivially zero
+     for (float v : a0) mag += std::fabs(v);
+     if (ok && !(mag > 0)) { std::fprintf(stderr, "FAIL fmt=%d rows=%d: attention output is zero\n", fmt, m); ok = false; }
++    if (res == kPass && !ok) res = kFail;
+     for (int v = 0; v < 2; ++v) { ck(cudaFree(sc[v])); ck(cudaFree(sel[v])); ck(cudaFree(scratch[v])); ck(cudaFree(attn[v])); }
+     ck(cudaFree(d_qidx)); ck(cudaFree(d_qcur)); ck(cudaFree(d_steps));
+     for (auto& sl : slots) free_slot(sl);
+-    return ok;
++    return res;
+ }
+ 
+ }  // namespace
+@@ -195,15 +204,22 @@ int main() {
+         std::puts("SKIP: no CUDA device");
+         return 77;
+     }
++    if (const char* v = std::getenv("STRATA_SCORES_MULTI"); v && std::atoi(v) == 0) {
++        std::puts("SKIP: STRATA_SCORES_MULTI=0 (the slots launch is off; the engine keeps the per-row calls)");
++        return 77;
++    }
+     // contexts per row: under and over the selection width (2048 cells), partial and complete indexer blocks
+     const int64_t ctx[8] = {1500, 37, 9000, 2049, 32768, 300, 20001, 4096};
+-    int cases = 0;
++    int cases = 0, skipped = 0;   // the gfx906 query swizzle declines only the int8 K/V format
+     for (int fmt = 0; fmt < 4; ++fmt)
+         for (int m : {1, 2, 4, 8}) {
+-            if (!check(fmt, m, ctx, 1000u * (uint32_t) fmt + (uint32_t) m)) return 1;
+-            ++cases;
++            const Result res = check(fmt, m, ctx, 1000u * (uint32_t) fmt + (uint32_t) m);
++            if (res == kFail) return 1;
++            ++(res == kSkip ? skipped : cases);
+         }
+-    std::printf("PASS: %d cases (4 KV formats x 1/2/4/8 rows of different slots%s): scores, ids and attention bitwise "
+-                "identical to one call per row\n", cases, std::getenv("STRATA_ATTN_LANECELL") ? ", lane-cell" : "");
++    if (cases == 0) return 77;
++    std::printf("PASS: %d cases (4 KV formats x 1/2/4/8 rows of different slots%s, %d declined): scores, ids and "
++                "attention bitwise identical to one call per row\n", cases,
++                std::getenv("STRATA_ATTN_LANECELL") ? ", lane-cell" : "", skipped);
+     return 0;
+ }
+-- 
+2.43.0
+

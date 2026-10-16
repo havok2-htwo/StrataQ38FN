@@ -1,0 +1,1242 @@
+From 7f86f97c100d619da8fdd0bda9157a7ce0554eee Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 14:02:55 +0200
+Subject: [PATCH 57/58] generate: STRATA_MSG_CKPT_TAIL=N checkpoints a prompt
+ before its last message (opt-in, layer split too)
+
+An agent client appends a ~2.5K-token user message to every request and drops it in the next one, so the turn
+checkpoint (at the last <|im_start|>, behind that message) is never a prefix of the next prompt and every turn
+resumed at the last periodic checkpoint: 54 of 54 image turns of a 95-165K conversation re-read ~10K tokens each.
+With N > 0 a prompt read also cuts and checkpoints before its last message when that message has at most N tokens and
+the prefix at least 8192 - a normal main-session checkpoint (with the picture keys below it), also on a layer split.
+N = 0: message_cut() returns the old STRATA_CACHE_MESSAGE_BOUNDARY expression (message_cut_test, 257 checks).
+tools/msg_ckpt_check.py: GPU check (9 runs, negative control, pin reference); not yet run on a GPU. CUDA built only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                              |   5 +
+ include/strata/program/message_boundary.hpp |  39 ++
+ src/program/generate.cpp                    |  27 +-
+ tests/program/message_cut_test.cpp          | 275 ++++++++
+ tools/msg_ckpt_check.py                     | 654 ++++++++++++++++++++
+ tools/vision_check_fake_engine.py           |  55 +-
+ 6 files changed, 1046 insertions(+), 9 deletions(-)
+ create mode 100644 tests/program/message_cut_test.cpp
+ create mode 100644 tools/msg_ckpt_check.py
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c78d8fb9..d5c07db7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -293,6 +293,11 @@ if(STRATA_BUILD_TESTS)
+   add_executable(slot_chain_test tests/program/slot_chain_test.cpp)
+   target_include_directories(slot_chain_test PRIVATE include)
+   add_test(NAME slot_chain_test COMMAND slot_chain_test)
++  # STRATA_MSG_CKPT_TAIL: where a prompt read checkpoints in front of its last message (against the default path and
++  # STRATA_CACHE_MESSAGE_BOUNDARY as it was), and a host model of an agent's turns (header-only, CPU)
++  add_executable(message_cut_test tests/program/message_cut_test.cpp)
++  target_include_directories(message_cut_test PRIVATE include)
++  add_test(NAME message_cut_test COMMAND message_cut_test)
+ 
+   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
+   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
+diff --git a/include/strata/program/message_boundary.hpp b/include/strata/program/message_boundary.hpp
+index cef9dbc5..3c0e7833 100644
+--- a/include/strata/program/message_boundary.hpp
++++ b/include/strata/program/message_boundary.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <vector>
+ 
+ namespace strata::program {
+@@ -17,4 +18,42 @@ inline int64_t message_checkpoint_boundary(const std::vector<int64_t>& ids, int6
+     return -1;
+ }
+ 
++/// STRATA_MSG_CKPT_TAIL=N (opt-in): the longest last message, in tokens, that a prompt read checkpoints in front of.
++/// Unset, empty, 0, negative or not a number: 0 (off).  At most 1 << 20.
++inline int64_t msg_ckpt_tail_parse(const char* v) {
++    if (v == nullptr || v[0] == '\0') return 0;
++    char* end = nullptr;
++    const long long n = std::strtoll(v, &end, 10);
++    if (end == v || *end != '\0' || n <= 0) return 0;
++    return n > (1LL << 20) ? (1LL << 20) : (int64_t) n;
++}
++
++/// Where a prompt read takes its message-boundary checkpoint (`at`, -1: none) and whether it is the "tail" kind (the
++/// first to be evicted, one alive at a time).
++///   tail > 0 (STRATA_MSG_CKPT_TAIL): the <|im_start|> of the last message before the turn boundary when that message
++///     is at most `tail` tokens and the prefix at least 8192 - on every layout, a layer split too - as an ordinary
++///     checkpoint.  An agent that sends a transient last user message (a reminder, its environment) each turn and drops
++///     it from the next request's history parts there, before the turn checkpoint: the next turn resumes from it.
++///   else STRATA_CACHE_MESSAGE_BOUNDARY=1 (`legacy`) as before: a tail of at most 1024, not with a layer split, the
++///     tail kind.
++///   Neither, or no prompt cache: none (the default path).
++struct MessageCut {
++    int64_t at = -1;
++    bool as_tail = false;
++};
++inline MessageCut message_cut(const std::vector<int64_t>& ids, int64_t resume, int64_t turn_at, int64_t turn_token,
++                              bool prompt_cache_on, bool legacy, bool multi_gpu, int64_t tail) {
++    MessageCut c;
++    if (!prompt_cache_on) return c;
++    if (tail > 0) {
++        c.at = message_checkpoint_boundary(ids, resume, turn_at, turn_token, 8192, tail);
++        return c;
++    }
++    if (legacy && !multi_gpu) {
++        c.at = message_checkpoint_boundary(ids, resume, turn_at, turn_token);
++        c.as_tail = true;
++    }
++    return c;
++}
++
+ } // namespace strata::program
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 899132ef..c6d68d64 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -377,6 +377,17 @@ bool giveback_checks_env() {
+     }();
+     return on;
+ }
++// STRATA_MSG_CKPT_TAIL=N (read once; off by default): a prompt read also checkpoints in front of its last message (the
++// <|im_start|> before the turn boundary) when that message is at most N tokens and the prefix at least 8192, on every
++// layout (a layer split too) and as an ordinary checkpoint, not the evict-first tail kind of
++// STRATA_CACHE_MESSAGE_BOUNDARY.  An agent that appends a transient user message each turn (a reminder, its environment)
++// and drops it from the next request parts from the last request right there, before its turn checkpoint; the next
++// turn resumes from this one instead of the last periodic checkpoint.  Text and image requests alike: the checkpoint is
++// the main session's, with the pictures below it (message_boundary.hpp message_cut)
++int64_t msg_ckpt_tail_env() {
++    static const int64_t n = strata::program::msg_ckpt_tail_parse(std::getenv("STRATA_MSG_CKPT_TAIL"));
++    return n;
++}
+ // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
+ // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+ // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+@@ -8992,6 +9003,11 @@ int main(int argc, char** argv) {
+                 std::fprintf(stderr, "strata serve: STRATA_PARK_ASYNC is off: the pinned staging or a copy stream "
+                                      "could not be set up; parking as before\n");
+         }
++        if (msg_ckpt_tail_env() > 0)
++            std::fprintf(stderr, "strata serve: STRATA_MSG_CKPT_TAIL=%lld: a prompt read also checkpoints in front of a "
++                                 "last message of up to %lld tokens (a prefix of 8192 or more)%s\n",
++                         (long long) msg_ckpt_tail_env(), (long long) msg_ckpt_tail_env(),
++                         o.prompt_cache > 0 ? "" : "; off: --prompt-cache 0");
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+         auto park_current_body = [&](size_t held) -> bool {
+@@ -14262,9 +14278,11 @@ int main(int argc, char** argv) {
+                 const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
+                 return e != nullptr && std::atoi(e) != 0;
+             }();
+-            // Only add a snapshot; the existing token and image checks still decide reuse.
+-            const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
+-                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
++            // Only add a snapshot; the existing token and image checks still decide reuse.  STRATA_MSG_CKPT_TAIL: on a
++            // layer split too, with a longer last message, as an ordinary checkpoint (message_cut)
++            const strata::program::MessageCut msg_cut = strata::program::message_cut(
++                ids, resume, turn_at, o.turn_token, o.prompt_cache > 0, message_checkpoint, multi_gpu, msg_ckpt_tail_env());
++            const int64_t message_at = msg_cut.at;
+             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
+             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
+             int64_t pin_at = -1;
+@@ -14375,7 +14393,8 @@ int main(int argc, char** argv) {
+                 }
+                 at = to;
+                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
+-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
++                    !checkpoint_at(to, nullptr, msg_cut.as_tail && to == message_at && to != turn_at && to != root_at &&
++                                                    to != pin_at)) {   // the tail kind leaves first
+                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                     return 1;
+                 }
+diff --git a/tests/program/message_cut_test.cpp b/tests/program/message_cut_test.cpp
+new file mode 100644
+index 00000000..2c812ca9
+--- /dev/null
++++ b/tests/program/message_cut_test.cpp
+@@ -0,0 +1,275 @@
++// STRATA_MSG_CKPT_TAIL: where a prompt read takes its message-boundary checkpoint (include/strata/program/
++// message_boundary.hpp, message_cut), against STRATA_CACHE_MESSAGE_BOUNDARY as it was and the default path (none), and
++// a host model of an agent's turns that shows which checkpoint the next turn can resume from.  Header-only, CPU: no
++// model, no GPU.
++//
++// The agent (measured on production, 2026-10-14 06:43-07:37, the prefix diagnostic): every request ends with a
++// transient user message of about 2531 tokens that the next request no longer carries; the next request has the reply
++// and a tool result in its place.  So the last request's turn checkpoint (at its last <|im_start|>, after that
++// message) is never a prefix of the next prompt, and the next turn resumes at the last periodic checkpoint, about 10K
++// tokens back on average.  A checkpoint in front of the transient message is a prefix.
++//
++// What this does not test: the engine's prompt read, checkpoint_at and the conversation cache (the GPU check,
++// tools/msg_ckpt_check.py, does that).  `starts` below is a transcription of generate.cpp's starts_with (the n - 1 rule
++// and the picture keys below the length), so the model can say which checkpoint a turn resumes from; `read` (where
++// the checkpoints land) is a transcription too.  Only message_cut, msg_ckpt_tail_parse and the eviction policy
++// (conv_cache.hpp) are the engine's own code.  The tokens-read-again numbers it prints are a model, not a measurement.
++#include "strata/program/conv_cache.hpp"
++#include "strata/program/message_boundary.hpp"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++namespace mb = strata::program;
++
++namespace {
++int failures = 0, checks = 0;
++void check(bool ok, const char* what) {
++    ++checks;
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++constexpr int64_t kTurn = 248045;    // <|im_start|>
++constexpr int64_t kPad = 248056;     // <|image_pad|>
++constexpr int64_t kEvery = 16384;    // --prompt-cache-every
++constexpr int64_t kRoot = 2048;      // --prompt-cache-root
++constexpr int64_t kTransient = 2531; // the agent's last user message, measured
++
++struct Img {
++    int64_t start;
++    uint64_t hash;
++    bool operator==(const Img& o) const { return start == o.start && hash == o.hash; }
++};
++struct Prompt {
++    std::vector<int64_t> ids;
++    std::vector<Img> imgs;
++};
++struct Check {
++    int64_t len;
++    std::vector<Img> imgs;
++};
++
++std::vector<Img> below(const std::vector<Img>& all, int64_t L) {
++    std::vector<Img> v;
++    for (const Img& k : all) if (k.start < L) v.push_back(k);
++    return v;
++}
++
++// one message: <|im_start|>, a role word, `n` tokens of text from stream `seed`
++void message(Prompt& p, int64_t role, int64_t n, uint32_t seed) {
++    p.ids.push_back(kTurn);
++    p.ids.push_back(role);
++    uint32_t x = seed * 2654435761u + 7u;
++    for (int64_t i = 0; i < n; ++i) {
++        x = x * 1664525u + 1013904223u;
++        p.ids.push_back(1000 + (int64_t) (x >> 12) % 150000);
++    }
++}
++void picture(Prompt& p, int64_t rows, uint64_t hash) {
++    p.imgs.push_back({(int64_t) p.ids.size(), hash});
++    for (int64_t i = 0; i < rows; ++i) p.ids.push_back(kPad);
++}
++constexpr int64_t kSystem = 1, kUser = 2, kAssistant = 3;
++
++// the conversation's history after `turns` turns: a system prompt, message 3 with three pictures, then per turn the
++// reply and a tool result (the parts every later request carries)
++Prompt history(int turns, uint64_t pic_hash = 0xabc) {
++    Prompt p;
++    message(p, kSystem, 7200, 1);
++    message(p, kUser, 400, 2);
++    message(p, kAssistant, 300, 3);
++    message(p, kUser, 50, 4);
++    picture(p, 1200, pic_hash);
++    picture(p, 1200, pic_hash + 1);
++    picture(p, 1200, pic_hash + 2);
++    for (int t = 0; t < turns; ++t) {
++        message(p, kAssistant, 600 + 37 * t, 100 + t);
++        message(p, kUser, 900 + 53 * t, 200 + t);
++    }
++    return p;
++}
++// the request of turn `t`: the history, the transient message, the assistant header
++Prompt request(int t, uint64_t pic_hash = 0xabc) {
++    Prompt p = history(t, pic_hash);
++    message(p, kUser, kTransient - 2, 9000 + t);   // a different reminder each turn
++    p.ids.push_back(kTurn);
++    p.ids.push_back(kAssistant);
++    p.ids.push_back(10);
++    return p;
++}
++
++// generate.cpp's starts_with: tokens and the pictures below the length, at most n - 1 of them
++bool starts(const Prompt& p, const Prompt& from, const Check& c) {
++    const int64_t n = (int64_t) p.ids.size();
++    if (c.len < 1 || c.len > n - 1 || c.len > (int64_t) from.ids.size()) return false;
++    if (!std::equal(from.ids.begin(), from.ids.begin() + c.len, p.ids.begin())) return false;
++    return below(p.imgs, c.len) == c.imgs;
++}
++
++int64_t last_turn(const std::vector<int64_t>& ids, int64_t resume) {
++    for (int64_t i = (int64_t) ids.size() - 1; i > resume; --i)
++        if (ids[(size_t) i] == kTurn) return i;
++    return -1;
++}
++
++// the checkpoints a read of `p` from `resume` takes (the root from 0, every kEvery from resume, the turn checkpoint
++// and the message cut), as generate.cpp's cuts and pp_next_check place them (the periodic ones at their nominal
++// positions: the engine takes them at the next chunk end, which this model does not need)
++std::vector<Check> read(const Prompt& p, int64_t resume, bool multi_gpu, int64_t tail, bool legacy,
++                        int64_t* msg_at = nullptr) {
++    std::vector<Check> out;
++    const int64_t n = (int64_t) p.ids.size();
++    const int64_t turn_at = last_turn(p.ids, resume);
++    if (resume == 0)
++        for (int64_t i = 1; i < turn_at; ++i)
++            if (p.ids[(size_t) i] == kTurn) {
++                if (i >= kRoot) out.push_back({i, below(p.imgs, i)});
++                break;
++            }
++    for (int64_t L = resume + kEvery; L < n - 1; L += kEvery) out.push_back({L, below(p.imgs, L)});
++    const mb::MessageCut cut = mb::message_cut(p.ids, resume, turn_at, kTurn, true, legacy, multi_gpu, tail);
++    if (msg_at) *msg_at = cut.at;
++    if (cut.at > resume) out.push_back({cut.at, below(p.imgs, cut.at)});
++    if (turn_at > resume) out.push_back({turn_at, below(p.imgs, turn_at)});
++    return out;
++}
++
++int64_t resume_of(const Prompt& next, const Prompt& prev, const std::vector<Check>& cs) {
++    int64_t r = 0;
++    for (const Check& c : cs)
++        if (c.len > r && starts(next, prev, c)) r = c.len;
++    return r;
++}
++}  // namespace
++
++int main() {
++    // ---- the switch's value
++    check(mb::msg_ckpt_tail_parse(nullptr) == 0, "unset: off");
++    check(mb::msg_ckpt_tail_parse("") == 0, "empty: off");
++    check(mb::msg_ckpt_tail_parse("0") == 0, "0: off");
++    check(mb::msg_ckpt_tail_parse("-4096") == 0, "negative: off");
++    check(mb::msg_ckpt_tail_parse("abc") == 0, "not a number: off");
++    check(mb::msg_ckpt_tail_parse("4096x") == 0, "trailing garbage: off");
++    check(mb::msg_ckpt_tail_parse("4096") == 4096, "4096");
++    check(mb::msg_ckpt_tail_parse("99999999999") == (1LL << 20), "clamped to 1 << 20");
++
++    // ---- the default path and STRATA_CACHE_MESSAGE_BOUNDARY as before (the old expression, side by side)
++    const Prompt r3 = request(3);
++    const int64_t t3 = last_turn(r3.ids, 0);
++    for (int64_t resume : {(int64_t) 0, (int64_t) 8000, t3 - 10})
++        for (int legacy = 0; legacy < 2; ++legacy)
++            for (int multi = 0; multi < 2; ++multi)
++                for (int cache = 0; cache < 2; ++cache) {
++                    const mb::MessageCut c = mb::message_cut(r3.ids, resume, t3, kTurn, cache, legacy, multi, 0);
++                    const int64_t old = legacy && !multi && cache
++                                        ? mb::message_checkpoint_boundary(r3.ids, resume, t3, kTurn) : -1;
++                    check(c.at == old, "tail 0: message_at is the old expression's");
++                    check(c.as_tail == (legacy && !multi && cache), "tail 0: the tail kind exactly where it was on");
++                }
++    check(mb::message_cut(r3.ids, 0, t3, kTurn, true, true, false, 0).at == -1,
++          "STRATA_CACHE_MESSAGE_BOUNDARY alone: the agent's 2531-token message is past its 1024-token tail");
++
++    // ---- the switch: in front of the transient message, on a layer split too, an ordinary checkpoint
++    const int64_t front = (int64_t) history(3).ids.size();   // the transient message's <|im_start|>
++    for (int multi = 0; multi < 2; ++multi) {
++        const mb::MessageCut c = mb::message_cut(r3.ids, 0, t3, kTurn, true, false, multi, 4096);
++        check(c.at == front, "tail 4096: at the transient message's <|im_start|>");
++        check(!c.as_tail, "tail 4096: an ordinary checkpoint (not evicted first)");
++        check(mb::message_cut(r3.ids, 0, t3, kTurn, true, true, multi, 4096).at == front,
++              "tail 4096 wins over STRATA_CACHE_MESSAGE_BOUNDARY");
++    }
++    check(mb::message_cut(r3.ids, 0, t3, kTurn, false, false, true, 4096).at == -1, "no prompt cache: none");
++    check(mb::message_cut(r3.ids, 0, t3, kTurn, true, false, true, kTransient - 10).at == -1,
++          "a tail below the message: none");
++    check(mb::message_cut(r3.ids, front, t3, kTurn, true, false, true, 4096).at == -1,
++          "resumed at the boundary itself: nothing new to take");
++    check(mb::message_cut(r3.ids, 0, -1, kTurn, true, false, true, 4096).at == -1, "ckpt=0 (no turn_at): none");
++
++    // ---- the agent's turns: which checkpoint the next turn resumes from
++    int64_t reread_off = 0, reread_on = 0;
++    for (int t = 3; t < 40; ++t) {
++        const Prompt prev = request(t), next = request(t + 1);
++        const int64_t prev_turn = last_turn(prev.ids, 0);
++        int64_t at = -1;
++        const std::vector<Check> off = read(prev, 0, true, 0, false);
++        const std::vector<Check> on = read(prev, 0, true, 8192, false, &at);
++        const int64_t r_off = resume_of(next, prev, off), r_on = resume_of(next, prev, on);
++        check(!starts(next, prev, {prev_turn, below(prev.imgs, prev_turn)}),
++              "the last request's turn checkpoint is never a prefix of the next prompt");
++        check(at == (int64_t) history(t).ids.size(), "the message cut is in front of the transient message");
++        check(r_on == at, "on: the next turn resumes at the message cut");
++        check(r_off > 0 && r_off < at && (r_off % kEvery == 0 || r_off < kEvery),
++              "off: the next turn resumes at a periodic checkpoint (or the root)");
++        reread_off += (int64_t) next.ids.size() - r_off;
++        reread_on += (int64_t) next.ids.size() - r_on;
++        // the pictures: another picture at the same tokens (another hash) resumes from none of them past message 3
++        const Prompt other = request(t + 1, 0xdef);
++        check(resume_of(other, prev, on) < other.imgs[0].start + 1, "other pictures: nothing past them resumes");
++    }
++    check(reread_on * 2 < reread_off, "on: under half the tokens read again");
++    std::printf("message_cut_test: tokens read again over 37 agent turns: %lld off, %lld on (a model, not a "
++                "measurement)\n", (long long) reread_off, (long long) reread_on);
++
++    // ---- production's size with --prompt-cache 6: the cut survives the eviction (conv_cache.hpp's real policy: the
++    // root pinned, the rest least recently used; a checkpoint's stamp advances when created and when a request resumes
++    // from it, generate.cpp 8877/8984/12477).  The conversation is read from 0 at turn 30 (about 96K tokens: the root,
++    // five periodic checkpoints, the cut and the turn checkpoint, more than 6) and then turn by turn to about 168K; the
++    // chain the main session holds is what it parks (all of `checks`), so it is what the next turn finds.
++    {
++        struct Item {
++            Check c;
++            uint64_t used;
++        };
++        std::vector<Item> chain;
++        uint64_t clock = 0;
++        int64_t resume = 0;
++        int evicted = 0;
++        bool cut_kept = true, resumed_at_cut = true;
++        for (int t = 30; t < 46; ++t) {
++            const Prompt cur = request(t), next = request(t + 1);
++            // what is kept: the checkpoints the request resumed through (a prefix of it); the one it resumed from bumped
++            std::vector<Item> kept;
++            for (Item& it : chain)
++                if (it.c.len <= resume) {
++                    if (it.c.len == resume) it.used = ++clock;
++                    kept.push_back(it);
++                }
++            chain = kept;
++            int64_t at = -1;
++            for (const Check& c : read(cur, resume, true, 8192, false, &at)) {
++                chain.push_back({c, ++clock});
++                while ((int) chain.size() > 6) {
++                    std::vector<uint64_t> stamps;
++                    for (const Item& it : chain) stamps.push_back(it.used);
++                    chain.erase(chain.begin() + (std::ptrdiff_t) strata::program::conv_cache::eviction_victim(
++                                                    stamps.data(), stamps.size(), 6));
++                    ++evicted;
++                }
++            }
++            cut_kept = cut_kept && std::any_of(chain.begin(), chain.end(), [&](const Item& it) { return it.c.len == at; });
++            std::vector<Check> cs;
++            for (const Item& it : chain) cs.push_back(it.c);
++            const int64_t r = resume_of(next, cur, cs);
++            resumed_at_cut = resumed_at_cut && r == at;
++            resume = r;
++        }
++        check(evicted > 0, "production size: the eviction runs");
++        check(cut_kept, "production size, --prompt-cache 6: every turn's cut is still in the chain after its read");
++        check(resumed_at_cut, "production size, --prompt-cache 6: every next turn resumes at the cut");
++        check(chain.front().c.len < kEvery && chain.front().c.len >= kRoot, "the root is still the chain's first");
++        std::printf("message_cut_test: 16 turns at %zu-%zu tokens, --prompt-cache 6: %d evicted, the cut always kept\n",
++                    request(30).ids.size(), request(45).ids.size(), evicted);
++    }
++
++    if (failures) {
++        std::fprintf(stderr, "message_cut_test: %d of %d checks FAILED\n", failures, checks);
++        return 1;
++    }
++    std::printf("message_cut_test OK (%d checks)\n", checks);
++    return 0;
++}
+diff --git a/tools/msg_ckpt_check.py b/tools/msg_ckpt_check.py
+new file mode 100644
+index 00000000..32bbe374
+--- /dev/null
++++ b/tools/msg_ckpt_check.py
+@@ -0,0 +1,654 @@
++#!/usr/bin/env python3
++"""STRATA_MSG_CKPT_TAIL: an agent's next turn resumes in front of the transient last message the agent dropped, not
++at the last periodic checkpoint - for an image conversation decoded in batch slots and for its text control, on the
++production config's engine (a 4-GPU layer split, --batch 16 in 4 pipelined groups, --vision, STRATA_MROPE_SLOTS,
++STRATA_SLOT_PARK, STRATA_SLOT_CKPT_MOVE, STRATA_SLOT_CHAIN_REUSE, STRATA_GIVEBACK_CHECKS).
++
++GPU only (the engine starts on the config's cards; the config's image encoder encodes the pictures first).
++--self-test runs this file against tools/vision_check_fake_engine.py on the CPU (CACHE_CHECK_FAKE_MODEL=1), with no
++model and no GPU: it checks this harness's own logic, not the engine.
++
++What production showed (2026-10-14 06:43-07:37, the server's prefix diagnostic): the agent conversation with three user
++pictures in message 3 ends every request with a user message of about 2531 tokens that the next request no longer
++carries (the reply and a tool result take its place).  The next prompt parts from the last one at that message's
++<|im_start|>, before the last request's turn checkpoint, so every turn resumed at the last periodic checkpoint (16384
++apart) and read about 10K tokens again.  With the switch the read also checkpoints at that <|im_start|> (message_cut).
++
++The conversations (every leg its own): a system prompt of --system-tokens (2500: the root at its end), a user message
++of about --total-tokens (20000; the image leg's opens with --pictures pictures, A B A), so a root and one periodic
++checkpoint, then the transient message of --transient-tokens (2531) and the assistant header.  Turn 2: the same history
++up to the transient message, a FIXED assistant reply (the same tokens in every run, so every run sends the same turn-2
++prompt), a tool result, a new transient message.  Slots: sx = 0 (group 0), st = row 1 of group 1 (the text requests
++beside the turns), sy = row 0 of group 2 (a slot no request used before: its region holds nothing of picture A).
++
++  IMG  I1 (BGENI) into sx beside TB (BGEN) in st; then Y, another conversation, alone (GEN): the main session, which
++       held I1, is parked into the RAM cache; then I2 (BGENI) into sy, TB' (BGEN) into st beside it.  I2 is restored
++       at its resume point, region 0 rebuilt from its prompt, copied into sy's region (copy_needed), decoded in sy: the
++       path production takes every turn
++  TXT  the same with a text conversation: T1 into sx beside TB2; Y2 alone; T2 into sx beside TB2'
++
++The processes (--runs), each with the same requests in the same order:
++  off      the switch unset: I2 and T2 resume at the periodic checkpoint (the gap)
++  on       STRATA_MSG_CKPT_TAIL=--tail (8192): I2 resumes at I1's message cut, restored from the RAM cache
++           ('restored <n> tokens (checkpoint)'); T2 at T1's (from sx's chain or the RAM cache)
++  ref      the switch on, without Y / Y2: I2 and T2 come right after their turn 1 and resume at the SAME length by
++           another route (mounted from the main session's own checkpoints, no restore line)
++  pin      the switch unset, pin=<cut> on turn 1 and pin=<turn 2's cut> on turn 2: the same chunk cuts and an ordinary
++           checkpoint at the same lengths through code that does not use message_cut (pin_at).  Turn 1 against on's:
++           the same chunk geometry, so whether the switch's extra cut disturbs the live read is decided, and turn 2
++           against on's: the same resume length from another checkpoint producer (on and ref share one capture)
++  on-skip  on plus STRATA_MROPE_REGION_SKIP=1 (its startup WARNING allowed): the negative control.  I2's admission into
++           sy skips the region copy, so sy reads a region without picture A; its tokens must differ from on's, or the
++           slot comparisons could not see a wrong region or position (INCONCLUSIVE)
++  old      (--old-exe) the production binary, the switch unset: every request's REUSED == off's; tokens: the solo
++           requests exactly, the batch-slot ones by their first token (a later difference is INCONCLUSIVE)
++  on-nd, ref-nd, pin-nd  (--no-draft-pair) without the MTP drafter, where any later-token difference is NO-GO; on-skip
++           then runs without the drafter too and is compared with on-nd
++Duration, an estimate (not measured): about 97 s per engine start plus about 1-2 minutes of requests: about 15 minutes
++for off, on, ref, pin and on-skip, 18 with --old-exe, 26 with --no-draft-pair as well.
++
++GO / NO-GO.  Deciding: on's I2 / T2 REUSED == the message cut (the image one with its restore line), decoded on in its
++slot; their tokens == ref's and == pin's (the first token always decides; a later difference is INCONCLUSIVE in a batch
++slot except between two runs without the drafter, where it is NO-GO); on's turn 1 == pin's turn 1 (as above); the
++negative control differs; the startup line exactly in the runs with the switch; with --old-exe the default path as
++above.  Every compared pair is first checked for the same prompt (else INCONCLUSIVE).  INCONCLUSIVE: off does not show
++the gap, ref or pin did not resume at the cut, a turn did not decode on in its slot beside a text slot.  Turn 1 against
++off's is only reported ('info': another chunk geometry may round differently).  One summary, exit 0 (GO), 2 (NO-GO), 3
++(INCONCLUSIVE), 64 (usage); --out writes the criteria, every request and the runs as JSON.
++
++Not covered: production's size (95-165K tokens, three pictures in message 3, 6+ periodic checkpoints and --prompt-cache 6
++eviction).  --total-tokens 100000 --pictures 3 runs the same legs at that size (longer: about 2 minutes of reads per
++run more); tests/program/message_cut_test.cpp models the eviction on the CPU.
++
++Exact comparisons need deterministic decoding: by default STRATA_IQ_MT_MIN=1 and --extra "--pcie-frac 0 --adapt-every
++1000000 --no-prefill-borrow --suffix-draft 0" (as tools/vision_batch_check.py).  The engine's environment is the
++config's "env", CUDA_DEVICE_ORDER=PCI_BUS_ID, CUDA_VISIBLE_DEVICES in the config's order, and a fresh
++STRATA_CONV_TIER_DIR per run.
++
++  python3 tools/msg_ckpt_check.py --exe build-vrope/strata \\
++      --config /media/raid0/StrataQ38FN/linux/configs/T16-143-prod262r-vision-cpu-v3.json \\
++      --old-exe /media/raid0/StrataQ38FN/Strata/engine/strata-g3-143v3 --no-draft-pair --out msg_ckpt.json
++  python3 tools/msg_ckpt_check.py --self-test        # CPU only, about a minute
++"""
++import argparse, hashlib, json, os, re, shutil, shlex, subprocess, sys, tempfile, time, traceback
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++
++import vision_batch_check as vbc  # noqa: E402
++import cache_reuse_check as crc  # noqa: E402
++from vision_batch_check import EXACT, EXIT, EXIT_USAGE, LIVE, SKIP, SKIP_WARNING, Engine, EngineError, first_diff  # noqa: E402,E501
++
++vbc.KEEP_LOG = re.compile(vbc.KEEP_LOG.pattern + r"|STRATA_MSG_CKPT_TAIL|pin=")
++
++CONFIG = "/media/raid0/StrataQ38FN/linux/configs/T16-143-prod262r-vision-cpu-v3.json"
++FAKE = HERE / "vision_check_fake_engine.py"
++EOS = (248044, 248046)
++SWITCH = "STRATA_MSG_CKPT_TAIL"
++LEGACY = "STRATA_CACHE_MESSAGE_BOUNDARY"
++
++
++def R(switch, overwrite=True, nd=False, pin=False, skip=False):
++    return {"switch": switch, "overwrite": overwrite, "nd": nd, "pin": pin, "skip": skip}
++
++
++RUNS = {"off": R(False), "on": R(True), "ref": R(True, overwrite=False), "pin": R(False, pin=True),
++        "on-skip": R(True, skip=True), "old": R(False),
++        "on-nd": R(True, nd=True), "ref-nd": R(True, overwrite=False, nd=True), "pin-nd": R(False, nd=True, pin=True)}
++BASE_RUNS = ("off", "on", "ref", "pin", "on-skip")
++STARTUP = re.compile(r"strata serve: STRATA_MSG_CKPT_TAIL=(\d+): a prompt read also checkpoints")
++FILLER = ("Step %d of the build log: the agent ran the tests, read the failures, changed one file and wrote down "
++          "what it changed and why. ")
++SYSTEM = ("You are a coding agent. Rule %d: read the files before you change them, run the tests after every change, "
++          "and say what you did. ")
++REMINDER = ("Reminder %d: the working directory, the open files and the task list follow; keep to the task, do not "
++            "repeat finished steps. ")
++Q1 = "Look at the pictures and the log above, then fix the failing test."
++Q1_TEXT = "Read the log above, then fix the failing test."
++TOOL = "<tool_response>\n{\"status\": \"ok\", \"tests_passed\": 41, \"tests_failed\": 1}\n</tool_response>"
++# turn 2's assistant reply: a fixed text, not a run's turn-1 reply, so every run sends the same turn-2 prompt (only the
++# tokens up to the message cut decide the resume)
++CANNED = ("I read the log: the failing test expects the parser to accept an empty list. I changed parse_items to "
++          "return an empty list for an empty input and ran the tests again.")
++# leg, request prefix, the request that overwrites the main session, the text requests beside turn 1 / turn 2, the
++# prompts' variant, the image leg, the slot turn 2 goes into ("sy": a fresh one, "sx": turn 1's)
++LEGS = (("IMG", "I", "Y", "TB", "TBb", 10, True, "sy"), ("TXT", "T", "Y2", "TB2", "TB2b", 30, False, "sx"))
++PIC_ORDER = ("A", "B", "A")
++
++
++def usage(msg):
++    print(f"msg_ckpt_check.py: {msg}", file=sys.stderr, flush=True)
++    sys.exit(EXIT_USAGE)
++
++
++class Parser(argparse.ArgumentParser):
++    def error(self, message):
++        self.print_usage(sys.stderr)
++        usage(message)
++
++
++def sha(ids):
++    return hashlib.sha1(",".join(map(str, ids)).encode()).hexdigest()[:16]
++
++
++# ---------------------------------------------------------------------------------------------------------------- prompts
++class Prompts:
++    def __init__(self, tok, pics):
++        self.tok, self.pics = tok, pics      # pics: the encoder's answers, in prompt order ("n": its image tokens)
++        self.turn = self.enc("<|im_start|>")[0]
++
++    def enc(self, s):
++        return self.tok.encode(s, parse_special=True)
++
++    def text(self, pattern, variant, tokens):
++        per = max(1, len(self.tok.encode(pattern % 100)))
++        return "".join(pattern % (1000 * variant + i) for i in range(max(0, tokens) // per + 1))
++
++    def system(self, variant, tokens):
++        return self.enc(f"<|im_start|>system\n{self.text(SYSTEM, variant, tokens)}<|im_end|>\n")
++
++    def user1(self, variant, tokens, image):
++        body = self.text(FILLER, variant + 1, tokens) + "\n\n" + (Q1 if image else Q1_TEXT)
++        if not image:
++            return self.enc(f"<|im_start|>user\n{body}<|im_end|>\n")
++        tags = "<|vision_start|><|image_pad|><|vision_end|>" * len(self.pics)
++        ids = self.enc(f"<|im_start|>user\n{tags}{body}<|im_end|>\n")
++        out, k = [], 0
++        for j, t in enumerate(ids):
++            if t != vbc.IMAGE_PAD:
++                out.append(t)
++                continue
++            if j == 0 or ids[j - 1] != vbc.VISION_START or k >= len(self.pics):
++                raise SystemExit("the tokenizer did not give <|vision_start|><|image_pad|> as two special tokens")
++            out += [vbc.IMAGE_PAD] * self.pics[k]["n"]
++            k += 1
++        if k != len(self.pics):
++            raise SystemExit(f"{k} <|image_pad|> tokens for {len(self.pics)} pictures")
++        return out
++
++    def transient(self, variant, tokens):
++        """The agent's last user message: a reminder that the next request no longer carries."""
++        return self.enc(f"<|im_start|>user\n<system-reminder>\n{self.text(REMINDER, variant, tokens - 12)}"
++                        f"</system-reminder><|im_end|>\n")
++
++    def head(self):
++        return self.enc("<|im_start|>assistant\n<think>\n\n</think>\n\n")
++
++    def reply_tool(self):
++        """The fixed assistant reply and a tool result."""
++        return self.enc(f"<|im_start|>assistant\n{CANNED}<|im_end|>\n<|im_start|>user\n{TOOL}<|im_end|>\n")
++
++    def short(self, variant, tokens):
++        """Another conversation (the requests that overwrite the main session)."""
++        return self.system(variant, 600) + self.enc(f"<|im_start|>user\n{self.text(FILLER, variant + 1, tokens)}"
++                                                    f"\n\nSummarize the log above.<|im_end|>\n") + self.head()
++
++    def side(self, k):
++        return self.enc(f"<|im_start|>user\nWrite a short poem about the number {k}, then explain it.<|im_end|>\n") + \
++            self.head()
++
++
++def plan(P, a):
++    p = {}
++    for leg, K, Y, B, B2, v, image, _ in LEGS:
++        hist = P.system(v, a.system_tokens) + P.user1(v, a.total_tokens, image)
++        p[f"{K}1"] = hist + P.transient(v + 5, a.transient_tokens) + P.head()
++        p[f"cut_{K}"] = len(hist)            # the transient message's <|im_start|>: the message cut
++        p[f"turn_{K}"] = max(i for i, t in enumerate(p[f"{K}1"]) if t == P.turn)
++        p[f"root_{K}"] = len(P.system(v, a.system_tokens))
++        hist2 = hist + P.reply_tool()
++        p[f"{K}2"] = hist2 + P.transient(v + 7, a.transient_tokens) + P.head()
++        p[f"cut2_{K}"] = len(hist2)          # turn 2's own message cut (the pin run pins there: the same chunk cuts)
++        p[Y] = P.short(v + 50, a.short_tokens)
++        p[B] = P.side(v)
++        p[B2] = P.side(v + 1)
++    return p
++
++
++# ---------------------------------------------------------------------------------------------------------------- runs
++def engine_env(a, cfg, tier_root, run):
++    env = dict(os.environ)
++    if cfg.get("gpu"):
++        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
++        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in cfg["gpu"])
++    if not a.no_config_env:
++        env.update({k: str(v) for k, v in (cfg.get("env") or {}).items()})
++    env["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [env.get("LD_LIBRARY_PATH", "")])
++    if a.mt_min:
++        env["STRATA_IQ_MT_MIN"] = a.mt_min
++    if "STRATA_CONV_TIER_DIR" in env:      # a fresh disk tier per run: no earlier run answers anything
++        env["STRATA_CONV_TIER_DIR"] = tempfile.mkdtemp(prefix=f"tier-{run}-", dir=tier_root)
++    env.pop(SWITCH, None)
++    env.pop(LEGACY, None)                  # (the old switch is not what is checked)
++    env.pop(SKIP, None)
++    if RUNS[run]["switch"]:
++        env[SWITCH] = str(a.tail)
++    if RUNS[run]["skip"]:
++        env[SKIP] = "1"
++    return env
++
++
++def scenario(e, p, a, S, run, pic_file):
++    r = {}
++    cfg = RUNS[run]
++
++    def keep(name, rec):
++        rec["ids_sha"] = sha(p[name])
++        r[name] = rec
++
++    for leg, K, Y, B, B2, _, image, s2 in LEGS:
++        emb = pic_file if image else None
++        k1 = f"pin={p[f'cut_{K}']}" if cfg["pin"] else ""
++        k2 = f"pin={p[f'cut2_{K}']}" if cfg["pin"] else ""
++        keep(B, e.admit(S["st"], a.side_max_new, p[B], name=B))                  # decodes beside turn 1
++        keep(f"{K}1", e.admit(S["sx"], a.max_new, p[f"{K}1"], emb=emb, keys=k1, name=f"{K}1"))
++        e.wait_done(S["sx"])
++        e.wait_done(S["st"])
++        if cfg["overwrite"]:
++            keep(Y, e.solo(8, p[Y], name=Y))
++        # turn 2 first (in the ref runs nothing may come between the turns), then a text request beside it
++        keep(f"{K}2", e.admit(S[s2], a.max_new, p[f"{K}2"], emb=emb, keys=k2, name=f"{K}2"))
++        keep(B2, e.admit(S["st"], a.side_max_new, p[B2], name=B2))
++        e.wait_done(S[s2])
++        e.wait_done(S["st"])
++    return r
++
++
++def pick_slots(slots, groups):
++    gs = slots // groups if groups and slots % groups == 0 else slots
++    sx, st = 0, min(slots - 1, gs + 1)
++    sy = next((b for b in (2 * gs, slots - 1, slots - 2, 1) if 0 <= b < slots and b not in (sx, st)), -1)
++    return {"sx": sx, "st": st, "sy": sy}
++
++
++def run_one(a, cfg, exe, run, p, P, tier_root, pic_file):
++    log = str(Path(a.logs) / f"{run}.log")
++    env = engine_env(a, cfg, tier_root, run)
++    nd = RUNS[run]["nd"]
++    c = crc.without_mtp(cfg) if nd else cfg
++    print(f"[{run}] starting {exe} ({SWITCH}={env.get(SWITCH, '(unset)')}{', ' + SKIP + '=1' if RUNS[run]['skip'] else ''}"
++          f"{', pin=' if RUNS[run]['pin'] else ''}{', without --mtp' if nd else ''}"
++          f"{'' if RUNS[run]['overwrite'] else ', no request between the turns'}); log {log}", flush=True)
++    e = Engine(exe, c, a.batch, True, a.extra.split(), env, log, run, a.line_timeout, a.start_timeout)
++    e.P = P
++    info = e.info
++    print(f"[{run}] ready: batch_slots={info.get('batch_slots')} batch_groups={info.get('batch_groups')} "
++          f"mrope_slots={info.get('mrope_slots', '-')}", flush=True)
++    out = {"exe": exe, "log": log, "env": {k: env.get(k) for k in (SWITCH, LEGACY, SKIP)}, "info": info,
++           "facts": e.facts, "no_mtp": nd}
++    try:
++        slots = int(info.get("batch_slots") or 0)
++        groups = max(1, int(info.get("batch_groups") or 1))
++        S = pick_slots(slots, groups)
++        if slots < 3 or len(set(S.values())) < 3 or min(S.values()) < 0:
++            raise EngineError(f"{run}: {slots} batch slots: three are needed (--batch {a.batch})")
++        if info.get("mrope_slots") != "1":
++            raise EngineError(f"{run}: no INFO mrope_slots=1 (STRATA_MROPE_SLOTS=1 in the config's env and --vision): "
++                              f"an image slot would not decode beside a text slot")
++        out["slots"] = S
++        out["requests"] = scenario(e, p, a, S, run, pic_file)
++    finally:
++        e.quit()
++        text = e.log_text()
++        out["warnings"] = [l for l in text.splitlines() if "WARNING" in l]
++        out["skip_warning"] = bool(re.search(SKIP_WARNING, text))
++        m = STARTUP.search(text)
++        out["startup_tail"] = int(m.group(1)) if m else None
++        out["errs"] = list(e.errs)
++        out["unexpected"] = e.unexpected[:20]
++    for name, rec in out["requests"].items():
++        notes = [l.split(": ", 1)[-1].strip()[:110] for l in rec.get("log", [])
++                 if "gave back" in l or "restored" in l or "capture=" in l or "pin=" in l]
++        print(f"[{run}] {name}: {rec['op']}{'' if rec.get('slot') is None else ' ' + str(rec['slot'])} "
++              f"{rec['prompt_tokens']} tokens, REUSED {rec['reused']}, {len(rec['tokens'])} generated"
++              f"{''.join(f'; {n}' for n in notes)}", flush=True)
++    return out
++
++
++# ---------------------------------------------------------------------------------------------------------------- verdict
++def compare(c, name, got, ref, group, strict):
++    """same_tokens, after checking that the two requests sent the same prompt."""
++    if got.get("ids_sha") != ref.get("ids_sha"):
++        return c.add(name, "INCONCLUSIVE", "the two requests did not send the same prompt", group)
++    return crc.same_tokens(c, name, got, ref, group, strict=strict)
++
++
++def verdict(a, runs, p):
++    c = crc.Crit()
++    said = crc.said
++    have = {k: v for k, v in runs.items() if v.get("requests")}
++    for k, v in runs.items():
++        if v.get("failed"):
++            hard = v.get("engine_error") and not RUNS[k]["nd"] and not RUNS[k]["skip"]
++            c.add(f"[{k}] the engine run ran to its end", "NO-GO" if hard else "INCONCLUSIVE", v["failed"], "run")
++    for k, v in have.items():
++        allow = list(a.allow_warning) + ([SKIP_WARNING] if RUNS[k]["skip"] else [])
++        bad = [w for w in v.get("warnings", []) if not any(re.search(x, w) for x in allow)]
++        c.add(f"[{k}] no WARNING or unexpected ERR line", "NO-GO" if bad or v.get("errs") else "GO",
++              "; ".join((bad + v.get("errs", []))[:3]), "run")
++        want = a.tail if RUNS[k]["switch"] else None
++        c.add(f"[{k}] the startup line says {SWITCH}={want}" if want else f"[{k}] no {SWITCH} startup line",
++              "GO" if v.get("startup_tail") == want else "NO-GO", f"it says {v.get('startup_tail')}", "run")
++    if not all(k in have for k in ("off", "on", "ref")):
++        c.add("off, on and ref ran", "INCONCLUSIVE", "nothing to compare with", "run")
++        return c, crc.finish(c)
++    for k in ("pin", "on-skip"):
++        if k not in have:
++            c.add(f"the {k} run ran", "INCONCLUSIVE", runs.get(k, {}).get("failed", "not run"), "run")
++    nd_pair = a.no_draft_pair
++    off, on, ref = have["off"]["requests"], have["on"]["requests"], have["ref"]["requests"]
++    for leg, K, Y, B, B2, _, image, s2 in LEGS:
++        g, n1, n2, cut, root = leg, f"{K}1", f"{K}2", p[f"cut_{K}"], p[f"root_{K}"]
++        gap = root <= (off[n2]["reused"] or 0) < cut
++        c.add(f"{leg} reproduced with the switch off: {K}2 REUSED {off[n2]['reused']} < the message cut {cut} (the root "
++              f"{root}; turn 1's turn checkpoint {p[f'turn_{K}']} is past where turn 2 parts)",
++              "GO" if gap else "INCONCLUSIVE", "" if gap else "the scenario does not show the gap", g)
++        ok_ref = ref[n2]["reused"] == cut and not said(ref[n2], r"conversation cache: restored")
++        c.add(f"{leg} reference: {K}2 right after {K}1 resumes at the cut {cut} from the main session's own checkpoints "
++              f"(REUSED {ref[n2]['reused']})", "GO" if ok_ref else "INCONCLUSIVE",
++              "" if ok_ref else "the reference did not take its route: no length to compare with", g)
++        for run in ("on", "on-nd"):
++            if run not in have:
++                continue
++            rq = have[run]["requests"]
++            got = rq[n2]["reused"]
++            if image:
++                route = said(rq[n2], rf"conversation cache: restored {cut} tokens \(checkpoint\)")
++                c.add(f"{leg} [{run}]: {K}2 REUSED {got} == {K}1's message cut {cut} (restored from the RAM cache)",
++                      "GO" if got == cut and route else "NO-GO", "" if route else "no 'restored <cut> tokens "
++                      "(checkpoint)' line", g)
++            else:
++                route = said(rq[n2], rf"conversation cache: restored {cut} tokens|gave back {cut} tokens")
++                c.add(f"{leg} [{run}]: {K}2 REUSED {got} == {K}1's message cut {cut}", "GO" if got == cut else "NO-GO",
++                      "" if route else "(no restore / give-back line of that length: another route)", g)
++            slotted = bool(rq[n2].get("cont")) and rq[n2].get("beside_text", 0) > 0
++            c.add(f"{leg} [{run}]: {K}2 decoded on in its batch slot beside a text slot (BT lines {rq[n2].get('bt')}, "
++                  f"beside text {rq[n2].get('beside_text')})", "GO" if slotted else "INCONCLUSIVE",
++                  "" if slotted else "not the production path: the slot comparisons do not cover it", g)
++            for rn in (("ref-nd", "pin-nd") if run == "on-nd" else ("ref", "pin")):
++                if rn not in have:
++                    continue
++                rr = have[rn]["requests"]
++                if got == cut and rr[n2]["reused"] == cut:
++                    how = "another route" if rn.startswith("ref") else "another checkpoint producer, pin=N"
++                    compare(c, f"{leg} [{run}]: {K}2 tokens == {rn}'s (the same length, {how})", rq[n2], rr[n2], g,
++                            strict=run == "on-nd")
++                elif rr[n2]["reused"] != cut:
++                    c.add(f"{leg} [{rn}]: {K}2 REUSED {rr[n2]['reused']} == the cut {cut}",
++                          "NO-GO" if run == "on-nd" and rn == "ref-nd" else "INCONCLUSIVE",
++                          "no length to compare with", g)
++            # turn 1: the switch's extra cut against pin's cut at the same length (the same chunk geometry): decided
++            pn = "pin-nd" if run == "on-nd" else "pin"
++            if pn in have:
++                compare(c, f"{leg} [{run}]: {K}1 (turn 1, read with the extra cut) tokens == {pn}'s (pin=<cut>: the same "
++                        f"chunk cuts)", rq[n1], have[pn]["requests"][n1], g, strict=run == "on-nd")
++        same = on[n1]["tokens"] == off[n1]["tokens"]
++        c.add(f"{leg} turn 1 [on] against [off]: {K}1 (REUSED {on[n1]['reused']} / {off[n1]['reused']}) the same tokens",
++              "info", "" if same else f"differ at {first_diff(on[n1]['tokens'], off[n1]['tokens'])} (another chunk "
++              f"geometry: the pin comparison decides)", g)
++        if image and "on-skip" in have:
++            sk = have["on-skip"]
++            base = "on-nd" if sk.get("no_mtp") else "on"
++            if base not in have:
++                c.add(f"{leg} negative control: {base} ran", "INCONCLUSIVE", "", g)
++                continue
++            q, b = sk["requests"][n2], have[base]["requests"][n2]
++            if not sk.get("skip_warning"):
++                c.add(f"{leg} negative control: [on-skip] has the {SKIP}=1 WARNING", "INCONCLUSIVE",
++                      "the skip was not on", g)
++            elif q.get("ids_sha") != b.get("ids_sha") or q["reused"] != b["reused"]:
++                c.add(f"{leg} negative control: [on-skip] {K}2 as {base}'s (prompt, REUSED {q['reused']} / "
++                      f"{b['reused']})", "INCONCLUSIVE", "not the same request", g)
++            else:
++                d = q["tokens"] != b["tokens"]
++                c.add(f"{leg} negative control: [on-skip] {K}2 tokens (the region copy skipped) differ from {base}'s",
++                      "GO" if d else "INCONCLUSIVE",
++                      (f"differ at token {first_diff(q['tokens'], b['tokens'])}" +
++                       ("" if sk.get("no_mtp") else " (with the drafter: --no-draft-pair makes it strict)")) if d else
++                      "the same tokens: the slot comparisons cannot see a wrong region or position", g)
++    if "old" in have:
++        old = have["old"]["requests"]
++        for k in off:
++            o, f = old.get(k), off[k]
++            if o is None:
++                c.add(f"default path: the old binary's {k}", "INCONCLUSIVE", "missing", "default")
++                continue
++            c.add(f"default path: off's {k} REUSED {f['reused']} == the old binary's {o['reused']}",
++                  "GO" if f["reused"] == o["reused"] else "NO-GO", "", "default")
++            if f["op"] == "GEN":
++                ok = f["tokens"] == o["tokens"]
++                c.add(f"default path: off's {k} tokens == the old binary's (solo, {len(f['tokens'])} tokens)",
++                      "GO" if ok else "NO-GO", "" if ok else f"differ at {first_diff(f['tokens'], o['tokens'])}",
++                      "default")
++            else:
++                compare(c, f"default path: off's {k} tokens == the old binary's (a batch slot)", f, o, "default", False)
++        fo, fn = have["old"]["facts"].get("expert_slots"), have["off"]["facts"].get("expert_slots")
++        c.add(f"default path: expert-cache slots {fn} == the old binary's {fo}", "GO" if fo == fn else "INCONCLUSIVE",
++              "", "default")
++    elif "old" in runs:
++        c.add("default path: the old binary ran", "INCONCLUSIVE", runs["old"].get("failed", ""), "default")
++    if nd_pair and not all(k in have for k in ("on-nd", "ref-nd", "pin-nd")):
++        c.add("the runs without the MTP drafter all ran", "INCONCLUSIVE", "", "nodraft")
++    return c, crc.finish(c)
++
++
++# ---------------------------------------------------------------------------------------------------------------- main
++def picture_file(pics, order, work):
++    """The embeddings of the pictures in prompt order, one file (the records one after another, as the engine reads a
++    request's pictures)."""
++    if len(order) == 1:
++        return pics[order[0]]["file"]
++    out = work / f"pics-{''.join(order)}.sve"
++    out.write_bytes(b"".join(Path(pics[k]["file"]).read_bytes() for k in order))
++    return str(out)
++
++
++def check(argv):
++    ap = Parser(description="STRATA_MSG_CKPT_TAIL: where an agent's next turn resumes (see the module docstring)")
++    ap.add_argument("--exe", required=True, help="the engine to check (with the switch)")
++    ap.add_argument("--config", default=CONFIG)
++    ap.add_argument("--old-exe", default=None, help="the production binary: the default path must be unchanged")
++    ap.add_argument("--old-extra", default="", help="arguments for the old binary only (the self-test's --fake-old)")
++    ap.add_argument("--batch", type=int, default=16)
++    ap.add_argument("--tail", type=int, default=8192, help=f"{SWITCH} in the runs with the switch")
++    ap.add_argument("--max-new", type=int, default=48)
++    ap.add_argument("--side-max-new", type=int, default=96, help="the text requests beside the turns")
++    ap.add_argument("--system-tokens", type=int, default=2500)
++    ap.add_argument("--total-tokens", type=int, default=20000)
++    ap.add_argument("--pictures", type=int, default=1, choices=(1, 2, 3), help="the image leg's pictures (A, B, A)")
++    ap.add_argument("--transient-tokens", type=int, default=2531)
++    ap.add_argument("--short-tokens", type=int, default=1500, help="the request that overwrites the main session")
++    ap.add_argument("--every", type=int, default=16384, help="the engine's --prompt-cache-every (only checked here)")
++    ap.add_argument("--extra", default=EXACT)
++    ap.add_argument("--mt-min", default="1")
++    ap.add_argument("--no-config-env", action="store_true")
++    ap.add_argument("--no-draft-pair", action="store_true",
++                    help="also run on-nd, ref-nd and pin-nd without the MTP drafter (a later-token difference is NO-GO "
++                         "there), and on-skip without it")
++    ap.add_argument("--allow-warning", action="append", default=[])
++    ap.add_argument("--runs", default=",".join(BASE_RUNS),
++                    help="which processes: off, on and ref always, pin and on-skip (left out: INCONCLUSIVE); old is "
++                         "added by --old-exe, on-nd, ref-nd and pin-nd by --no-draft-pair")
++    ap.add_argument("--logs", default=None)
++    ap.add_argument("--out", default=None)
++    ap.add_argument("--tokenizer", default=None, help="instead of the config's")
++    ap.add_argument("--line-timeout", type=float, default=300.0)
++    ap.add_argument("--start-timeout", type=float, default=900.0)
++    a = ap.parse_args(argv)
++    for k in ("exe", "old_exe"):             # the engine starts in the config's "cwd"
++        if getattr(a, k, None):
++            setattr(a, k, str(Path(getattr(a, k)).resolve()))
++    try:
++        cfg = json.loads(Path(a.config).read_text())
++    except (OSError, ValueError) as x:
++        usage(f"--config {a.config}: {x}")
++    if not cfg.get("vision"):
++        usage(f"--config {a.config}: no \"vision\" block (the image encoder)")
++    if a.system_tokens < 2100:
++        usage("--system-tokens below 2100: the root checkpoint (first turn boundary >= 2048) would not be at its end")
++    if a.system_tokens + a.total_tokens < max(8192, a.every) + 1100:
++        usage(f"--total-tokens {a.total_tokens}: the history must pass the periodic checkpoint ({a.every}) and 8192")
++    if not 0 < a.transient_tokens < a.tail:
++        usage(f"--transient-tokens {a.transient_tokens} must be below --tail {a.tail}")
++    runs_wanted = [r for r in a.runs.split(",") if r]
++    if any(r not in BASE_RUNS for r in runs_wanted) or not {"off", "on", "ref"} <= set(runs_wanted):
++        usage(f"--runs {a.runs}: off, on and ref, and of pin and on-skip any")
++    if a.old_exe:
++        runs_wanted.append("old")
++    if a.no_draft_pair:
++        if "--mtp" not in cfg.get("args", []):
++            usage("--no-draft-pair: the config has no --mtp to drop")
++        runs_wanted += ["on-nd", "ref-nd", "pin-nd"]
++        RUNS["on-skip"]["nd"] = True     # compared with on-nd: strict
++    try:
++        tok = vbc.tokenizer(a.tokenizer or cfg["tokenizer"])
++    except Exception as x:  # noqa: BLE001
++        usage(f"the tokenizer cannot be read: {x!r}")
++    a.logs = str(Path(a.logs or tempfile.mkdtemp(prefix="msg-ckpt-logs-")).resolve())
++    Path(a.logs).mkdir(parents=True, exist_ok=True)
++    work = Path(tempfile.mkdtemp(prefix="msg-ckpt-work-")).resolve()
++    tier_root = tempfile.mkdtemp(prefix="msg-ckpt-tier-")
++    pics = vbc.encode_pictures(a, cfg, work)           # (the encoder ends before any engine starts)
++    order = PIC_ORDER[:a.pictures]
++    P = Prompts(tok, [pics[k] for k in order])
++    pic_file = picture_file(pics, order, work)
++    p = plan(P, a)
++    print("prompts: " + "; ".join(f"{K}1 {len(p[K + '1'])} (root {p['root_' + K]}, message cut {p['cut_' + K]}, turn "
++                                  f"{p['turn_' + K]}), {K}2 {len(p[K + '2'])} (its cut {p['cut2_' + K]})"
++                                  for _, K, *_ in LEGS), flush=True)
++    runs = {}
++    try:
++        for r in runs_wanted:
++            exe = a.old_exe if r == "old" else a.exe
++            try:
++                runs[r] = run_one(a, cfg, exe, r, p, P, tier_root, pic_file)
++            except EngineError as x:
++                runs[r] = {"exe": exe, "failed": str(x), "engine_error": True}
++                print(f"[{r}] {x}", flush=True)
++            except Exception as x:  # noqa: BLE001
++                traceback.print_exc()
++                runs[r] = {"exe": exe, "failed": f"this tool failed: {x!r}"}
++    finally:
++        for e in list(LIVE):
++            e.quit()
++        shutil.rmtree(tier_root, ignore_errors=True)
++    print("summary:", flush=True)
++    c, v = verdict(a, runs, p)
++    print(f"VERDICT {v}  (engine logs: {a.logs})", flush=True)
++    if a.out:
++        Path(a.out).write_text(json.dumps({"verdict": v, "criteria": c.rows, "runs": runs, "settings": vars(a),
++                                           "prompts": {k: (len(x) if isinstance(x, list) else x) for k, x in p.items()}},
++                                          indent=1))
++    return EXIT[v]
++
++
++# ---------------------------------------------------------------------------------------------------------------- self-test
++SELF_CASES = [
++    # name, fake faults, extra harness arguments, expected exit, {criterion substring: status}
++    ("go", "", ["--no-draft-pair"], 0, {
++        "IMG reproduced": "GO", "TXT reproduced": "GO", "IMG reference": "GO", "TXT reference": "GO",
++        "IMG [on]: I2 REUSED": "GO", "IMG [on]: I2 tokens == ref's": "GO", "IMG [on]: I2 tokens == pin's": "GO",
++        "IMG [on]: I2 decoded on": "GO", "IMG [on]: I1 (turn 1": "GO", "IMG [on-nd]: I1 (turn 1": "GO",
++        "TXT [on]: T2 REUSED": "GO", "TXT [on]: T2 tokens == ref's": "GO", "TXT [on]: T2 tokens == pin's": "GO",
++        "IMG [on-nd]: I2 tokens == ref-nd's": "GO", "IMG [on-nd]: I2 tokens == pin-nd's": "GO",
++        "IMG negative control": "GO", "default path: off's I2 tokens": "GO", "default path: off's Y tokens": "GO",
++        "[on] the startup line": "GO", "[on-skip] the startup line": "GO", "[off] no STRATA_MSG_CKPT_TAIL": "GO",
++        "[on-skip] no WARNING": "GO"}),
++    ("nomsg", "nomsg", [], 2, {"IMG [on]: I2 REUSED": "NO-GO", "TXT [on]: T2 REUSED": "NO-GO",
++                               "IMG reference": "INCONCLUSIVE"}),
++    ("msgwrong", "msgwrong", [], 2, {"IMG [on]: I2 tokens == ref's": "NO-GO", "IMG [on]: I2 REUSED": "GO",
++                                     "TXT [on]: T2 REUSED": "GO"}),
++    # a wrong capture at the cut: on and ref restore the same snapshot and agree; only pin's own checkpoint sees it
++    ("msgcapture", "msgcapture", [], 2, {"IMG [on]: I2 tokens == ref's": "GO", "IMG [on]: I2 tokens == pin's": "NO-GO"}),
++    ("msgdefault", "msgdefault", [], 2, {"default path: off's I2 tokens": "NO-GO",
++                                         "IMG [on]: I2 tokens == ref's": "GO"}),
++    # a blind negative control: the image comparisons are not believed
++    ("noskip", "noskip", [], 3, {"IMG negative control: [on-skip] I2 tokens": "INCONCLUSIVE",
++                                 "IMG [on]: I2 tokens == ref's": "GO"}),
++]
++
++
++def wrapper(path, extra="", pre=""):
++    path.write_text(f"#!/bin/sh\nexec {pre}{shlex.quote(sys.executable)} {shlex.quote(str(FAKE))} {extra} \"$@\"\n")
++    path.chmod(0o755)
++    return str(path)
++
++
++def self_test(argv):
++    ap = Parser(description="--self-test: this harness against the fake engine (CPU only)")
++    ap.add_argument("--self-test", action="store_true")
++    ap.add_argument("--template", default=CONFIG)
++    ap.add_argument("--keep", action="store_true")
++    ap.add_argument("--only", default=None)
++    a = ap.parse_args(argv)
++    try:
++        cfg = json.loads(Path(a.template).read_text())
++    except (OSError, ValueError) as x:
++        usage(f"--template {a.template}: {x}")
++    work = Path(tempfile.mkdtemp(prefix="msg-ckpt-selftest-"))
++    # the old binary: production's (the regions on, the switch absent), so the fake as the new one without its faults
++    new, old = wrapper(work / "fake-new"), wrapper(work / "fake-old", pre="env -u VISION_CHECK_FAKE_FAULT ")
++    cfg = dict(cfg, exe=new, cwd=str(work), lib_dirs=[])
++    cfg["vision"] = dict(cfg.get("vision") or {}, exe=new, mmproj="fake.mmproj", model="fake.gguf", gpu=False)
++    cfg["env"] = dict(cfg.get("env") or {}, STRATA_MROPE_SLOTS="1", STRATA_SLOT_PARK="1")
++    (work / "cfg.json").write_text(json.dumps(cfg))
++    failed = []
++    t0 = time.time()
++    cases = list(SELF_CASES) + [("go3", "", ["--pictures", "3"], 0, {"IMG [on]: I2 REUSED": "GO",
++                                                                      "IMG negative control": "GO"})]
++    for name, faults, extra, want_exit, want in cases:
++        if a.only and name != a.only:
++            continue
++        out = work / f"{name}.json"
++        env = {k: v for k, v in os.environ.items() if not k.startswith("VISION_CHECK_FAKE_")}
++        env.pop(SWITCH, None)
++        env.pop(SKIP, None)
++        env.update(CACHE_CHECK_FAKE_MODEL="1", VISION_CHECK_FAKE_FAULT=faults, VISION_CHECK_FAKE_TICK_MS="0.05",
++                   VISION_CHECK_FAKE_WINDOW_MS="0.2")
++        cmd = [sys.executable, str(Path(__file__).resolve()), "--exe", new, "--old-exe", old, "--config",
++               str(work / "cfg.json"), "--out", str(out), "--logs", str(work / f"logs-{name}"), "--line-timeout", "60",
++               "--start-timeout", "60", *extra]
++        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
++        ok = r.returncode == want_exit
++        why = [] if ok else [f"exit {r.returncode}, expected {want_exit}"]
++        try:
++            rows = json.loads(out.read_text())["criteria"]
++        except (OSError, ValueError):
++            rows = []
++            why.append("no --out JSON")
++        for sub, st in want.items():
++            hit = [x for x in rows if sub in x["criterion"]]
++            if not hit or any(x["status"] != st for x in hit):
++                why.append(f"{sub!r}: {[x['status'] for x in hit] or 'missing'}, expected {st}")
++        if name.startswith("go"):
++            bad = [x["criterion"] for x in rows if x["status"] not in ("GO", "info")]
++            if bad:
++                why.append(f"not GO: {bad[:4]}")
++        print(f"{'ok  ' if not why else 'FAIL'} {name}{'' if not why else ': ' + '; '.join(why)}", flush=True)
++        if why:
++            failed.append(name)
++            print(r.stdout[-6000:], r.stderr[-2000:], sep="\n")
++    if not a.only:
++        r = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--exe", new, "--no-such-argument"],
++                           capture_output=True, text=True)
++        if r.returncode != EXIT_USAGE:
++            failed.append("usage")
++        print(f"{'ok  ' if r.returncode == EXIT_USAGE else 'FAIL'} usage (exit {r.returncode})", flush=True)
++    if not a.keep:
++        shutil.rmtree(work, ignore_errors=True)
++    else:
++        print(f"kept {work}", flush=True)
++    print(f"self-test: {'all ok' if not failed else 'FAILED: ' + ', '.join(failed)} in {time.time() - t0:.0f} s",
++          flush=True)
++    return 0 if not failed else 1
++
++
++def main():
++    if "--self-test" in sys.argv[1:]:
++        return self_test(sys.argv[1:])
++    return check(sys.argv[1:])
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/vision_check_fake_engine.py b/tools/vision_check_fake_engine.py
+index 5689d8cd..6e94e168 100755
+--- a/tools/vision_check_fake_engine.py
++++ b/tools/vision_check_fake_engine.py
+@@ -60,6 +60,10 @@ Faults (VISION_CHECK_FAKE_FAULT=a,b,...; the new binary only, never with --fake-
+   warning    one more WARNING line at the start
+   samegrid   (the encoder) every picture on a 16 x 16 grid, so two pictures sit alike after them
+   encstall   (the encoder) never answers an ENC line
++  noskip     STRATA_MROPE_REGION_SKIP=1 writes its WARNING but does nothing (a blind negative control)
++  (STRATA_MSG_CKPT_TAIL's own faults - nomsg, msgwrong, msgdefault, msgcapture - are described where it is read)
++The keys pin=N (one more cut and an ordinary checkpoint at N; its retention is not modelled) and --tail-role-token
++(#458: the turn boundary moves in front of a short trailing turn of that role) are modelled as generate.cpp has them.
+ --fake-old: the last release - no regions whatever the environment, no faults.
+ VISION_CHECK_FAKE_TICK_MS: what a batch window takes (default 0.3 ms); VISION_CHECK_FAKE_WINDOW_MS: what the next solo
+ window's drafts take, the time a STOP has to arrive in (default 5 ms); VISION_CHECK_FAKE_EOS_AFTER: the reply token
+@@ -191,6 +195,8 @@ class Fake:
+         env = os.environ
+         self.slot_park = env.get("STRATA_SLOT_PARK", "0") not in ("", "0")
+         self.skip = env.get("STRATA_MROPE_REGION_SKIP", "0") not in ("", "0")
++        self.skip_works = self.skip and "noskip" not in self.faults   # (noskip: the WARNING, but no effect)
++        self.tail_role = opt("--tail-role-token", -1)                    # #458 (13521-13528)
+         on = env.get("STRATA_MROPE_SLOTS", "0") not in ("", "0")   # mrope_slots_env (generate.cpp 209-215)
+         self.regions = on and self.vision and self.batch > 0 and not self.old and "noregions" not in self.faults
+         self.tick_s = float(env.get("VISION_CHECK_FAKE_TICK_MS", "0.3")) / 1000.0
+@@ -234,6 +240,19 @@ class Fake:
+         self.park_verify = on("STRATA_SLOT_PARK_VERIFY")
+         self.switches_off = not on("STRATA_SLOT_CHAIN_REUSE") and not on("STRATA_GIVEBACK_CHECKS")
+         self.ckpt_move = on("STRATA_SLOT_CKPT_MOVE")
++        # STRATA_MSG_CKPT_TAIL=N (tools/msg_ckpt_check.py; message_boundary.hpp message_cut): a prompt read also
++        # checkpoints in front of its last message (the <|im_start|> before the turn boundary) when that message is at
++        # most N tokens and the prefix at least 8192, an ordinary checkpoint.  Its faults:
++        #   nomsg       the switch does nothing
++        #   msgwrong    a conversation restored from the RAM cache at such a checkpoint decodes wrong tokens
++        #   msgdefault  with the switch unset, a request that resumed decodes wrong tokens (the default path changed)
++        #   msgcapture  the capture at such a checkpoint is wrong: every request resumed from it decodes wrong tokens,
++        #               by any route (a route-against-route comparison cannot see it; one against pin=N can)
++        #   noskip      STRATA_MROPE_REGION_SKIP=1 does nothing (its negative control is blind)
++        tail = env.get("STRATA_MSG_CKPT_TAIL", "")
++        self.msg_tail = int(tail) if tail.isdigit() and not self.old and "nomsg" not in self.faults else 0
++        self.msg_off = not tail.isdigit() or int(tail) == 0
++        self.msg_cuts = set()                # the tokens of every message-boundary checkpoint taken (msgwrong)
+         self.bad = set()                     # givebackwrong: the ids of the checkpoints mounted wrong
+         self.stop = threading.Event()
+         self.q = queue.Queue()
+@@ -282,6 +301,9 @@ class Fake:
+             log("strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring "
+                 "96 slots")                                                                             # 7234
+         log("strata serve: 1415 MiB of VRAM free with everything loaded")                             # 9829
++        if self.msg_tail > 0:
++            log(f"strata serve: STRATA_MSG_CKPT_TAIL={self.msg_tail}: a prompt read also checkpoints in front of a "
++                f"last message of up to {self.msg_tail} tokens (a prefix of 8192 or more)")
+         batch = (f" batch_slots={self.batch} slot_cache=1 batch_groups={self.groups}" +
+                  (" mrope_slots=1" if self.regions else "")) if self.batch else ""
+         out(f"INFO logit_bias=1 context={self.max_context} kv=int8 kv_resident={self.kv_resident} "
+@@ -413,6 +435,7 @@ class Fake:
+             out("ERR bad request: max_new")                                                          # 11992
+             return
+         req_ckpt = keys.get("ckpt", "1") != "0"
++        req_pin = int(keys["pin"]) if keys.get("pin", "").isdigit() else 0   # pin=N (11978, 13553-13575)
+         n = len(ids)
+         if geni and not self.vision:
+             out("ERR this engine was started without --vision")                                     # 11997
+@@ -506,7 +529,8 @@ class Fake:
+             for (c_ids, c_imgs, c_wh), is_live in [(e["live"], True)] + [(c, False) for c in e["checks"]]:
+                 if len(c_ids) > best_n and starts_with(c_ids, c_imgs):
+                     best, best_n, best_live, best_wh = idx, len(c_ids), is_live, c_wh
+-                    best_bad = tuple(c_ids) in self.bad
++                    best_bad = tuple(c_ids) in self.bad or ("msgwrong" in self.faults and
++                                                            tuple(c_ids) in self.msg_cuts)
+         incoming = self.parked.pop(best) if best >= 0 and best_n > max(resume, slot_tokens) else None   # 12330
+         if incoming:
+             slot_source = -1
+@@ -590,6 +614,12 @@ class Fake:
+         out(f"RESUME {resume}")                                                                       # 12628
+         # the read: up to the root, up to the last turn boundary (the checkpoints there), up to the last token
+         turn_at = next((j for j in range(n - 1, resume, -1) if ids[j] == TURN), -1)                   # 13405-13408
++        if turn_at > 0 and self.tail_role >= 0:  # #458 (13521-13528): a short turn of that role stays out
++            for j in range(turn_at - 1, resume, -1):
++                if ids[j] == TURN:
++                    if j + 1 < n and ids[j + 1] == self.tail_role:
++                        turn_at = j
++                    break
+         last_turn = turn_at
+         if not req_ckpt:
+             turn_at = -1                         # ckpt=0 drops the split there (13424)
+@@ -599,11 +629,20 @@ class Fake:
+                 if ids[j] == TURN:
+                     root_at = j if j >= CACHE_ROOT else -1
+                     break
++        msg_at = -1                              # STRATA_MSG_CKPT_TAIL (message_cut): in front of the last message
++        if self.msg_tail > 0 and turn_at > resume:
++            for j in range(turn_at - 1, resume, -1):
++                if turn_at - j > self.msg_tail:
++                    break
++                if ids[j] == TURN:
++                    msg_at = j if j >= 8192 else -1
++                    break
++        pin_at = req_pin if req_ckpt and resume < req_pin < n - 1 else -1   # (the pinned retention is not modelled)
+         at, cancelled = resume, False
+         periodic = set()                         # CACHE_CHECK_FAKE_MODEL: every --prompt-cache-every tokens (9053-9076)
+         if self.ext and self.every > 0 and req_ckpt:
+             periodic = set(range(resume + self.every, n - 1, self.every))
+-        for to in sorted({c for c in (root_at, turn_at, n - 1) if c > resume} | periodic):
++        for to in sorted({c for c in (root_at, msg_at, turn_at, pin_at, n - 1) if c > resume} | periodic):
+             if self.stop.is_set():
+                 cancelled = True
+                 break
+@@ -611,8 +650,12 @@ class Fake:
+             for q in range(at, to, step):
+                 out(f"PP {min(to, q + step)} {n} {1000 * (time.time() - t0):.0f} 1000.0")              # 9021, 12817
+             at = to
+-            if to in (root_at, turn_at) or to in periodic:
++            if to in (root_at, turn_at, msg_at, pin_at) or to in periodic:
+                 self.checks.append((tuple(ids[:to]), below(to), src_wh))
++                if to == msg_at:
++                    self.msg_cuts.add(tuple(ids[:to]))
++                    if "msgcapture" in self.faults:
++                        self.bad.add(tuple(ids[:to]))
+                 if len(self.checks) > PROMPT_CACHE:
+                     self.checks.pop(0)
+         prompt_ms = 1000 * (time.time() - t0)
+@@ -622,8 +665,10 @@ class Fake:
+         hf = prompt_hash(ids[:-1], rows)         # the session's tokens so far; x: the token the next window feeds
+         if "pathdep" in self.faults and src_wh:
+             hf = mix(hf, src_wh, PATH)           # the state it resumed carries its windows' numbers (TESTLOG #59 (4))
++        if "msgdefault" in self.faults and self.msg_off and resume > 0:
++            src_bad = True                       # (msgdefault: the default path changed)
+         if src_bad:
+-            hf = mix(hf, 1, WRONG)               # (chainwrong / givebackwrong)
++            hf = mix(hf, 1, WRONG)               # (chainwrong / givebackwrong / msgwrong / msgdefault)
+         x, k, produced, finish, first = ids[-1], 0, 0, "cancel" if cancelled else "length", True
+         wh, accepted, offered = src_wh, 0, 0
+         d0 = time.time()
+@@ -679,7 +724,7 @@ class Fake:
+                     len(self.live) == len(consumed))
+             if cont:
+                 b = admit_slot
+-                if self.regions and not self.skip and (self.region0 != 0 or self.region_img[b]):   # 10214-10243
++                if self.regions and not self.skip_works and (self.region0 != 0 or self.region_img[b]):   # 10214-10243
+                     self.region[b] = self.region0
+                     self.region_img[b] = self.region0 != 0
+                 s = self.slots[b]
+-- 
+2.43.0
+

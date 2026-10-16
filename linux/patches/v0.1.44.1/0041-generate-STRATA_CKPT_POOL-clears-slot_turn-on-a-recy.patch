@@ -1,0 +1,91 @@
+From 12f2715d8ff3abe6959810a9e1d7bd2ce91bc033 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 02:29:09 +0200
+Subject: [PATCH 41/58] generate: STRATA_CKPT_POOL clears slot_turn on a
+ recycled checkpoint
+
+CheckpointPool::clear_marks reset ids, imgs, used and pinned but not slot_turn (set by STRATA_SLOT_PARK's slot_park_put).
+A pooled checkpoint that had been part of a slot turn kept the mark when checkpoint_at took it for a main-session save,
+and the slot-chain filters then left it out.  The marks are now cleared by conversation_checkpoint_clear_marks
+(conversation_cache.hpp, so a CPU test can reach it), stage parts included; the state vectors stay allocated.
+
+Generated tokens are unchanged (checkpoint restores are exact); with CKPT_POOL + SLOT_PARK the chains and parked
+bytes can differ.  conversation_cache_test: 4269 checks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/conversation_cache.hpp |  7 +++++++
+ src/core/conversation_cache_test.cpp       | 23 ++++++++++++++++++++++
+ src/program/generate.cpp                   |  5 +----
+ 3 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index adea2ea9..5a012c4e 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -229,6 +229,13 @@ inline bool conversation_checkpoint_same(const ConversationCheckpoint& a, const
+         if (!conversation_checkpoint_same(a.stage_parts[i], b.stage_parts[i])) return false;
+     return true;
+ }
++/// A dropped checkpoint made ready for reuse (STRATA_CKPT_POOL): its tokens, pictures and every run-time mark
++/// cleared (stage parts too), its running-state vectors kept for the next save to write into.  slot_turn is cleared
++/// too: a recycled slot-turn checkpoint taken for a main-session save was otherwise left out of slot chains.
++inline void conversation_checkpoint_clear_marks(ConversationCheckpoint& c) {
++    c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.slot_turn = false;
++    for (ConversationCheckpoint& part : c.stage_parts) conversation_checkpoint_clear_marks(part);
++}
+ inline bool conversation_kv_same(const ConversationKv& a, const ConversationKv& b) {
+     return a.format == b.format && a.cells == b.cells && a.heads == b.heads && a.head_dim == b.head_dim &&
+            a.page_size == b.page_size && a.pooled_rows == b.pooled_rows && a.idx_dim == b.idx_dim &&
+diff --git a/src/core/conversation_cache_test.cpp b/src/core/conversation_cache_test.cpp
+index 9825194f..faf1b03b 100644
+--- a/src/core/conversation_cache_test.cpp
++++ b/src/core/conversation_cache_test.cpp
+@@ -546,5 +546,28 @@ int main() {
+         check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 10, 11, 12}, {}, false).tokens == 6, "the other mode stays");
+         check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 10, 11, 12}, {{2, 77}}, true).tokens == 6, "the picture stays");
+     }
++    {   // STRATA_CKPT_POOL: a recycled checkpoint keeps its state vectors but none of its marks, slot_turn included
++        ConversationCheckpoint c;
++        c.ids = {1, 2, 3};
++        c.imgs = {{1, 9}};
++        c.gdn.resize(32, 5);
++        c.used = 7; c.pinned = true; c.slot_turn = true;
++        ConversationCheckpoint part = c;
++        c.stage_parts = {part, part};
++        conversation_checkpoint_clear_marks(c);
++        check(c.ids.empty() && c.imgs.empty() && c.used == 0 && !c.pinned && !c.slot_turn,
++              "a recycled checkpoint has no tokens, pictures or marks (slot_turn too)");
++        check(c.gdn.size() == 32, "its running-state vectors are kept for the next save");
++        bool parts_clear = c.stage_parts.size() == 2;
++        for (const auto& p : c.stage_parts)
++            parts_clear = parts_clear && p.ids.empty() && p.imgs.empty() && p.used == 0 && !p.pinned && !p.slot_turn &&
++                          p.gdn.size() == 32;
++        check(parts_clear, "its stage parts are cleared alike, their vectors kept");
++        // a main-session checkpoint saved into it is not taken for a slot's turn checkpoint (left out of a chain)
++        std::vector<ConversationCheckpoint> chain{c};
++        chain[0].ids = {1, 2};
++        check(conversation_checkpoints_stage_copy(chain, 2, 0, true).size() == 1,
++              "a reused checkpoint stays in a slot image's chain");
++    }
+     std::printf("conversation_cache_test: %d checks passed\n", checks);
+ }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index afceb920..f2c988d7 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1753,10 +1753,7 @@ public:
+         v.erase(v.begin() + (std::ptrdiff_t) w, v.end());
+     }
+ private:
+-    static void clear_marks(ConvCheckpoint& c) {
+-        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false;
+-        for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
+-    }
++    static void clear_marks(ConvCheckpoint& c) { strata::core::conversation_checkpoint_clear_marks(c); }
+     bool on_;
+     size_t cap_;
+     std::mutex mu_;
+-- 
+2.43.0
+

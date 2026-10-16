@@ -1,0 +1,1255 @@
+From 9e64a5782655b35c760593771689316c9bc622da Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 16:14:17 +0200
+Subject: [PATCH 38/58] serve: STRATA_SLOT_PARK=1 parks a pipelined slot's
+ conversation, reply included
+
+With pipelined slot groups a finished slot is wiped by the next window of
+its group that runs it as a pad row, or overwritten by the next admission
+into it, and only the main sessions' copy of its prompt was parked: the
+next turn of that conversation read the reply again.
+
+STRATA_SLOT_PARK=1 (default off) captures a slot's conversation when it
+ends (BDONE): its tokens, the running state at its end and its K/V, on
+one persistent thread per stage device through pinned staging blocks of
+its own, while the other slots decode, without a device-wide wait (the
+slot's last window has left every stage).  A group whose pad row would
+write a slot still being captured starts after the other groups.  The
+image goes to the conversation cache when the slot is overwritten (an
+admission into it) or at the next request after a pad row wrote it, and
+only then takes the slot's checkpoints along (lazy attach: its turn
+checkpoint, and copies of the chain its prompt was read with, made beside
+the slots after the admission).  While the slot still holds it the slot
+stays the source; a request that continues from the slot drops the image
+and takes the chain back.  The main sessions' copy of the admission's
+prompt is no longer parked: the slot's image holds it and the reply.  A
+slot image has no draft-layer K/V (pipelined slots draft nothing) and is
+restored without it, as after a slot's give-back: drafts may differ,
+tokens never.  The elastic K/V and runs without --batch-groups keep the
+old path.  Retained K/V pages are dropped before a slot's give-back with
+the switch too (critique A1).
+
+STRATA_SUPERSEDE_PREFIX=1 (implied by the above; critique A2) decides
+which parked copies an outgoing conversation supersedes by tokens: an
+entry is dropped when its live tokens start the outgoing ones, or its
+deepest checkpoint does and is deeper than the outgoing chain's
+shallowest.  With STRATA_SLOT_CKPT_MOVE the chain rule dropped every
+conversation that only shared the system prompt's root.
+
+A turn checkpoint parked with a slot's image is marked (slot_turn, run
+time only), so the next slot image of that conversation does not carry
+the older turns' checkpoints along.
+
+The all-idle timing line is followed by how many group starts waited for
+a slot's capture and for how long (24 users x 4 turns: 62 waits, 0.8 s
+of one group's time in a 156 s run).
+
+STRATA_SLOT_PARK_VERIFY=1 compares every slot capture with a plain one
+before anything writes the slot (ERR on a difference).
+STRATA_SLOT_PARK_TEST_RESTORE=1 (tests) puts every idle slot's image into
+the cache at the next request, so later turns come back from there.
+
+Tests: batch_test16 (greedy and T=0.7 seed 1234), batch_interleave_test
+and batch_overlap_test with VERIFY on: identical to the reference dumps;
+batch_interleave_test and batch_groups_cache_test with TEST_RESTORE (the
+later turns restored from slot images instead of the slots' give-back):
+identical tokens.  Unit: prefix rule, slot_turn copy/compare.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/conversation_cache.hpp |  81 ++-
+ src/core/conversation_cache_test.cpp       |  83 +++
+ src/program/generate.cpp                   | 690 ++++++++++++++++++++-
+ 3 files changed, 836 insertions(+), 18 deletions(-)
+
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 1d713614..e84ed986 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -29,6 +29,10 @@ struct ConversationCheckpoint {
+     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
+     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
+     bool pinned = false;
++    // STRATA_SLOT_PARK: the turn checkpoint a batch slot's conversation was parked with (its own, not one of the chain
++    // it was admitted with).  Once that conversation goes on, the next slot image of it does not carry this one along
++    // (it holds the new turn's).  A run-time mark only, not in the session file.
++    bool slot_turn = false;
+     // Ordinary layer-split checkpoints retain each device's running state.
+     // Whole-session parking is currently single-GPU and rejects these parts.
+     std::vector<ConversationCheckpoint> stage_parts;
+@@ -100,6 +104,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
+         for (size_t k = 0; k < stages; ++k) {
+             ConversationCheckpoint part;
+             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
++            part.slot_turn = c.slot_turn;
+             out.parts[k].push_back(std::move(part));
+         }
+     }
+@@ -147,23 +152,32 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split,
+ 
+ /// What conversation_checkpoints_split(checks, stages) puts in stage `k`'s list (0: `stage0`, k >= 1: `parts[k - 1]`),
+ /// COPIED, so `checks` stays as it is: a capture that runs beside the serve loop (STRATA_PARK_ASYNC) reads the chain
+-/// while the loop may read it too.  Without a split (stages == 0) every checkpoint as it is.
++/// while the loop may read it too.  Without a split (stages == 0) every checkpoint as it is.  `without_slot_turn`:
++/// the ones marked slot_turn are left out (STRATA_SLOT_PARK: the chain a batch slot's image takes along).
+ inline std::vector<ConversationCheckpoint> conversation_checkpoints_stage_copy(
+-        const std::vector<ConversationCheckpoint>& checks, size_t stages, size_t k) {
++        const std::vector<ConversationCheckpoint>& checks, size_t stages, size_t k, bool without_slot_turn = false) {
+     std::vector<ConversationCheckpoint> out;
+     if (stages == 0) {
+-        out = checks;
++        if (!without_slot_turn) {
++            out = checks;
++            return out;
++        }
++        size_t n = 0;
++        for (const auto& c : checks) n += c.slot_turn ? 0 : 1;
++        out.reserve(n);
++        for (const auto& c : checks)
++            if (!c.slot_turn) out.push_back(c);
+         return out;
+     }
+     if (k > stages) return out;
+     size_t whole = 0;
+-    for (const auto& c : checks) whole += c.stage_parts.size() == stages ? 1 : 0;
++    for (const auto& c : checks) whole += c.stage_parts.size() == stages && !(without_slot_turn && c.slot_turn) ? 1 : 0;
+     out.reserve(whole);
+     for (const auto& c : checks) {
+-        if (c.stage_parts.size() != stages) continue;
++        if (c.stage_parts.size() != stages || (without_slot_turn && c.slot_turn)) continue;
+         const ConversationCheckpoint& state = k == 0 ? c : c.stage_parts[k - 1];
+         ConversationCheckpoint part;
+-        part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
++        part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned; part.slot_turn = c.slot_turn;
+         part.gdn = state.gdn; part.ple = state.ple; part.tails = state.tails; part.dead = state.dead;
+         part.block_pos = state.block_pos;
+         out.push_back(std::move(part));
+@@ -182,6 +196,11 @@ struct SavedConversation {
+     bool cvec = true;
+     // with a layer split, the later stages' own images, one per stage, in stage order
+     std::vector<SavedConversation> stage_images;
++    /// The engine runs a drafter, but this image holds no draft-layer K/V: a batch slot's conversation
++    /// (STRATA_SLOT_PARK; slots in pipelined groups draft nothing).  It is validated and restored without the draft
++    /// layer, whose K/V below it then stays as it was - as after a slot's give-back: drafts may differ, tokens never.
++    /// A run-time mark only, not in a session file.
++    bool draftless = false;
+ 
+     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
+     bool pinned() const {
+@@ -203,6 +222,7 @@ struct SavedConversation {
+ inline bool conversation_checkpoint_same(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
+     if (a.ids != b.ids || a.imgs != b.imgs || a.gdn != b.gdn || a.ple != b.ple || a.tails != b.tails ||
+         a.dead != b.dead || a.block_pos != b.block_pos || a.used != b.used || a.pinned != b.pinned ||
++        a.slot_turn != b.slot_turn ||
+         a.stage_parts.size() != b.stage_parts.size()) return false;
+     for (size_t i = 0; i < a.stage_parts.size(); ++i)
+         if (!conversation_checkpoint_same(a.stage_parts[i], b.stage_parts[i])) return false;
+@@ -216,7 +236,7 @@ inline bool conversation_kv_same(const ConversationKv& a, const ConversationKv&
+ /// Two parked images alike in every byte (STRATA_PARK_ASYNC_VERIFY: a capture against another of the same state).
+ inline bool conversation_image_same(const SavedConversation& a, const SavedConversation& b) {
+     if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec ||
+-        !conversation_checkpoint_same(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() ||
++        a.draftless != b.draftless || !conversation_checkpoint_same(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() ||
+         a.kv.size() != b.kv.size() || a.stage_images.size() != b.stage_images.size()) return false;
+     for (size_t i = 0; i < a.checkpoints.size(); ++i)
+         if (!conversation_checkpoint_same(a.checkpoints[i], b.checkpoints[i])) return false;
+@@ -367,8 +387,19 @@ public:
+     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
+     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
+     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
++    //
++    // set_supersede_prefix(true) (STRATA_SUPERSEDE_PREFIX, implied by STRATA_SLOT_PARK) decides by tokens instead.
++    // With STRATA_SLOT_CKPT_MOVE a turn checkpoint moves into its batch slot, so a parked chain often holds only the
++    // system prompt's root, and the rule above then drops every other conversation that shares that root; a batch
++    // slot's image (STRATA_SLOT_PARK) holds only its turn checkpoint, so the chain rule never finds its predecessor.
++    // By prefix, an entry that holds no pinned prefix is superseded when its live tokens start the outgoing ones
++    // (this conversation, earlier), or when its deepest checkpoint starts them and is longer than the outgoing chain's
++    // shallowest checkpoint (deeper than any root the two may share).  A root alone never drops an entry.
++    void set_supersede_prefix(bool on) { supersede_prefix_ = on; }
++    bool supersede_prefix() const { return supersede_prefix_; }
+     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
++        if (supersede_prefix_) return drop_superseded_by_prefix(ids, images, checkpoints, cvec);
+         auto held = [&](const ConversationCheckpoint& c) {
+             if (c.ids == ids && c.imgs == images) return true;
+             for (const auto& k : checkpoints)
+@@ -393,6 +424,41 @@ public:
+         return dropped;
+     }
+     size_t superseded() const { return superseded_; }
++    size_t drop_superseded_by_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
++                                     const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
++        // c's tokens, and the pictures among them, start the outgoing conversation
++        auto starts = [&](const ConversationCheckpoint& c) {
++            const size_t n = c.ids.size();
++            if (n == 0 || n > ids.size() || !std::equal(c.ids.begin(), c.ids.end(), ids.begin())) return false;
++            size_t j = 0;
++            for (const auto& image : images) {
++                if (image.start >= (int64_t) n) continue;
++                if (j == c.imgs.size() || !(c.imgs[j++] == image)) return false;
++            }
++            return j == c.imgs.size();
++        };
++        size_t root = 0;   // the outgoing chain's shallowest checkpoint (0: none - then only the live rule applies)
++        for (const auto& k : checkpoints)
++            if (!k.ids.empty() && (root == 0 || k.ids.size() < root)) root = k.ids.size();
++        size_t dropped = 0;
++        for (size_t i = 0; i < entries_.size();) {
++            const auto& e = entries_[i];
++            const ConversationCheckpoint* deepest = nullptr;
++            for (const auto& c : e.checkpoints)
++                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
++            const bool earlier = starts(e.live) ||
++                                 (deepest && root > 0 && deepest->ids.size() > root && starts(*deepest));
++            if (e.cvec == cvec && !e.pinned() && earlier) {
++                bytes_ -= e.bytes();
++                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
++                ++dropped;
++                continue;
++            }
++            ++i;
++        }
++        superseded_ += dropped;
++        return dropped;
++    }
+ 
+     bool put(SavedConversation&& image, size_t held = 0) {
+         const size_t n = image.bytes();
+@@ -407,6 +473,7 @@ public:
+ private:
+     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
+     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
++    bool supersede_prefix_ = false;   // drop_superseded by tokens (set_supersede_prefix)
+     std::deque<SavedConversation> entries_; // least recently active first
+     ConversationKvReuse reuse_;
+ };
+diff --git a/src/core/conversation_cache_test.cpp b/src/core/conversation_cache_test.cpp
+index 04534f23..9825194f 100644
+--- a/src/core/conversation_cache_test.cpp
++++ b/src/core/conversation_cache_test.cpp
+@@ -357,6 +357,22 @@ int main() {
+         for (size_t j = 0; all && j < whole.size(); ++j) all = conversation_checkpoint_same(whole[j], chain[j]);
+         check(all, "no layer split: every checkpoint as it is");
+ 
++        // STRATA_SLOT_PARK: the chain a slot's image takes along leaves out the turn checkpoints of earlier slot images
++        chain[2].slot_turn = true;
++        for (size_t k = 0; k <= 2; ++k) {
++            const auto along = conversation_checkpoints_stage_copy(chain, 2, k, true);
++            check(along.size() == 1 && along[0].ids == chain[0].ids && !along[0].slot_turn,
++                  "the chain copy leaves the slot turn checkpoint out (each stage's list)");
++            const auto all2 = conversation_checkpoints_stage_copy(chain, 2, k);
++            check(all2.size() == 2 && all2[1].slot_turn, "without the switch it is copied, mark and all");
++        }
++        {
++            const auto along = conversation_checkpoints_stage_copy(chain, 0, 0, true);
++            check(along.size() == 2 && along[0].ids == chain[0].ids && along[1].ids == chain[1].ids,
++                  "no layer split: every checkpoint but the slot turn one");
++        }
++        chain[2].slot_turn = false;
++
+         // the deep comparison a verified capture uses: any byte, stamp or mark that differs is seen
+         auto ck = chain[2];
+         check(conversation_checkpoint_same(ck, chain[2]), "a checkpoint is the same as its copy");
+@@ -366,6 +382,8 @@ int main() {
+         check(!conversation_checkpoint_same(ck, chain[2]), "the LRU stamp differs");
+         ck = chain[2]; ck.pinned = false;
+         check(!conversation_checkpoint_same(ck, chain[2]), "the pin differs");
++        ck = chain[2]; ck.slot_turn = true;
++        check(!conversation_checkpoint_same(ck, chain[2]), "the slot turn mark differs");
+         SavedConversation a = image({1, 2, 3});
+         a.kv.resize(2);
+         a.kv[1].k.resize(100, 3);
+@@ -463,5 +481,70 @@ int main() {
+         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
+         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+     }
++    {
++        // STRATA_SUPERSEDE_PREFIX: with STRATA_SLOT_CKPT_MOVE the parked chains hold the shared root only.  The chain
++        // rule drops every conversation sharing that root; the prefix rule keeps them
++        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
++        auto fill = [&](ConversationCache& cache) {
++            for (int32_t u = 0; u < 3; ++u) {
++                SavedConversation other = image({1, 2, 3, 4, 100 + u, 101 + u});
++                other.checkpoints = {cp({1, 2, 3, 4})};
++                check(cache.put(std::move(other)), "park a conversation sharing the system prompt");
++            }
++        };
++        SavedConversation outgoing = image({1, 2, 3, 4, 200, 201, 202});
++        outgoing.checkpoints = {cp({1, 2, 3, 4})};
++        ConversationCache chain(1 << 20, 8), prefix(1 << 20, 8);
++        prefix.set_supersede_prefix(true);
++        fill(chain);
++        fill(prefix);
++        SavedConversation o1 = outgoing, o2 = outgoing;
++        check(chain.put(std::move(o1)) && chain.size() == 1 && chain.superseded() == 3,
++              "the chain rule drops every conversation that shares the root (critique A2)");
++        check(prefix.put(std::move(o2)) && prefix.size() == 4 && prefix.superseded() == 0,
++              "the prefix rule keeps them: a root alone supersedes nothing");
++    }
++    {
++        // the prefix rule's drops: this conversation earlier (its live tokens start the outgoing ones), a deeper
++        // checkpoint than the outgoing root that starts them; kept: a branch, a pinned entry, the other steering mode,
++        // another picture
++        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
++        ConversationCache cache(1 << 20, 16);
++        cache.set_supersede_prefix(true);
++        SavedConversation stripped = image({1, 2, 3, 4, 10, 99, 98});  // turn t-1, its reply rendered otherwise
++        stripped.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10})};
++        cache.put(std::move(stripped));
++        SavedConversation earlier = image({1, 2, 3, 4, 10, 11});      // turn t-1 with its reply
++        earlier.checkpoints = {cp({1, 2, 3, 4, 10})};                  // ({..10} is its root: `stripped` stays)
++        cache.put(std::move(earlier));
++        SavedConversation branch = image({1, 2, 3, 4, 50, 51});        // another turn after the root
++        branch.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 50})};
++        cache.put(std::move(branch));
++        SavedConversation pinned = image({1, 2, 3, 4, 10});
++        pinned.checkpoints = {cp({1, 2, 3, 4, 10})};
++        pinned.checkpoints[0].pinned = true;
++        cache.put(std::move(pinned));
++        cache.put(image({1, 2, 3, 4, 10, 11}, false));                  // the other steering mode
++        SavedConversation picture = image({1, 2, 3, 4, 10, 11});
++        picture.live.imgs = {{2, 77}};
++        cache.put(std::move(picture));
++        check(cache.size() == 6 && cache.superseded() == 0, "six entries, none superseded yet");
++        // a batch slot's image of turn t: its live tokens include the reply, its chain is the turn checkpoint only
++        SavedConversation slot = image({1, 2, 3, 4, 10, 11, 12, 13, 14});
++        slot.checkpoints = {cp({1, 2, 3, 4, 10, 11, 12})};
++        check(cache.put(std::move(slot)), "park the slot image");
++        // `earlier` goes (its live tokens are a prefix); `stripped` stays: its deepest checkpoint {..10} is not deeper
++        // than the outgoing chain's shallowest, {..12}
++        check(cache.superseded() == 1 && cache.size() == 6, "this conversation a turn back goes (its live tokens start the new ones)");
++        SavedConversation main = image({1, 2, 3, 4, 10, 11, 12, 13, 14, 15});
++        main.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11, 12})};
++        check(cache.put(std::move(main)), "park a main-session image with the root and a deeper checkpoint");
++        // now: the slot image (live a prefix) and `stripped` ({..10} deeper than the root {1..4}, a prefix) go;
++        // `branch` ({..50} not a prefix), `pinned`, the other mode and the picture stay
++        check(cache.superseded() == 3 && cache.size() == 5, "the slot image and the copy with a deeper checkpoint go");
++        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 50, 51, 52}, {}, true).tokens == 6, "the branch stays");
++        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 10, 11, 12}, {}, false).tokens == 6, "the other mode stays");
++        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 10, 11, 12}, {{2, 77}}, true).tokens == 6, "the picture stays");
++    }
+     std::printf("conversation_cache_test: %d checks passed\n", checks);
+ }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index d71415df..6a19536d 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -279,6 +279,52 @@ bool park_async_verify_env() {
+     }();
+     return on;
+ }
++// STRATA_SUPERSEDE_PREFIX=1 (read once; off by default): the conversation cache decides which parked copies an outgoing
++// conversation supersedes by tokens instead of by its checkpoint chain (ConversationCache::set_supersede_prefix).  With
++// STRATA_SLOT_CKPT_MOVE a parked chain often holds only the system prompt's root, and the chain rule then drops every
++// other conversation that shares it.  Implied by STRATA_SLOT_PARK
++bool supersede_prefix_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_SUPERSEDE_PREFIX");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
++// STRATA_SLOT_PARK=1 (read once; off by default): a pipelined batch slot's conversation - its prompt, its reply and the
++// running state at its end - goes to the conversation cache, instead of being lost to the next group window that runs
++// the idle slot as a pad row (or to the next admission into it).  It is captured when the slot ends, on one thread per
++// stage device while the other slots decode; a group whose pad row would write a slot still being captured waits for
++// it.  The image goes to the cache when the slot is overwritten (an admission into it) or at the next request after a
++// pad row wrote it, and only then takes the slot's checkpoints along (its turn checkpoint, and copies of the chain
++// the admission's prompt was read with); while the slot still holds it, the slot is the source (a request continued
++// from the slot drops the image).  The main sessions' copy of the admission's prompt is not parked: the slot's image
++// holds it and the reply.  The image has no draft-layer K/V (the slots draft nothing): restored, the drafter's K/V
++// below it stays as it was, as after a slot's give-back - drafts may differ, tokens never.  Only with --batch-groups
++// (a layer split) and the conversation cache; not with the elastic K/V.  Implies STRATA_SUPERSEDE_PREFIX.
++// STRATA_SLOT_PARK_VERIFY=1 captures the slot again, plainly, before anything writes it and requires the same bytes
++// (the engine stops with ERR otherwise).  STRATA_SLOT_PARK_TEST_RESTORE=1 (tests only): an idle slot is never
++// continued from itself - at the next request its image goes to the cache, and the conversation comes back from there
++bool slot_park_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_SLOT_PARK");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
++bool slot_park_verify_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_SLOT_PARK_VERIFY");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
++bool slot_park_test_restore_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_SLOT_PARK_TEST_RESTORE");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
+ // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+ // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+@@ -1862,6 +1908,79 @@ private:
+     bool stop_ = false;
+ };
+ 
++/// STRATA_SLOT_PARK: one persistent thread per stage device; submit() queues job(k) for every thread k and returns at
++/// once, and each thread runs the queued jobs in their order.  An item is done when every thread has run it (done(),
++/// wait()).  The threads go where StageThreads' go.  A job does not throw.  The destructor stops the threads after the
++/// jobs they are running (the caller stops those first); queued ones are not run.
++class StageQueueThreads {
++public:
++    struct Item {
++        std::function<void(size_t)> job;
++        size_t left = 0;   ///< threads that have not run it yet (under the lock)
++    };
++    explicit StageQueueThreads(size_t n) : n_(n) {}
++    StageQueueThreads(const StageQueueThreads&) = delete;
++    StageQueueThreads& operator=(const StageQueueThreads&) = delete;
++    ~StageQueueThreads() {
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            stop_ = true;
++        }
++        go_.notify_all();
++        for (std::thread& t : threads_) t.join();
++    }
++    std::shared_ptr<Item> submit(std::function<void(size_t)> job) {
++        auto it = std::make_shared<Item>();
++        it->job = std::move(job);
++        it->left = n_;
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            while (threads_.size() < n_) {
++                const size_t k = threads_.size();
++                threads_.emplace_back([this, k] { loop(k); });
++            }
++            q_.push_back(it);
++        }
++        go_.notify_all();
++        return it;
++    }
++    bool done(const Item& it) {
++        std::lock_guard<std::mutex> lk(mu_);
++        return it.left == 0;
++    }
++    void wait(const Item& it) {
++        std::unique_lock<std::mutex> lk(mu_);
++        done_.wait(lk, [&] { return it.left == 0; });
++    }
++private:
++    void loop(size_t k) {
++        spread_engine_thread();
++        uint64_t next = 0;   // this thread's next item, counted from the first ever queued
++        std::unique_lock<std::mutex> lk(mu_);
++        for (;;) {
++            go_.wait(lk, [&] { return stop_ || next < base_ + q_.size(); });
++            if (stop_) return;
++            std::shared_ptr<Item> it = q_[(size_t) (next - base_)];
++            ++next;
++            lk.unlock();
++            it->job(k);
++            lk.lock();
++            if (--it->left == 0) done_.notify_all();
++            while (!q_.empty() && q_.front()->left == 0) {   // every thread is past it
++                q_.pop_front();
++                ++base_;
++            }
++        }
++    }
++    const size_t n_;
++    std::mutex mu_;
++    std::condition_variable go_, done_;
++    std::vector<std::thread> threads_;
++    std::deque<std::shared_ptr<Item>> q_;
++    uint64_t base_ = 0;
++    bool stop_ = false;
++};
++
+ // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
+ // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
+ // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
+@@ -8535,6 +8654,7 @@ int main(int argc, char** argv) {
+         strata::core::ConversationCache conversations(
+             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
+             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
++        if (supersede_prefix_env() || slot_park_env()) conversations.set_supersede_prefix(true);
+         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
+         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
+         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
+@@ -8618,6 +8738,9 @@ int main(int argc, char** argv) {
+             std::vector<int32_t> live;            ///< what the capture holds: the tokens, pictures and control vector
+             std::vector<ImgKey> live_imgs;        ///  mode of the main sessions when it started
+             bool cvec = true;
++            /// STRATA_SLOT_PARK: >= 0 - not a park's capture but the chain the admission into this slot was read with
++            /// (the complete checkpoints of `checks` but slot turn ones, copied), which the slot's image takes along
++            int slot = -1;
+             std::vector<int> dev;                 ///< per stage (0 = the first): its device
+             std::vector<strata::core::SavedConversation> parts;      ///< per stage: its image
+             std::vector<strata::core::ConversationKvReuse> reuse;    ///< per stage: the retained K/V it starts from
+@@ -10446,6 +10569,12 @@ int main(int argc, char** argv) {
+             // #879: it was running when non-finite logits dropped the cached state; its state may have started from
+             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
+             bool tainted = false;
++            // STRATA_SLOT_PARK: its conversation goes to the conversation cache (captured when it ends, parked when the
++            // slot is overwritten), so the main sessions' copy of its prompt is not parked; cleared where that cannot
++            // happen (not captured, not admitted to the cache, dropped).  `chain`: copies of the checkpoints its prompt
++            // was read with (slot_chain_settle), which the image takes along
++            bool parks = false;
++            std::vector<ConvCheckpoint> chain;
+         };
+         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+         // timing of the batch windows since the slots were last all idle (one stderr line then)
+@@ -10912,6 +11041,12 @@ int main(int argc, char** argv) {
+                     if (held(S) && !parks(S)) return S;
+             return 0;
+         };
++        // STRATA_SLOT_PARK: group starts that waited for a slot's capture (a pad row would write it), and how long, since
++        // the last all-idle line; per group, when its wait began
++        int64_t sp_waited = 0;
++        double sp_wait_ms = 0.0;
++        std::vector<char> sp_waiting(pg.size(), 0);
++        std::vector<Clock::time_point> sp_wait_t0(pg.size());
+         // all idle: the timing line, as batch_step (reset_busy: the watchdog's busy flag too - not inside a request)
+         auto idle_report = [&](bool reset_busy) {
+             const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+@@ -10922,9 +11057,357 @@ int main(int argc, char** argv) {
+                 const std::string pr = stage_verifier(k).profile_report();
+                 if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
+             }
++            if (sp_waited > 0)
++                std::fprintf(stderr, "strata batch: STRATA_SLOT_PARK: %lld group start%s waited for a slot's capture, "
++                                     "%.1f ms in all\n", (long long) sp_waited, sp_waited == 1 ? "" : "s", sp_wait_ms);
++            sp_waited = 0;
++            sp_wait_ms = 0.0;
+             bt_windows = bt_rows = 0;
+             if (reset_busy) strata::core::progress().busy.store(false);
+         };
++        // ---- STRATA_SLOT_PARK (slot_park_env): a pipelined slot's conversation, captured when the slot ends (on one
++        // StageQueueThreads thread per stage device, through two pinned staging blocks per device of its own) and put
++        // into the conversation cache when the slot is overwritten (slot_park_put)
++        bool slot_park_on = slot_park_env() && piped && conversations.enabled() && o.prompt_cache > 0 && !kvg.on;
++        struct SlotPark {
++            bool pending = false;                ///< captured or being captured, not yet in the cache or dropped
++            bool verified = false;               ///< STRATA_SLOT_PARK_VERIFY: compared with a plain capture
++            std::atomic<bool> cancel{false};     ///< stops the capture between two blocks
++            std::shared_ptr<StageQueueThreads::Item> item;   ///< its job on every stage's thread
++            std::vector<int32_t> live;           ///< what the slot held when it ended: its tokens and control vector mode
++            bool cvec = true;
++            std::vector<strata::core::SavedConversation> parts;   ///< per stage (0 = the first): its image
++            std::vector<std::string> why;
++            std::vector<char> ok;
++            std::vector<double> ms;
++            std::vector<std::exception_ptr> thrown;
++        };
++        std::vector<std::unique_ptr<SlotPark>> spark(bs.size());
++        std::vector<int> spark_dev;          // per stage: its device
++        std::vector<void*> spark_staging;    // per stage: two pinned blocks of kParkStaging bytes
++        struct SlotStagingFree {
++            std::vector<void*>& p;
++            ~SlotStagingFree() { for (void* x : p) if (x != nullptr) cudaFreeHost(x); }
++        } spark_staging_free{spark_staging};
++        StageQueueThreads slot_threads(slot_park_on ? stages.size() + 1 : 0);
++        struct SlotParkStop {   // declared after the threads: the captures stop first, then the threads go
++            std::vector<std::unique_ptr<SlotPark>>& s;
++            ~SlotParkStop() { for (auto& p : s) if (p) p->cancel.store(true); }
++        } slot_park_stop{spark};
++        // STRATA_SLOT_PARK: the slot the last admission continues in while the main sessions still hold its prompt
++        // (that slot parks the conversation, with its reply; -1: none), and whether the chain its prompt was read with
++        // has gone along to the slot (slot_chain_settle)
++        int main_slot = -1;
++        bool main_chain = false;
++        if (slot_park_on) {
++            // the staging blocks and every thread's copy stream and events now, so a capture beside the slots
++            // allocates and creates nothing on the device
++            const size_t n = stages.size() + 1;
++            int main_dev = 0;
++            cudaGetDevice(&main_dev);
++            spark_dev.resize(n);
++            for (size_t k = 0; k < n; ++k) spark_dev[k] = k == 0 ? main_dev : stages[k - 1]->dev;
++            spark_staging.assign(2 * n, nullptr);
++            for (size_t i = 0; i < spark_staging.size() && slot_park_on; ++i) {
++                const strata::core::OnDevice on(spark_dev[i / 2]);
++                if (cudaHostAlloc(&spark_staging[i], kParkStaging, cudaHostAllocPortable) != cudaSuccess) {
++                    spark_staging[i] = nullptr;
++                    slot_park_on = false;
++                }
++            }
++            std::vector<std::string> why(n);
++            if (slot_park_on) {
++                auto it = slot_threads.submit([&](size_t k) {
++                    const strata::core::OnDevice on(spark_dev[k]);
++                    (void) strata::core::conversation_capture_prepare(why[k]);
++                });
++                slot_threads.wait(*it);
++                for (const std::string& w : why)
++                    if (!w.empty()) slot_park_on = false;
++            }
++            (void) cudaGetLastError();
++            if (slot_park_on)
++                std::fprintf(stderr, "strata serve: STRATA_SLOT_PARK: a pipelined slot's conversation is captured when "
++                                     "it ends, on %zu threads (%zu x %zu MiB pinned staging), and parked when the slot is "
++                                     "overwritten\n", n, spark_staging.size(), kParkStaging >> 20);
++            else
++                std::fprintf(stderr, "strata serve: STRATA_SLOT_PARK is off: the pinned staging or a copy stream could "
++                                     "not be set up\n");
++        } else if (slot_park_env()) {
++            std::fprintf(stderr, "strata serve: STRATA_SLOT_PARK is off: it needs pipelined slot groups "
++                                 "(--batch-groups with a layer split), the conversation cache and no elastic K/V\n");
++        }
++        // stage k's part of slot b's capture, on its thread: the slot's running state and K/V [0, its tokens), copied
++        // through the staging blocks with no device-wide wait (the slot's last window has left every stage: each
++        // stage's batch_poll saw its stream idle), and without the draft layer (the slots have none)
++        auto slot_park_job = [&](int b, size_t k) {
++            SlotPark& sp = *spark[(size_t) b];
++            try {
++                const auto t = Clock::now();
++                const strata::core::OnDevice on(spark_dev[k]);
++                const std::vector<ConvCheckpoint> none;
++                const std::vector<ImgKey> no_imgs;
++                const strata::core::ConversationView view{sp.live, no_imgs, none, sp.cvec};
++                strata::core::ConversationCapture how;
++                how.device_sync = false;
++                how.staging[0] = spark_staging[2 * k];
++                how.staging[1] = spark_staging[2 * k + 1];
++                how.staging_bytes = kParkStaging;
++                how.cancel = &sp.cancel;
++                sp.ok[k] = strata::core::conversation_snapshot_save(sp.parts[k], view, *bslot_ss[k][(size_t) b], g, nullptr,
++                                                                    sp.why[k], {}, nullptr, how);
++                sp.ms[k] = std::chrono::duration<double, std::milli>(Clock::now() - t).count();
++            } catch (...) {
++                sp.thrown[k] = std::current_exception();
++            }
++        };
++        // slot b has ended (BDONE): start its capture, if it is to be parked and its image fits the cache's budget and
++        // the RAM floor without evicting anything (the image evicts when it is parked, as a park's does)
++        auto slot_park_start = [&](int b) {
++            BSlot& sl = bs[(size_t) b];
++            if (!sl.parks) return;
++            sl.parks = false;
++            if (!sl.cached || !conversations.wants((int64_t) sl.ids.size())) return;
++            if (spark[(size_t) b] && spark[(size_t) b]->pending) return;   // (settled at its admission; never here)
++            const size_t n = stages.size() + 1;
++            const std::vector<ConvCheckpoint> none;
++            const std::vector<ImgKey> no_imgs;
++            const strata::core::ConversationView view{sl.ids, no_imgs, none, sl.cvec};
++            size_t estimate = 0;
++            std::string e;
++            for (size_t k = 0; k < n; ++k) {
++                size_t bytes = 0;
++                if (!strata::core::conversation_snapshot_bytes(view, *bslot_ss[k][(size_t) b], g, nullptr, bytes, e)) {
++                    std::fprintf(stderr, "strata batch: slot %d's conversation is not parked (%s)\n", b, e.c_str());
++                    return;
++                }
++                estimate += bytes;
++            }
++            bool fits = estimate <= conversations.budget();
++            std::optional<strata::core::HostMemoryReading> mem;
++            if (fits) {
++                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
++                mem = strata::core::sample_host_memory();
++                fits = strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
++                                                               estimate, floor);
++            }
++            if (!fits) {
++                std::fprintf(stderr, "strata batch: slot %d's conversation is not parked (snapshot %zu MiB; budget %zu "
++                                     "MiB, %lld MiB RAM floor, %s)\n", b, estimate >> 20, conversations.budget() >> 20,
++                             (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str());
++                return;
++            }
++            if (!spark[(size_t) b]) spark[(size_t) b] = std::make_unique<SlotPark>();
++            SlotPark& sp = *spark[(size_t) b];
++            try {
++                sp.live = sl.ids;
++                sp.cvec = sl.cvec;
++                sp.parts.clear();
++                sp.parts.resize(n);
++                sp.why.assign(n, std::string());
++                sp.ok.assign(n, 0);
++                sp.ms.assign(n, 0.0);
++                sp.thrown.assign(n, nullptr);
++            } catch (const std::bad_alloc&) {
++                sp.parts.clear();
++                return;
++            }
++            sp.cancel.store(false);
++            sp.verified = false;
++            sp.pending = true;
++            sl.parks = true;
++            sp.item = slot_threads.submit([&slot_park_job, b](size_t k) { slot_park_job(b, k); });
++        };
++        // stop slot b's capture and drop it (its conversation goes on in the main sessions, or #879's flush); the
++        // memory is freed on a stage thread
++        auto slot_park_discard = [&](int b) {
++            if (!spark[(size_t) b] || !spark[(size_t) b]->pending) return;
++            SlotPark& sp = *spark[(size_t) b];
++            sp.cancel.store(true);
++            slot_threads.wait(*sp.item);
++            sp.pending = false;
++            bs[(size_t) b].parks = false;
++            auto trash = std::make_shared<std::vector<strata::core::SavedConversation>>(std::move(sp.parts));
++            sp.parts.clear();
++            (void) slot_threads.submit([trash](size_t k) { if (k == 0) trash->clear(); });
++        };
++        // a group window starts at width S (0: up to its last active slot): a pad row would write a slot whose capture
++        // has not finished yet
++        auto slot_park_blocks = [&](int gi, int S) {
++            if (S == 0)
++                for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) S = t + 1;
++            for (int t = 0; t < S; ++t) {
++                const size_t b = (size_t) (gi * GS + t);
++                if (!bs[b].active && spark[b] && spark[b]->pending && !slot_threads.done(*spark[b]->item)) return true;
++            }
++            return false;
++        };
++        // STRATA_SLOT_PARK_VERIFY: slot b's capture against a plain one of the same slot, before anything writes it.
++        // false: `err` says why (the engine stops)
++        auto slot_park_verify = [&](int b) -> bool {
++            if (!slot_park_verify_env() || !spark[(size_t) b] || !spark[(size_t) b]->pending) return true;
++            SlotPark& sp = *spark[(size_t) b];
++            if (sp.verified) return true;
++            slot_threads.wait(*sp.item);
++            for (size_t k = 0; k < sp.parts.size(); ++k)
++                if (!sp.ok[k] || sp.thrown[k]) return true;   // (a failed capture is not parked)
++            const std::vector<ConvCheckpoint> none;
++            const std::vector<ImgKey> no_imgs;
++            const strata::core::ConversationView view{sp.live, no_imgs, none, sp.cvec};
++            size_t bytes = 0;
++            for (size_t k = 0; k < sp.parts.size(); ++k) {
++                const strata::core::OnDevice on(spark_dev[k]);
++                strata::core::ConversationCapture how;
++                how.device_sync = false;   // (the slot is idle; the other groups may run)
++                strata::core::SavedConversation ref;
++                if (!strata::core::conversation_snapshot_save(ref, view, *bslot_ss[k][(size_t) b], g, nullptr, err, {},
++                                                              nullptr, how))
++                    return false;
++                if (!strata::core::conversation_image_same(sp.parts[k], ref)) {
++                    err = "STRATA_SLOT_PARK_VERIFY: slot " + std::to_string(b) + "'s capture (stage " + std::to_string(k) +
++                          ") differs from a plain capture";
++                    return false;
++                }
++                bytes += ref.bytes();
++            }
++            std::fprintf(stderr, "strata batch: STRATA_SLOT_PARK_VERIFY: slot %d, %zu tokens, %zu bytes identical\n", b,
++                         sp.live.size(), bytes);
++            sp.verified = true;
++            return true;
++        };
++        // slot b's image into the conversation cache, as a park puts one (its superseded copies, the budget, the RAM
++        // floor), with the slot's checkpoints taken along now: its own (the turn checkpoint; a copy of one of the
++        // chain's is dropped) and the chain its prompt was read with.  `intact`: nothing has written the slot since it
++        // ended.  false: `err` says why (a failed copy, as a park's)
++        auto slot_park_put = [&](int b, bool intact) -> bool {
++            if (!spark[(size_t) b] || !spark[(size_t) b]->pending) return true;
++            SlotPark& sp = *spark[(size_t) b];
++            BSlot& sl = bs[(size_t) b];
++            const auto tw = Clock::now();
++            slot_threads.wait(*sp.item);
++            const double wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
++            const size_t n = sp.parts.size();
++            double capture_ms = 0.0;
++            for (size_t k = 0; k < n; ++k) capture_ms = std::max(capture_ms, sp.ms[k]);
++            for (size_t k = 0; k < n; ++k)
++                if (sp.thrown[k]) {
++                    try {
++                        std::rethrow_exception(sp.thrown[k]);
++                    } catch (const std::bad_alloc&) {
++                        std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking slot %d\n", b);
++                        slot_park_discard(b);
++                        return true;
++                    }
++                }
++            for (size_t k = 0; k < n; ++k)
++                if (!sp.ok[k]) {
++                    err = sp.why[k];
++                    slot_park_discard(b);
++                    return false;
++                }
++            if (intact && !slot_park_verify(b)) {
++                slot_park_discard(b);
++                return false;
++            }
++            if (slot_park_verify_env() && !sp.verified) {
++                err = "STRATA_SLOT_PARK_VERIFY: slot " + std::to_string(b) + " was written before its capture was compared";
++                slot_park_discard(b);
++                return false;
++            }
++            sp.pending = false;
++            try {
++                const size_t n_st = stages.size();
++                auto along_ok = [&](const ConvCheckpoint& c) {   // a complete checkpoint of this conversation
++                    return c.stage_parts.size() == n_st && !c.ids.empty() && c.ids.size() <= sp.live.size() &&
++                           c.imgs.empty() && std::equal(c.ids.begin(), c.ids.end(), sp.live.begin());
++                };
++                std::vector<ConvCheckpoint> along;
++                for (ConvCheckpoint& c : sl.checks) {
++                    bool copy = false;
++                    for (const ConvCheckpoint& k : sl.chain) copy = copy || (k.ids == c.ids && k.imgs == c.imgs);
++                    if (copy || !along_ok(c)) { ckpt_pool.give(std::move(c)); continue; }
++                    c.slot_turn = true;
++                    along.push_back(std::move(c));
++                }
++                for (ConvCheckpoint& c : sl.chain)
++                    if (along_ok(c)) along.push_back(std::move(c));
++                sl.checks.clear();
++                sl.chain.clear();
++                strata::core::ConversationCheckpointSplit cs = strata::core::conversation_checkpoints_split(std::move(along), n_st);
++                strata::core::SavedConversation image = std::move(sp.parts[0]);
++                image.checkpoints = std::move(cs.stage0);
++                for (size_t k = 1; k < n; ++k) {
++                    sp.parts[k].checkpoints = std::move(cs.parts[k - 1]);
++                    image.stage_images.push_back(std::move(sp.parts[k]));
++                }
++                image.draftless = use_mtp;
++                sp.parts.clear();
++                // park_current_body's steps around its capture, in its order
++                if (const size_t dropped = conversations.drop_superseded(image.live.ids, image.live.imgs,
++                                                                         image.checkpoints, image.cvec))
++                    std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
++                                 "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
++                if (!conversations.make_room(image.bytes(), 0)) {
++                    std::fprintf(stderr, "strata serve: conversation cache: skip parking slot %d (snapshot %zu MiB exceeds "
++                                         "available budget)\n", b, image.bytes() >> 20);
++                    sl.parks = false;
++                    return true;
++                }
++                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
++                size_t evicted = 0;
++                std::optional<strata::core::HostMemoryReading> mem;
++                auto admit = [&] {
++                    mem = strata::core::sample_host_memory();
++                    return strata::core::conversation_memory_admit(
++                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, 0, floor);
++                };
++                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
++                       conversations.evict_oldest())
++                    ++evicted;
++                if (!admit()) {
++                    std::fprintf(stderr, "strata serve: conversation cache: skip parking slot %d (RAM floor after capture: "
++                                         "%lld MiB needed, %s; evicted %zu, %zu still parked)\n", b,
++                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(), evicted,
++                                 conversations.size());
++                    sl.parks = false;
++                    return true;
++                }
++                if (evicted)
++                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this "
++                                         "snapshot (%lld MiB floor)\n", evicted, evicted == 1 ? "" : "s",
++                                 (long long) o.conversation_cache_min_free_mib);
++                const size_t tokens = image.live.ids.size(), snapshot_bytes = image.bytes();
++                const bool stored = conversations.put(std::move(image), 0);
++                if (!stored) sl.parks = false;
++                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu "
++                                     "evictions=%zu snapshot_bytes=%zu reused_kv_bytes=0 capture=slot %d capture_ms=%.1f "
++                                     "wait_ms=%.1f\n", stored ? "parked" : "skipped", tokens,
++                             std::chrono::duration<double, std::milli>(Clock::now() - tw).count(), conversations.size(),
++                             conversations.bytes(), conversations.evictions(), snapshot_bytes, b, capture_ms, wait_ms);
++            } catch (const std::bad_alloc&) {
++                std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking slot %d\n", b);
++                sl.parks = false;
++                sp.parts.clear();
++            }
++            return true;
++        };
++        // at a request: the idle slots a pad row has written since they ended (their images are complete) go to the
++        // cache, so the request can find them.  STRATA_SLOT_PARK_TEST_RESTORE: every idle slot's
++        auto slot_park_flush = [&]() -> bool {
++            if (!slot_park_on) return true;
++            for (int b = 0; b < (int) bs.size(); ++b) {
++                BSlot& sl = bs[(size_t) b];
++                if (sl.active || !spark[(size_t) b] || !spark[(size_t) b]->pending) continue;
++                const bool test = sl.cached && slot_park_test_restore_env();
++                if (sl.cached && !test) continue;   // the slot still holds it: the slot is the source
++                if (test) {
++                    if (!slot_park_verify(b)) return false;
++                    sl.cached = false;
++                }
++                if (!slot_park_put(b, test)) return false;
++            }
++            return true;
++        };
+         // STRATA_TRACE: the drain before the line in hand (an admission's first phase), and when the first rows came
+         // after a batch admission (the pipeline's refill after BADM) or after a drain for another line (drain + refill)
+         double line_drain_ms = 0.0, adm_drain_ms = 0.0;
+@@ -10966,6 +11449,7 @@ int main(int argc, char** argv) {
+                         sl.active = false;
+                         sl.cached = false;
+                         sl.checks.clear();
++                        sl.parks = false;
+                         nan_flush = true;
+                         continue;
+                     }
+@@ -10986,6 +11470,7 @@ int main(int argc, char** argv) {
+                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
+                         // row writes this slot clears the flag (below, where the group starts), so a stale state is never reused
+                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
++                        if (slot_park_on) slot_park_start(gi * GS + t);   // STRATA_SLOT_PARK: its capture starts
+                     } else {
+                         sl.x = y;
+                         sl.p += 1;
+@@ -11011,7 +11496,17 @@ int main(int argc, char** argv) {
+                             pick = gi;
+                     if (pick < 0) continue;
+                 } else {
+-                    if (!may_start) continue;
++                    if (!may_start) {
++                        // STRATA_SLOT_PARK: a drain (no group starts until the line in hand is served) ends the waits
++                        if (slot_park_on)
++                            for (size_t gi = 0; gi < sp_waiting.size(); ++gi)
++                                if (sp_waiting[gi]) {
++                                    sp_waiting[gi] = 0;
++                                    ++sp_waited;
++                                    sp_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - sp_wait_t0[gi]).count();
++                                }
++                        continue;
++                    }
+                     int ov_S = 0;   // during an overlapped read: the width it starts at (ov_layout)
+                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
+                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
+@@ -11020,6 +11515,15 @@ int main(int argc, char** argv) {
+                             if (gi < (int) ov_wait_seen.size() && !ov_wait_seen[(size_t) gi]) { ov_wait_seen[(size_t) gi] = 1; ++ov_waited; }
+                             continue;
+                         }
++                        // STRATA_SLOT_PARK: a pad row would write a slot whose capture is still running: the other groups
++                        // go first
++                        if (slot_park_on && slot_park_blocks(gi, ov_active ? ov_S : 0)) {
++                            if (!sp_waiting[(size_t) gi]) {
++                                sp_waiting[(size_t) gi] = 1;
++                                sp_wait_t0[(size_t) gi] = Clock::now();
++                            }
++                            continue;
++                        }
+                         pick = gi;
+                     }
+                     if (pick < 0) continue;
+@@ -11035,10 +11539,22 @@ int main(int argc, char** argv) {
+                         BSlot& sl = bs[(size_t) (pick * GS + t)];
+                         G.tok[t] = sl.active ? sl.x : 0;
+                         G.pos[t] = sl.active ? sl.p : 0;
+-                        if (!sl.active) sl.cached = false;   // its pad row writes its state
++                        if (!sl.active) {
++                            // STRATA_SLOT_PARK_VERIFY: a slot's capture is compared before the pad row writes the slot
++                            if (slot_park_on && !slot_park_verify(pick * GS + t)) {
++                                std::printf("ERR %s\n", err.c_str());
++                                return false;
++                            }
++                            sl.cached = false;   // its pad row writes its state
++                        }
+                     }
+                     G.inflight = true;
+                     G.stage = 0;
++                    if (slot_park_on && sp_waiting[(size_t) pick]) {
++                        sp_waiting[(size_t) pick] = 0;
++                        ++sp_waited;
++                        sp_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - sp_wait_t0[(size_t) pick]).count();
++                    }
+                     drive.d.failed = false;
+                     if (!ov_active) apply_pending(false);   // an overlapped read: the expert tables stay as they are
+                 }
+@@ -11090,7 +11606,14 @@ int main(int argc, char** argv) {
+                 const auto t = Clock::now();
+                 const strata::core::OnDevice on(apark.dev[k]);
+                 const size_t n_st = stages.size();
+-                std::vector<ConvCheckpoint> mine = strata::core::conversation_checkpoints_stage_copy(checks, n_st, k);
++                std::vector<ConvCheckpoint> mine = strata::core::conversation_checkpoints_stage_copy(checks, n_st, k,
++                                                                                                    apark.slot >= 0);
++                if (apark.slot >= 0) {   // STRATA_SLOT_PARK: the chain only (host memory; nothing read on the device)
++                    apark.parts[k].checkpoints = std::move(mine);
++                    apark.ok[k] = 1;
++                    apark.ms[k] = std::chrono::duration<double, std::milli>(Clock::now() - t).count();
++                    return;
++                }
+                 const std::vector<ConvCheckpoint> none;
+                 const strata::core::ConversationView view{apark.live, apark.live_imgs, none, apark.cvec};
+                 strata::core::ConversationCapture how;
+@@ -11125,9 +11648,66 @@ int main(int argc, char** argv) {
+             apark.reuse.clear();
+             park_threads.start(1, [trash](size_t) { trash->first.clear(); trash->second.clear(); });
+         };
++        // STRATA_SLOT_PARK, after an admission whose slot parks the conversation: copy the chain its prompt was read
++        // with (the complete checkpoints of `checks`, not a slot turn one) for the slot's image, beside the slots on the
++        // park threads (nothing on the device).  When that cannot run, slot_chain_settle copies it at the next request.
++        auto slot_chain_start = [&]() {
++            main_chain = false;
++            const size_t n_st = stages.size(), n = n_st + 1;
++            size_t estimate = 0;
++            bool any = false;
++            for (const ConvCheckpoint& c : checks)
++                if (c.stage_parts.size() == n_st && !c.slot_turn) {
++                    any = true;
++                    estimate += c.bytes();
++                }
++            if (!any) {   // nothing to take along
++                main_chain = true;
++                return;
++            }
++            if (!park_async_on || apark.pending) return;
++            bool fits = estimate <= conversations.budget();
++            if (fits) {
++                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
++                const auto mem = strata::core::sample_host_memory();
++                fits = strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
++                                                               estimate, floor);
++            }
++            if (!fits) return;
++            try {
++                apark.live = live;
++                apark.live_imgs = live_imgs;
++                apark.cvec = cvec_cached;
++                apark.slot = main_slot;
++                apark.parts.clear();
++                apark.parts.resize(n);
++                apark.reuse.clear();
++                apark.reuse.resize(n);
++                apark.why.assign(n, std::string());
++                apark.ok.assign(n, 0);
++                apark.reused.assign(n, 0);
++                apark.ms.assign(n, 0.0);
++                apark.thrown.assign(n, nullptr);
++            } catch (const std::bad_alloc&) {
++                apark.parts.clear();
++                apark.reuse.clear();
++                return;
++            }
++            apark.cancel.store(false);
++            apark.pending = true;
++            apark.t0 = Clock::now();
++            park_threads.start(n, park_async_job);
++        };
+         // after a request: start the capture of what the main sessions hold, if a park may want it.  Whatever keeps it
+         // from running beside the slots leaves it to the park at the next request, as without the switch.
+         auto park_async_start = [&]() {
++            if (main_slot >= 0) {   // STRATA_SLOT_PARK: its slot parks this conversation; the chain goes along
++                if (live_ok && !nan_flush) {
++                    slot_chain_start();
++                    return;
++                }
++                main_slot = -1;
++            }
+             if (!park_async_on || apark.pending) return;
+             if (!live_ok || live.empty() || !conversations.wants((int64_t) live.size()) || nan_flush) return;
+             if (kvg.on) {   // the elastic K/V moves cells between requests (kvg_ensure / kvg_trim)
+@@ -11236,6 +11816,7 @@ int main(int argc, char** argv) {
+             }
+             apark.cancel.store(false);
+             apark.pending = true;
++            apark.slot = -1;
+             apark.t0 = Clock::now();
+             park_threads.start(n, park_async_job);
+         };
+@@ -11247,6 +11828,40 @@ int main(int argc, char** argv) {
+             apark.pending = false;
+             park_async_discard();
+         };
++        // STRATA_SLOT_PARK, at a request before anything else reads the slots or the cache: the chain of the last
++        // admission's prompt goes to its slot (the copy slot_chain_start made, or one made here), so that slot's image
++        // takes it along.  Every checkpoint of it is a prefix of the slot's tokens, and the cells below it in the slot
++        // are the ones the admission copied from the main sessions, which held them below it
++        auto slot_chain_settle = [&]() {
++            if (apark.pending && apark.slot >= 0) {
++                park_threads.wait();
++                apark.pending = false;
++                const int b = apark.slot;
++                bool complete = !apark.parts.empty();
++                for (size_t k = 0; k < apark.parts.size(); ++k) complete = complete && apark.ok[k] && !apark.thrown[k];
++                const bool same = live_ok && apark.live == live && apark.live_imgs == live_imgs && apark.cvec == cvec_cached;
++                if (b == main_slot && complete && same && bs[(size_t) b].parks) {
++                    strata::core::ConversationCheckpointSplit cs;
++                    cs.stage0 = std::move(apark.parts[0].checkpoints);
++                    for (size_t k = 1; k < apark.parts.size(); ++k) cs.parts.push_back(std::move(apark.parts[k].checkpoints));
++                    std::vector<ConvCheckpoint> whole;
++                    if (strata::core::conversation_checkpoints_merge(std::move(cs), whole)) {
++                        for (ConvCheckpoint& c : whole) bs[(size_t) b].chain.push_back(std::move(c));
++                        main_chain = true;
++                    }
++                }
++                park_async_discard();
++            }
++            if (main_slot < 0 || main_chain || !bs[(size_t) main_slot].parks || !live_ok) return;
++            BSlot& sl = bs[(size_t) main_slot];
++            try {
++                for (const ConvCheckpoint& c : checks)
++                    if (c.stage_parts.size() == stages.size() && !c.slot_turn) sl.chain.push_back(c);
++                main_chain = true;
++            } catch (const std::bad_alloc&) {
++                sl.chain.clear();
++            }
++        };
+         // STRATA_PARK_ASYNC_VERIFY: the synchronous capture park_current_body takes, without retained K/V
+         auto park_capture_sync = [&](strata::core::SavedConversation& out) -> bool {
+             const size_t n_st = stages.size();
+@@ -11430,6 +12045,9 @@ int main(int argc, char** argv) {
+             }
+             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
+                 park_async_drop();   // (STRATA_PARK_ASYNC: it may move the sessions' memory)
++                if (slot_park_on)   // (STRATA_SLOT_PARK: the slots' captures, too, are done before)
++                    for (const auto& sp : spark)
++                        if (sp && sp->pending) slot_threads.wait(*sp->item);
+                 std::string verr;
+                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
+                 else vram_command(line, verr);
+@@ -11512,6 +12130,7 @@ int main(int argc, char** argv) {
+             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+                 park_async_drop();   // (STRATA_PARK_ASYNC: a session restore rewrites what it reads)
+                 const bool save = line[0] == 'S';
++                if (!save) main_slot = -1;   // (STRATA_SLOT_PARK: the main sessions no longer hold that admission's prompt)
+                 const std::string path = line.substr(save ? 5 : 8);
+                 const auto t0 = Clock::now();
+                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+@@ -12023,12 +12642,29 @@ int main(int argc, char** argv) {
+                         sl.checks.clear();
+                         ++n_slots;
+                     }
++                if (slot_park_on) {   // STRATA_SLOT_PARK: no slot's capture or chain is kept either
++                    for (int b = 0; b < (int) bs.size(); ++b) {
++                        slot_park_discard(b);
++                        bs[(size_t) b].parks = false;
++                        bs[(size_t) b].chain.clear();
++                    }
++                    main_slot = -1;
++                }
+                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
+                                      "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
+                                      "not kept after their reply); reading this prompt from token 0\n", n_checks,
+                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
+                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
+             }
++            // STRATA_SLOT_PARK: the last admission's chain to its slot, then the images of the slots a pad row has
++            // written since they ended into the cache (this request may continue one of them)
++            if (slot_park_on) {
++                slot_chain_settle();
++                if (!slot_park_flush()) {
++                    std::printf("ERR %s\n", err.c_str());
++                    return 1;
++                }
++            }
+             int64_t resume = 0;
+             bool from_live = false;
+             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+@@ -12133,8 +12769,9 @@ int main(int argc, char** argv) {
+             }
+             if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
+                 const strata::core::OnDevice on(stages[i]->dev);
++                // the draft: the last stage's (STRATA_SLOT_PARK: a slot's image has none)
+                 if (!strata::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
+-                        use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
++                        use_mtp && !incoming->draftless && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {
+                     std::fprintf(stderr, "strata serve: conversation cache: discard invalid stage snapshot (%s)\n",
+                                  err.c_str());
+                     incoming.reset();
+@@ -12143,7 +12780,7 @@ int main(int argc, char** argv) {
+                 }
+             }
+             if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
+-                    use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err)) {
++                    use_mtp && !incoming->draftless && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err)) {
+                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
+                 incoming.reset();
+                 err.clear();
+@@ -12160,7 +12797,15 @@ int main(int argc, char** argv) {
+                 for (const ConvCheckpoint& c : checks)
+                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
+             const bool park_due = (!from_live || incoming || slot_source >= 0) && !pin_sibling;
+-            if (apark.pending) {   // STRATA_PARK_ASYNC: the capture started after the last request
++            // STRATA_SLOT_PARK: the main sessions hold the prompt of the last admission, whose slot parks that
++            // conversation with its reply: nothing to park here
++            const int owner = main_slot >= 0 && bs[(size_t) main_slot].parks ? main_slot : -1;
++            main_slot = -1;
++            if (park_due && owner >= 0) {
++                park_async_drop();   // (none runs: slot_chain_start copies the chain instead)
++                std::fprintf(stderr, "strata serve: conversation cache: %zu tokens not parked here: slot %d parks them "
++                                     "with its reply\n", live.size(), owner);
++            } else if (apark.pending) {   // STRATA_PARK_ASYNC: the capture started after the last request
+                 if (!park_async_take(park_due, incoming ? incoming->bytes() : 0)) {
+                     std::printf("ERR %s\n", err.c_str());
+                     return 1;
+@@ -12173,8 +12818,9 @@ int main(int argc, char** argv) {
+                 lent_slot = -1;   // (a longer start than the main session's)
+                 // STRATA_PARK_ASYNC: K/V pages retained from a restore describe the cells this copy overwrites with
+                 // another conversation's (a park that did not run - live_ok was false - left them): they go, as at a
+-                // session restore, so no later capture takes them for this conversation's
+-                if (park_async_on) conversations.take_reuse();
++                // session restore, so no later capture takes them for this conversation's.  STRATA_SLOT_PARK: the
++                // same (the park skipped for a slot that parks the conversation left them)
++                if (park_async_on || slot_park_on) conversations.take_reuse();
+                 const auto t0 = Clock::now();
+                 if (!copy_from_slot(slot_source, slot_ck, err)) {
+                     // the main session may be half written: read this prompt from the start
+@@ -12216,6 +12862,19 @@ int main(int argc, char** argv) {
+                     live_imgs.clear();
+                     resume = slot_tokens;
+                     from_live = true;
++                    if (slot_park_on) {
++                        // STRATA_SLOT_PARK: the conversation goes on here, so the slot's image goes, and the chain its
++                        // prompt was read with comes along (the cells below each checkpoint are the ones just copied)
++                        slot_park_discard(slot_source);
++                        for (ConvCheckpoint& c : bs[(size_t) slot_source].chain) {
++                            bool held = false;
++                            for (const ConvCheckpoint& k : checks) held = held || k.ids == c.ids;
++                            if (!held && (int64_t) c.ids.size() <= slot_tokens && c.imgs.empty() &&
++                                std::equal(c.ids.begin(), c.ids.end(), live.begin()))
++                                checks.push_back(std::move(c));
++                        }
++                        bs[(size_t) slot_source].chain.clear();
++                    }
+                     std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
+                                  "%.1f ms\n", slot_source, (long long) slot_tokens,
+                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
+@@ -12230,7 +12889,7 @@ int main(int argc, char** argv) {
+             if (incoming) {
+                 const auto t0 = Clock::now();
+                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
+-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
++                        use_mtp && !incoming->draftless && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
+                     strata::core::ConversationRestore::restored) {
+                     // Already prevalidated above: a failure here is fatal, never
+                     // permission to decode from a partially restored session.
+@@ -12240,7 +12899,7 @@ int main(int argc, char** argv) {
+                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+                     const strata::core::OnDevice on(stages[i]->dev);
+                     if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
++                            use_mtp && !incoming->draftless && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                         strata::core::ConversationRestore::restored) {
+                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
+                                     err.c_str());
+@@ -12248,7 +12907,7 @@ int main(int argc, char** argv) {
+                     }
+                     if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                 }
+-                if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
++                if (use_mtp && !incoming->draftless && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
+                     uint64_t draft_hash = 0;
+                     const auto& draft_kv = stages.empty() || mtp_first ? incoming->kv.back() : incoming->stage_images.back().kv.back();
+                     const strata::core::OnDevice on_d(stages.empty() || mtp_first ? 0 : stages.back()->dev);
+@@ -12333,6 +12992,7 @@ int main(int argc, char** argv) {
+                     for (ConvCheckpoint& k : bs[(size_t) lent_slot].checks)
+                         if ((int64_t) k.ids.size() == resume && starts_with(k.ids, k.imgs)) { c = &k; lent = true; }
+                 if (!lent) lent_slot = -1;
++                if (lent && slot_park_on) slot_park_discard(lent_slot);   // STRATA_SLOT_PARK: it goes on from here
+                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
+                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+                 if (reread && c != nullptr) {
+@@ -14497,6 +15157,11 @@ int main(int argc, char** argv) {
+                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
+                             (int64_t) live.size() == p;
+                 const auto tc0 = Clock::now();
++                // STRATA_SLOT_PARK: the conversation the slot held goes to the cache before the copy overwrites it
++                if (cont && slot_park_on && !slot_park_put(admit_slot, bs[(size_t) admit_slot].cached)) {
++                    std::printf("ERR %s\n", err.c_str());
++                    return 1;
++                }
+                 if (cont && !copy_to_slot(admit_slot, live, err)) {
+                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
+                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
+@@ -14528,6 +15193,9 @@ int main(int argc, char** argv) {
+                     }
+                     sl.cvec = cvec_cached;
+                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
++                    // STRATA_SLOT_PARK: the slot parks this conversation (with its reply), not the main sessions
++                    sl.parks = slot_park_on && !sl.img;
++                    if (sl.parks) main_slot = admit_slot;
+                     const ConvCheckpoint* best = nullptr;
+                     size_t best_at = 0;   // its place in `checks` (STRATA_SLOT_CKPT_MOVE)
+                     for (size_t i = 0; i < checks.size(); ++i) {
+-- 
+2.43.0
+

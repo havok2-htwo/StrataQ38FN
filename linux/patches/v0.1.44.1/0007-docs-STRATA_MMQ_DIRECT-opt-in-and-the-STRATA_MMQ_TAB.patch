@@ -1,0 +1,44 @@
+From 66df6061390cb4d925113e3e80bd03f24bad2a2e Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:53:05 +0200
+Subject: [PATCH 07/58] docs: STRATA_MMQ_DIRECT (opt-in) and the STRATA_MMQ_TAB
+ build option, with the measurements
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/DETAILS.md | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 5bd5fbbb..62792a9f 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -1786,6 +1786,25 @@ the pairs in which the switched arm won). They are here so you can try them on y
+   instead of 512: prefill 292.5 -> 667.1 tok/s on a 29,854-token prompt (medians of 12 and 6 fresh-engine trials).
+   Reads of up to 512 fresh tokens cost about 0.6-0.75 s more per request, and the card had 0 MiB free while decoding.
+   Details, limits and the measurement: [PREFILL_HEAD_ALIAS.md](PREFILL_HEAD_ALIAS.md).
++- **`STRATA_MMQ_DIRECT=1`: the prompt's MMQ reads resident experts in their cache slots** (CUDA, native packs). The prompt
++  path multiplies its experts in groups of 16 with llama.cpp's MMQ, which wants a group's weights in one buffer at a fixed
++  stride, so every expert a chunk routes to is copied there first (2.3-3.1 MB each, per chunk and layer), resident ones
++  too. With this on, a Strata-side copy of MMQ's outer scheduler (`src/prefill/moe_mmq_tab.cuh`) takes one pointer per
++  expert instead, and a resident expert is read where it is; streamed, peer-GPU and other experts are still copied. The
++  launch (tile size, stream-k split, fixup) is the one MMQ makes for the copied group and the tile code is llama.cpp's
++  own, so the answers are the same bits (`prefill_mmq_tab_test`: 874 products bitwise equal to the copied path, every type
++  and tile size). Each sized cache slot keeps 256 bytes after its expert, because MMQ reads up to 136 bytes past a
++  640-wide down matrix; they are zeroed before each group. That is about 2.3 MiB over 9,300 slots (one slot fewer out of
++  6,998 on one RTX 3090). `STRATA_MMQ_DIRECT=2` keeps that layout but copies as before (an A/B reference); 0 or unset is
++  the default path, byte for byte. Under HIP, or when CMake turned the build option `STRATA_MMQ_TAB` off (it does so, with
++  a message, when the llama.cpp tree's `mmq.cuh` differs from the one the copy mirrors), the variable is ignored.
++  Measured on 4x RTX 3090, UD-IQ4_XS, split `12,24,36` with `--trim-stage-weights` and `--batch 16` (every expert
++  resident), the engine driven directly, its "read in" time, medians of 8: a 170-token prompt 331 -> 251 ms (-24%) and
++  369 -> 290 ms (-21%) in two series, a 1,217-token prompt 773 -> 634 ms (-18%) and 838 -> 675 ms (-19%). Skipping
++  those copies altogether (wrong answers; the bound) gave 225 and 577 ms. On one RTX 3090 with 40 GiB of experts
++  streamed from RAM the copies of streamed experts stay, and the prompt time moved by 0-1.5%. Greedy answers with it on
++  were identical to off: `tools/batch_test16.py` (16 prompts, solo and batch), 20 prompts of 170 and 1,217 tokens, and
++  on one GPU (resident and streamed experts in the same groups), with `STRATA_PREFILL_CPU_SHARE=0` and no adaptive swaps.
+ 
+ ## Thread placement: `--aux-cpus` (Linux, off by default)
+ 
+-- 
+2.43.0
+

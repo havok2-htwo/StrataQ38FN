@@ -1,0 +1,232 @@
+From 0b9af54090011c71bb79ee402fbcd2a6ef9e51e7 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 23:30:14 +0200
+Subject: [PATCH 26/58] generate: STRATA_SLOT_CKPT_MOVE=1 moves a batch
+ admission's turn checkpoint into the slot
+
+A batch admission copied the main chain's longest checkpoint into the slot (~112 MB of host vectors, 7.6 ms, ~60 ms
+on fresh pages).  With the switch, the request's own turn checkpoint (or one it took out of the slot it is admitted
+to) moves instead; a root, a pinned prefix and any other checkpoint the chain shares are still copied.
+
+The chain then no longer holds it, so the request path also looks in the slots:
+- while the main session holds its tokens (live, its cells below it), a slot's checkpoint is restored on the main
+  session as a chain one would be, with no K/V copy; when that slot is the one the request is admitted to, it moves
+  back into the chain first (the admission drops the slot's checkpoints), else the slot keeps it and the admission
+  copies it as it copied the chain's;
+- an active slot's checkpoints are a slot source like an idle slot's (its windows write its cells from p on): a
+  second request with the same history after the main session moved on restores instead of reading it all;
+- a slot source that is the admit slot moves its checkpoint into the chain instead of copying it.
+
+The switch also keeps the dropped checkpoints' storage as STRATA_CKPT_POOL=1 does: a moved checkpoint frees
+nothing at the next prune, so without it every save faulted in fresh pages (17 -> 38-60 ms, more than the copy saved).
+
+Off by default: nothing changes.  A session SAVE or a parked conversation right after an admission lacks the moved
+turn checkpoint (the slot holds it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 111 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 101 insertions(+), 10 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1093cd76..7c8ee3fd 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -224,6 +224,19 @@ bool ckpt_threads_env() {
+     }();
+     return on;
+ }
++// STRATA_SLOT_CKPT_MOVE=1 (read once; off by default): a batch admission MOVES its own turn checkpoint into the slot
++// instead of copying it (~112 MB of host vectors).  The main session's chain no longer holds it, so the request path
++// looks for it in the slots' checkpoints too: while the main session's cells still hold its tokens it is restored there
++// as before (no K/V copy), else an active slot holding it gives it back like an idle one (a second request with the
++// same history).  The same bytes are restored from another container, so the tokens are the same.  It keeps the
++// dropped checkpoints' storage as STRATA_CKPT_POOL does (the slot's old checkpoint is the next save's)
++bool slot_ckpt_move_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_SLOT_CKPT_MOVE");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
+ // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+ // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+@@ -8398,7 +8411,9 @@ int main(int argc, char** argv) {
+         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
+         bool nan_flush = false;
+         std::vector<ConvCheckpoint> checks;
+-        CheckpointPool ckpt_pool(ckpt_pool_env());   // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused
++        // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused.  STRATA_SLOT_CKPT_MOVE turns it on too: a moved
++        // checkpoint frees nothing at the next prune, so every save would fault in fresh pages (17 -> 40-60 ms)
++        CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env());
+         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+@@ -11500,8 +11515,29 @@ int main(int argc, char** argv) {
+                         from_live = false;
+                     }
+             }
++            // STRATA_SLOT_CKPT_MOVE: a turn checkpoint a batch admission moved into its slot is still one of the main
++            // session's while the main session holds its tokens (the cells below it are the ones it was taken over):
++            // it is restored there as one of `checks` would be (lent_slot: the slot that keeps it).  moved_in: the length
++            // of a slot's checkpoint this request moved into `checks` (from the slot it is admitted to), -1: none
++            int lent_slot = -1;
++            int64_t moved_in = -1;
++            if (slot_ckpt_move_env() && o.prompt_cache > 0 && want_cvec == cvec_cached && live_ok)
++                for (int b = 0; b < (int) bs.size(); ++b) {
++                    if (bs[(size_t) b].cvec != cvec_cached) continue;
++                    for (const ConvCheckpoint& c : bs[(size_t) b].checks) {
++                        const int64_t L = (int64_t) c.ids.size();
++                        if (L > resume && L <= (int64_t) live.size() && starts_with(c.ids, c.imgs) &&
++                            std::equal(c.ids.begin(), c.ids.end(), live.begin()) && imgs_below(live_imgs, L) == c.imgs) {
++                            resume = L;
++                            from_live = false;
++                            lent_slot = b;
++                        }
++                    }
++                }
+             // --batch: an idle slot that holds the start of this prompt (the conversation it served last) is a
+-            // source too - its sessions are copied back below, so only the new part is read
++            // source too - its sessions are copied back below, so only the new part is read.  STRATA_SLOT_CKPT_MOVE: an
++            // active slot's checkpoints too (its windows write its cells from p on, so the ones below a checkpoint still
++            // hold its prompt; the groups have finished before a request is read)
+             int slot_source = -1;
+             int64_t slot_tokens = 0;
+             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
+@@ -11509,8 +11545,9 @@ int main(int argc, char** argv) {
+             if (o.prompt_cache > 0 && req_imgs.empty())
+                 for (int b = 0; b < (int) bs.size(); ++b) {
+                     const BSlot& sl = bs[(size_t) b];
+-                    if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
+-                    if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
++                    const bool idle_source = !sl.active && sl.cached;
++                    if (sl.cvec != want_cvec || !(idle_source || (sl.active && slot_ckpt_move_env()))) continue;
++                    if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
+                         slot_source = b;
+                         slot_tokens = (int64_t) sl.ids.size();
+                         slot_ck = nullptr;
+@@ -11599,6 +11636,7 @@ int main(int argc, char** argv) {
+                 return 1;
+             }
+             if (slot_source >= 0) {
++                lent_slot = -1;   // (a longer start than the main session's)
+                 const auto t0 = Clock::now();
+                 if (!copy_from_slot(slot_source, slot_ck, err)) {
+                     // the main session may be half written: read this prompt from the start
+@@ -11621,7 +11659,18 @@ int main(int argc, char** argv) {
+                     }
+                     if (slot_ck != nullptr) {
+                         live = slot_ck->ids;
+-                        checks.push_back(*slot_ck);   // the main session's chain has it now
++                        if (slot_ckpt_move_env() && admit_slot == slot_source) {
++                            // STRATA_SLOT_CKPT_MOVE: the slot this request continues in drops its checkpoints at the
++                            // admission, so this one moves (and moves on into the slot then: moved_in)
++                            std::vector<ConvCheckpoint>& sc = bs[(size_t) slot_source].checks;
++                            const auto it = sc.begin() + (slot_ck - sc.data());
++                            checks.push_back(std::move(*it));
++                            sc.erase(it);
++                            slot_ck = &checks.back();
++                            moved_in = (int64_t) slot_ck->ids.size();
++                        } else {
++                            checks.push_back(*slot_ck);   // the main session's chain has it now
++                        }
+                         checks.back().used = ++check_clock;
+                     } else {
+                         live = bs[(size_t) slot_source].ids;
+@@ -11694,6 +11743,7 @@ int main(int argc, char** argv) {
+                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                 }
+                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
++                lent_slot = -1;   // (the main session holds the parked conversation now)
+                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
+                              (long long) resume, from_live ? "live" : "checkpoint",
+                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+@@ -11740,6 +11790,11 @@ int main(int argc, char** argv) {
+             } else if (!from_live) {
+                 ConvCheckpoint* c = nullptr;
+                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
++                bool lent = false;   // STRATA_SLOT_CKPT_MOVE: the one a slot keeps (found above)
++                if (c == nullptr && lent_slot >= 0)
++                    for (ConvCheckpoint& k : bs[(size_t) lent_slot].checks)
++                        if ((int64_t) k.ids.size() == resume && starts_with(k.ids, k.imgs)) { c = &k; lent = true; }
++                if (!lent) lent_slot = -1;
+                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
+                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+                 if (reread && c != nullptr) {
+@@ -11769,6 +11824,20 @@ int main(int argc, char** argv) {
+                     std::printf("ERR restoring a conversation checkpoint failed\n");
+                     return 1;
+                 }
++                if (lent && lent_slot == admit_slot) {
++                    // the slot this request continues in drops its checkpoints at the admission: this one moves back
++                    // into the chain (and on into the slot then: moved_in)
++                    std::vector<ConvCheckpoint>& sc = bs[(size_t) lent_slot].checks;
++                    const auto it = sc.begin() + (c - sc.data());
++                    checks.push_back(std::move(*it));
++                    sc.erase(it);
++                    moved_in = resume;
++                    lent_slot = -1;
++                }
++                if (lent && trace)
++                    std::fprintf(stderr, "strata trace: the checkpoint at %lld restored from slot %d's%s\n",
++                                 (long long) resume, lent_slot >= 0 ? lent_slot : admit_slot,
++                                 lent_slot >= 0 ? "" : " (moved back into the chain)");
+             }
+             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
+             // host copies and slots are always current (every writer writes both), so they need nothing
+@@ -13922,12 +13991,34 @@ int main(int argc, char** argv) {
+                     sl.cvec = cvec_cached;
+                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
+                     const ConvCheckpoint* best = nullptr;
+-                    for (const ConvCheckpoint& c : checks)
++                    size_t best_at = 0;   // its place in `checks` (STRATA_SLOT_CKPT_MOVE)
++                    for (size_t i = 0; i < checks.size(); ++i) {
++                        const ConvCheckpoint& c = checks[i];
+                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
+-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
++                            std::equal(c.ids.begin(), c.ids.end(), live.begin())) {
+                             best = &c;
++                            best_at = i;
++                        }
++                    }
++                    bool best_lent = false;
++                    // STRATA_SLOT_CKPT_MOVE: the checkpoint this request mounted from another slot (that slot keeps it)
++                    if (lent_slot >= 0 && lent_slot != admit_slot && (best == nullptr || (int64_t) best->ids.size() < resume))
++                        for (const ConvCheckpoint& c : bs[(size_t) lent_slot].checks)
++                            if ((int64_t) c.ids.size() == resume && c.ids.size() < live.size() &&
++                                std::equal(c.ids.begin(), c.ids.end(), live.begin())) {
++                                best = &c;
++                                best_lent = true;
++                            }
++                    // STRATA_SLOT_CKPT_MOVE: this request's own turn checkpoint (or the one it moved out of this slot)
++                    // moves into the slot; a pinned prefix, a root and any other the chain shares are copied as before
++                    const bool move_best = slot_ckpt_move_env() && best != nullptr && !best_lent && !sl.img &&
++                                           !best->pinned && ((turn_at > 0 && (int64_t) best->ids.size() == turn_at) ||
++                                            (int64_t) best->ids.size() == moved_in);
+                     const auto tc3 = Clock::now();
+-                    if (best != nullptr && !sl.img) {
++                    if (move_best) {
++                        sl.checks.push_back(std::move(checks[best_at]));
++                        checks.erase(checks.begin() + (std::ptrdiff_t) best_at);
++                    } else if (best != nullptr && !sl.img) {
+                         if (ckpt_pool.on()) {   // a copy into a dropped checkpoint's vectors (their pages are in)
+                             ConvCheckpoint c = ckpt_pool.take();
+                             c = *best;
+@@ -13947,11 +14038,11 @@ int main(int argc, char** argv) {
+                         std::fprintf(stderr, "strata trace: admission of slot %d: drain %.1f, prompt %.1f (read %.1f, "
+                                              "windows %.1f, %d checkpoint(s) %.1f = sync %.1f + save %.1f + evict %.1f, "
+                                              "rest %.1f), first window %.1f, slot copy %.1f, slot freed %.1f, "
+-                                             "checkpoint copy %.1f\n", admit_slot, adm_drain_ms, prompt_ms,
++                                             "checkpoint copy %.1f%s\n", admit_slot, adm_drain_ms, prompt_ms,
+                                      req_times.read_ms, req_times.windows_ms, req_times.ckpts, ck, req_times.sync_ms,
+                                      req_times.save_ms, req_times.evict_ms,
+                                      prompt_ms - req_times.read_ms - req_times.windows_ms - ck, decode_ms, span(tc0, tc1),
+-                                     span(tc1, tc2), span(tc3, tc4));
++                                     span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
+                     }
+                 }
+                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+-- 
+2.43.0
+

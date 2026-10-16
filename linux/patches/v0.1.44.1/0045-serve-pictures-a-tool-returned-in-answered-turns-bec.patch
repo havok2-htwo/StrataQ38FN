@@ -1,0 +1,96 @@
+From db073efd8d7579ac02795795f2a9188590f42ed6 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 16:27:16 +0200
+Subject: [PATCH 45/58] serve: pictures a tool returned in answered turns
+ become a note (an image request runs alone and drains all slots)
+
+Clients resend the whole history, so one screenshot from an agent's Read made every later request of the
+conversation an image request: it waited for every slot to finish and held the others back. The picture of the turn
+being answered and pictures a user sent stay. STRATA_IMAGE_HISTORY=keep restores the old behaviour.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ serve/server.py    | 18 ++++++++++++++++++
+ serve/test_load.py | 32 ++++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/serve/server.py b/serve/server.py
+index 66e2d798..d5580ddb 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -4075,12 +4075,30 @@ class Service:
+                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
+         return fetched
+ 
++    def _age_out_tool_images(self, messages):
++        """Pictures a tool returned (an agent's Read of a screenshot) in turns the model has already answered become a
++        short note.  Clients resend the whole history every turn, so one such picture made every later request of the
++        conversation an image request, and an image request runs alone: it waits for every slot to finish and holds the
++        others back (one every ~3 min in production).  The picture of the turn being answered stays; pictures a user
++        sends stay (a follow-up question may be about them).  STRATA_IMAGE_HISTORY=keep turns this off."""
++        if os.environ.get("STRATA_IMAGE_HISTORY") == "keep":
++            return
++        last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
++        for m in messages[:last]:
++            content = m.get("content")
++            if m.get("role") != "tool" or not isinstance(content, list):
++                continue
++            for n, item in enumerate(content):
++                if isinstance(item, dict) and item.get("type") == "image":
++                    content[n] = {"type": "text", "text": "[image omitted: a picture from an earlier turn]"}
++
+     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
+         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
+         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
+         prompt; with thinking, Service.run writes it once the thinking is over."""
+         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
+         # between pictures and raise ClientGone
++        self._age_out_tool_images(messages)
+         fetched = self._note_unreadable_tool_images(messages, cancel)
+         ids = self.encode_prompt(messages, tools, kwargs)
+         if force and kwargs.get("enable_thinking", True) is False:
+diff --git a/serve/test_load.py b/serve/test_load.py
+index e580a775..c6500661 100644
+--- a/serve/test_load.py
++++ b/serve/test_load.py
+@@ -61,5 +61,37 @@ class LoadTest(unittest.TestCase):
+             self.assertTrue(Path(s.load_peak_path).exists())
+ 
+ 
++
++
++class AgeOutTest(unittest.TestCase):
++    def messages(self):
++        img = {"type": "image", "source": "data:image/png;base64,AAAA"}
++        return [{"role": "user", "content": [{"type": "text", "text": "look"}, dict(img)]},
++                {"role": "assistant", "content": "ok"},
++                {"role": "tool", "content": [dict(img)]},
++                {"role": "assistant", "content": "seen"},
++                {"role": "tool", "content": [dict(img)]}]
++
++    def test_old_tool_images_become_notes_user_and_current_stay(self):
++        from serve.frontend import images_of
++        s = object.__new__(Service)
++        m = self.messages()
++        s._age_out_tool_images(m)
++        self.assertEqual(len(images_of(m)), 2)              # the user's picture and the current tool picture
++        self.assertEqual(m[2]["content"][0]["type"], "text")
++
++    def test_keep(self):
++        import os
++        from serve.frontend import images_of
++        s = object.__new__(Service)
++        m = self.messages()
++        os.environ["STRATA_IMAGE_HISTORY"] = "keep"
++        try:
++            s._age_out_tool_images(m)
++        finally:
++            del os.environ["STRATA_IMAGE_HISTORY"]
++        self.assertEqual(len(images_of(m)), 3)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

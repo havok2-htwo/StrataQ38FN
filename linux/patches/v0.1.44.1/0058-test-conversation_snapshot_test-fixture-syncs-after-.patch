@@ -1,0 +1,41 @@
+From f17f3eec6af5dce6ec6a2fa72de98e8ed9ec10de Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 05:23:18 +0200
+Subject: [PATCH 58/58] test: conversation_snapshot_test fixture syncs after
+ writing the state (a pageable cudaMemcpy can return before its DMA lands)
+
+The snapshot copies run on a private non-blocking stream and rely on the caller's device sync (conversation_copy.hpp).
+fill()/fill_after() wrote the fixture with a pageable cudaMemcpy / cudaMemset and did not sync, so 'restore A over B'
+could race the tail of B's write: A/B/A byte-exact failed 4 of 10 runs on this branch (1 of 10 on the 0.1.43 line,
+0 of 10 on stock v0.1.44.1). With the sync: 0 of 30. Test-only; production callers synchronize before every copy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/conversation_snapshot_test.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/core/conversation_snapshot_test.cpp b/src/core/conversation_snapshot_test.cpp
+index cfb56870..1e2541d6 100644
+--- a/src/core/conversation_snapshot_test.cpp
++++ b/src/core/conversation_snapshot_test.cpp
+@@ -96,6 +96,9 @@ struct Fixture {
+             for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
+             if (!data.empty()) cuda_check(cudaMemcpy(sources[i],data.data(),data.size(),cudaMemcpyDefault));
+         }
++        // a pageable cudaMemcpy can return before its DMA lands; the snapshot copies run on a non-blocking stream and
++        // rely on the caller's device sync (conversation_copy.hpp), so the fixture keeps that contract too
++        cuda_check(cudaDeviceSynchronize());
+     }
+     void fill_after(uint8_t salt, int64_t first_dirty) {
+         for (size_t i=0;i<sources.size();++i) {
+@@ -104,6 +107,7 @@ struct Fixture {
+             if (sizes[i] > offset)
+                 cuda_check(cudaMemset(static_cast<uint8_t*>(sources[i])+offset, salt, sizes[i]-offset));
+         }
++        cuda_check(cudaDeviceSynchronize());   // (as fill: the snapshot copies run on a non-blocking stream)
+     }
+     ~Fixture() { for (void* p:device) cudaFree(p); for (void* p:host) cudaFreeHost(p); }
+ };
+-- 
+2.43.0
+

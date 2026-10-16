@@ -1,0 +1,907 @@
+From 1b9247b139af041096bebee79a017b519da622ae Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 02:29:09 +0200
+Subject: [PATCH 43/58] serve: --batch runs an image request alone; a dead
+ encoder fails only image requests
+
+The engine keeps one M-RoPE table per device for all batch slots (previous commit), so an image request must not share
+the batch.  generate_batched hands a request with embeddings to _generate_alone: it queues behind earlier image
+requests (image_line), new requests stand back from its arrival (not counted as waiting, so a read that gave way
+still gets the control lines - no deadlock), the slots decode to their end, then it takes the control lines with
+every slot free and runs GENI on the solo path to its DONE (never promoted into a slot).
+- STRATA_IMAGE_WAIT_S (120): an image that waited longer for the slots gives up with a 503 the client can retry
+  (ImageWaitTimeout, a GpuBusy), and the text held behind it goes on.
+- An engine refusal ("ERR vision: ...", a slot the server had already freed) waits for the slots again (up to 3 tries)
+  instead of failing.
+- A dead or unstartable vision encoder no longer fails text-only requests (load(vision=False) for generation; the
+  encoder is started for image requests and tool pictures only).
+Text-only traffic sends the same lines as before.  test_image_alone.py: 13 tests (gate, deadlock case, order, cancel,
+engine death, restart, orphan flag, timeout, refusal retry, over HTTP with the fake engine).
+
+Measured on 4x RTX 3090 (k5 engine, CPU encoder, T16-143-prod262r + --vision): 15/15 image checks, 16 text users +
+images for 90 s: 491 tok/s text, every image answered correctly in 4.8-11.3 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py           | 230 ++++++++++++++++---
+ serve/test_image_alone.py | 466 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 666 insertions(+), 30 deletions(-)
+ create mode 100644 serve/test_image_alone.py
+
+diff --git a/serve/server.py b/serve/server.py
+index 4e55d844..5cd93d30 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -254,6 +254,9 @@ def _timeout_env(name: str, default: float) -> float | None:
+ # still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
+ # STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
+ ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
++# --batch with images: how long an image request waits for the slots before it to finish (it runs alone, and new
++# requests wait behind it) before it gives up with a 503 the client can retry.  STRATA_IMAGE_WAIT_S (0 = no limit).
++IMAGE_WAIT_S = _timeout_env("STRATA_IMAGE_WAIT_S", 120.0) or 0.0
+ STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+ STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+ 
+@@ -379,6 +382,11 @@ def unload_wait(value, default: float) -> float:
+         return default
+ 
+ 
++class ImageWaitTimeout(GpuBusy):
++    """--batch: an image request waited longer than STRATA_IMAGE_WAIT_S for the engine alone (the slots before it were
++    still decoding): a 503 the client can retry, and the text requests held behind it go on."""
++
++
+ ENGINE_REQUEST = re.compile(
+     # "+ 12288 of 98179 read": a request cancelled while its prompt was read (#471)
+     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
+@@ -953,6 +961,7 @@ class StrataEngine:
+             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+             self.ctl_epoch = 0                          # how often the control lines were taken
+             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
++            self.image_line: list[object] = []          # image requests waiting for (or having) the engine alone
+         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
+         self._yielded = None                            # (slot, tokens read): the last request on them gave way
+@@ -1427,13 +1436,21 @@ class StrataEngine:
+ 
+     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
+ 
+-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
++    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False,
++                      quiet: bool = False):
+         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
+-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
++        `after_epoch`: a request whose read gave way lets the requests waiting then go first.  `new`: a request not
++        admitted yet - while an image request waits for the engine alone, or has it (image_line), it stands back and
++        is not counted as waiting meanwhile (a read that gave way to it would otherwise wait for it, holding the slot
++        the image request waits for).  `quiet`: the image request itself, never counted as waiting (a solo request is
++        not moved into a slot for it, and no read gives way to it)."""
+         entry = [plen]
++        counted = False
+         with self.slot_cv:
+-            self.waiting += 1
+-            self.wait_lens.append(entry)
++            if not quiet and not (new and self.image_line):
++                self.waiting += 1
++                self.wait_lens.append(entry)
++                counted = True
+         beat = time.monotonic()
+         try:
+             while True:
+@@ -1442,13 +1459,27 @@ class StrataEngine:
+                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
+                     # restart is under way it keeps waiting and goes on with the new engine.
+                     raise EngineDied("the engine stopped while this request waited; it was not sent")
++                if new:
++                    with self.slot_cv:
++                        if self.image_line and counted:     # an image request came: stand back until it is done
++                            self.waiting = max(0, self.waiting - 1)
++                            if entry in self.wait_lens:
++                                self.wait_lens.remove(entry)
++                            counted = False
++                            self.slot_cv.notify_all()
++                        elif not self.image_line and not counted:
++                            self.waiting += 1
++                            self.wait_lens.append(entry)
++                            counted = True
+                 with self.slot_cv:
+-                    turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
++                    turn = (counted or quiet) and (after_epoch is None or self.ctl_epoch > after_epoch or
++                                                   self.waiting <= 1)
+                 if turn and self.ctl.acquire(timeout=0.5):
+-                    if self.alive():
++                    if self.alive() and not (new and self.image_line):
+                         break
+                     self.ctl.release()                  # it died (or is being restarted) while this one was getting
+-                    turn = False                        # the lines: not the engine this request was meant for
++                    turn = False                        # the lines: not the engine this request was meant for (or
++                                                        # an image request came meanwhile: it goes first)
+                 if not turn:
+                     with self.slot_cv:
+                         self.slot_cv.wait(timeout=0.5)
+@@ -1459,9 +1490,10 @@ class StrataEngine:
+                     yield None
+         finally:
+             with self.slot_cv:
+-                self.waiting = max(0, self.waiting - 1)
+-                if entry in self.wait_lens:
+-                    self.wait_lens.remove(entry)
++                if counted:
++                    self.waiting = max(0, self.waiting - 1)
++                    if entry in self.wait_lens:
++                        self.wait_lens.remove(entry)
+         with self.slot_cv:
+             self.ctl_epoch += 1
+             self.slot_cv.notify_all()
+@@ -1475,7 +1507,8 @@ class StrataEngine:
+         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
+         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
+         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
+-                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
++                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0" or
++                self.image_line):                       # an image request waits for the slots to finish
+             return False
+         with self.slot_cv:
+             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
+@@ -1485,6 +1518,118 @@ class StrataEngine:
+         with self.slot_cv:
+             return any(e[0] * 2 <= plen for e in self.wait_lens)
+ 
++    def _take_engine_alone(self, cancel, me, plen: int):
++        """The image request `me` (in image_line): waits for its turn among the image requests and for every slot to
++        be free, then takes the control lines, yielding None heartbeats.  True: it holds them and no slot is busy;
++        False: cancelled.  It waits for the slots without the control lines: a read that gave way (BYIELD) holds a
++        slot and needs them to go on (waiting with them is the deadlock of ENGINE_REVIEW finding 1)."""
++        beat = since = time.monotonic()
++        said = False
++        while True:
++            if not self.alive() and not getattr(self, "starting", False):
++                raise EngineDied("the engine stopped while this request waited; it was not sent")
++            if IMAGE_WAIT_S > 0 and time.monotonic() - since >= IMAGE_WAIT_S:
++                raise ImageWaitTimeout(f"an image request runs alone and the other requests did not finish within "
++                                       f"{IMAGE_WAIT_S:.0f} s (STRATA_IMAGE_WAIT_S); try again")
++            with self.slot_cv:
++                first = bool(self.image_line) and self.image_line[0] is me
++                if first and any(self.slot_busy):
++                    self._reap_orphan_slots()           # (#1603: a busy flag nobody owns would hold it for good)
++                ready = first and not any(self.slot_busy)
++                if first and not ready and not said:
++                    said = True
++                    print(f"[strata] parallel: an image request waits for {sum(map(bool, self.slot_busy))} busy "
++                          "slot(s) to finish (it runs alone); new requests wait behind it", flush=True)
++                if not ready:
++                    self.slot_cv.wait(timeout=0.5)
++            if ready:
++                ok = yield from self._take_control(cancel, plen, quiet=True)
++                if not ok:
++                    return False
++                with self.slot_cv:
++                    if not any(self.slot_busy):
++                        return True
++                self.ctl.release()                      # a request that had the lines took a slot meanwhile
++                continue
++            if cancel.is_set():
++                return False
++            if time.monotonic() - beat >= 10.0:         # a heartbeat every 10 s, as _take_control
++                beat = time.monotonic()
++                yield None
++
++    def _generate_alone(self, ids, max_new, sampling, cancel, embeddings):
++        """--batch, a request with an image: the engine's M-RoPE table (the image's positions) is one per GPU and is
++        rebuilt at every admission, while each batch row reads it at its own slot's position - an image decoding next
++        to other slots gave them its positions, and itself theirs (silently wrong text).  Until the engine keeps one
++        per slot, an image request has the engine alone for its whole run: it queues behind the image requests before
++        it (image_line); from its arrival no new request is admitted, the ones in slots decode to their end, then it
++        takes the control lines with every slot free and keeps them to its DONE (GENI on the solo path; never moved
++        into a slot, since nothing it waits for STOPs it, and no read gives way to it)."""
++        self.progress, self.progress_ms, self.reused = None, 0, 0
++        keys = self.sampling_keys(sampling or {})
++        out: list[int] = []
++        pending: list[int] = []
++        me = object()
++        with self.slot_cv:
++            self.image_line.append(me)
++            self.slot_cv.notify_all()
++        holding, born, phase = False, self.gen, "none"
++        try:
++            for attempt in range(3):
++                ok = yield from self._take_engine_alone(cancel, me, len(ids))
++                if not ok:
++                    return
++                holding, born = True, self.gen
++                btrace("ctl acquired (alone, an image)")
++                self._last_done = None                  # (#879: this request's DONE decides below)
++                self._send(f"GENI {int(max_new)}{keys} {embeddings} {','.join(str(int(t)) for t in ids)}")
++                phase = "solo"
++                self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
++                self._ctl_erred = False
++                try:
++                    for x in self._control(cancel, pending.append):
++                        while pending:
++                            t = pending.pop(0)
++                            out.append(t)
++                            yield t
++                        if x is None:                   # a heartbeat (False: a token, flushed above)
++                            yield None
++                except ValueError as e:
++                    # the engine still had a slot decoding (its busy flag was freed here first: a BDONE wait that
++                    # timed out, a reaped orphan) and refused the picture: it changed nothing, so wait for the slots
++                    # again instead of failing the request
++                    if not (self._ctl_erred and str(e).startswith("vision:") and not out and attempt < 2):
++                        raise
++                    print(f"[strata] parallel: the engine refused the image request ({e}); waiting for its slots",
++                          flush=True)
++                    phase, holding = "none", False
++                    self.ctl.release()
++                    continue
++                break
++            phase = "none"                              # its DONE is read
++            while pending:
++                t = pending.pop(0)
++                out.append(t)
++                yield t
++            if self._done_finish() == "nonfinite":        # #879
++                raise EngineNonFinite("the engine's logits became non-finite (#879)")
++        finally:
++            # a consumer that left early (or an error): keep the engine and this server in step, as generate_batched
++            try:
++                if phase == "solo" and (self.gen != born or not self.alive() or self._ctl_erred):
++                    phase = "none"                      # #1012 / #1059: nothing to stop or drain
++                if phase == "solo":
++                    self._send("STOP")
++                    self._drain_control("DONE", born=born)
++            except EngineDied:
++                pass
++            if holding:
++                self.ctl.release()
++            with self.slot_cv:                          # the next image request, or the requests that stood back
++                if me in self.image_line:
++                    self.image_line.remove(me)
++                self.slot_cv.notify_all()
++
+     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
+         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
+@@ -1496,6 +1641,9 @@ class StrataEngine:
+         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
+         if not self.alive():
+             raise EngineDied("the engine is unavailable; this request was not sent")
++        if embeddings:                                  # an image: alone in the engine (see _generate_alone)
++            yield from self._generate_alone(ids, max_new, sampling, cancel, embeddings)
++            return
+         self.progress, self.progress_ms, self.reused = None, 0, 0
+         born = self.gen                                 # the engine process this request is sent to
+         keys = self.sampling_keys(sampling or {})
+@@ -1504,7 +1652,7 @@ class StrataEngine:
+         prompt, left = list(ids), int(max_new)
+         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
+         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
+-        ok = yield from self._take_control(cancel, len(prompt))
++        ok = yield from self._take_control(cancel, len(prompt), new=True)
+         if not ok:
+             return
+         holding, born = True, self.gen                  # (the engine it now has the control lines of)
+@@ -1617,8 +1765,8 @@ class StrataEngine:
+                                     self.slot_cv.wait(timeout=1.0)
+                             if cancel.is_set():
+                                 return
+-                            if not holding:
+-                                ok = yield from self._take_control(cancel, len(prompt))
++                            if not holding:             # (one with nothing generated yet is not admitted yet)
++                                ok = yield from self._take_control(cancel, len(prompt), new=not out)
+                                 if not ok:
+                                     return
+                                 holding, born = True, self.gen
+@@ -3309,6 +3457,16 @@ class Service:
+                     print(f"[strata] images: stopping the idle image encoder: {e}", flush=True)
+         threading.Thread(target=loop, daemon=True).start()
+ 
++    def _vision_start(self):
++        """Start a dead (or unloaded) image encoder again for a request with images; requests without images leave it
++        (see ensure_loaded).  The caller holds self.fifo."""
++        if self._vision_down():
++            print("[strata] starting the vision encoder ...", flush=True)
++            try:
++                self.vision.restart()
++            except Exception as e:
++                raise EngineDied(f"the vision encoder failed to start: {e}") from e
++
+     def free_vram_mib(self) -> int | None:
+         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
+         be read (then nothing is refused)."""
+@@ -3327,10 +3485,12 @@ class Service:
+         except Exception:
+             return None
+ 
+-    def ensure_loaded(self):
++    def ensure_loaded(self, vision: bool = True):
+         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
+-        the free-VRAM check.  The caller holds self.fifo."""
+-        if self.loaded() and not self._vision_down():
++        the free-VRAM check.  The caller holds self.fifo.  `vision` False: for a request without images - a dead image
++        encoder does not fail it (it is started with the engine if it can be, else only that is said; an image request
++        starts it, or gets the error)."""
++        if self.loaded() and (not vision or not self._vision_down()):
+             return
+         hook_failed = None
+         if self.before_load:
+@@ -3387,8 +3547,12 @@ class Service:
+             try:
+                 self.vision.restart()
+             except Exception as e:
+-                raise EngineDied(f"the vision encoder failed to start: {e}") from e
+-            vision_started = True
++                if vision:
++                    raise EngineDied(f"the vision encoder failed to start: {e}") from e
++                print(f"[strata] the vision encoder failed to start ({e}); requests without images go on, the next "
++                      "one with an image tries it again", flush=True)
++            else:
++                vision_started = True
+         if self.loaded():
+             return
+         if getattr(self.engine, "unloaded", False):
+@@ -3452,11 +3616,13 @@ class Service:
+         print(f"[strata] {e}. {note} The next request starts the engine again."
+               f"{' Its log: ' + log if log else ''}", flush=True)
+ 
+-    def load(self):
+-        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
++    def load(self, vision: bool = True):
++        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy).
++        `vision` False (a generation request, before its images are known): a dead image encoder does not fail it -
++        prepare() starts it for a request with images (ensure_loaded)."""
+         # a request is on its way: the idle thread must not unload between this and the request's own start
+         self.last_request_at = time.time()
+-        if self.loaded() and not self._vision_down():
++        if self.loaded() and (not vision or not self._vision_down()):
+             return
+         trace = getattr(self.request_trace, "record", None)
+         waiting = time.perf_counter()
+@@ -3474,7 +3640,7 @@ class Service:
+                         trace["queue_s"] += round(loading - waiting, 3)
+                         trace["state"] = "loading"
+                 try:
+-                    self.ensure_loaded()
++                    self.ensure_loaded(vision=vision)
+                 finally:
+                     if trace is not None:
+                         with self.status_lock:
+@@ -3851,8 +4017,9 @@ class Service:
+                         if src.startswith(("http://", "https://")):
+                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
+                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
++                            self._vision_start()
+                             self.vision.encode(src)
+-                    except (ValueError, OSError) as e:
++                    except (ValueError, OSError, EngineDied) as e:
+                         why = str(e)
+                 if why is not None:
+                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
+@@ -3891,6 +4058,7 @@ class Service:
+             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
+             # same FIFO as the requests.
+             with self._turn(cancel):
++                self._vision_start()             # a request without images does not start a dead encoder
+                 self._vision_up()
+                 try:
+                     encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+@@ -4197,12 +4365,14 @@ class Service:
+                     # #1603: a parallel request stays counted as queued until it is registered as running below -
+                     # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
+                     # loaded engine has nothing to start, so it does not wait for the fifo at all
++                    # A dead or unstartable image encoder fails only a request with images (as before): one
++                    # without images goes on without it
+                     try:
+                         if not par:
+-                            self.ensure_loaded()
+-                        elif not (self.loaded() and not self._vision_down()):
++                            self.ensure_loaded(vision=bool(emb))
++                        elif not (self.loaded() and not (emb and self._vision_down())):
+                             with self.fifo:
+-                                self.ensure_loaded()
++                                self.ensure_loaded(vision=bool(emb))
+                     except BaseException:
+                         if par:
+                             with self.status_lock:
+@@ -5829,7 +5999,7 @@ def make_handler(svc: Service):
+             messages, validator = prepare_format(req.get("response_format"), messages)
+             if validator is not None and (tools or req.get("strata_mcp")):
+                 raise ValueError("structured response_format with tools/MCP is not supported")
+-            svc.load()
++            svc.load(vision=False)    # (images: prepare() starts the encoder)
+             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
+             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+@@ -6024,7 +6194,7 @@ def make_handler(svc: Service):
+                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
+             except ValueError as e:                           # its message starts with the field's name: the param
+                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
+-            svc.load()
++            svc.load(vision=False)
+             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
+             # starts as the cached one did; the parser and the response keep the request's own tools
+             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
+@@ -6062,7 +6232,7 @@ def make_handler(svc: Service):
+             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+ 
+         def _anthropic(self, req):
+-            svc.load()
++            svc.load(vision=False)
+             req = svc.with_shared(req, "anthropic")
+             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+             self._no_local_images(messages)
+diff --git a/serve/test_image_alone.py b/serve/test_image_alone.py
+new file mode 100644
+index 00000000..10a53e64
+--- /dev/null
++++ b/serve/test_image_alone.py
+@@ -0,0 +1,466 @@
++"""--batch ("parallel"): a request with an image has the engine alone.
++
++The engine's M-RoPE position table (an image's positions) is one per GPU and is rebuilt at every admission, while each
++batch row reads it at its own slot's position: an image decoding next to other slots gave them its positions and took
++theirs (silently wrong text).  Until the engine keeps one per slot, the server runs an image request on the solo path
++(GENI) with no other slot active for its whole run: from its arrival no new request is admitted, the slots that decode
++finish, then it runs; image requests queue one after another; a cancelled or failed one gives the turn back.  Also: a
++dead image encoder fails only requests with images.
++
++The admission logic is tested on an engine object without a process; the whole path over HTTP with the fake engine
++of test_parallel (taught GENI, and to log the lines it receives).
++
++    python -m unittest serve.test_image_alone -v
++"""
++import json
++import sys
++import tempfile
++import threading
++import time
++import unittest
++import urllib.error
++import urllib.request
++from pathlib import Path
++from unittest import mock
++
++import serve.server as server
++from serve import test_parallel
++from serve.server import EngineDied, StrataEngine
++
++# the fake engine of test_parallel, which also reads GENI / BGENI and logs every line it receives (RECV <command>),
++# and the end of a GENI (END GENI, written before its DONE: a line the server sent before that came during it)
++FAKE = test_parallel.FAKE_BATCH
++for old, new in (
++        ('lines, stop = queue.Queue(), threading.Event()\n',
++         'lines, stop = queue.Queue(), threading.Event()\n'
++         'evf = open(args[args.index("--events") + 1], "a") if "--events" in args else None\n'
++         'evl = threading.Lock()\n'
++         'def note(s):\n'
++         '    if evf:\n'
++         '        with evl:\n'
++         '            evf.write(s + "\\n"); evf.flush()\n'),
++        ('        l = l.strip()\n', '        l = l.strip()\n        note("RECV " + l.split(" ", 1)[0])\n'),
++        ('if line.startswith(("GEN ", "BGEN ")):', 'if line.startswith(("GEN ", "BGEN ", "GENI ", "BGENI ")):'),
++        ('slot = int(f[1]) if f[0] == "BGEN" else None', 'slot = int(f[1]) if f[0] in ("BGEN", "BGENI") else None'),
++        ('max_new = int(f[2] if f[0] == "BGEN" else f[1])', 'max_new = int(f[2] if f[0] in ("BGEN", "BGENI") else f[1])'),
++        ('        fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")\n',
++         '        fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")\n'
++         '        if f[0] == "GENI":\n'
++         '            note("END GENI")\n'),
++        # VREFUSE in a GENI's prompt: the first one is refused as the engine refuses a picture while a slot decodes
++        ('            continue\n        if log:\n',
++         '            continue\n'
++         '        if f[0] == "GENI" and b"VREFUSE" in bytes(int(x) & 255 for x in ids) and b"VREFUSE" not in fired:\n'
++         '            fired.add(b"VREFUSE")\n'
++         '            print("ERR vision: an image request is not taken while batch slot 0 decodes", flush=True)\n'
++         '            continue\n'
++         '        if log:\n')):
++    assert FAKE.count(old) == 1, old
++    FAKE = FAKE.replace(old, new)
++
++LONG_REPLY = "ok, " + "la " * 15 + "done."
++
++
++def run(gen):
++    """Consumes a generator of the engine (heartbeats and tokens); -> its return value."""
++    try:
++        while True:
++            next(gen)
++    except StopIteration as s:
++        return s.value
++
++
++def engine_without_process(n=2):
++    """A StrataEngine with the admission state of a started one and no process: alive() is `e.up`."""
++    e = StrataEngine("missing-executable", [], lazy=True)
++    e.batch = n
++    e.slot_busy = [False] * n
++    e.slot_claims, e.slot_releasing, e._orphan_seen = set(), set(), {}
++    e.slot_cv = threading.Condition()
++    e.waiting, e.admitting, e.wait_lens, e.ctl_epoch = 0, 0, [], 0
++    e.ctl = threading.Lock()
++    e.image_line = []
++    e.gen = 1
++    e.up = True
++    e.alive = lambda: e.up
++    return e
++
++
++def until(cond, timeout=5.0):
++    end = time.time() + timeout
++    while time.time() < end:
++        if cond():
++            return True
++        time.sleep(0.01)
++    return cond()
++
++
++class Admission(unittest.TestCase):
++    """The gate itself: who may take the control lines while an image request waits for the engine alone."""
++
++    def busy(self, e, b):
++        with e.slot_cv:
++            e.slot_busy[b] = True
++            e.slot_claims.add(b)
++
++    def free(self, e, b):
++        with e.slot_cv:
++            e.slot_busy[b] = False
++            e.slot_claims.discard(b)
++            e.slot_cv.notify_all()
++
++    def taker(self, e, plen, got, res, **kw):
++        def go():
++            try:
++                res.append(run(e._take_control(threading.Event(), plen, **kw)))
++                got.set()
++            except Exception as x:     # noqa: BLE001 - asserted by the test
++                res.append(x)
++        th = threading.Thread(target=go, daemon=True)
++        th.start()
++        return th
++
++    def image(self, e, cancel, res):
++        def go():
++            try:
++                for _ in e._generate_alone([1, 2, 3], 8, {}, cancel, "x.sve"):
++                    pass
++                res.append("ended")
++            except Exception as x:     # noqa: BLE001
++                res.append(x)
++        th = threading.Thread(target=go, daemon=True)
++        th.start()
++        self.assertTrue(until(lambda: e.image_line))
++        return th
++
++    def test_a_read_that_gave_way_goes_on_and_a_new_request_stands_back(self):
++        """A long read gave way (BYIELD) to a short request and waits in its slot for the control lines; an image
++        request arrives.  The short one - not admitted yet - stands back and is not counted as waiting, so the read
++        that gave way is not left waiting for it (it holds the slot the image waits for: that was a deadlock)."""
++        e = engine_without_process()
++        self.assertTrue(e.ctl.acquire(timeout=1))          # the long read on the control lines
++        self.busy(e, 1)                                     # ... and the slot its part read will wait in
++        short_got, short = threading.Event(), []
++        self.taker(e, 5, short_got, short, new=True)
++        self.assertTrue(until(lambda: e.waiting == 1))
++        epoch = e.ctl_epoch
++        me = object()
++        with e.slot_cv:
++            e.image_line.append(me)                         # an image request comes
++        e.ctl.release()                                     # the long read gives way
++        long_got, long = threading.Event(), []
++        self.taker(e, 3000, long_got, long, after_epoch=epoch)
++        self.assertTrue(long_got.wait(5), "the read that gave way never got the control lines back (deadlock)")
++        self.assertFalse(short_got.is_set(), "a new request was admitted while an image request waited")
++        self.assertEqual((e.waiting, e.wait_lens), (0, []))
++        e.ctl.release()                                     # it read the rest and decoded; its slot is free
++        self.free(e, 1)
++        time.sleep(0.6)
++        self.assertFalse(short_got.is_set())                # still the image's turn
++        with e.slot_cv:
++            e.image_line.remove(me)                         # the image request is done
++            e.slot_cv.notify_all()
++        self.assertTrue(short_got.wait(5))
++        self.assertEqual(short, [True])
++        e.ctl.release()
++        self.assertEqual((e.waiting, e.wait_lens), (0, []))
++
++    def test_the_image_waits_for_the_slots_without_the_control_lines(self):
++        e = engine_without_process()
++        self.busy(e, 0)
++        me = object()
++        e.image_line.append(me)
++        got, res = threading.Event(), []
++
++        def go():
++            res.append(run(e._take_engine_alone(threading.Event(), me, 10)))
++            got.set()
++        threading.Thread(target=go, daemon=True).start()
++        time.sleep(0.7)
++        self.assertFalse(got.is_set())
++        self.assertFalse(e.ctl.locked())                    # a continuing request can still take them
++        self.assertEqual(e.waiting, 0)                      # nor is it counted (no solo request STOPped for it)
++        self.free(e, 0)
++        self.assertTrue(got.wait(5))
++        self.assertEqual(res, [True])
++        self.assertTrue(e.ctl.locked())                     # it has them, every slot free
++        e.ctl.release()
++
++    def test_images_take_turns_in_arrival_order(self):
++        e = engine_without_process()
++        a, b = object(), object()
++        e.image_line += [a, b]
++        got_b = threading.Event()
++        threading.Thread(target=lambda: (run(e._take_engine_alone(threading.Event(), b, 10)), got_b.set()),
++                         daemon=True).start()
++        self.assertTrue(run(e._take_engine_alone(threading.Event(), a, 10)))
++        time.sleep(0.6)
++        self.assertFalse(got_b.is_set())
++        e.ctl.release()
++        time.sleep(0.6)
++        self.assertFalse(got_b.is_set())                    # the lines are free, but `a` is still running
++        with e.slot_cv:
++            e.image_line.remove(a)
++            e.slot_cv.notify_all()
++        self.assertTrue(got_b.wait(5))
++        e.ctl.release()
++
++    def test_a_cancelled_image_request_gives_the_turn_back(self):
++        e = engine_without_process()
++        self.busy(e, 0)
++        cancel, img = threading.Event(), []
++        th = self.image(e, cancel, img)
++        text_got, text = threading.Event(), []
++        self.taker(e, 5, text_got, text, new=True)
++        time.sleep(0.7)
++        self.assertFalse(text_got.is_set())
++        self.assertEqual(e.waiting, 0)
++        cancel.set()
++        th.join(5)
++        self.assertEqual(img, ["ended"])
++        self.assertEqual(e.image_line, [])
++        self.assertTrue(text_got.wait(5))
++        e.ctl.release()
++
++    def test_engine_death_gives_the_turn_back(self):
++        e = engine_without_process()
++        self.busy(e, 0)
++        img = []
++        th = self.image(e, threading.Event(), img)
++        text_got, text = threading.Event(), []
++        self.taker(e, 5, text_got, text, new=True)
++        time.sleep(0.3)
++        e.up = False
++        th.join(5)
++        self.assertEqual(len(img), 1)
++        self.assertIsInstance(img[0], EngineDied)
++        self.assertEqual(e.image_line, [])
++        self.assertTrue(until(lambda: text))                # the waiter ends too (a clean 503), never hangs
++        self.assertIsInstance(text[0], EngineDied)
++
++    def test_an_image_that_waits_too_long_gives_up_and_the_text_goes_on(self):
++        e = engine_without_process()
++        self.busy(e, 0)                                     # a slot that decodes on and on
++        img = []
++        with mock.patch.object(server, "IMAGE_WAIT_S", 0.8):
++            th = self.image(e, threading.Event(), img)
++            text_got, text = threading.Event(), []
++            self.taker(e, 5, text_got, text, new=True)
++            time.sleep(0.3)
++            self.assertFalse(text_got.is_set())             # held behind the image
++            th.join(5)
++        self.assertEqual(len(img), 1)
++        self.assertIsInstance(img[0], server.ImageWaitTimeout)
++        self.assertIsInstance(img[0], server.GpuBusy)       # (a 503 the client can retry)
++        self.assertEqual(e.image_line, [])
++        self.assertTrue(text_got.wait(5))                   # the held text request goes on
++        self.assertFalse(e.ctl.locked() and not text)
++        e.ctl.release()
++
++    def test_a_restart_under_way_keeps_it_waiting_then_it_goes_on(self):
++        e = engine_without_process()
++        self.busy(e, 0)
++        me = object()
++        e.image_line.append(me)
++        got, res = threading.Event(), []
++
++        def go():
++            try:
++                res.append(run(e._take_engine_alone(threading.Event(), me, 10)))
++            except Exception as x:     # noqa: BLE001
++                res.append(x)
++            got.set()
++        threading.Thread(target=go, daemon=True).start()
++        e.starting, e.up = True, False
++        time.sleep(0.7)
++        self.assertFalse(got.is_set())
++        with e.slot_cv:                                     # restart(): a new process with every slot free
++            e.slot_busy = [False, False]
++            e.slot_claims = set()
++            e.up, e.starting = True, False
++            e.slot_cv.notify_all()
++        self.assertTrue(got.wait(5))
++        self.assertEqual(res, [True])
++        e.ctl.release()
++
++    def test_a_leaked_busy_flag_does_not_hold_it(self):
++        e = engine_without_process()
++        e.ORPHAN_SLOT_S = 0.3
++        e.slot_busy[1] = True                               # nobody owns it (#1603)
++        me = object()
++        e.image_line.append(me)
++        self.assertTrue(run(e._take_engine_alone(threading.Event(), me, 10)))
++        self.assertEqual(e.slot_busy, [False, False])
++        e.ctl.release()
++
++    def test_no_slot_goes_back_to_the_solo_path_while_an_image_waits(self):
++        e = engine_without_process()
++        e.info = {"slot_cache": 1}
++        self.busy(e, 0)
++        self.assertTrue(e._may_go_solo(100, 0, None))
++        e.image_line.append(object())
++        self.assertFalse(e._may_go_solo(100, 0, None))
++
++
++class DeadVision:
++    """An image encoder that died and cannot start again."""
++
++    def __init__(self, d):
++        self.dir = Path(d)
++        self.rows = self.dir / "img.sve"
++        self.rows.write_bytes(b"rows")
++        self.starts = 0
++
++    def alive(self):
++        return False
++
++    def restart(self):
++        self.starts += 1
++        raise RuntimeError("no GPU for it")
++
++    def unload(self):
++        pass
++
++    def encode(self, source, keep=()):
++        return self.rows, 3
++
++
++class LiveVision(DeadVision):
++    def alive(self):
++        return True
++
++
++class OverHttp(unittest.TestCase):
++    """The real StrataEngine and Service, the fake engine behind them."""
++
++    start_engine, tearDown = test_parallel.ParallelService.start, test_parallel.ParallelService.tearDown
++    chat = test_parallel.ParallelService.chat
++
++    def start(self, vision=LiveVision, slots=2):
++        self.start_engine(slots)
++        script = Path(self.tmp.name) / "fake_strata.py"
++        script.write_text(FAKE, encoding="utf-8")
++        self.events = Path(self.tmp.name) / "events.log"
++        # the fake was started with test_parallel's script: start this one (same arguments, plus --events)
++        real = server.subprocess.Popen
++        self.engine.unload()
++        patch = mock.patch.object(server.subprocess, "Popen", lambda cmd, **kw: real(
++            [sys.executable, str(script), *cmd[1:], "--events", str(self.events)], **kw))
++        patch.start()
++        self.addCleanup(patch.stop)
++        self.engine.restart()
++        self.vdir = tempfile.TemporaryDirectory()
++        self.addCleanup(self.vdir.cleanup)
++        self.svc.vision = vision(self.vdir.name)
++
++    def image_chat(self, text, max_tokens=64):
++        body = {"messages": [{"role": "user", "content": [
++                    {"type": "text", "text": text},
++                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}],
++                "max_tokens": max_tokens, "reasoning_effort": "none"}
++        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
++                                     headers={"Content-Type": "application/json"})
++        with urllib.request.urlopen(req, timeout=60) as r:
++            return json.loads(r.read().decode())
++
++    def go(self, fn, text, out, errors):
++        def one():
++            try:
++                out[text] = fn(text)["choices"][0]["message"]["content"]
++            except Exception as e:   # noqa: BLE001 - reported by the test
++                errors.append((text, repr(e)))
++        th = threading.Thread(target=one)
++        th.start()
++        return th
++
++    def recv(self):
++        return [x.split(" ", 1)[1] if x.startswith("RECV ") else x for x in self.events.read_text().splitlines()]
++
++    def assert_alone(self, ev):
++        """Every GENI is followed by its own end before the engine receives any other line (but its own STOP: the
++        consumer leaves at the end-of-turn token, before the DONE)."""
++        for i, x in enumerate(ev):
++            if x == "GENI":
++                during = ev[i + 1:ev.index("END GENI", i)]
++                self.assertEqual([y for y in during if y != "STOP"], [], ev)
++
++    def test_an_image_waits_for_the_slots_and_runs_alone(self):
++        self.start(slots=3)                                 # a slot stays free: the late request could take it
++        out, errors = {}, []
++        threads = [self.go(self.chat, "first LONGREPLY", out, errors)]
++        time.sleep(0.1)
++        threads.append(self.go(self.chat, "second LONGREPLY", out, errors))
++        self.assertTrue(until(lambda: sum(self.engine.slot_busy) == 2))   # both decode in the slots
++        threads.append(self.go(self.image_chat, "the picture LONGREPLY", out, errors))
++        self.assertTrue(until(lambda: self.engine.image_line))
++        time.sleep(0.1)
++        threads.append(self.go(self.chat, "late", out, errors))
++        for th in threads:
++            th.join(60)
++        self.assertEqual(errors, [])
++        self.assertEqual(out, {"first LONGREPLY": LONG_REPLY, "second LONGREPLY": LONG_REPLY,
++                               "the picture LONGREPLY": LONG_REPLY, "late": "ok, done."})
++        ev = self.recv()
++        self.assertEqual(ev.count("GENI"), 1, ev)
++        self.assert_alone(ev)
++        # the late request was sent only after the image's end; nothing was admitted after the image came
++        after = ev[ev.index("END GENI") + 1:]
++        self.assertTrue([x for x in after if x in ("GEN", "BGEN")], ev)
++        self.assertEqual([x for x in ev[:ev.index("GENI")] if x in ("GEN", "BGEN", "GENI", "BGENI")],
++                         ["GEN", "BGEN", "BGEN"], ev)       # first solo, then both moved into the slots
++        # the fake logged how many slots were active when the GENI came: none
++        geni = [x.split() for x in self.log.read_text().splitlines() if x.startswith("GENI")]
++        self.assertEqual([g[3] for g in geni], ["0"])
++        e = self.engine
++        self.assertEqual((e.image_line, e.waiting, e.wait_lens, any(e.slot_busy), e.ctl.locked()),
++                         ([], 0, [], False, False))
++
++    def test_images_queue_one_after_another(self):
++        self.start()
++        out, errors = {}, []
++        threads = [self.go(self.image_chat, "one LONGREPLY", out, errors)]
++        self.assertTrue(until(lambda: self.engine.image_line))
++        threads.append(self.go(self.image_chat, "two LONGREPLY", out, errors))
++        time.sleep(0.05)
++        threads.append(self.go(self.chat, "text LONGREPLY", out, errors))
++        for th in threads:
++            th.join(60)
++        self.assertEqual(errors, [])
++        self.assertEqual(set(out.values()), {LONG_REPLY})
++        self.assertEqual(len(out), 3)
++        ev = self.recv()
++        self.assertEqual(ev.count("GENI"), 2, ev)
++        self.assertNotIn("BGENI", ev)
++        self.assert_alone(ev)
++        self.assertEqual(self.engine.image_line, [])
++
++    def test_an_engine_refusal_waits_for_the_slots_again(self):
++        """The engine refuses the picture (it still had a slot decoding that this server had already freed): the
++        request waits for the slots again and is sent once more instead of failing."""
++        self.start()
++        out = self.image_chat("VREFUSE what is it?")
++        self.assertEqual(out["choices"][0]["message"]["content"], "ok, done.")
++        ev = self.recv()
++        self.assertEqual(ev.count("GENI"), 2, ev)
++        e = self.engine
++        self.assertEqual((e.image_line, any(e.slot_busy), e.ctl.locked()), ([], False, False))
++        self.assertEqual(self.chat("after")["choices"][0]["message"]["content"], "ok, done.")
++
++    def test_a_dead_encoder_fails_only_image_requests(self):
++        self.start(vision=DeadVision)
++        self.assertEqual(self.chat("hi")["choices"][0]["message"]["content"], "ok, done.")
++        with self.assertRaises(urllib.error.HTTPError) as cm:
++            self.image_chat("what is it?")
++        with cm.exception as e:
++            self.assertEqual(e.code, 503)
++            self.assertIn("the vision encoder failed to start", json.loads(e.read().decode())["error"]["message"])
++        self.assertEqual(self.svc.vision.starts, 1)          # the text request did not try it
++        # the model unloaded (idle): a text request loads it; the encoder is tried with it, its failure only said
++        self.engine.unload()
++        self.assertEqual(self.chat("again")["choices"][0]["message"]["content"], "ok, done.")
++        self.assertEqual(self.svc.vision.starts, 2)
++        self.assertTrue(self.engine.alive())
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
