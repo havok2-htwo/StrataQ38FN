@@ -1,0 +1,339 @@
+From 31af7dfff3de650e75fc8910558a432a2f7db507 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:50:30 +0200
+Subject: [PATCH 1/3] qsa: STRATA_ATTN_VBATCH=1 issues the decode attention's V
+ loads 8 cells at a time (opt-in, =4 four cells)
+
+attn_chunk_body's value loop read one cell per iteration: srow[c], then that cell's V load, then its
+12 fmaf, so a block paid one dependent load round trip per cell (64 per chunk; sm_86 SASS unrolls by 2
+but keeps each cell's LDGs behind its own guard).  With the switch the loop takes 8 (or 4) cells per
+step, as PR #540's pre-sm_75 kernel does: the group's srow values and V loads first, then each cell
+folded into the 12 accumulators in ascending order with the same fmaf and the same V expression
+(load_v1, moved out of the pre-sm_75 #if unchanged).  A group with a masked cell (page -1) breaks to
+the scalar loop at that group, which skips masked cells as before (never folds them with weight 0:
+fmaf(0, v, -0.0f) is +0.0f).  The tail (n_here not a multiple of the group) runs the scalar loop.
+
+A template parameter VBATCH (0, 4, 8) on attn_chunk_body, attn_chunk_kernel and
+attn_chunk_slots_kernel; the per-row batch launcher (warp and lane-cell scoring), the slots launcher
+and qsa_decode_attn_step select it.  The pre-sm_75 / gfx103x kernel keeps precedence, the gfx906 query
+swizzle path is unchanged.  qsa_decode_attn_set_vbatch overrides the environment (for the parity test).
+
+Default (switch off): unchanged.  Checked on sm_86 (CUDA 12, Release): cuobjdump -sass of all 17
+existing kernels in qsa_decode_attn.cu.o (attn_chunk_kernel<M>, <M, true>, attn_chunk_slots_kernel
+<M, false/true>, attn_merge_kernel) is identical instruction for instruction, control words included,
+and the registers are unchanged (37-63).  The new kernels: 8 cells 60-68 registers, 4 cells 43-63,
+no spills except 4 bytes in the lane-cell K8V4 one at 8 cells.  Their value loop issues the group's
+LDGs together, then 96 (48) FFMA, with the scalar loop's I2F/HADD2.F32/FMUL per cell.  Not run on a
+GPU yet; qsa_vbatch_parity (next commit) compares off against 8 and 4.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/kernels/qsa_decode_attn.hpp |   6 +
+ src/kernels/cuda/qsa_decode_attn.cu        | 162 ++++++++++++++-------
+ 2 files changed, 117 insertions(+), 51 deletions(-)
+
+diff --git a/include/strata/kernels/qsa_decode_attn.hpp b/include/strata/kernels/qsa_decode_attn.hpp
+index d68bab43..4f0c109f 100644
+--- a/include/strata/kernels/qsa_decode_attn.hpp
++++ b/include/strata/kernels/qsa_decode_attn.hpp
+@@ -32,6 +32,12 @@ struct QsaAttnPools {
+     const int32_t* page_table = nullptr;
+ };
+ 
++/// STRATA_ATTN_VBATCH=1 (opt-in; =8 the same, =4 four cells): the attention's value loop issues the V loads of 8 cells
++/// together before folding them in the same order, bitwise the same output.  8 (or 1), 4 and 0 (off) override the
++/// environment and -1 restores it (the parity test's off/on in one process).  Set before graph capture; captured
++/// graphs keep the kernels they captured.
++void qsa_decode_attn_set_vbatch(int cells);
++
+ /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
+ uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
+ 
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index 85257e6c..6f6f32ec 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -86,6 +86,28 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
+     } else load8_q4(p, value, row, d0, out);
+ }
+ 
++// One V element of pool row `row`, dimension `d` (the value loop's own thread index), per KV format: the scalar
++// value loop's expressions, for the batched value loops (PR #540's pre-sm_75 kernel, STRATA_ATTN_VBATCH).
++template <int KV_MODE>
++__device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, int d) {
++    if constexpr (KV_MODE == 0) {
++        return __half2float(__ushort_as_half(p.v_pool[row * HD + d]));
++    } else if constexpr (KV_MODE == 1) {
++        const float sc = __half2float(__ushort_as_half(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
++        return (float) p.v_q[row * HD + d] * sc;
++    } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
++        constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
++        const int b = d / QK4_0;
++        const int rem = d % QK4_0;
++        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
++        const float dd = __half2float(__ushort_as_half(blk->d));
++        const int j = rem < 16 ? rem : (rem - 16);
++        const uint8_t byte = blk->qs[j];
++        const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
++        return (float) nibble * dd;
++    }
++}
++
+ // Exact-intent score reduce-scatter: the same butterfly pairs as twelve warp_sum calls,
+ // with 16 shuffle exchanges instead of 60. Used only by the opt-in gfx906 INT8
+ // query-swizzled specialization; softmax, value accumulation and merge are unchanged.
+@@ -117,7 +139,7 @@ __device__ __forceinline__ int reduce12_head_of_lane(int lane) {
+ }
+ 
+ // The chunk kernel's body; `p` is the query's KV pools (the call's one set, or blockIdx.z's slot's set).
+-template <int KV_MODE, bool LANE_CELL, bool QUERY_SWIZZLE, bool REDUCE12>
++template <int KV_MODE, bool LANE_CELL, bool QUERY_SWIZZLE, bool REDUCE12, int VBATCH>
+ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, QsaAttnPools p,
+                                                 const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
+                                                 int n_kv_heads, int page_size, float scale,
+@@ -256,7 +278,32 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+     float acc[G];
+ #pragma unroll
+     for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+-    for (int c = 0; c < n_here; ++c) {
++    int c = 0;
++    if constexpr (VBATCH > 0) {
++        // STRATA_ATTN_VBATCH: VBATCH (8 or 4) cells at a time with their V loads issued together (the loop below
++        // is one dependent load chain per cell), as PR #540's pre-sm_75 kernel does.  Each cell is still folded into
++        // the 12 accumulators in ascending order with the same fmaf and the same V expression (load_v1), so the sums
++        // are the plain loop's, bit for bit.  A group holding a masked cell (page -1, rare) leaves this loop and the
++        // scalar one below finishes the chunk from that group on: a masked cell is skipped, never folded with
++        // weight 0 (fmaf(0, v, -0.0f) is +0.0f).  sm_86: 8 cells take 60-68 registers (3 blocks per SM), 4 cells
++        // 43-49 (5), the plain loop 37-40.
++        constexpr int VB = VBATCH;
++        for (; c + VB <= n_here; c += VB) {
++            long long r[VB];
++            long long any = 0;
++#pragma unroll
++            for (int j = 0; j < VB; ++j) { r[j] = srow[c + j]; any |= r[j]; }
++            if (any < 0) break;
++            float v[VB];
++#pragma unroll
++            for (int j = 0; j < VB; ++j) v[j] = load_v1<KV_MODE>(p, r[j], t);
++#pragma unroll
++            for (int j = 0; j < VB; ++j)
++#pragma unroll
++                for (int h = 0; h < G; ++h) acc[h] = fmaf(sp[h][c + j], v[j], acc[h]);
++        }
++    }
++    for (; c < n_here; ++c) {
+         if (srow[c] < 0) continue;   // masked above, weight 0
+         float v;
+         if constexpr (KV_MODE == 0) {
+@@ -282,21 +329,21 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+ }
+ 
+-template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false>
++template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false, int VBATCH = 0>
+ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                              const int32_t* __restrict__ ids,
+                                                              const int32_t* __restrict__ step, int n_kv_heads,
+                                                              int page_size, float scale, float* __restrict__ part_acc,
+                                                              float* __restrict__ part_m, float* __restrict__ part_l,
+                                                              int n_chunks, int cap = 0, long long scratch_stride = 0) {
+-    attn_chunk_body<KV_MODE, LANE_CELL, QUERY_SWIZZLE, REDUCE12>(q, p, ids, step, n_kv_heads, page_size, scale,
+-                                                                 part_acc, part_m, part_l, n_chunks, cap,
+-                                                                 scratch_stride);
++    attn_chunk_body<KV_MODE, LANE_CELL, QUERY_SWIZZLE, REDUCE12, VBATCH>(q, p, ids, step, n_kv_heads, page_size,
++                                                                         scale, part_acc, part_m, part_l, n_chunks,
++                                                                         cap, scratch_stride);
+ }
+ 
+ // The same blocks for queries of different slots: query blockIdx.z reads its own slot's pools, everything else is
+ // attn_chunk_kernel's batched form (qsa_decode_attn_slots).
+-template <int KV_MODE, bool LANE_CELL>
++template <int KV_MODE, bool LANE_CELL, int VBATCH = 0>
+ __global__ void __launch_bounds__(THREADS) attn_chunk_slots_kernel(const float* __restrict__ q, QsaAttnSlotPools ps,
+                                                                    const int32_t* __restrict__ ids,
+                                                                    const int32_t* __restrict__ step, int n_kv_heads,
+@@ -305,8 +352,9 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_slots_kernel(const float*
+                                                                    float* __restrict__ part_m,
+                                                                    float* __restrict__ part_l, int n_chunks, int cap,
+                                                                    long long scratch_stride) {
+-    attn_chunk_body<KV_MODE, LANE_CELL, false, false>(q, ps.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
+-                                                      part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
++    attn_chunk_body<KV_MODE, LANE_CELL, false, false, VBATCH>(q, ps.p[blockIdx.z], ids, step, n_kv_heads, page_size,
++                                                              scale, part_acc, part_m, part_l, n_chunks, cap,
++                                                              scratch_stride);
+ }
+ 
+ // PR #540 (sskver): the same attention with fewer shuffles and less shared-memory traffic, bit for bit the kernel
+@@ -373,27 +421,6 @@ __device__ __forceinline__ int head_of_lane(int lane) {
+     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
+ }
+ 
+-// One V element of pool row `row`, dimension `d` (the value loop's own thread index), per KV format.
+-template <int KV_MODE>
+-__device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, int d) {
+-    if constexpr (KV_MODE == 0) {
+-        return __half2float(__ushort_as_half(p.v_pool[row * HD + d]));
+-    } else if constexpr (KV_MODE == 1) {
+-        const float sc = __half2float(__ushort_as_half(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
+-        return (float) p.v_q[row * HD + d] * sc;
+-    } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+-        constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+-        const int b = d / QK4_0;
+-        const int rem = d % QK4_0;
+-        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+-        const float dd = __half2float(__ushort_as_half(blk->d));
+-        const int j = rem < 16 ? rem : (rem - 16);
+-        const uint8_t byte = blk->qs[j];
+-        const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+-        return (float) nibble * dd;
+-    }
+-}
+-
+ template <int KV_MODE, int NC_ = 2, bool DPP_ = false>
+ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* __restrict__ q, QsaAttnPools p,
+                                                              const int32_t* __restrict__ ids,
+@@ -634,13 +661,33 @@ bool pre75_attn() {
+     return cc[dev] < 75;
+ #endif
+ }
++#endif
++
++// STRATA_ATTN_VBATCH=1 (or 8): the value loop with the V loads of 8 cells issued together, =4 of 4 cells;
++// bit-identical to the plain loop (attn_chunk_body).  The cells per group, 0 off.  qsa_decode_attn_set_vbatch
++// overrides the environment (the parity test's off/on in one process).
++int vbatch_cells(int v) { return v == 1 || v == 8 ? 8 : v == 4 ? 4 : 0; }
++int g_vbatch = -1;
++int vbatch_attn() {
++    static const int env = [] {
++        const char* v = std::getenv("STRATA_ATTN_VBATCH");
++        return v ? vbatch_cells(std::atoi(v)) : 0;
++    }();
++    return g_vbatch < 0 ? env : g_vbatch;
++}
++// attn_chunk_kernel<M>, or with STRATA_ATTN_VBATCH its batched-V form; the pre-sm_75 / gfx103x kernel (which batches
++// its V loads already) keeps precedence
++#define STRATA_ATTN_PLAIN(M, VB)                                    \
++    ((VB) == 8 ? attn_chunk_kernel<M, false, false, false, 8>       \
++               : (VB) == 4 ? attn_chunk_kernel<M, false, false, false, 4> : attn_chunk_kernel<M>)
++#if defined(STRATA_ATTN_PRE75_BUILT)
+ #if defined(__HIPCC__)
+-#define STRATA_ATTN_CHUNK(M) (pre75_attn() ? attn_chunk_kernel_pre75<M, 8, true> : attn_chunk_kernel<M>)
++#define STRATA_ATTN_CHUNK(M, VB) (pre75_attn() ? attn_chunk_kernel_pre75<M, 8, true> : STRATA_ATTN_PLAIN(M, VB))
+ #else
+-#define STRATA_ATTN_CHUNK(M) (pre75_attn() ? attn_chunk_kernel_pre75<M> : attn_chunk_kernel<M>)
++#define STRATA_ATTN_CHUNK(M, VB) (pre75_attn() ? attn_chunk_kernel_pre75<M> : STRATA_ATTN_PLAIN(M, VB))
+ #endif
+ #else
+-#define STRATA_ATTN_CHUNK(M) attn_chunk_kernel<M>
++#define STRATA_ATTN_CHUNK(M, VB) STRATA_ATTN_PLAIN(M, VB)
+ #endif
+ 
+ // S25: STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
+@@ -676,6 +723,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
+     cudaStream_t st = (cudaStream_t) stream;
+     const bool lane_cell = lane_cell_attn();
++    const int vbatch = vbatch_attn();
+ #if defined(STRATA_HIP_GFX906)
+     static const bool query_swizzle = [] {
+         const char* v = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE"); return v && v[0] == '1';
+@@ -689,7 +737,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+                      use_query_swizzle, (long long) n_q, (long long) cap, kv_mode, lane_cell);
+     }
+ #endif
+-#define STRATA_ATTN_LC(M) attn_chunk_kernel<M, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
++#define STRATA_ATTN_LC(M) (vbatch == 8 ? attn_chunk_kernel<M, true, false, false, 8> : vbatch == 4 ? attn_chunk_kernel<M, true, false, false, 4> : attn_chunk_kernel<M, true>)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
+     if (lane_cell) {
+         if (kv_mode == 3) STRATA_ATTN_LC(3);
+         else if (kv_mode == 2) STRATA_ATTN_LC(2);
+@@ -728,17 +776,21 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     } else
+ #endif
+     if (kv_mode == 3)
+-        STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
++        STRATA_ATTN_CHUNK(3, vbatch)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
++                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
++                                                                n_chunks, (int) cap, stride);
+     else if (kv_mode == 2)
+-        STRATA_ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
++        STRATA_ATTN_CHUNK(2, vbatch)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
++                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
++                                                                n_chunks, (int) cap, stride);
+     else if (kv_mode == 1)
+-        STRATA_ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
++        STRATA_ATTN_CHUNK(1, vbatch)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
++                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
++                                                                n_chunks, (int) cap, stride);
+     else
+-        STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
++        STRATA_ATTN_CHUNK(0, vbatch)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
++                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
++                                                                n_chunks, (int) cap, stride);
+     attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
+                                                                                   attn, stride);
+     const cudaError_t e = cudaGetLastError();
+@@ -765,6 +817,7 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const
+         if (attn_kv_mode(pools.p[z]) != kv_mode) return false;
+     }
+     const bool lane_cell = lane_cell_attn();
++    const int vbatch = vbatch_attn();
+     // only where qsa_decode_attn_batch runs attn_chunk_kernel; its other variants keep the per-query calls
+ #if defined(STRATA_ATTN_PRE75_BUILT)
+     if (!lane_cell && pre75_attn()) return false;
+@@ -783,7 +836,7 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const
+     const float scale = 1.0f / sqrtf((float) HD);
+     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
+     cudaStream_t st = (cudaStream_t) stream;
+-#define STRATA_ATTN_SLOTS(M, LC) attn_chunk_slots_kernel<M, LC><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
++#define STRATA_ATTN_SLOTS(M, LC) (vbatch == 8 ? attn_chunk_slots_kernel<M, LC, 8> : vbatch == 4 ? attn_chunk_slots_kernel<M, LC, 4> : attn_chunk_slots_kernel<M, LC>)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
+     if (lane_cell) {
+         if (kv_mode == 3) STRATA_ATTN_SLOTS(3, true);
+         else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true);
+@@ -806,6 +859,8 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const
+     return true;
+ }
+ 
++void qsa_decode_attn_set_vbatch(int cells) { g_vbatch = cells < 0 ? -1 : vbatch_cells(cells); }
++
+ uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
+     const int64_t chunks = (cap + CHUNK - 1) / CHUNK;
+     return (uint64_t) chunks * (uint64_t) s.n_head * (HD + 2) + 64;
+@@ -833,18 +888,23 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+     const float scale = 1.0f / sqrtf((float) HD);
+     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
+     cudaStream_t st = (cudaStream_t) stream;
++    const int vbatch = vbatch_attn();
+     if (kv_mode == 3)
+-        STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
++        STRATA_ATTN_CHUNK(3, vbatch)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv,
++                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
++                                                                n_chunks, 0, 0);
+     else if (kv_mode == 2)
+-        STRATA_ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
++        STRATA_ATTN_CHUNK(2, vbatch)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv,
++                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
++                                                                n_chunks, 0, 0);
+     else if (kv_mode == 1)
+-        STRATA_ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
++        STRATA_ATTN_CHUNK(1, vbatch)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv,
++                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
++                                                                n_chunks, 0, 0);
+     else
+-        STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
++        STRATA_ATTN_CHUNK(0, vbatch)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv,
++                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
++                                                                n_chunks, 0, 0);
+     attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
+     const cudaError_t e = cudaGetLastError();
+     if (e != cudaSuccess) {
+-- 
+2.43.0
+

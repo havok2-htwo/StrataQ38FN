@@ -1,0 +1,64 @@
+From 389ef5c85edd0659f656569fd9753780aa3d1bed Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 10:01:33 +0200
+Subject: [PATCH 2/3] test: sampler_same_test binds SamplerParams' 14 fields by
+ name and checks NaN payloads bit for bit (STRATA_EARLY_SAMPLE=1)
+
+A new field in a padding hole kept sizeof at 80, so the size guard missed it; a structured binding does not compile.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/core/sampler_same_test.cpp | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/tests/core/sampler_same_test.cpp b/tests/core/sampler_same_test.cpp
+index 33ecf171..d6e9e06f 100644
+--- a/tests/core/sampler_same_test.cpp
++++ b/tests/core/sampler_same_test.cpp
+@@ -2,8 +2,9 @@
+ // batch_poll's draw would be the same, so a change in any field sample_tokens reads must be seen.  Header-only, CPU.
+ #include "strata/kernels/sampler.hpp"
+ 
+-#include <cmath>
++#include <cstdint>
+ #include <cstdio>
++#include <cstring>
+ 
+ namespace {
+ int failures = 0;
+@@ -18,9 +19,13 @@ void check(bool ok, const char* what) {
+ int main() {
+     using strata::kernels::SamplerParams;
+     using strata::kernels::same_sampling;
+-    // a new field changes the size (x86-64): same_sampling must compare it too, then this number moves with it
+-    static_assert(sizeof(void*) != 8 || sizeof(SamplerParams) == 80, "a new SamplerParams field: add it to same_sampling");
+     SamplerParams a;
++    {
++        // exactly these 14 fields: a new one (even a bool in a padding hole, where the size stays 80) stops this
++        // binding from compiling - add it to same_sampling, to the list below and to its `differs` line
++        [[maybe_unused]] const auto& [top_k, top_p, min_p, temperature, min_keep, penalty_last_n, penalty_repeat,
++                                      penalty_freq, penalty_present, seed, counter, greedy, logit_bias, gumbel] = a;
++    }
+     a.temperature = 0.7f;
+     a.seed = 42;
+     a.counter = 1000;
+@@ -50,8 +55,14 @@ int main() {
+     // bit for bit: -0.0 is not 0.0, and a NaN is never the same draw
+     differs([](SamplerParams& p, const float*) { p.min_p = -0.0f; }, "min_p -0.0 vs 0.0");
+     {
+-        SamplerParams n = a;
+-        n.top_p = std::nanf("");
++        // two NaNs: float == calls even the same one different, so a match here is the bit compare
++        const auto nan_bits = [](uint32_t u) { float f; std::memcpy(&f, &u, sizeof f); return f; };
++        SamplerParams n = a, m = a;
++        n.top_p = nan_bits(0x7fc00000u);
++        m.top_p = nan_bits(0x7fc00000u);
++        check(same_sampling(n, m), "the same NaN bits are the same draw");
++        m.top_p = nan_bits(0x7fc00001u);
++        check(!same_sampling(n, m) && !same_sampling(m, n), "NaN payloads differ");
+         check(!same_sampling(n, a), "NaN top_p vs 0.95");
+     }
+     if (failures != 0) return 1;
+-- 
+2.43.0
+

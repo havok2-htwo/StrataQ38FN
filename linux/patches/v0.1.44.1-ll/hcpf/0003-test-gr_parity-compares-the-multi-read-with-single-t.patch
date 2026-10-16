@@ -1,0 +1,51 @@
+From b628d0599870f2a0d5e53b132cfca4b6c28e09c3 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:46:21 +0200
+Subject: [PATCH 3/5] test: gr_parity compares the multi read with single-token
+ reads at 1..7 tokens too
+
+The multi read was checked only at the full 8 tokens, which run the generic kernels; the launches of 1..6 tokens have
+their own instantiations (#783) and were checked only by fused_gr_check against the plain read. Each size now runs on
+poisoned outputs and is compared with as many single-token reads, bit for bit (or within the STRATA_GR_V3 tolerance).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/gr_parity.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/src/kernels/gr_parity.cpp b/src/kernels/gr_parity.cpp
+index 34d7510b..77db6441 100644
+--- a/src/kernels/gr_parity.cpp
++++ b/src/kernels/gr_parity.cpp
+@@ -376,6 +376,28 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
+         std::printf("  fused GR multi max-T differs from single-token calls\n");
+         ++bad;
+     }
++    // the smaller launches too: 1..6 tokens have their own instantiations (and opt-in kernels, STRATA_GR_DOWN_PF)
++    {
++        int tbad = 0;
++        for (int tt = 1; tt < T; ++tt) {
++            check(cudaMemsetAsync(d_r_out, 0xff, r.size() * sizeof(float), stream), "multi T poison R_out");
++            check(cudaMemsetAsync(d_lo, 0xff, (size_t) T * LR * sizeof(float), stream), "multi T poison lo");
++            check(cudaMemsetAsync(d_rs, 0xff, (size_t) T * HC * sizeof(float), stream), "multi T poison rs");
++            check(cudaMemsetAsync(d_inj_out, 0xff, (size_t) T * HC * sizeof(float), stream), "multi T poison inject");
++            check(cudaMemsetAsync(d_mixed, 0xff, (size_t) T * N * sizeof(float), stream), "multi T poison mixed");
++            fused_gr_read_multi(args.data(), tt, d_xn, stream);
++            check(cudaStreamSynchronize(stream), "multi T sync");
++            const Snapshot part = snapshot();
++            for (int t = 0; t < tt; ++t) fused_gr_read(args[t], stream);
++            check(cudaStreamSynchronize(stream), "single T reference sync");
++            if (!same(part, snapshot())) {
++                std::printf("  fused GR multi T=%d differs from single-token calls\n", tt);
++                ++tbad;
++            }
++        }
++        std::printf("  fused GR multi T 1..%d against single-token calls %s\n", T - 1, tbad == 0 ? "pass" : "FAIL");
++        bad += tbad;
++    }
+ 
+     cudaGraph_t graph = nullptr;
+     cudaGraphExec_t graph_exec = nullptr;
+-- 
+2.43.0
+

@@ -1,0 +1,263 @@
+From 2ac15656ea598a5e6bafabd44893a8e834920e6a Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:48:13 +0200
+Subject: [PATCH 1/3] verify: the last stage draws a batch window's sampled
+ rows right behind its graph (opt-in STRATA_EARLY_SAMPLE=1)
+
+batch_launch enqueues sample_rows' per-row sample_tokens launches on cs_ behind the window and its commit, in
+sample_rows' order, so batch_poll finds them done instead of launching them and waiting (cudaStreamSynchronize)
+after it has seen the graph finish.  Same kernels, same logits, same Philox(seed, position), same stream order:
+the same tokens.  batch_poll still draws a row when its draw would differ from the early one (same_sampling: every
+field sample_tokens reads, floats bit for bit), and rows with a logit bias are always drawn there.  init_slots takes
+the split sampler's scratch beforehand (sample_tokens_reserve), so no cudaMalloc runs with the window in flight and
+the split never falls back to the one-block kernel there.  Greedy rows are unchanged (their pick is the graph's).
+Off by default: nothing changes; SASS of every .cu object is identical.  sampler_same_test (CPU) covers
+same_sampling.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                     |  4 ++
+ include/strata/core/verify.hpp     |  8 ++++
+ include/strata/kernels/sampler.hpp | 18 +++++++++
+ src/core/verify.cpp                | 36 ++++++++++++++++--
+ src/kernels/cuda/sampler.cu        |  8 ++++
+ tests/core/sampler_same_test.cpp   | 60 ++++++++++++++++++++++++++++++
+ 6 files changed, 130 insertions(+), 4 deletions(-)
+ create mode 100644 tests/core/sampler_same_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d5c07db7..3ed0e6a2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1249,6 +1249,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(batch_rows_test tests/core/batch_rows_test.cpp)
+   target_include_directories(batch_rows_test PRIVATE include)
+   add_test(NAME batch_rows_test COMMAND batch_rows_test)
++  # STRATA_EARLY_SAMPLE keeps a row drawn early only when every field the sampler reads is the same (header-only, CPU)
++  add_executable(sampler_same_test tests/core/sampler_same_test.cpp)
++  target_include_directories(sampler_same_test PRIVATE include)
++  add_test(NAME sampler_same_test COMMAND sampler_same_test)
+   # how many pipelined slot groups --batch runs with: the 0.1.41 default, and --batch-mtp keeping it serial (header-only, CPU)
+   add_executable(batch_groups_test src/program/batch_groups_test.cpp)
+   target_include_directories(batch_groups_test PRIVATE include)
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 8047ec2b..e34c1498 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -380,6 +380,14 @@ private:
+     int32_t b_out_[8] = {};
+     std::vector<strata::kernels::SamplerParams> slot_sp_;
+     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
++    /// row t's draw in sample_rows (a sampled slot), or false: a greedy row, the graph's pick stands
++    bool row_draw(int t, strata::kernels::SamplerParams& sp) const;
++    // STRATA_EARLY_SAMPLE=1 (the last stage): batch_launch enqueues sample_rows' draws right behind the window, so
++    // batch_poll finds them done and launches nothing.  A row whose draw batch_poll would make differently (its
++    // slot's sampling set meanwhile) is drawn again there, over the same logits.
++    bool early_sample_ = false;                       ///< on here (init_slots reserved the sampler's scratch)
++    uint32_t b_early_ = 0;                            ///< the window's rows drawn so (bit t)
++    strata::kernels::SamplerParams b_early_sp_[8];    ///< ... and their draws
+     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
+     int32_t* commitb_ = nullptr;
+     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
+diff --git a/include/strata/kernels/sampler.hpp b/include/strata/kernels/sampler.hpp
+index a3121ba1..7cf4baaa 100644
+--- a/include/strata/kernels/sampler.hpp
++++ b/include/strata/kernels/sampler.hpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ 
+ namespace strata::kernels {
+ 
+@@ -44,6 +45,23 @@ struct SamplerParams {
+ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                    const SamplerParams& p, int* out, void* stream);
+ 
++// STRATA_EARLY_SAMPLE: sample_tokens on `stream` (the current device) for up to 16 rows of `n_vocab` never calls
++// cudaMalloc after this - the split's scratch is taken now, or its failure is remembered and the one-block kernel
++// runs, as it would have anyway.  Call it while the stream is idle and not being captured; false (nothing done) for
++// a stream under capture.
++bool sample_tokens_reserve(int n_vocab, void* stream);
++
++// Every field sample_tokens reads is the same (floats bit for bit): the two draws pick the same token.
++inline bool same_sampling(const SamplerParams& a, const SamplerParams& b) {
++    const auto bits = [](float f) { uint32_t u = 0; std::memcpy(&u, &f, sizeof u); return u; };
++    return a.top_k == b.top_k && bits(a.top_p) == bits(b.top_p) && bits(a.min_p) == bits(b.min_p) &&
++           bits(a.temperature) == bits(b.temperature) && a.min_keep == b.min_keep &&
++           a.penalty_last_n == b.penalty_last_n && bits(a.penalty_repeat) == bits(b.penalty_repeat) &&
++           bits(a.penalty_freq) == bits(b.penalty_freq) && bits(a.penalty_present) == bits(b.penalty_present) &&
++           a.seed == b.seed && a.counter == b.counter && a.greedy == b.greedy && a.logit_bias == b.logit_bias &&
++           a.gumbel == b.gumbel;
++}
++
+ // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
+ // sample_tokens' one-block argmax, which takes it unless STRATA_ARGMAX_MULTI=0.  False (nothing launched) where it
+ // cannot run: HIP, a card or a build below sm_90.  Device pointers; capturable.
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 48c68273..67ab9c16 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -173,6 +173,8 @@ inline bool g_qfuse_hc() {
+     return false;
+ #endif
+ }
++// STRATA_EARLY_SAMPLE=1: the last stage's sampled rows are enqueued in batch_launch (see early_sample_)
++inline bool g_early_sample() { static const bool on = [] { const char* v = std::getenv("STRATA_EARLY_SAMPLE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+ inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+ #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
+ 
+@@ -2826,6 +2828,13 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string&
+     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
+     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
+                  (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
++    // STRATA_EARLY_SAMPLE: sample_tokens must not reach cudaMalloc in batch_launch, with the window in flight (a
++    // malloc that synchronises would wait on a graph that waits on this thread's doorbells)
++    if (g_early_sample() && last_stage()) {
++        early_sample_ = strata::kernels::sample_tokens_reserve((int) n_vocab_, cs_);
++        std::fprintf(stderr, "strata verify: STRATA_EARLY_SAMPLE=1: %s\n",
++                     early_sample_ ? "sampled rows are drawn right behind the window" : "off (the stream is being captured)");
++    }
+     return true;
+ }
+ 
+@@ -3086,6 +3095,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+     *(volatile uint32_t*) h_flagB_ = 0;
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     last_t_ = S;
++    b_early_ = 0;   // (batch_launch sets it after this)
+     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
+     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
+     last_batch_ = true;
+@@ -3253,13 +3263,20 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
+     return next_ == nullptr || next_->commit_slot_prefixes(keep, err);
+ }
+ 
++bool Verifier::row_draw(int t, strata::kernels::SamplerParams& sp) const {
++    sp = slot_sp_[(size_t) last_rows_[t]];
++    if (sp.greedy || sp.temperature <= 0.0f) return false;
++    sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
++    sp.penalty_last_n = 0;
++    return true;
++}
++
+ bool Verifier::sample_rows(int S, std::string& err) {
+     bool any = false;
+     for (int t = 0; t < S; ++t) {
+-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
+-        if (sp.greedy || sp.temperature <= 0.0f) continue;
+-        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
+-        sp.penalty_last_n = 0;
++        strata::kernels::SamplerParams sp;
++        if (!row_draw(t, sp)) continue;
++        if ((b_early_ >> t & 1u) && strata::kernels::same_sampling(sp, b_early_sp_[t])) continue;   // drawn in batch_launch
+         strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+                                        m_out_ + t, cs_);
+         any = true;
+@@ -3343,6 +3360,17 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
+     if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
+         le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
++    b_early_ = 0;
++    if (early_sample_ && last_stage())   // STRATA_EARLY_SAMPLE: sample_rows' draws, in its order behind the window and its commit
++        for (int t = 0; t < S; ++t) {
++            strata::kernels::SamplerParams sp;
++            // (a logit bias lives in one device buffer that set_logit_bias may rewrite: batch_poll draws that row)
++            if (!row_draw(t, sp) || sp.logit_bias != nullptr) continue;
++            strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0,
++                                           sp, m_out_ + t, cs_);
++            b_early_ |= 1u << t;
++            b_early_sp_[t] = sp;
++        }
+     (void) cudaStreamQuery(cs_);
+     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+         for (int t = 0; t < S; ++t) {
+diff --git a/src/kernels/cuda/sampler.cu b/src/kernels/cuda/sampler.cu
+index b9e04318..7245117b 100644
+--- a/src/kernels/cuda/sampler.cu
++++ b/src/kernels/cuda/sampler.cu
+@@ -1297,6 +1297,14 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
+     if (stream == nullptr) cudaDeviceSynchronize();
+ }
+ 
++bool sample_tokens_reserve(int n_vocab, void* stream) {
++    if (stream_capturing(stream)) return false;
++    const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
++    if (sampled_path() == SampledPath::Split && n_vocab > 0 && n_blocks <= kSplitMaxBlocks)
++        (void) split_scratch(stream, (size_t) 16 * n_blocks * kSelMax);   // sample_tokens' size for <= 16 rows
++    return true;
++}
++
+ namespace {
+ int coupled_blocks(int nv) { return (nv + kSplitBlockSpan - 1) / kSplitBlockSpan; }
+ int coupled_kpart(int nv) { return nv < kSelMax ? nv : kSelMax; }
+diff --git a/tests/core/sampler_same_test.cpp b/tests/core/sampler_same_test.cpp
+new file mode 100644
+index 00000000..33ecf171
+--- /dev/null
++++ b/tests/core/sampler_same_test.cpp
+@@ -0,0 +1,60 @@
++// same_sampling (include/strata/kernels/sampler.hpp): STRATA_EARLY_SAMPLE keeps a row drawn in batch_launch only when
++// batch_poll's draw would be the same, so a change in any field sample_tokens reads must be seen.  Header-only, CPU.
++#include "strata/kernels/sampler.hpp"
++
++#include <cmath>
++#include <cstdio>
++
++namespace {
++int failures = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++}  // namespace
++
++int main() {
++    using strata::kernels::SamplerParams;
++    using strata::kernels::same_sampling;
++    // a new field changes the size (x86-64): same_sampling must compare it too, then this number moves with it
++    static_assert(sizeof(void*) != 8 || sizeof(SamplerParams) == 80, "a new SamplerParams field: add it to same_sampling");
++    SamplerParams a;
++    a.temperature = 0.7f;
++    a.seed = 42;
++    a.counter = 1000;
++    check(same_sampling(a, a), "a draw is its own");
++    SamplerParams b = a;
++    check(same_sampling(a, b), "a copy");
++    const float bias = 0.0f;
++    const auto differs = [&](void (*edit)(SamplerParams&, const float*), const char* what) {
++        SamplerParams c = a;
++        edit(c, &bias);
++        check(!same_sampling(a, c) && !same_sampling(c, a), what);
++    };
++    differs([](SamplerParams& p, const float*) { p.top_k = 40; }, "top_k");
++    differs([](SamplerParams& p, const float*) { p.top_p = 0.9f; }, "top_p");
++    differs([](SamplerParams& p, const float*) { p.min_p = 0.05f; }, "min_p");
++    differs([](SamplerParams& p, const float*) { p.temperature = 0.8f; }, "temperature");
++    differs([](SamplerParams& p, const float*) { p.min_keep = 2; }, "min_keep");
++    differs([](SamplerParams& p, const float*) { p.penalty_last_n = 64; }, "penalty_last_n");
++    differs([](SamplerParams& p, const float*) { p.penalty_repeat = 1.1f; }, "penalty_repeat");
++    differs([](SamplerParams& p, const float*) { p.penalty_freq = 0.5f; }, "penalty_freq");
++    differs([](SamplerParams& p, const float*) { p.penalty_present = 0.5f; }, "penalty_present");
++    differs([](SamplerParams& p, const float*) { p.seed = 43; }, "seed");
++    differs([](SamplerParams& p, const float*) { p.counter = 1001; }, "counter (the position)");
++    differs([](SamplerParams& p, const float*) { p.greedy = true; }, "greedy");
++    differs([](SamplerParams& p, const float* x) { p.logit_bias = x; }, "logit_bias");
++    differs([](SamplerParams& p, const float*) { p.gumbel = true; }, "gumbel");
++    // bit for bit: -0.0 is not 0.0, and a NaN is never the same draw
++    differs([](SamplerParams& p, const float*) { p.min_p = -0.0f; }, "min_p -0.0 vs 0.0");
++    {
++        SamplerParams n = a;
++        n.top_p = std::nanf("");
++        check(!same_sampling(n, a), "NaN top_p vs 0.95");
++    }
++    if (failures != 0) return 1;
++    std::puts("sampler_same_test: passed");
++    return 0;
++}
+-- 
+2.43.0
+

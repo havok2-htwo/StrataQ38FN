@@ -1,0 +1,56 @@
+From bfca9a6aa803e213f46da5dbfb857f5d4ab2993f Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:42:37 +0200
+Subject: [PATCH 2/5] fused_gr: STRATA_GR_NORM_FAST=1 runs the register split
+ norm on CUDA too (opt-in)
+
+norm_fast_on() read the switch only under HIP, so on CUDA gr_norm_split_fast_kernel never ran. The env is now read
+on both; unset keeps each backend's default (gfx12 on HIP, off on CUDA), so the default path is unchanged. The fast
+split norm takes the same elements through the same operations in the same order as gr_norm_split_kernel, and
+fused_gr_check compares the split and staged reads that use it with the plain read bit for bit (1..8 tokens, with
+and without the pending write) before a card runs them. New ctest gr_parity_norm_fast: the staged multi read with
+the switch against the single-token reads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt               | 4 ++++
+ src/kernels/cuda/fused_gr.cu | 5 +++--
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d5c07db7..06228559 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -945,6 +945,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_include_directories(gr_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(gr_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME gr_parity COMMAND gr_parity --selftest)
++  # the multi read as staged (STRATA_HC_SPLIT=2 names it on a card fused_gr_check has not seen) with the opt-in
++  # register split norm, against the single-token reads bit for bit
++  add_test(NAME gr_parity_norm_fast COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_norm_fast PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_NORM_FAST=1")
+ 
+   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
+   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index c3c2fc8d..3c9f74e6 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -1006,11 +1006,12 @@ bool gr_down_max4() {
+ }
+ 
+ // the split norm with registers (gr_norm_split_fast_kernel): gfx12 only until another arch is measured;
+-// STRATA_GR_NORM_FAST=0 / 1 forces it off / on
++// STRATA_GR_NORM_FAST=0 / 1 forces it off / on (CUDA too, where it is off by default; fused_gr_check compares the
++// split and staged reads that use it with the plain read bit for bit before a card runs them)
+ bool norm_fast_on() {
+-#if defined(__HIPCC__)
+     static const int env = [] { const char* e = std::getenv("STRATA_GR_NORM_FAST"); return e != nullptr ? (std::atoi(e) != 0 ? 1 : 0) : -1; }();
+     if (env >= 0) return env != 0;
++#if defined(__HIPCC__)
+     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+     int dev = 0;
+     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+-- 
+2.43.0
+

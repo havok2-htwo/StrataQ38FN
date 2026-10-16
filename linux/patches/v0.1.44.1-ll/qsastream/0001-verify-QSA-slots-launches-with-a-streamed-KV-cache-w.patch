@@ -1,0 +1,498 @@
+From 038994f4e235d299287a4d46fd79febfa6bb24c1 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 10:04:56 +0200
+Subject: [PATCH 1/2] verify: QSA slots launches with a streamed KV cache when
+ every row is another slot's (opt-in STRATA_QSA_SLOTS_STREAM=1)
+
+Each row resolves its own map after the rows' top-k and before their attention. Test qsa_slots_stream_parity
+compares slots-with-streaming against the per-row loop bitwise, with evictions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                          |   9 +
+ src/core/verify.cpp                     |  15 +-
+ src/kernels/qsa_slots_stream_parity.cpp | 403 ++++++++++++++++++++++++
+ 3 files changed, 426 insertions(+), 1 deletion(-)
+ create mode 100644 src/kernels/qsa_slots_stream_parity.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d5c07db7..2d9ea6f1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -447,6 +447,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_test(NAME qsa_slots_parity_lanecell COMMAND qsa_slots_parity)
+     set_tests_properties(qsa_slots_parity qsa_slots_parity_lanecell PROPERTIES SKIP_RETURN_CODE 77)
+     set_tests_properties(qsa_slots_parity_lanecell PROPERTIES ENVIRONMENT "STRATA_ATTN_LANECELL=1")
++    # STRATA_QSA_SLOTS_STREAM: the same on streamed K/V (each row's resolve between the rows' top-k and their
++    # attention) against the per-row resolve-then-attend loop, with evicting slot pools, bitwise
++    add_executable(qsa_slots_stream_parity src/kernels/qsa_slots_stream_parity.cpp)
++    target_include_directories(qsa_slots_stream_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
++    target_link_libraries(qsa_slots_stream_parity PRIVATE strata_kernels CUDA::cudart)
++    add_test(NAME qsa_slots_stream_parity COMMAND qsa_slots_stream_parity)
++    add_test(NAME qsa_slots_stream_parity_lanecell COMMAND qsa_slots_stream_parity)
++    set_tests_properties(qsa_slots_stream_parity qsa_slots_stream_parity_lanecell PROPERTIES SKIP_RETURN_CODE 77)
++    set_tests_properties(qsa_slots_stream_parity_lanecell PROPERTIES ENVIRONMENT "STRATA_ATTN_LANECELL=1")
+   endif()
+   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
+   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 48c68273..fc2d95d0 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -211,6 +211,10 @@ const bool g_batch_self_commit = env_on("STRATA_BATCH_SELF_COMMIT");
+ // one call per row; every row is computed by the same kernel with the same arithmetic as its own call.  Not with a
+ // streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
+ const bool g_qsa_slots = env_on("STRATA_QSA_SLOTS");
++// STRATA_QSA_SLOTS_STREAM=1 (opt-in, with STRATA_QSA_SLOTS=1): the slots launches also with a streamed KV cache, when
++// every row of the window is another slot's.  Each row then resolves its own map (its own page table, VRAM slots and
++// host copy) after the rows' top-k and before their attention; no row's resolve touches another row's blocks.
++const bool g_qsa_slots_stream = env_on("STRATA_QSA_SLOTS_STREAM");
+ 
+ // every row of a batch window is another slot's (no slot has proposal rows)
+ bool one_row_per_slot(const int* rows, int S) {
+@@ -951,6 +955,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
+     // STRATA_BATCH_SELF_COMMIT: the window keeps its rows (no commit graph, nothing to snapshot for one)
+     const bool keep_rows = batch_rec_ && batch_self_commits(brow_, T);
++    // STRATA_QSA_SLOTS_STREAM: no two rows of the window share a slot's streamed K/V
++    const bool rows_own_slots = batch_rec_ && g_qsa_slots_stream && one_row_per_slot(brow_, T);
+ 
+     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
+     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
+@@ -1438,9 +1444,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 }
+                 stamp(l, 10, grp);
+                 bool streamed = false;   // a streamed KV cache keeps the per-row resolve-then-attend order
++                                         // (STRATA_QSA_SLOTS_STREAM: unless every row is another slot's)
+                 if (batch_rec_ && g_qsa_slots)
+                     for (int t = tb; t < te; ++t) streamed = streamed || slot_ss(t).qsa_states[qi].kv_mode == 1;
+-                if (batch_rec_ && g_qsa_slots && !streamed) {
++                if (batch_rec_ && g_qsa_slots && (!streamed || rows_own_slots)) {
+                     // the rows' block scores, top-k and attention, up to 8 rows per launch.  The rows only read
+                     // their slots' keys and K/V here and write their own scores/sel/scratch/attn rows, so running
+                     // each step for all rows before the next is the per-row loop's result
+@@ -1463,6 +1470,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                                  1, max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
+                         qsa_block_topk(scores_ + (size_t) t0 * max_blocks_, step_ + t0 * kStepCount, m, max_blocks_,
+                                        cap_, s, sel_ + (size_t) t0 * cap_, cs);
++                        // STRATA_QSA_SLOTS_STREAM: each row's selected blocks resident, as the per-row loop has them
++                        // before its attention (a no-op for a row whose cache is not streamed)
++                        if (streamed)
++                            for (int t = t0; t < t0 + m; ++t)
++                                qsa_kv_resolve(slot_ss(t).qsa_states[qi], *g_, sel_ + (size_t) t * cap_,
++                                               step_ + t * kStepCount, 1, cap_, cs);
+                         if (!qsa_decode_attn_slots(qcur_ + t0 * NH * HD, px, sel_ + (size_t) t0 * cap_,
+                                                    step_ + t0 * kStepCount, cap_, s,
+                                                    attn_scratch_ + (size_t) t0 * attn_scratch_floats_,
+diff --git a/src/kernels/qsa_slots_stream_parity.cpp b/src/kernels/qsa_slots_stream_parity.cpp
+new file mode 100644
+index 00000000..492d7072
+--- /dev/null
++++ b/src/kernels/qsa_slots_stream_parity.cpp
+@@ -0,0 +1,403 @@
++// src/kernels/qsa_slots_stream_parity.cpp - STRATA_QSA_SLOTS_STREAM: the batch window's slots launches (block
++// scores and top-k over the rows, then each row's kv_stream_resolve, then one qsa_decode_attn_slots) on STREAMED K/V,
++// against verify.cpp's per-row loop (scores, top-k, resolve, attention, one row after the other).  Every row is
++// another slot's: its own indexer keys, residency map, VRAM slot pool of 1,024 pages and pinned host copy, with a
++// context of 12K-44K cells, so the resolves evict from the second or third step on.  Each case runs several
++// consecutive steps on the same maps (fresh queries per step); the m=8 case has one fully resident row (no resolve,
++// as qsa_kv_resolve does for a kv_mode 0 state).  Checks, per step and row:
++//   1. scores, selected ids and attention output bitwise identical between the two orders;
++//   2. each arm's map inverts itself, every selected block is resident, every resident slot holds its block's bytes
++//      of the host copy;
++//   3. both arms count the same lookups and calls, none overflowed, and the resolves evicted (misses > slots).
++// The slot a missed block lands in follows the resolve's atomics (today too), so the maps themselves are not
++// compared: the attention reads K/V only through the page table.  FP16, INT8, Q4_0 and K8V4.  Synthetic, no model.
++// Where a slots launcher declines by design the engine keeps its per-row calls and the test skips (77).
++#include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_q8.hpp"
++#include "strata/kernels/kv_stream.hpp"
++#include "strata/kernels/qsa.hpp"
++#include "strata/kernels/qsa_decode_attn.hpp"
++#include "strata/kernels/qsa_select.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++namespace k = strata::kernels;
++namespace {
++
++void ck(cudaError_t e) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "CUDA: %s\n", cudaGetErrorString(e));
++        std::exit(2);
++    }
++}
++template <typename T> T* up(const std::vector<T>& h) {
++    T* d = nullptr;
++    ck(cudaMalloc(&d, h.size() * sizeof(T)));
++    ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
++    return d;
++}
++template <typename T> std::vector<T> down(const T* d, size_t n) {
++    std::vector<T> h(n);
++    ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost));
++    return h;
++}
++template <typename T> T* dzero(size_t n) {
++    T* d = nullptr;
++    ck(cudaMalloc(&d, n * sizeof(T) + 64));
++    ck(cudaMemset(d, 0, n * sizeof(T) + 64));
++    return d;
++}
++// splitmix64: the host copies are hundreds of MB, mt19937 per element would dominate the run
++struct Rng {
++    uint64_t x;
++    uint64_t next() {
++        uint64_t z = (x += 0x9e3779b97f4a7c15ull);
++        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
++        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
++        return z ^ (z >> 31);
++    }
++};
++// a finite fp16 of magnitude 2^-5 .. 2^2 (as qsa_slots_parity)
++uint16_t rnd_half(uint32_t x) {
++    return (uint16_t) (((x & 1u) << 15) | ((10u + (x >> 1) % 7u) << 10) | ((x >> 4) & 0x3ffu));
++}
++
++constexpr int64_t kSlots = 1024;   // VRAM pages per streamed row: kv_stream_resolve's minimum (one resolve block)
++constexpr int kSteps = 6;          // decode steps per case: selections of up to 514 blocks fill 1,024 slots by step 2
++constexpr int kRows = k::kQsaAttnMaxSlots;
++constexpr int kResidentRow = 6;    // the m=8 case's fully resident row
++// contexts per row at the first step (cells): every streamed row has far more blocks than slots
++constexpr int64_t kCtx[kRows] = {41000, 16001, 23000, 30001, 12345, 44000, 9000, 17003};
++
++// One K/V layout's per-block byte runs (kv_stream.cu's runs_of): array i holds `len[i]` bytes per block.
++struct Layout {
++    int n = 0;
++    int64_t len[4] = {};
++    int kind[4] = {};   // 0 bytes, 1 fp16 halves, 2 block_q4_0
++};
++Layout layout_of(int fmt, const k::QsaShapes& s) {
++    const int64_t rows = s.n_head_kv * s.page_size, hd = s.head_dim;
++    const int64_t codes = rows * hd, scales = rows * (hd / k::KV_Q8_GROUP) * 2;
++    const int64_t q4 = rows * (int64_t) k::kv_q4_bytes_per_head((int) hd);
++    Layout l;
++    if (fmt == k::kKvHybrid) {
++        l.n = 3; l.len[0] = codes; l.len[1] = scales; l.len[2] = q4; l.kind[1] = 1; l.kind[2] = 2;
++    }
++    else if (fmt == k::kKvQ4) { l.n = 2; l.len[0] = l.len[1] = q4; l.kind[0] = l.kind[1] = 2; }
++    else if (fmt == k::kKvInt8) {
++        l.n = 4; l.len[0] = l.len[1] = codes; l.len[2] = l.len[3] = scales; l.kind[2] = l.kind[3] = 1;
++    } else { l.n = 2; l.len[0] = l.len[1] = rows * hd * 2; l.kind[0] = l.kind[1] = 1; }
++    return l;
++}
++// the arrays in runs_of's order as attention pools (`table` is the page table)
++k::QsaAttnPools attn_pools(int fmt, void* const a[4], const int32_t* table) {
++    k::QsaAttnPools p;
++    p.page_table = table;
++    if (fmt == k::kKvHybrid) {
++        p.k_q = (const int8_t*) a[0]; p.k_scale = (const uint16_t*) a[1]; p.v_q4 = (const uint8_t*) a[2];
++    }
++    else if (fmt == k::kKvQ4) { p.k_q4 = (const uint8_t*) a[0]; p.v_q4 = (const uint8_t*) a[1]; }
++    else if (fmt == k::kKvInt8) {
++        p.k_q = (const int8_t*) a[0]; p.v_q = (const int8_t*) a[1];
++        p.k_scale = (const uint16_t*) a[2]; p.v_scale = (const uint16_t*) a[3];
++    } else { p.k_pool = (const uint16_t*) a[0]; p.v_pool = (const uint16_t*) a[1]; }
++    return p;
++}
++k::KvHostPools host_pools(int fmt, void* const a[4]) {
++    k::KvHostPools h;
++    if (fmt == k::kKvHybrid) { h.k_q = (int8_t*) a[0]; h.k_scale = (uint16_t*) a[1]; h.v_q4 = (uint8_t*) a[2]; }
++    else if (fmt == k::kKvQ4) { h.k_q4 = (uint8_t*) a[0]; h.v_q4 = (uint8_t*) a[1]; }
++    else if (fmt == k::kKvInt8) {
++        h.k_q = (int8_t*) a[0]; h.v_q = (int8_t*) a[1]; h.k_scale = (uint16_t*) a[2]; h.v_scale = (uint16_t*) a[3];
++    }
++    else { h.k_pool = (uint16_t*) a[0]; h.v_pool = (uint16_t*) a[1]; }
++    return h;
++}
++
++// One slot's fixed data: indexer keys and the authoritative K/V (pinned, mapped host copy; the resident row also a
++// device copy with the identity page table).
++struct Slot {
++    int64_t n_blocks = 0;
++    float *pooled = nullptr, *dead = nullptr;
++    void* host[4] = {};   // host pointers (the copy kernel reads them mapped: UVA)
++    void* dev[4] = {};    // the resident row only
++    int32_t* ident = nullptr;
++};
++Slot make_slot(const Layout& l, const k::QsaShapes& s, int64_t ctx, int64_t max_blocks, bool resident, Rng& r) {
++    Slot sl;
++    sl.n_blocks = (ctx + kSteps + s.page_size - 1) / s.page_size;
++    std::vector<float> pooled((size_t) (max_blocks * s.idx_dim)), dead((size_t) s.idx_dim);
++    std::mt19937 mr((uint32_t) r.next());
++    std::normal_distribution<float> nd(0.f, 1.f);
++    for (auto& v : pooled) v = nd(mr);
++    for (auto& v : dead) v = nd(mr);
++    sl.pooled = up(pooled);
++    sl.dead = up(dead);
++    for (int a = 0; a < l.n; ++a) {
++        const size_t bytes = (size_t) (sl.n_blocks * l.len[a]);
++        ck(cudaHostAlloc(&sl.host[a], bytes + 64, cudaHostAllocMapped));
++        uint8_t* h = (uint8_t*) sl.host[a];
++        if (l.kind[a] == 1) {
++            uint16_t* p = (uint16_t*) h;
++            for (size_t i = 0; i < bytes / 2; ++i) p[i] = rnd_half((uint32_t) r.next());
++        } else {
++            for (size_t i = 0; i < bytes; i += 8) {
++                const uint64_t x = r.next();
++                std::memcpy(h + i, &x, std::min<size_t>(8, bytes - i));
++            }
++            if (l.kind[a] == 2) {   // finite q4_0 scales
++                k::block_q4_0* b = reinterpret_cast<k::block_q4_0*>(h);
++                for (size_t i = 0; i < bytes / sizeof(k::block_q4_0); ++i) b[i].d = rnd_half((uint32_t) r.next());
++            }
++        }
++        if (resident) {
++            ck(cudaMalloc(&sl.dev[a], bytes + 64));
++            ck(cudaMemcpy(sl.dev[a], h, bytes, cudaMemcpyHostToDevice));
++        }
++    }
++    if (resident) {
++        std::vector<int32_t> t((size_t) sl.n_blocks);
++        for (int64_t i = 0; i < sl.n_blocks; ++i) t[(size_t) i] = (int32_t) i;
++        sl.ident = up(t);
++    }
++    return sl;
++}
++void free_slot(Slot& sl) {
++    ck(cudaFree(sl.pooled)); ck(cudaFree(sl.dead));
++    for (int a = 0; a < 4; ++a) {
++        if (sl.host[a]) ck(cudaFreeHost(sl.host[a]));
++        if (sl.dev[a]) ck(cudaFree(sl.dev[a]));
++    }
++    if (sl.ident) ck(cudaFree(sl.ident));
++}
++
++// One arm's streamed state of one row: its residency map and VRAM slot pool.
++struct Stream {
++    k::KvStreamMap m;
++    void* pool[4] = {};
++};
++Stream make_stream(const Layout& l, int64_t n_blocks, cudaStream_t cs) {
++    Stream st;
++    st.m.page_table = dzero<int32_t>((size_t) n_blocks);
++    st.m.slot_block = dzero<int32_t>(kSlots); st.m.slot_stamp = dzero<int32_t>(kSlots);
++    st.m.slot_ref = dzero<int32_t>(kSlots);
++    st.m.miss_block = dzero<int32_t>(kSlots); st.m.miss_slot = dzero<int32_t>(kSlots);
++    st.m.ctl = dzero<int32_t>(k::kKvCtlInts);
++    st.m.n_blocks = n_blocks;
++    st.m.n_slots = kSlots;
++    for (int a = 0; a < l.n; ++a) st.pool[a] = dzero<uint8_t>((size_t) (kSlots * l.len[a]));
++    k::kv_stream_reset(st.m, cs);
++    return st;
++}
++void free_stream(Stream& st) {
++    for (int32_t* p : {st.m.page_table, st.m.slot_block, st.m.slot_stamp, st.m.slot_ref, st.m.miss_block, st.m.miss_slot,
++                       st.m.ctl})
++        ck(cudaFree(p));
++    for (void* p : st.pool) if (p) ck(cudaFree(p));
++}
++
++// 2. the map inverts itself, every selected block is resident, every resident slot holds its block's host bytes
++const char* check_map(const Stream& st, const Slot& sl, const Layout& l, const int32_t* ids, int64_t width,
++                      int64_t page_size) {
++    const auto pt = down(st.m.page_table, (size_t) st.m.n_blocks);
++    const auto sb = down(st.m.slot_block, (size_t) kSlots);
++    for (int64_t b = 0; b < st.m.n_blocks; ++b)
++        if (pt[(size_t) b] < -1 || pt[(size_t) b] >= kSlots || (pt[(size_t) b] >= 0 && sb[(size_t) pt[(size_t) b]] != b))
++            return "page table";
++    for (int64_t j = 0; j < kSlots; ++j)
++        if (sb[(size_t) j] >= 0 && (sb[(size_t) j] >= st.m.n_blocks || pt[(size_t) sb[(size_t) j]] != j))
++            return "slot table";
++    for (int64_t i = 0; i < width; ++i)
++        if (pt[(size_t) (ids[i] / page_size)] < 0) return "a selected block not resident";
++    for (int a = 0; a < l.n; ++a) {
++        const auto pool = down((const uint8_t*) st.pool[a], (size_t) (kSlots * l.len[a]));
++        for (int64_t j = 0; j < kSlots; ++j)
++            if (sb[(size_t) j] >= 0 && std::memcmp(&pool[(size_t) (j * l.len[a])],
++                                                   (const uint8_t*) sl.host[a] + sb[(size_t) j] * l.len[a],
++                                                   (size_t) l.len[a]))
++                return "slot bytes";
++    }
++    return nullptr;
++}
++
++enum Result { kPass, kFail, kSkip };
++
++// one case: rows 0..m-1, KV format `fmt`, kSteps decode steps; `evicted` counts rows whose resolves evicted
++Result check(int fmt, int m, const std::vector<Slot>& slots, const Layout& l, int64_t max_blocks, cudaStream_t cs,
++             uint32_t seed, int& evicted) {
++    const k::QsaShapes s = k::qsa_real_shapes();
++    const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
++    const int64_t NH = s.n_head, HD = s.head_dim, QI = s.idx_n_head * s.idx_dim;
++    const int64_t sf = (int64_t) k::qsa_decode_attn_scratch_floats(cap, s);
++    std::mt19937 r(seed);
++    std::normal_distribution<float> nd(0.f, 1.f);
++    auto resident = [&](int t) { return m == kRows && t == kResidentRow; };
++    std::vector<Stream> arm[2];
++    for (int v = 0; v < 2; ++v)
++        for (int t = 0; t < m; ++t) arm[v].push_back(make_stream(l, slots[(size_t) t].n_blocks, cs));
++    auto pools = [&](int v, int t) {
++        const Slot& sl = slots[(size_t) t];
++        return resident(t) ? attn_pools(fmt, sl.dev, sl.ident)
++                           : attn_pools(fmt, arm[v][(size_t) t].pool, arm[v][(size_t) t].m.page_table);
++    };
++    auto resolve = [&](int v, int t, const int32_t* sel, const int32_t* step) {
++        if (resident(t)) return;   // qsa_kv_resolve: nothing for a fully resident state
++        const Slot& sl = slots[(size_t) t];
++        const Stream& st = arm[v][(size_t) t];
++        k::kv_stream_resolve(st.m, attn_pools(fmt, st.pool, st.m.page_table), host_pools(fmt, sl.host), fmt, sel, step,
++                             1, cap, s, cs);
++    };
++    float* d_qidx = dzero<float>((size_t) (m * QI));
++    float* d_qcur = dzero<float>((size_t) (m * NH * HD));
++    int32_t* d_steps = dzero<int32_t>((size_t) (m * k::kStepCount));
++    float *sc[2], *scratch[2], *attn[2];
++    int32_t* sel[2];
++    for (int v = 0; v < 2; ++v) {
++        sc[v] = dzero<float>((size_t) (m * max_blocks));
++        sel[v] = dzero<int32_t>((size_t) (m * cap));
++        scratch[v] = dzero<float>((size_t) (m * sf));
++        attn[v] = dzero<float>((size_t) (m * NH * HD));
++    }
++    const float* pooled[k::kQsaAttnMaxSlots];
++    const float* dead[k::kQsaAttnMaxSlots];
++    for (int t = 0; t < m; ++t) { pooled[t] = slots[(size_t) t].pooled; dead[t] = slots[(size_t) t].dead; }
++    Result res = kPass;
++    std::vector<float> qidx((size_t) (m * QI)), qcur((size_t) (m * NH * HD));
++    std::vector<int32_t> steps((size_t) (m * k::kStepCount));
++    for (int step = 0; step < kSteps && res == kPass; ++step) {
++        for (auto& x : qidx) x = nd(r);
++        for (auto& x : qcur) x = nd(r);
++        for (int t = 0; t < m; ++t) k::qsa_step_fill(steps.data() + t * k::kStepCount, kCtx[t] - 1 + step, s);
++        ck(cudaMemcpyAsync(d_qidx, qidx.data(), qidx.size() * 4, cudaMemcpyHostToDevice, cs));
++        ck(cudaMemcpyAsync(d_qcur, qcur.data(), qcur.size() * 4, cudaMemcpyHostToDevice, cs));
++        ck(cudaMemcpyAsync(d_steps, steps.data(), steps.size() * 4, cudaMemcpyHostToDevice, cs));
++        // 0: verify.cpp's per-row loop: scores, top-k, resolve, attention, one row after the other
++        for (int t = 0; t < m; ++t) {
++            const int32_t* st = d_steps + t * k::kStepCount;
++            k::qsa_block_scores(pooled[t], dead[t], d_qidx + t * QI, st, 1, max_blocks, s, sc[0] + t * max_blocks, cs);
++            k::qsa_block_topk(sc[0] + t * max_blocks, st, 1, max_blocks, cap, s, sel[0] + t * cap, cs);
++            resolve(0, t, sel[0] + t * cap, st);
++            k::qsa_decode_attn_batch(d_qcur + t * NH * HD, pools(0, t), sel[0] + t * cap, st, cap, s,
++                                     scratch[0] + t * sf, attn[0] + t * NH * HD, 1, cs);
++        }
++        // 1: STRATA_QSA_SLOTS_STREAM: scores and top-k over the rows, each row's resolve, one attention launch
++        k::QsaAttnSlotPools px;
++        for (int t = 0; t < m; ++t) px.p[t] = pools(1, t);
++        if (!k::qsa_block_scores_slots(pooled, dead, d_qidx, d_steps, m, max_blocks, s, sc[1], cs)) {
++            std::puts("SKIP: qsa_block_scores_slots declined (STRATA_SCORES_MULTI=0); the engine keeps the per-row "
++                      "calls");
++            res = kSkip;
++            break;
++        }
++        k::qsa_block_topk(sc[1], d_steps, m, max_blocks, cap, s, sel[1], cs);
++        for (int t = 0; t < m; ++t) resolve(1, t, sel[1] + t * cap, d_steps + t * k::kStepCount);
++        if (!k::qsa_decode_attn_slots(d_qcur, px, sel[1], d_steps, cap, s, scratch[1], attn[1], m, cs)) {
++            std::puts("SKIP: qsa_decode_attn_slots declined (the pre-sm_75 or gfx906 query-swizzle attention); the "
++                      "engine keeps the per-row calls");
++            res = kSkip;
++            break;
++        }
++        ck(cudaStreamSynchronize(cs));
++        // 1. bitwise
++        const auto s0 = down(sc[0], (size_t) (m * max_blocks)), s1 = down(sc[1], (size_t) (m * max_blocks));
++        const auto i0 = down(sel[0], (size_t) (m * cap)), i1 = down(sel[1], (size_t) (m * cap));
++        const auto a0 = down(attn[0], (size_t) (m * NH * HD)), a1 = down(attn[1], (size_t) (m * NH * HD));
++        double mag = 0;
++        for (float x : a0) mag += std::fabs(x);
++        for (int t = 0; t < m && res == kPass; ++t) {
++            const int64_t nb = steps[(size_t) (t * k::kStepCount + k::kStepNBid)] + 1;
++            const int64_t w = steps[(size_t) (t * k::kStepCount + k::kStepWidth)];
++            const char* what = nullptr;
++            if (std::memcmp(&s0[(size_t) (t * max_blocks)], &s1[(size_t) (t * max_blocks)], (size_t) nb * 4))
++                what = "scores";
++            else if (std::memcmp(&i0[(size_t) (t * cap)], &i1[(size_t) (t * cap)], (size_t) w * 4)) what = "ids";
++            else if (std::memcmp(&a0[(size_t) (t * NH * HD)], &a1[(size_t) (t * NH * HD)], (size_t) (NH * HD) * 4))
++                what = "attention";
++            for (int v = 0; v < 2 && !what && !resident(t); ++v)   // 2. the maps
++                what = check_map(arm[v][(size_t) t], slots[(size_t) t], l, (v ? i1 : i0).data() + t * cap, w,
++                                 s.page_size);
++            if (what) {
++                std::fprintf(stderr, "FAIL fmt=%d rows=%d step=%d row=%d ctx=%lld: %s\n", fmt, m, step, t,
++                             (long long) kCtx[t] + step, what);
++                res = kFail;
++            }
++        }
++        if (res == kPass && !(mag > 0)) {
++            std::fprintf(stderr, "FAIL fmt=%d rows=%d step=%d: attention output is zero\n", fmt, m, step);
++            res = kFail;
++        }
++    }
++    // 3. the counters
++    for (int t = 0; t < m && res == kPass; ++t) {
++        if (resident(t)) continue;
++        const k::KvStreamCounters c0 = k::kv_stream_counters(arm[0][(size_t) t].m);
++        const k::KvStreamCounters c1 = k::kv_stream_counters(arm[1][(size_t) t].m);
++        if (c0.overflow || c1.overflow || c0.calls != (uint64_t) kSteps || c1.calls != c0.calls ||
++            c1.lookups != c0.lookups) {
++            std::fprintf(stderr, "FAIL fmt=%d rows=%d row=%d: counters (calls %llu/%llu, lookups %llu/%llu, overflow "
++                                 "%d/%d)\n", fmt, m, t, (unsigned long long) c0.calls, (unsigned long long) c1.calls,
++                         (unsigned long long) c0.lookups, (unsigned long long) c1.lookups, (int) c0.overflow,
++                         (int) c1.overflow);
++            res = kFail;
++        }
++        if (c0.misses > (uint64_t) kSlots && c1.misses > (uint64_t) kSlots) ++evicted;
++    }
++    for (int v = 0; v < 2; ++v) {
++        ck(cudaFree(sc[v])); ck(cudaFree(sel[v])); ck(cudaFree(scratch[v])); ck(cudaFree(attn[v]));
++        for (auto& st : arm[v]) free_stream(st);
++    }
++    ck(cudaFree(d_qidx)); ck(cudaFree(d_qcur)); ck(cudaFree(d_steps));
++    return res;
++}
++
++}  // namespace
++
++int main() {
++    int devices = 0;
++    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
++        std::puts("SKIP: no CUDA device");
++        return 77;
++    }
++    if (const char* v = std::getenv("STRATA_SCORES_MULTI"); v && std::atoi(v) == 0) {
++        std::puts("SKIP: STRATA_SCORES_MULTI=0 (the slots launch is off; the engine keeps the per-row calls)");
++        return 77;
++    }
++    const k::QsaShapes s = k::qsa_real_shapes();
++    const int64_t max_blocks = (*std::max_element(kCtx, kCtx + kRows) + kSteps) / s.idx_block + 2;
++    cudaStream_t cs = nullptr;
++    ck(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));   // the engine's own stream, as the window graph's
++    int cases = 0, skipped = 0, evicted = 0, streamed_rows = 0;
++    for (int fmt : {k::kKvF16, k::kKvInt8, k::kKvQ4, k::kKvHybrid}) {
++        const Layout l = layout_of(fmt, s);
++        Rng r{0x5157u + 977u * (uint64_t) fmt};
++        std::vector<Slot> slots;
++        for (int t = 0; t < kRows; ++t) slots.push_back(make_slot(l, s, kCtx[t], max_blocks, t == kResidentRow, r));
++        for (int m : {1, 2, 4, 8}) {
++            const Result res = check(fmt, m, slots, l, max_blocks, cs, 1000u * (uint32_t) fmt + (uint32_t) m, evicted);
++            if (res == kFail) return 1;
++            ++(res == kSkip ? skipped : cases);
++            if (res == kPass) streamed_rows += m == kRows ? m - 1 : m;
++        }
++        for (auto& sl : slots) free_slot(sl);
++    }
++    ck(cudaStreamDestroy(cs));
++    if (cases == 0) return 77;
++    // every streamed row's context outgrows its 1,024 slots, so every one of them must have evicted
++    if (evicted != streamed_rows) {
++        std::fprintf(stderr, "FAIL: only %d of %d streamed rows evicted\n", evicted, streamed_rows);
++        return 1;
++    }
++    std::printf("PASS: %d cases (4 KV formats x 1/2/4/8 rows of different slots%s, %d declined, %d steps each, %d "
++                "streamed rows all evicting): scores, ids and attention bitwise identical to the per-row "
++                "resolve-then-attend loop, maps consistent\n", cases,
++                std::getenv("STRATA_ATTN_LANECELL") ? ", lane-cell" : "", skipped, kSteps, streamed_rows);
++    return 0;
++}
+-- 
+2.43.0
+

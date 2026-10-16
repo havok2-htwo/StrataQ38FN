@@ -1,0 +1,55 @@
+From aeb0cc4f230cf7ef2350d23efabf6ba61f41b302 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 10:39:08 +0200
+Subject: [PATCH 2/2] test: qsa_slots_stream_parity syncs after zeroing (a
+ cudaMemset can land after the non-blocking stream's map reset); diagnosis
+ line on an attention mismatch
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/qsa_slots_stream_parity.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/src/kernels/qsa_slots_stream_parity.cpp b/src/kernels/qsa_slots_stream_parity.cpp
+index 492d7072..8f23b8c7 100644
+--- a/src/kernels/qsa_slots_stream_parity.cpp
++++ b/src/kernels/qsa_slots_stream_parity.cpp
+@@ -53,6 +53,7 @@ template <typename T> T* dzero(size_t n) {
+     T* d = nullptr;
+     ck(cudaMalloc(&d, n * sizeof(T) + 64));
+     ck(cudaMemset(d, 0, n * sizeof(T) + 64));
++    ck(cudaDeviceSynchronize());   // cudaMemset may still run when the non-blocking stream's reset_kernel starts
+     return d;
+ }
+ // splitmix64: the host copies are hundreds of MB, mt19937 per element would dominate the run
+@@ -327,6 +328,27 @@ Result check(int fmt, int m, const std::vector<Slot>& slots, const Layout& l, in
+             if (what) {
+                 std::fprintf(stderr, "FAIL fmt=%d rows=%d step=%d row=%d ctx=%lld: %s\n", fmt, m, step, t,
+                              (long long) kCtx[t] + step, what);
++                if (what[0] == 'a') {   // diagnosis: arm 1's maps through the per-row launcher
++                    float* d = dzero<float>((size_t) (NH * HD));
++                    k::qsa_decode_attn_batch(d_qcur + t * NH * HD, pools(1, t), sel[1] + t * cap,
++                                             d_steps + t * k::kStepCount, cap, s, scratch[1] + t * sf, d, 1, cs);
++                    ck(cudaStreamSynchronize(cs));
++                    const auto c = down(d, (size_t) (NH * HD));
++                    int n0 = 0, n1 = 0, first = -1;
++                    for (int64_t i = 0; i < NH * HD; ++i) {
++                        const size_t j = (size_t) (t * NH * HD + i);
++                        if (std::memcmp(&c[(size_t) i], &a0[j], 4)) { ++n0; if (first < 0) first = (int) i; }
++                        if (std::memcmp(&c[(size_t) i], &a1[j], 4)) ++n1;
++                    }
++                    std::fprintf(stderr, "  diag: per-row launcher on arm 1's maps differs from arm 0 in %d and from "
++                                 "arm 1 in %d of %lld floats (first %d: a0 %g a1 %g)\n", n0, n1, (long long) (NH * HD),
++                                 first, first >= 0 ? a0[(size_t) (t * NH * HD + first)] : 0.0,
++                                 first >= 0 ? a1[(size_t) (t * NH * HD + first)] : 0.0);
++                    for (int u = 0; u < m; ++u)
++                        std::fprintf(stderr, "  row %d: width %d nb %d\n", u, steps[(size_t) (u * k::kStepCount +
++                                     k::kStepWidth)], steps[(size_t) (u * k::kStepCount + k::kStepNBid)]);
++                    ck(cudaFree(d));
++                }
+                 res = kFail;
+             }
+         }
+-- 
+2.43.0
+

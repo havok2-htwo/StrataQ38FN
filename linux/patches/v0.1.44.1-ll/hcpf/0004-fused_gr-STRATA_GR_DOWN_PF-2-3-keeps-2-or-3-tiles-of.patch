@@ -1,0 +1,205 @@
+From 6d5131783ffc241d1a4abeff74d999965ffb0efc Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:47:37 +0200
+Subject: [PATCH 4/5] fused_gr: STRATA_GR_DOWN_PF=2|3 keeps 2 or 3 tiles of
+ weights in flight in the staged down projection (opt-in)
+
+gr_down_staged_kernel loads the next tile's weights while it uses the current one, then copies them into the current
+registers inside a `#pragma unroll 1` loop, so the loads of tile h + 2 wait for tile h + 1 to land: about eight
+serial DRAM round trips a read on 41 blocks. gr_down_staged_pf_kernel<T, PF> unrolls the eight tiles and keeps a
+lane's weights in a ring of PF + 1 register slots at compile-time indices, issuing tile h + PF at the top of tile h.
+The activations' cp.async staging, the barriers, the per-lane sums (chunks lane + 32 q of tile h, ascending h then
+q, the same dot8u and += per token) and the warp sum and epilogue are the staged kernel's, so the outputs are the
+same bits; fused_gr_check compares the staged read with the plain one bit for bit before a card uses it.
+
+Only the exact-token launches of 1..6 tokens (STRATA_NO_MULTI_GR unset) take it; 7 and 8 tokens keep the generic
+kernel. ptxas on sm_86: PF=2 uses 80-114 registers, PF=3 121-138, no spills (the staged <4,true> kernel uses 80
+with 8 bytes of spill). Unset (or any other value) launches exactly the kernels as before: the SASS of every
+existing kernel in fused_gr.cu is unchanged. New ctests gr_parity_down_pf2 / _pf3 (staged multi read against the
+single-token reads, now at 1..8 tokens); fused_gr_bench's hashes compare a run with the switch to one without.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |   5 ++
+ src/kernels/cuda/fused_gr.cu   | 121 ++++++++++++++++++++++++++++++++-
+ src/kernels/fused_gr_bench.cpp |   2 +
+ 3 files changed, 126 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 06228559..42ccf771 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -949,6 +949,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # register split norm, against the single-token reads bit for bit
+   add_test(NAME gr_parity_norm_fast COMMAND gr_parity --selftest)
+   set_tests_properties(gr_parity_norm_fast PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_NORM_FAST=1")
++  # the staged down projection with 2 / 3 tiles of weights in flight (the launches of 1..6 tokens)
++  add_test(NAME gr_parity_down_pf2 COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_down_pf2 PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_PF=2")
++  add_test(NAME gr_parity_down_pf3 COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_down_pf3 PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_PF=3")
+ 
+   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
+   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 3c9f74e6..da1fd9b9 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -881,6 +881,104 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+     }
+ }
+ 
++// STRATA_GR_DOWN_PF=2 / 3 (opt-in): gr_down_staged_kernel with the weights of PF tiles in flight instead of one.  The
++// eight tiles are unrolled, so a lane's weights sit in a ring of PF + 1 register slots at compile-time indices: the
++// copy of the next tile into the current one goes, which waited for the next tile's loads before the one after it
++// could be issued.  The activations' staging, the barriers and every sum are the staged kernel's (a lane
++// accumulates the chunks lane + 32 q of tile h in ascending h, then q), so the same bits.  Only for the exact-token
++// launches of 1..6 tokens: (PF + 1) x 5 uint4 a thread beside the token sums.
++template <int T, int PF>
++__global__ void __launch_bounds__(THREADS) gr_down_staged_pf_kernel(GrMulti m) {
++    static_assert(PF >= 1 && PF < N_HTILES, "the prefetch distance is 1..7 tiles");
++    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
++    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
++    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
++    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
++    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
++    const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
++    float acc[T];
++#pragma unroll
++    for (int k = 0; k < T; ++k) acc[k] = 0.0f;
++    uint4 wr[PF + 1][HQ];                               // tile h in slot h % (PF + 1)
++    if (active) {
++#pragma unroll
++        for (int p = 0; p < PF; ++p) {
++#pragma unroll
++            for (int q = 0; q < HQ; ++q) wr[p][q] = __ldg(w4 + p * (H_TILE / 8) + lane + 32 * q);
++        }
++    }
++    stage_htile(m, T, 0, hbuf, t);
++    cp_async_commit();
++    stage_htile(m, T, 1, hbuf + buf_f4, t);
++    cp_async_commit();
++#pragma unroll
++    for (int h = 0; h < N_HTILES; ++h) {
++        if (active && h + PF < N_HTILES) {              // into the slot tile h - 1 left
++#pragma unroll
++            for (int q = 0; q < HQ; ++q)
++                wr[(h + PF) % (PF + 1)][q] = __ldg(w4 + (h + PF) * (H_TILE / 8) + lane + 32 * q);
++        }
++        if (h + 1 < N_HTILES) cp_async_wait1();         // tile h has landed (h + 1 may still be on its way)
++        else cp_async_wait0();
++        __syncthreads();
++        const float4* cur = hbuf + (h & 1) * buf_f4;
++        if (active) {
++#pragma unroll
++            for (int q = 0; q < HQ; ++q) {
++                const int j = lane + 32 * q;
++                const Bf16x8 wvq = unpack8(wr[h % (PF + 1)][q]);
++#pragma unroll
++                for (int k = 0; k < T; ++k) {
++                    const float4* pk = cur + (size_t) k * (H_TILE / 4);
++                    acc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
++                }
++            }
++        }
++        __syncthreads();                                // every warp is done with buffer h & 1
++        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
++        cp_async_commit();                              // an empty group at the end keeps the wait counts simple
++    }
++    if (!active) return;
++    float s[T];
++#pragma unroll
++    for (int k = 0; k < T; ++k) s[k] = warp_sum(acc[k]);
++    // lane k writes token k (every lane holds every sum after the xor reduction)
++#pragma unroll
++    for (int k = 0; k < T; ++k) {
++        if (lane != k) continue;
++        if (inject_block) {
++            m.a[k].inject_out[row] = s[k];
++        } else {
++            const float x = s[k] / (float) HC;
++            m.a[k].lo[row] = x / (1.0f + __expf(-x));
++        }
++    }
++}
++
++// STRATA_GR_DOWN_PF: 2 or 3 tiles of weights in flight in the staged down projection (above); anything else = 1, the
++// staged kernel itself.  Read once.
++int gr_down_pf() {
++    static const int pf = [] {
++        const char* v = std::getenv("STRATA_GR_DOWN_PF");
++        const int n = v != nullptr ? std::atoi(v) : 1;
++        return n == 2 || n == 3 ? n : 1;
++    }();
++    return pf;
++}
++template <int PF>
++void launch_down_staged_pf(int ct, const GrMulti& c, size_t smem, cudaStream_t st) {
++    switch (ct) {
++        case 1: gr_down_staged_pf_kernel<1, PF><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        case 2: gr_down_staged_pf_kernel<2, PF><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        case 3: gr_down_staged_pf_kernel<3, PF><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        case 4: gr_down_staged_pf_kernel<4, PF><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        case 5: gr_down_staged_pf_kernel<5, PF><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        default: gr_down_staged_pf_kernel<6, PF><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++    }
++}
++
+ // the current device is Volta (sm_70): the fast norm/up is its default
+ bool cur_dev_volta() {
+ #if defined(__HIPCC__)
+@@ -959,6 +1057,21 @@ int down_chunk(bool staged, int* tile_out) {
+         set_staged_attr(gr_down_staged_kernel<6, true>, 6);
+         set_staged_attr(gr_down_staged_kernel<4, false>, 4);
+         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
++        if (gr_down_pf() == 2) {
++            set_staged_attr(gr_down_staged_pf_kernel<1, 2>, 1);
++            set_staged_attr(gr_down_staged_pf_kernel<2, 2>, 2);
++            set_staged_attr(gr_down_staged_pf_kernel<3, 2>, 3);
++            set_staged_attr(gr_down_staged_pf_kernel<4, 2>, 4);
++            set_staged_attr(gr_down_staged_pf_kernel<5, 2>, 5);
++            set_staged_attr(gr_down_staged_pf_kernel<6, 2>, 6);
++        } else if (gr_down_pf() == 3) {
++            set_staged_attr(gr_down_staged_pf_kernel<1, 3>, 1);
++            set_staged_attr(gr_down_staged_pf_kernel<2, 3>, 2);
++            set_staged_attr(gr_down_staged_pf_kernel<3, 3>, 3);
++            set_staged_attr(gr_down_staged_pf_kernel<4, 3>, 4);
++            set_staged_attr(gr_down_staged_pf_kernel<5, 3>, 5);
++            set_staged_attr(gr_down_staged_pf_kernel<6, 3>, 6);
++        }
+         cudaGetLastError();      // drop any error the attempt left behind
+         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
+         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
+@@ -1074,8 +1187,12 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long
+         const bool max4 = ct <= 4 && gr_down_max4();
+         if (staged) {
+             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
+-            // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
+-            if (exact_t && ct == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
++            // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels.
++            // STRATA_GR_DOWN_PF=2|3: those launches with 2 or 3 tiles of weights in flight (the same sums, same order)
++            const int pf = exact_t && ct <= 6 ? gr_down_pf() : 1;
++            if (pf == 2) launch_down_staged_pf<2>(ct, c, smem, st);
++            else if (pf == 3) launch_down_staged_pf<3>(ct, c, smem, st);
++            else if (exact_t && ct == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+             else if (exact_t && ct == 2) gr_down_staged_kernel<2, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+             else if (exact_t && ct == 3) gr_down_staged_kernel<3, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+             else if (exact_t && ct == 4) gr_down_staged_kernel<4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+diff --git a/src/kernels/fused_gr_bench.cpp b/src/kernels/fused_gr_bench.cpp
+index 0ac95eaf..8ec78dab 100644
+--- a/src/kernels/fused_gr_bench.cpp
++++ b/src/kernels/fused_gr_bench.cpp
+@@ -4,6 +4,8 @@
+ //     build/fused_gr_bench [iters] [T min] [T max] [cold sets]
+ // With "cold sets" > 1 it also times the read with the weights rotating over that many copies (a layer's weights are
+ // cold in the engine) and prints the per-stage split (norm / down / up) from the GPU stamps.
++// The read is the plain one unless STRATA_HC_SPLIT=1 / 2 names split / staged; the staged read's opt-in switches
++// (STRATA_GR_NORM_FAST, STRATA_GR_DOWN_PF) are read once, so compare a switch by the printed hashes of two runs.
+ #include "strata/kernels/fused_gr.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,79 @@
+From 70b4488ef4f61c8616045e85008798eb2d31b25f Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:55:20 +0200
+Subject: [PATCH 3/3] test: qsa_vbatch_parity gives the batch launcher one page
+ table covering every row's cells
+
+The batch launcher takes one pool set for all rows, and the test handed it row 0's table, sized for the shortest
+context, so rows with longer contexts read past it on the device. It now gets one shared table sized for the longest
+context, with every row's masked pages applied; the slots and step launchers keep their per-row tables.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/qsa_vbatch_parity.cpp | 23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/src/kernels/qsa_vbatch_parity.cpp b/src/kernels/qsa_vbatch_parity.cpp
+index d1494baf..7dd20d2e 100644
+--- a/src/kernels/qsa_vbatch_parity.cpp
++++ b/src/kernels/qsa_vbatch_parity.cpp
+@@ -99,7 +99,9 @@ struct Out {
+ };
+ 
+ // one case: `m` rows, KV format `fmt`, contexts `ctx[i]`, each row with its own selection and page table (masked
+-// pages per `mask`); the rows' pools are `pools[i]` (the batch and step launchers use pools[0] for every row)
++// pages per `mask`); the slots and step launchers give row i pools[i] and its own table, the batch launcher (rows of
++// one sequence) gives every row pools[0] and one shared table that covers the longest context and masks the pages
++// of every row's chosen positions
+ Result check(int fmt, int m, const int64_t* ctx, bool mask, const Pools* pools, uint32_t seed) {
+     const k::QsaShapes s = k::qsa_real_shapes();
+     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
+@@ -111,6 +113,9 @@ Result check(int fmt, int m, const int64_t* ctx, bool mask, const Pools* pools,
+     for (auto& v : qcur) v = nd(r);
+     std::vector<int32_t> steps((size_t) (m * k::kStepCount)), ids((size_t) (m * cap), 0);
+     std::vector<int32_t*> d_pt((size_t) m);
++    const int64_t max_ctx = *std::max_element(ctx, ctx + m);
++    std::vector<int32_t> shared_pt((size_t) ((max_ctx + s.page_size - 1) / s.page_size));
++    for (auto& p : shared_pt) p = (int32_t) (r() % (uint32_t) kPhysPages);
+     for (int t = 0; t < m; ++t) {
+         k::qsa_step_fill(steps.data() + t * k::kStepCount, ctx[t] - 1, s);
+         const int64_t w = steps[(size_t) (t * k::kStepCount + k::kStepWidth)];
+@@ -132,17 +137,21 @@ Result check(int fmt, int m, const int64_t* ctx, bool mask, const Pools* pools,
+             // selection positions whose page is made non-resident: a group's first, middle and last cell, a whole
+             // group (128..135), a chunk tail (2048..2050) and the last cell; a page holds neighbours too
+             for (int64_t pos : {0, 13, 23, 71, 128, 129, 130, 131, 132, 133, 134, 135, 1000, 2048, 2050})
+-                if (pos < w) pt[(size_t) (id[pos] / s.page_size)] = -1;
+-            if (w > 0) pt[(size_t) (id[w - 1] / s.page_size)] = -1;
+-            for (int i = 0; i < 3; ++i) pt[(size_t) (r() % (uint32_t) pages)] = -1;
++                if (pos < w) pt[(size_t) (id[pos] / s.page_size)] = shared_pt[(size_t) (id[pos] / s.page_size)] = -1;
++            if (w > 0) pt[(size_t) (id[w - 1] / s.page_size)] = shared_pt[(size_t) (id[w - 1] / s.page_size)] = -1;
++            for (int i = 0; i < 3; ++i) {
++                const size_t pg = (size_t) (r() % (uint32_t) pages);
++                pt[pg] = shared_pt[pg] = -1;
++            }
+         }
+         d_pt[(size_t) t] = up(pt);
+     }
+     float* d_q = up(qcur);
+     int32_t* d_ids = up(ids);
+     int32_t* d_steps = up(steps);
+-    k::QsaAttnPools p0 = pools[0].pools;   // the batch launcher's one pool set, with row 0's page table
+-    p0.page_table = d_pt[0];
++    int32_t* d_shared_pt = up(shared_pt);
++    k::QsaAttnPools p0 = pools[0].pools;   // the batch launcher: one pool set, one table valid for every row
++    p0.page_table = d_shared_pt;
+     k::QsaAttnSlotPools px;
+     for (int t = 0; t < m; ++t) { px.p[t] = pools[t].pools; px.p[t].page_table = d_pt[(size_t) t]; }
+     Out o[3];   // batch, slots, step
+@@ -196,7 +205,7 @@ Result check(int fmt, int m, const int64_t* ctx, bool mask, const Pools* pools,
+     }
+     for (auto& oo : o)
+         for (int v = 0; v < kVariants; ++v) { ck(cudaFree(oo.scratch[v])); ck(cudaFree(oo.attn[v])); }
+-    ck(cudaFree(d_q)); ck(cudaFree(d_ids)); ck(cudaFree(d_steps));
++    ck(cudaFree(d_q)); ck(cudaFree(d_ids)); ck(cudaFree(d_steps)); ck(cudaFree(d_shared_pt));
+     for (int32_t* p : d_pt) ck(cudaFree(p));
+     if (!ok) return kFail;
+     return slots_ran ? kPass : kSkip;
+-- 
+2.43.0
+

@@ -1,0 +1,32 @@
+From aa8c85d77a9a456036ac610f1b983ae8db15d186 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:42:18 +0200
+Subject: [PATCH 1/5] native_dense: STRATA_HC_Q8 uploads the GGUF's Q8_0 rows
+ of the stage's own layers only (a layer split)
+
+The GGUF loop that attaches the Q8_0 hyper-connection projections skipped no layer, so on a layer split every card
+held all 48 layers' rows (about 0.65 GiB a card) and read only its own. It now filters like the upload loop above it
+and the bf16-pack quantize loop below it (outside / in_range). Only VRAM changes: each stage's reads take the same
+rows as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/native_dense.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/core/native_dense.cpp b/src/core/native_dense.cpp
+index aba2882b..4651cf7c 100644
+--- a/src/core/native_dense.cpp
++++ b/src/core/native_dense.cpp
+@@ -388,6 +388,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+                     static const bool q8_inject = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
+                     const bool f32_inject = q8_inject && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
+                     if ((tensor.type != 8 && !f32_inject) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
++                    // a layer split: only this stage's layers (another stage's rows would cost VRAM and never be read)
++                    if (outside(tensor.name) || !in_range(tensor.name)) continue;
+                     auto found = table.table_.find(tensor.name);
+                     if (found == table.table_.end() || found->second.hc_q8 != nullptr) continue;
+                     auto& ref = found->second;
+-- 
+2.43.0
+

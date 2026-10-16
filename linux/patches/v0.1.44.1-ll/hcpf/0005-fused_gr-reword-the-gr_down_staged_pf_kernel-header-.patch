@@ -1,0 +1,31 @@
+From 096efada85f25a5dfc7864123ed38b401d15630b Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:52:56 +0200
+Subject: [PATCH 5/5] fused_gr: reword the gr_down_staged_pf_kernel header
+ comment (comment only)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/cuda/fused_gr.cu | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index da1fd9b9..ce96675c 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -882,9 +882,9 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+ }
+ 
+ // STRATA_GR_DOWN_PF=2 / 3 (opt-in): gr_down_staged_kernel with the weights of PF tiles in flight instead of one.  The
+-// eight tiles are unrolled, so a lane's weights sit in a ring of PF + 1 register slots at compile-time indices: the
+-// copy of the next tile into the current one goes, which waited for the next tile's loads before the one after it
+-// could be issued.  The activations' staging, the barriers and every sum are the staged kernel's (a lane
++// eight tiles are unrolled, so a lane's weights sit in a ring of PF + 1 register slots at compile-time indices and
++// the staged kernel's copy of the next tile into the current registers (which made the loads of tile h + 2 wait for
++// tile h + 1) is gone.  The activations' staging, the barriers and every sum are the staged kernel's (a lane
+ // accumulates the chunks lane + 32 q of tile h in ascending h, then q), so the same bits.  Only for the exact-token
+ // launches of 1..6 tokens: (PF + 1) x 5 uint4 a thread beside the token sums.
+ template <int T, int PF>
+-- 
+2.43.0
+
