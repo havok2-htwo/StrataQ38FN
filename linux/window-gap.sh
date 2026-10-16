@@ -60,7 +60,7 @@ bench_down trace-agent
 # 2b. low-concurrency baseline for batch-MTP: 1/2/4/8 users, ~1.2K prompts, 512 tokens, greedy; production and s28r
 for lc in LC-prod LC-s28r; do
     log "step lowconc $lc: start"
-    ( cd $L && timeout -s INT 1500 ./run_strata_variant.sh "lowconc-$lc" $C/$lc.json "1 2 4 8" --rounds 2 --max-tok 512 \
+    ( cd $L && timeout -s INT 1500 ./run_strata_variant.sh "lowconc-$lc" $C/$lc.json "1,2,4,8" --rounds 2 --max-tok 512 \
         --temperature 0 ) > "$OUT/lowconc-$lc.txt" 2>&1
     log "step lowconc $lc: exit $?"; bench_down "lowconc-$lc"
 done
