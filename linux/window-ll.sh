@@ -3,9 +3,9 @@
 # STRATA_QSA_SLOTS_STREAM, STRATA_ATTN_VBATCH, STRATA_GR_DOWN_PF / STRATA_GR_NORM_FAST, STRATA_EARLY_SAMPLE; plus the
 # zero-code arms STRATA_GR_FAST, STRATA_MMVF_ROWS).  Production comes back exactly as before.  Results: results/ll/.
 set -u
-R=/media/raid0/StrataQ38FN; OUT=$R/linux/results/ll; mkdir -p "$OUT"; URL=http://127.0.0.1:8090
+R=/media/raid0/StrataQ38FN; OUT=$R/linux/results/ll/w2; mkdir -p "$OUT"; URL=http://127.0.0.1:8090
 NEW=$R/Strata/engine/strata-g3-1441ll; OLD=$R/Strata/engine/strata-g3-1441a; C=$R/linux/configs
-PROD=$C/T16-1441-prod262r-vision-cpu.json; ALL=$C/LL-all.json; B=$R/Strata-1441-ll/build-ll
+PROD=$C/T16-1441-prod262r-vision-cpu.json; ALL=$C/LL-all.json; B=$R/Strata-1441-ll/build-ll13
 log() { echo "[$(date +%T)] $*" | tee -a "$OUT/window.log"; }
 gpu_apps() { nvidia-smi --query-compute-apps=pid --format=csv,noheader; }
 free_gpus() { for i in $(seq 45); do [ -z "$(gpu_apps)" ] && return 0; sleep 2; done

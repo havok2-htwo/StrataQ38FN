@@ -12,3 +12,8 @@ build-1441 (CUDA 13.0, MMQ_KQUANTS/Q6K_EXPERTS as that build).
 | earlysample | `STRATA_EARLY_SAMPLE=1` | the last stage samples right behind its graph |
 
 Analysis: `../../upstream/ANALYSIS-kernel-efficiency.md`. Window scripts: `../../window-ll.sh`, `../../bisect-ll.sh`.
+
+Build note: production's strata-g3-1441a comes from Strata-1441/build-1441: CUDA 13.0 (/usr/local/cuda-13.0/bin/nvcc), not
+the system nvcc 12.0, and MMQ_KQUANTS=OFF / Q6K_EXPERTS=OFF. A build with nvcc 12.0 changes tokens (first window,
+results/ll/text_ab.txt NO-GO even with every switch off). Compare like with like; the feature-ON build is checked
+separately (window-ll3.sh).
