@@ -1,0 +1,29 @@
+From 759b85d5daaf54d727b8d6323570d1de596ce2b0 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:11:53 +0200
+Subject: [PATCH 3/4] native_router: route_plan_multi's row guard broadcast
+ from lane 0, no divergent shuffle copies (opt-in STRATA_ROUTE_PLAN_FUSE=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/cuda/native_router.cu | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernels/cuda/native_router.cu b/src/kernels/cuda/native_router.cu
+index d94c508f..6ee0b624 100644
+--- a/src/kernels/cuda/native_router.cu
++++ b/src/kernels/cuda/native_router.cu
+@@ -176,7 +176,9 @@ __global__ void route_plan_multi(const float* __restrict__ logits, int32_t* __re
+     const int tk = (int) threadIdx.y;
+     const int tid = tk * 32 + (int) threadIdx.x;
+     if (tid == 0) s_bad = 0;
+-    if (tk < n_tok)
++    // warp-uniform by construction (threadIdx.y is one value per warp); the broadcast lets ptxas see it, so the
++    // router's shuffles need no divergent fallback copies
++    if (__shfl_sync(0xffffffffu, tk < n_tok, 0))
+         route_row<true>(logits + (size_t) tk * 512, ids + (size_t) tk * 10, weights + (size_t) tk * 10,
+                         (int) threadIdx.x, s_ids + tk * 10);
+     __syncthreads();
+-- 
+2.43.0
+

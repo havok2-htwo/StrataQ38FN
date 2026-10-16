@@ -1,0 +1,302 @@
+From 56ab8db248f1e85021edce5e4649ef4923c2138c Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:00:45 +0200
+Subject: [PATCH 2/7] hc read: fast up projection on 320 / 640 blocks, bitwise
+ the same (opt-in STRATA_GR_UP_SPLIT=2|4)
+
+gr_up_fast_kernel (STRATA_GR_FAST) runs 16 columns (64 rows, 2 passes of 32 rows) a block at 128 registers:
+160 blocks, 2 an SM, 16 warps an SM, and its token loop and lo staging have a run-time trip count.
+STRATA_GR_UP_SPLIT=2 / 4 gives a block 8 / 4 columns (one pass of 32 / 16 rows, 256 / 128 threads, at most 64
+registers so all 320 / 640 blocks are resident at once: 32 warps an SM), with an instantiation per token
+count. Each row is still 8 lanes with the same chunks, combination and xor tree, and each column's 4 streams
+sum in one block in the same order, so every output is the same bits. Not with a q8_1 image of `mixed`
+(STRATA_QFUSE, whose counter takes two blocks a group): that read keeps the 16 columns.
+The kernel's body is now a template that gr_up_fast_kernel instantiates at 16 columns: its SASS and all 89
+fused_gr kernels' are identical to g3-1441-ll (cuobjdump; gr_down_v3_kernel<1, 5, true> differs between
+identical compiles of the same source, ptxas, both before and after this change). gr_parity ctest arms:
+up_split2 and up_split4_down_split2 (with the production switches), up_split2_generic (STRATA_NO_MULTI_GR=1);
+fused_gr_bench's SPLIT lines cover the down x up arms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      | 11 ++++
+ include/strata/kernels/fused_gr.hpp |  3 +
+ src/kernels/cuda/fused_gr.cu        | 99 +++++++++++++++++++++++------
+ src/kernels/fused_gr_bench.cpp      | 36 +++++++----
+ 4 files changed, 118 insertions(+), 31 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 45237565..d0d86356 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -980,6 +980,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+                        "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_SPLIT=4;STRATA_GR_DOWN_PF=2;STRATA_GR_FAST=1;STRATA_GR_NORM_FAST=1")
+   add_test(NAME gr_parity_down_split2_pf3 COMMAND gr_parity --selftest)
+   set_tests_properties(gr_parity_down_split2_pf3 PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_SPLIT=2;STRATA_GR_DOWN_PF=3")
++  # the fast up projection on 320 / 640 blocks (STRATA_GR_UP_SPLIT=2 / 4), with the production switches; the
++  # STRATA_QFUSE part of gr_parity checks that a q8_1 read keeps the 16-column kernel
++  add_test(NAME gr_parity_up_split2 COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_up_split2 PROPERTIES ENVIRONMENT
++                       "STRATA_HC_SPLIT=2;STRATA_GR_UP_SPLIT=2;STRATA_GR_FAST=1;STRATA_GR_DOWN_PF=2;STRATA_GR_NORM_FAST=1")
++  add_test(NAME gr_parity_up_split4_down_split2 COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_up_split4_down_split2 PROPERTIES ENVIRONMENT
++                       "STRATA_HC_SPLIT=2;STRATA_GR_UP_SPLIT=4;STRATA_GR_DOWN_SPLIT=2;STRATA_GR_FAST=1;STRATA_GR_DOWN_PF=2;STRATA_GR_NORM_FAST=1")
++  add_test(NAME gr_parity_up_split2_generic COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_up_split2_generic PROPERTIES ENVIRONMENT
++                       "STRATA_HC_SPLIT=2;STRATA_GR_UP_SPLIT=2;STRATA_GR_FAST=1;STRATA_NO_MULTI_GR=1")
+ 
+   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
+   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
+diff --git a/include/strata/kernels/fused_gr.hpp b/include/strata/kernels/fused_gr.hpp
+index 67f4469e..ebd8b95c 100644
+--- a/include/strata/kernels/fused_gr.hpp
++++ b/include/strata/kernels/fused_gr.hpp
+@@ -69,6 +69,9 @@ void fused_gr_set_fast(int on);
+ /// The bench only: the staged down projection on 2 or 4 times the blocks (STRATA_GR_DOWN_SPLIT, bitwise the same);
+ /// 0 or 1 = the 41 blocks, -1 = STRATA_GR_DOWN_SPLIT.
+ void fused_gr_set_down_split(int n);
++/// The bench only: the fast up projection (STRATA_GR_FAST) on 2 or 4 times the blocks (STRATA_GR_UP_SPLIT, bitwise
++/// the same); 0 or 1 = the 160 blocks, -1 = STRATA_GR_UP_SPLIT.
++void fused_gr_set_up_split(int n);
+ /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing
+ /// every output with the plain read's operations in its order, so bitwise the plain read's and the single-token
+ /// read's: plain (0.1.31's default: the norm one block per token, the down projection on 41 blocks), split (the norm
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index d93f8b70..5c47e22c 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -1199,6 +1199,19 @@ int down_chunk(bool staged, int* tile_out) {
+ #if STRATA_GR_FAST_BUILD
+ __global__ void __launch_bounds__(THREADS) gr_norm_fast_kernel(GrMulti m);   // below, with the AMD fast path
+ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m);
++void launch_up_split(const GrMulti& m, int split, bool generic, cudaStream_t st);   // below (STRATA_GR_UP_SPLIT)
++// STRATA_GR_UP_SPLIT=2 / 4 (opt-in): the fast up projection (STRATA_GR_FAST) on 2 / 4 times the blocks (8 / 4 columns
++// a block, gr_up_fast_split_kernel below; the same bits); not with a q8_1 image of `mixed` (STRATA_QFUSE), whose group
++// counter takes two blocks a group.  Anything else = the 16 columns.  fused_gr_set_up_split (the bench) overrides it.
++int g_up_split = -1;
++int gr_up_split() {
++    static const int env = [] {
++        const char* v = std::getenv("STRATA_GR_UP_SPLIT");
++        const int n = v != nullptr ? std::atoi(v) : 1;
++        return n == 2 || n == 4 ? n : 1;
++    }();
++    return g_up_split == 2 || g_up_split == 4 ? g_up_split : (g_up_split >= 0 ? 1 : env);
++}
+ }  // namespace
+ static bool gr_fast();
+ namespace {
+@@ -1311,8 +1324,11 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long
+     }
+     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+ #if STRATA_GR_FAST_BUILD
+-    if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+-    else
++    if (fast) {
++        const int us = gr_up_split();   // STRATA_GR_UP_SPLIT=2|4: 320 / 640 blocks
++        if (us > 1 && m.a[0].q8_mixed == nullptr) launch_up_split(m, us, no_multi_gr, st);
++        else gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
++    } else
+ #endif
+ #if !STRATA_GR_FAST_BUILD
+     if (m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {
+@@ -1427,19 +1443,27 @@ __device__ __forceinline__ float xor8(float v) {
+ #endif
+     return v;
+ }
+-__global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
+-    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
+-    __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
++// The body, for COLS columns a block (x HC streams = rows; UPM_COLS = 16 is the kernel above's 64 rows) and MAX_T /
++// EXACT_T tokens as gr_up_multi_kernel: NT threads = 8 lanes a row, P passes of NT / 8 rows.
++template <int COLS>
++__host__ __device__ constexpr int up_fast_threads() { return HC * COLS * 8 < THREADS ? HC * COLS * 8 : THREADS; }
++template <int COLS, int MAX_T, bool EXACT_T>
++__device__ __forceinline__ void gr_up_fast_body(const GrMulti& m) {
++    constexpr int NT = up_fast_threads<COLS>(), GRPS = NT / 8, P = HC * COLS / GRPS;
++    __shared__ __align__(16) float lo[MAX_T][LR];
++    __shared__ float g[MAX_T][HC][COLS];
+     const int t = threadIdx.x, j = t & 7, grp = t >> 3;
+-    const int T = m.T;
+-    const int d0 = blockIdx.x * UPM_COLS;
+-    static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "geometry");
+-    uint4 w[2][5];
+-    float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
++    const int T = EXACT_T ? MAX_T : m.T;
++    const int d0 = blockIdx.x * COLS;
++    static_assert(LR == 40 * 8 && (HC * COLS) % GRPS == 0 && N % COLS == 0, "geometry");
++    uint4 w[P][5];
++    float rv[P], wn[P], rsc[P], bo[P], ip[P];
++#pragma unroll
++    for (int p = 0; p < P; ++p) rv[p] = wn[p] = rsc[p] = bo[p] = ip[p] = 0.0f;
+     const bool apply = j < T && m.a[j < T ? j : 0].apply;
+ #pragma unroll
+-    for (int p = 0; p < 2; ++p) {
+-        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
++    for (int p = 0; p < P; ++p) {
++        const int r = grp + GRPS * p, c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+         const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+ #pragma unroll
+         for (int q = 0; q < 4; ++q) w[p][q] = __ldg(w4 + j + 8 * q);
+@@ -1452,14 +1476,14 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
+             if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[c]; }
+         }
+     }
+-    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
++    for (int i = t; i < T * LR; i += NT) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+     __syncthreads();
+ #pragma unroll
+-    for (int p = 0; p < 2; ++p) {
+-        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
++    for (int p = 0; p < P; ++p) {
++        const int r = grp + GRPS * p, c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+         float mine = 0.0f;
+ #pragma unroll
+-        for (int k = 0; k < kFusedGrMaxT; ++k) {
++        for (int k = 0; k < MAX_T; ++k) {
+             if (k >= T) break;
+             const float* l = lo[k];
+             const float p0 = dot8(w[p][0], l + j * 8) + dot8(w[p][4], l + (32 + j) * 8);   // old lane j
+@@ -1480,14 +1504,46 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
+         }
+     }
+     __syncthreads();
+-    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+-        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
++    for (int i = t; i < T * COLS; i += NT) {
++        const int k = i / COLS, col = i - k * COLS;
+         float s = 0.0f;
+ #pragma unroll
+         for (int c = 0; c < HC; ++c) s += g[k][c][col];
+         m.a[k].mixed[d0 + col] = s / (float) HC;
+     }
+-    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi_kernel
++    // S26 STRATA_QFUSE, as gr_up_multi_kernel: its counter takes the two 16-column blocks of a q8_1 group, so only
++    // the 16-column kernel writes the image (the launch keeps the narrower ones away from a q8_1 read)
++    if (COLS == UPM_COLS && m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);
++}
++__global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) { gr_up_fast_body<UPM_COLS, kFusedGrMaxT, false>(m); }
++// STRATA_GR_UP_SPLIT=2 / 4 (opt-in, with STRATA_GR_FAST): gr_up_fast_kernel on 2 / 4 times the blocks - 8 / 4 columns a
++// block (320 blocks of 256 threads, one pass of 32 rows / 640 blocks of 128 threads, 16 rows), at most 64 registers
++// so the whole grid is resident at once (4 / 8 blocks an SM on 82 SMs), and an instantiation per token count (the
++// token loop and the lo staging unrolled at compile time).  Each row is still 8 lanes with the same chunks, the same
++// combination and the same xor tree, each column's 4 streams sum in one block in the same order: the same bits.
++template <int COLS, int MAX_T, bool EXACT_T>
++__global__ void __launch_bounds__(up_fast_threads<COLS>(), THREADS * 4 / up_fast_threads<COLS>()) gr_up_fast_split_kernel(GrMulti m) {
++    gr_up_fast_body<COLS, MAX_T, EXACT_T>(m);
++}
++template <int COLS>
++void launch_up_split_cols(const GrMulti& m, bool generic, cudaStream_t st) {
++    constexpr int G = N / COLS, NT = up_fast_threads<COLS>();
++    switch (generic ? 0 : m.T) {
++        case 1: gr_up_fast_split_kernel<COLS, 1, true><<<G, NT, 0, st>>>(m); break;
++        case 2: gr_up_fast_split_kernel<COLS, 2, true><<<G, NT, 0, st>>>(m); break;
++        case 3: gr_up_fast_split_kernel<COLS, 3, true><<<G, NT, 0, st>>>(m); break;
++        case 4: gr_up_fast_split_kernel<COLS, 4, true><<<G, NT, 0, st>>>(m); break;
++        case 5: gr_up_fast_split_kernel<COLS, 5, true><<<G, NT, 0, st>>>(m); break;
++        case 6: gr_up_fast_split_kernel<COLS, 6, true><<<G, NT, 0, st>>>(m); break;
++        case 7: gr_up_fast_split_kernel<COLS, 7, true><<<G, NT, 0, st>>>(m); break;
++        case 8: gr_up_fast_split_kernel<COLS, 8, true><<<G, NT, 0, st>>>(m); break;
++        default: gr_up_fast_split_kernel<COLS, kFusedGrMaxT, false><<<G, NT, 0, st>>>(m); break;
++    }
++}
++// generic: STRATA_NO_MULTI_GR=1 (the token count read at run time, as the default kernels then)
++void launch_up_split(const GrMulti& m, int split, bool generic, cudaStream_t st) {
++    if (split == 4) launch_up_split_cols<UPM_COLS / 4>(m, generic, st);
++    else launch_up_split_cols<UPM_COLS / 2>(m, generic, st);
+ }
+ #endif
+ 
+@@ -2171,6 +2227,11 @@ int g_gr_fast = -1;
+ #endif
+ void fused_gr_set_fast(int on) { g_gr_fast = on; }
+ void fused_gr_set_down_split(int n) { g_down_split = n; }
++#if STRATA_GR_FAST_BUILD
++void fused_gr_set_up_split(int n) { g_up_split = n; }
++#else
++void fused_gr_set_up_split(int) {}
++#endif
+ 
+ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
+                          int stamp_i0) {
+diff --git a/src/kernels/fused_gr_bench.cpp b/src/kernels/fused_gr_bench.cpp
+index 6004e30c..24258df9 100644
+--- a/src/kernels/fused_gr_bench.cpp
++++ b/src/kernels/fused_gr_bench.cpp
+@@ -7,7 +7,8 @@
+ // The read is the plain one unless STRATA_HC_SPLIT=1 / 2 names split / staged; the staged read's opt-in switches
+ // (STRATA_GR_NORM_FAST, STRATA_GR_DOWN_PF) are read once, so compare a switch by the printed hashes of two runs.
+ // The cold run ends with the SPLIT lines: the staged down projection on 41 / 81 / 162 blocks (STRATA_GR_DOWN_SPLIT)
+-// in this one process, each against the 41 blocks bit for bit, with its time (needs STRATA_HC_SPLIT=2).
++// and the fast up projection on 160 / 320 / 640 blocks (STRATA_GR_UP_SPLIT) in this one process, each arm against
++// 41 + 160 blocks bit for bit, with its time (the down split needs STRATA_HC_SPLIT=2).
+ #include "strata/kernels/fused_gr.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ 
+@@ -271,10 +272,12 @@ int main(int argc, char** argv) {
+                         cold_sets, f, T, 1e3 * ms / iters, med(n_), med(d_), med(u_));
+         }
+         // SPLIT: the staged down projection on 41 / 81 / 162 blocks (fused_gr_set_down_split 0 / 2 / 4, the bitwise-equal
+-        // STRATA_GR_DOWN_SPLIT), each arm's outputs against the 41-block arm's bit for bit, then its cold time.  The rest
+-        // of the read is what the environment says (STRATA_HC_SPLIT, STRATA_GR_FAST, STRATA_GR_DOWN_PF, ...).
+-        K::fused_gr_set_fast(-1);
+-        const int arms[3] = {0, 2, 4};
++        // STRATA_GR_DOWN_SPLIT) and the fast up projection on 160 / 320 / 640 blocks (fused_gr_set_up_split, the
++        // bitwise-equal STRATA_GR_UP_SPLIT), each arm's outputs against the first arm's bit for bit, then its cold
++        // time.  The fast norm/up (STRATA_GR_FAST=1, as production); the rest of the read is what the environment says
++        // (STRATA_HC_SPLIT, STRATA_GR_DOWN_PF, STRATA_GR_NORM_FAST, ...).
++        K::fused_gr_set_fast(1);
++        const int arms[9][2] = {{0, 0}, {2, 0}, {4, 0}, {0, 2}, {0, 4}, {2, 2}, {2, 4}, {4, 2}, {4, 4}};
+         for (int T = t_lo; T <= t_hi; ++T) {
+             for (int c = 0; c < cold_sets; ++c)
+                 for (int t = 0; t < T; ++t) {
+@@ -282,8 +285,10 @@ int main(int argc, char** argv) {
+                     a.q8_down = nullptr; a.q8_up = nullptr;
+                 }
+             std::vector<float> ref;
+-            for (int arm : arms) {
+-                K::fused_gr_set_down_split(arm);
++            for (const auto& ar : arms) {
++                K::fused_gr_set_down_split(ar[0]);
++                K::fused_gr_set_up_split(ar[1]);
++                const bool first = &ar == &arms[0];
+                 // bitwise: every set once from the same R, every output (R in place, lo, rs, inject, mixed) hashed in order
+                 std::vector<float> got;
+                 for (int c = 0; c < cold_sets; ++c) {
+@@ -304,7 +309,7 @@ int main(int argc, char** argv) {
+                     cudaMemcpy(p, dmix, (size_t) T * N * 4, cudaMemcpyDeviceToHost);
+                 }
+                 const bool err = cudaGetLastError() != cudaSuccess;
+-                if (arm == 0) ref = got;
++                if (first) ref = got;
+                 const bool same = !err && got.size() == ref.size() && std::memcmp(got.data(), ref.data(), got.size() * 4) == 0;
+                 if (!same) ++failures;
+                 for (int rep = 0; rep < 2; ++rep) {
+@@ -326,14 +331,21 @@ int main(int argc, char** argv) {
+                     cudaEventElapsedTime(&ms, e0, e1);
+                     best = std::fmin(best, 1e3 * ms / iters);
+                 }
+-                std::vector<double> d_;
+-                for (int i = 1; i < iters; ++i) d_.push_back((double) (hst[(size_t) i * 4 + 2] - hst[(size_t) i * 4 + 1]));
++                std::vector<double> d_, u_;
++                for (int i = 1; i < iters; ++i) {
++                    d_.push_back((double) (hst[(size_t) i * 4 + 2] - hst[(size_t) i * 4 + 1]));
++                    u_.push_back((double) (hst[(size_t) i * 4 + 3] - hst[(size_t) i * 4 + 2]));
++                }
+                 std::sort(d_.begin(), d_.end());
+-                std::printf("SPLIT down %d T %d | read %6.1f us (events, best of 3) | down stamp median %5.1f us | %s\n", arm, T,
+-                            best, d_[d_.size() / 2] / 1e3, err ? "CUDA ERROR" : (same ? "bitwise equal to down 0" : "DIFFERS from down 0"));
++                std::sort(u_.begin(), u_.end());
++                std::printf("SPLIT down %d up %d T %d | read %6.1f us (events, best of 3) | stamps median: down %5.1f up %5.1f us | %s\n",
++                            ar[0], ar[1], T, best, d_[d_.size() / 2] / 1e3, u_[u_.size() / 2] / 1e3,
++                            err ? "CUDA ERROR" : (same ? "bitwise equal to down 0 up 0" : "DIFFERS from down 0 up 0"));
+             }
+             K::fused_gr_set_down_split(-1);
++            K::fused_gr_set_up_split(-1);
+         }
++        K::fused_gr_set_fast(-1);
+     }
+     std::printf("fused_gr_bench: %d differing\n", failures);
+     return failures ? 1 : 0;
+-- 
+2.43.0
+

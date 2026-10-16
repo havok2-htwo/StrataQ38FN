@@ -1,0 +1,47 @@
+From adc906cfff98b87cb1dfe1cf184085299034f8a6 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:13:53 +0200
+Subject: [PATCH 7/7] fused_gr_bench: SPLIT section names the read variant,
+ skips down arms that would not split, drops the q8_1 image (opt-in
+ STRATA_GR_DOWN_SPLIT / STRATA_GR_UP_SPLIT)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/fused_gr_bench.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernels/fused_gr_bench.cpp b/src/kernels/fused_gr_bench.cpp
+index 24258df9..c9808a05 100644
+--- a/src/kernels/fused_gr_bench.cpp
++++ b/src/kernels/fused_gr_bench.cpp
+@@ -276,16 +276,26 @@ int main(int argc, char** argv) {
+         // bitwise-equal STRATA_GR_UP_SPLIT), each arm's outputs against the first arm's bit for bit, then its cold
+         // time.  The fast norm/up (STRATA_GR_FAST=1, as production); the rest of the read is what the environment says
+         // (STRATA_HC_SPLIT, STRATA_GR_DOWN_PF, STRATA_GR_NORM_FAST, ...).
++        // The down split runs only in the staged read of exact token counts (fused_gr_variant 3, no STRATA_NO_MULTI_GR):
++        // otherwise its arms would time the 41-block kernel again, so they are skipped.  No q8_1 image of mixed here
++        // (STRATA_BENCH_QMIXED would keep every up arm on the 16 columns).
+         K::fused_gr_set_fast(1);
++        const int variant = K::fused_gr_variant();
++        const char* nmg = std::getenv("STRATA_NO_MULTI_GR");
++        const bool down_runs = variant == 3 && !(nmg != nullptr && nmg[0] != '\0' && nmg[0] != '0');
++        std::printf("SPLIT: read variant %d (%s), down split arms %s, up split arms on the fast up projection, no q8_1 image\n",
++                    variant, variant == 3 ? "staged" : (variant == 2 ? "split" : "plain"),
++                    down_runs ? "run" : "skipped (needs STRATA_HC_SPLIT=2 and the exact-token launches)");
+         const int arms[9][2] = {{0, 0}, {2, 0}, {4, 0}, {0, 2}, {0, 4}, {2, 2}, {2, 4}, {4, 2}, {4, 4}};
+         for (int T = t_lo; T <= t_hi; ++T) {
+             for (int c = 0; c < cold_sets; ++c)
+                 for (int t = 0; t < T; ++t) {
+                     K::FusedGrArgs& a = as[(size_t) c * 8 + t];
+-                    a.q8_down = nullptr; a.q8_up = nullptr;
++                    a.q8_down = nullptr; a.q8_up = nullptr; a.q8_mixed = nullptr; a.q8_cnt = nullptr;
+                 }
+             std::vector<float> ref;
+             for (const auto& ar : arms) {
++                if (ar[0] != 0 && !down_runs) continue;
+                 K::fused_gr_set_down_split(ar[0]);
+                 K::fused_gr_set_up_split(ar[1]);
+                 const bool first = &ar == &arms[0];
+-- 
+2.43.0
+

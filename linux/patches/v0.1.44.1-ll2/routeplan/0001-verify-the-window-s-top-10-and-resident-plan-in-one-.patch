@@ -1,0 +1,439 @@
+From 8f2cd20b5d328640b79b7c341f799e09efc03a6c Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 13:58:23 +0200
+Subject: [PATCH 1/4] verify: the window's top-10 and resident plan in one
+ launch (opt-in STRATA_ROUTE_PLAN_FUSE=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                           |   5 +
+ include/strata/kernels/native_router.hpp |   6 +
+ src/core/verify.cpp                      |  26 +++-
+ src/kernels/cuda/native_router.cu        | 143 ++++++++++++++++++++--
+ src/kernels/route_plan_fuse_parity.cpp   | 144 +++++++++++++++++++++++
+ 5 files changed, 313 insertions(+), 11 deletions(-)
+ create mode 100644 src/kernels/route_plan_fuse_parity.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 842565fc..a2ce2e74 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1051,6 +1051,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_include_directories(resident_plan_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(resident_plan_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME resident_plan_parity COMMAND resident_plan_parity)
++  # STRATA_ROUTE_PLAN_FUSE: the top-10 + resident plan in one launch against the two separate calls, memcmp
++  add_executable(route_plan_fuse_parity src/kernels/route_plan_fuse_parity.cpp)
++  target_include_directories(route_plan_fuse_parity PRIVATE ${_strata_gpu_include_directories})
++  target_link_libraries(route_plan_fuse_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
++  add_test(NAME route_plan_fuse_parity COMMAND route_plan_fuse_parity)
+   # #783 PR-g: the multi-token hyper-connection read/write (exact-T projections under them) against the single-token calls
+   add_executable(gr_multi_parity src/kernels/gr_multi_parity.cpp)
+   target_include_directories(gr_multi_parity PRIVATE ${_strata_gpu_include_directories})
+diff --git a/include/strata/kernels/native_router.hpp b/include/strata/kernels/native_router.hpp
+index a940e1b3..c5ba180b 100644
+--- a/include/strata/kernels/native_router.hpp
++++ b/include/strata/kernels/native_router.hpp
+@@ -16,6 +16,12 @@ bool native_router_enabled();
+ void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
+ /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
+ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
++/// STRATA_ROUTE_PLAN_FUSE: native_router_top10_multi and resident_plan (verify_kernels.hpp, same plan arguments with
++/// n_entries = n_tok * 10, k = 10) in one launch; n_tok 1..8.  Every output bitwise the two separate calls.
++void native_router_top10_plan_multi(const float* logits, int32_t* ids, float* weights, int n_tok, const int32_t* res_layer,
++                                    int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
++                                    long long blob, int32_t* plan, long long capx, uint32_t* skip, uint32_t ring,
++                                    uint32_t* plan_err, void* stream);
+ /// The same contract for a model family's (experts, top-k): 512 / 10 (Flash-Next: the two calls above, unchanged) and
+ /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
+ bool native_router_topk_supported(int n_expert, int k);
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index cf3a2a58..4b7473c3 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -1559,6 +1559,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
+         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+         bool sg_ready = false;
++        // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
++        // resident experts; the weights stay the router's (route_prior.cu)
++        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
++        // STRATA_ROUTE_PLAN_FUSE=1 (opt-in, exact): the top-10 and the device plan below in one launch
++        // (native_router_top10_plan_multi) when nothing rewrites ids_ between them; every output bitwise the two calls
++        static const bool route_plan_fuse = [] { const char* e = std::getenv("STRATA_ROUTE_PLAN_FUSE"); return e && e[0] == '1'; }();
++        const bool rp_fuse = route_plan_fuse && n <= 8 && hits_.d_res != nullptr && (ar_on() || device_plan_) &&
++                             route_prior <= 0.0f && route_resident_cfg().margin <= 0.0f;
++        bool plan_done = false;   // the plan below was built by the router's launch
+         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+             try {
+                 if (w_sgi != nullptr)
+@@ -1568,6 +1577,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 if (!sg_ready)
+                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
+                                           NE, n, cs);
++                if (rp_fuse) {
++                    const bool ar = ar_on();
++                    native_router_top10_plan_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, (int) n,
++                                                   hits_.d_res + l * g.n_expert, (int) g.n_expert, hits_.cache_base,
++                                                   slot_off_d_, (long long) hits_.blob,
++                                                   plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K,
++                                                   ar ? nullptr : skip_ + grp,
++                                                   ar ? 0u : (uint32_t) ((l - lb_) * G + grp + 1),
++                                                   ar ? m_plan_err_ : nullptr, cs);
++                    plan_done = true;
++                } else
+                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+ #if defined(STRATA_HIP_GFX906)
+@@ -1585,9 +1605,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
+             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+         }
+-        // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
+-        // resident experts; the weights stay the router's (route_prior.cu)
+-        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
+         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
+             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+@@ -1599,11 +1616,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+         }
+         if (ar_on()) {
++            if (!plan_done)
+             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
+         } else {
+-            if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
++            if (device_plan_ && !plan_done)   // E-6: every routed expert resident: this group's plan without the host
+                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
+diff --git a/src/kernels/cuda/native_router.cu b/src/kernels/cuda/native_router.cu
+index 6611bceb..d94c508f 100644
+--- a/src/kernels/cuda/native_router.cu
++++ b/src/kernels/cuda/native_router.cu
+@@ -96,13 +96,11 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
+     const float inverse_selected_sum = 1.0f / selected_sum;
+     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+ }
+-__launch_bounds__(256, 1)
+-__global__ void route_multi(const float* __restrict__ logits, int32_t* __restrict__ ids,
+-                            float* __restrict__ weights, int n_tok) {
+-    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
+-    if (tk >= n_tok) return;
+-    logits += (size_t) tk * 512; ids += (size_t) tk * 10; weights += (size_t) tk * 10;
+-    const int lane = threadIdx.x;
++// One token's top-10 by one warp (route_multi's body; STRATA_ROUTE_PLAN_FUSE runs the same code).  With S_IDS the
++// picked ids are also stored in the block's shared copy at s_ids[rank].
++template <bool S_IDS>
++__device__ __forceinline__ void route_row(const float* __restrict__ logits, int32_t* __restrict__ ids,
++                                          float* __restrict__ weights, int lane, int32_t* s_ids) {
+     float values[16];
+ #pragma unroll
+     for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+@@ -140,6 +138,7 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
+         if ((expert & 31) == lane) {
+             values[expert / 32] = -INFINITY;
+             ids[rank] = expert;
++            if (S_IDS) s_ids[rank] = expert;
+             selected_sum += best;
+         }
+         if (rank == lane) selected = best;
+@@ -148,6 +147,124 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
+     const float inverse_selected_sum = 1.0f / selected_sum;
+     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+ }
++__launch_bounds__(256, 1)
++__global__ void route_multi(const float* __restrict__ logits, int32_t* __restrict__ ids,
++                            float* __restrict__ weights, int n_tok) {
++    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
++    if (tk >= n_tok) return;
++    route_row<false>(logits + (size_t) tk * 512, ids + (size_t) tk * 10, weights + (size_t) tk * 10, (int) threadIdx.x,
++                     nullptr);
++}
++// STRATA_ROUTE_PLAN_FUSE=1: the window's top-10 (route_multi) and its resident expert plan (resident_plan_kernel in
++// verify_kernels.cu) in ONE launch of one 32x8 block, n_tok <= 8 rows.  Warp y routes row y with route_row (this
++// file's flags, the router's bits) and keeps the ids in shared memory; after a barrier the 256 threads build the plan
++// exactly as resident_plan_kernel does with its 128 (entry i = thread i, n_tok * 10 <= 80 entries; the threads past
++// 128 only join the barriers).  The plan is integer-only (ids, slots, offsets, prefix counts), so --use_fast_math
++// does not reach it.  No early return before a barrier: a row past n_tok skips the routing, a bad expert returns
++// the whole block after the last barrier it shares.  Contract and outputs: see resident_plan (verify_kernels.hpp).
++constexpr int kRoutePlanThreads = 256;
++__launch_bounds__(kRoutePlanThreads, 1)
++__global__ void route_plan_multi(const float* __restrict__ logits, int32_t* __restrict__ ids,
++                                 float* __restrict__ weights, int n_tok, const int32_t* __restrict__ res, int n_expert,
++                                 const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
++                                 int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring,
++                                 volatile uint32_t* plan_err) {
++    __shared__ int32_t s_ids[kRoutePlanThreads];
++    __shared__ int32_t s_excl[kRoutePlanThreads];
++    __shared__ int32_t s_wsum[kRoutePlanThreads / 32];
++    __shared__ int s_bad;
++    const int tk = (int) threadIdx.y;
++    const int tid = tk * 32 + (int) threadIdx.x;
++    if (tid == 0) s_bad = 0;
++    if (tk < n_tok)
++        route_row<true>(logits + (size_t) tk * 512, ids + (size_t) tk * 10, weights + (size_t) tk * 10,
++                        (int) threadIdx.x, s_ids + tk * 10);
++    __syncthreads();
++
++    const int n = n_tok * 10, k = 10;
++    int32_t eid = -1;
++    int32_t slot = -1;
++    if (tid < n) {
++        eid = s_ids[tid];
++        slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
++        if (slot < 0) atomicOr(&s_bad, 1);
++    }
++    __syncthreads();
++    if (s_bad) {
++        if (tid == 0 && skip != nullptr) *skip = 0;
++        if (tid == 0 && skip == nullptr) {   // #871: the all-resident graph has no host plan to fall back on
++            pl[0] = 0; pl[1] = 0; pl[2] = 0;
++            if (plan_err != nullptr) { *plan_err = 1; __threadfence_system(); }
++        }
++        return;   // s_bad is block-uniform here: every thread leaves, no barrier follows for anyone
++    }
++
++    int first_j = tid;
++    int rank_in_group = 0;
++    int count_same = 0;
++    if (tid < n) {
++        for (int j = 0; j < n; ++j) {
++            if (s_ids[j] == eid) {
++                if (j < first_j) first_j = j;
++                if (j < tid) ++rank_in_group;
++                ++count_same;
++            }
++        }
++    }
++    const bool is_first = (tid < n && first_j == tid && slot >= 0);
++    const int my_cnt = is_first ? count_same : 0;
++    const int my_pack = (my_cnt << 16) | (is_first ? 1 : 0);
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    int pref = my_pack;
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++        const int up = __shfl_up_sync(0xffffffffu, pref, d);
++        if (lane >= d) pref += up;
++    }
++    s_excl[tid] = pref - my_pack;
++    if (lane == 31) s_wsum[warp] = pref;
++    __syncthreads();
++
++    int32_t* counts = pl;
++    int32_t* start = pl + 4;
++    int32_t* dst = start + capx + 1;
++    int32_t* tok = dst + capx;
++    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
++    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
++    int32_t* start2 = pl + ptr_off + 4 * capx;
++
++    if (is_first) {
++        int tot = s_excl[tid];
++        for (int w = 0; w < warp; ++w) tot += s_wsum[w];
++        const int grp_idx = tot & 0xffff;
++        const int ent_start = tot >> 16;
++        ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
++        start[grp_idx] = ent_start;
++    }
++    if (tid < n) {
++        const int fj_warp = first_j >> 5;
++        int fj_tot = s_excl[first_j];
++        for (int w = 0; w < fj_warp; ++w) fj_tot += s_wsum[w];
++        const int out_idx = (fj_tot >> 16) + rank_in_group;
++        dst[out_idx] = tid;
++        tok[out_idx] = tid / k;
++    }
++    if (tid == 0) {
++        int all = 0;
++        for (int w = 0; w < kRoutePlanThreads / 32; ++w) all += s_wsum[w];
++        const int groups = all & 0xffff;
++        start[groups] = n;
++        start2[0] = n;
++        counts[0] = groups;
++        counts[1] = n;
++        counts[2] = 0;
++        if (skip != nullptr) {
++            __threadfence();
++            *skip = ring;
++        }
++    }
++}
+ // The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
+ // (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used
+ // for the other shapes.
+@@ -233,6 +350,18 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+ }
++void native_router_top10_plan_multi(const float* logits, int32_t* ids, float* weights, int n_tok, const int32_t* res_layer,
++                                    int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
++                                    long long blob, int32_t* plan, long long capx, uint32_t* skip, uint32_t ring,
++                                    uint32_t* plan_err, void* stream) {
++    if (!stream || n_tok < 1 || n_tok > 8 || capx < (long long) n_tok * 10 || !valid(logits, (size_t) n_tok * 512 * 4) ||
++        !valid(ids, (size_t) n_tok * 10 * 4) || !valid(weights, (size_t) n_tok * 10 * 4) || !res_layer || !plan)
++        throw std::invalid_argument("native router + plan requires a stream, 1..8 rows, aligned buffers and a plan");
++    route_plan_multi<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
++        logits, ids, weights, n_tok, res_layer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring, plan_err);
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++}
+ bool native_router_topk_supported(int n_expert, int k) { return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8); }
+ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {
+     if (n_expert == 512 && k == 10) {   // Flash-Next: the pinned kernels above, unchanged
+diff --git a/src/kernels/route_plan_fuse_parity.cpp b/src/kernels/route_plan_fuse_parity.cpp
+new file mode 100644
+index 00000000..89155fc4
+--- /dev/null
++++ b/src/kernels/route_plan_fuse_parity.cpp
+@@ -0,0 +1,144 @@
++// src/kernels/route_plan_fuse_parity.cpp - STRATA_ROUTE_PLAN_FUSE: native_router_top10_plan_multi (the window's
++// top-10 and its resident expert plan in one launch) against the two separate calls it replaces,
++// native_router_top10_multi + resident_plan.
++//
++// rows 1..8, random router logits: independent per row, rows sharing one base vector plus small noise (many experts
++// picked by several rows: the plan's groups), and rows with exact ties (the lower expert wins).  Each case runs with
++// and without a slot table (`slot_off`) and in both plan modes: with a `skip` word (ring when the plan was built) and
++// without one (the all-resident graph's *plan_err).  A resident table with holes covers the "expert not resident"
++// branch (skip zeroed / empty plan + plan_err).  ids, weights, every plan word, skip and plan_err are compared with
++// memcmp.  GPU, synthetic, no model.
++#include "strata/kernels/native_router.hpp"
++#include "strata/kernels/verify_kernels.hpp"
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++namespace k = strata::kernels;
++
++namespace {
++void ck(cudaError_t e, const char* w) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e));
++        std::exit(2);
++    }
++}
++}  // namespace
++
++int main() {
++    const int K = 10, NE = 512, MAXT = 8;
++    const long long capx = (long long) k::kVerifyMaxT * K;
++    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
++    const size_t plan_words = (size_t) (ptr_off + 4 * capx + capx + 16);
++    const long long blob = 1337;
++    uint8_t* const cache_base = reinterpret_cast<uint8_t*>(uintptr_t(0x40000000));   // never dereferenced
++    std::mt19937 rng(1556);
++
++    float *d_logits, *d_w[2];
++    int32_t *d_ids[2], *d_plan[2], *d_res;
++    uint32_t *d_skip[2], *d_err[2];
++    unsigned long long* d_off;
++    ck(cudaMalloc(&d_logits, (size_t) MAXT * NE * 4), "logits");
++    for (int v = 0; v < 2; ++v) {
++        ck(cudaMalloc(&d_w[v], MAXT * K * 4), "w");
++        ck(cudaMalloc(&d_ids[v], MAXT * K * 4), "ids");
++        ck(cudaMalloc(&d_plan[v], plan_words * 4), "plan");
++        ck(cudaMalloc(&d_skip[v], 4), "skip");
++        ck(cudaMalloc(&d_err[v], 4), "err");
++    }
++    ck(cudaMalloc(&d_res, NE * 4), "res");
++    ck(cudaMalloc(&d_off, 1024 * 8), "off");
++    std::vector<unsigned long long> off(1024);
++    for (int s = 0; s < 1024; ++s) off[s] = (unsigned long long) s * 4096 + (s % 7) * 64;
++    ck(cudaMemcpy(d_off, off.data(), 1024 * 8, cudaMemcpyHostToDevice), "off");
++    std::vector<int32_t> res_full(NE), res_holes(NE);
++    for (int e = 0; e < NE; ++e) res_full[e] = (e * 37 + 11) % 1000;   // distinct slots, not the identity
++    cudaStream_t st;
++    ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
++
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++    int cases = 0, bad = 0, bad_paths = 0;
++    for (int rep = 0; rep < 24; ++rep) {
++        for (int n_tok = 1; n_tok <= MAXT; ++n_tok) {
++            const int kind = rep % 4;   // 0 independent, 1 shared base + noise, 2 ties, 3 wide scale
++            std::vector<float> logits((size_t) n_tok * NE), base(NE);
++            for (int e = 0; e < NE; ++e) base[e] = nd(rng) * 3.0f;
++            for (int t = 0; t < n_tok; ++t)
++                for (int e = 0; e < NE; ++e) {
++                    float x;
++                    if (kind == 0) x = nd(rng) * 2.0f;
++                    else if (kind == 1) x = base[e] + nd(rng) * 0.05f;
++                    else if (kind == 2) x = (float) ((int) (rng() % 6)) * 0.5f;   // many equal probabilities
++                    else x = nd(rng) * 40.0f;
++                    logits[(size_t) t * NE + e] = x;
++                }
++            ck(cudaMemcpy(d_logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice), "logits");
++            for (int holes = 0; holes < 2; ++holes) {
++                // with holes: about a third of the experts not resident (most windows then hit one)
++                for (int e = 0; e < NE; ++e) res_holes[e] = (holes && rng() % 3 == 0) ? -1 : res_full[e];
++                ck(cudaMemcpy(d_res, res_holes.data(), NE * 4, cudaMemcpyHostToDevice), "res");
++                for (int use_off = 0; use_off < 2; ++use_off) {
++                    for (int mode = 0; mode < 2; ++mode) {   // 0: skip word + ring, 1: all-resident (plan_err)
++                        for (int v = 0; v < 2; ++v) {
++                            ck(cudaMemsetAsync(d_plan[v], 0xAB, plan_words * 4, st), "fill");
++                            ck(cudaMemsetAsync(d_ids[v], 0xCD, MAXT * K * 4, st), "fill ids");
++                            ck(cudaMemsetAsync(d_w[v], 0xCD, MAXT * K * 4, st), "fill w");
++                            ck(cudaMemsetAsync(d_skip[v], 0x5A, 4, st), "skip");
++                            ck(cudaMemsetAsync(d_err[v], 0, 4, st), "err");
++                        }
++                        uint32_t* sk0 = mode == 0 ? d_skip[0] : nullptr;
++                        uint32_t* sk1 = mode == 0 ? d_skip[1] : nullptr;
++                        const uint32_t ring = mode == 0 ? 7u + (uint32_t) n_tok : 0u;
++                        const unsigned long long* so = use_off ? d_off : nullptr;
++                        k::native_router_top10_multi(d_logits, d_ids[0], d_w[0], n_tok, st);
++                        k::resident_plan(d_ids[0], n_tok * K, K, d_res, NE, cache_base, so, blob, d_plan[0], capx, sk0,
++                                         ring, st, mode == 1 ? d_err[0] : nullptr);
++                        k::native_router_top10_plan_multi(d_logits, d_ids[1], d_w[1], n_tok, d_res, NE, cache_base, so,
++                                                          blob, d_plan[1], capx, sk1, ring,
++                                                          mode == 1 ? d_err[1] : nullptr, st);
++                        ck(cudaStreamSynchronize(st), "sync");
++                        std::vector<int32_t> plan[2], ids[2];
++                        std::vector<float> w[2];
++                        uint32_t skip[2], perr[2];
++                        for (int v = 0; v < 2; ++v) {
++                            plan[v].resize(plan_words);
++                            ids[v].resize(MAXT * K);
++                            w[v].resize(MAXT * K);
++                            ck(cudaMemcpy(plan[v].data(), d_plan[v], plan_words * 4, cudaMemcpyDeviceToHost), "plan");
++                            ck(cudaMemcpy(ids[v].data(), d_ids[v], MAXT * K * 4, cudaMemcpyDeviceToHost), "ids");
++                            ck(cudaMemcpy(w[v].data(), d_w[v], MAXT * K * 4, cudaMemcpyDeviceToHost), "w");
++                            ck(cudaMemcpy(&skip[v], d_skip[v], 4, cudaMemcpyDeviceToHost), "skip");
++                            ck(cudaMemcpy(&perr[v], d_err[v], 4, cudaMemcpyDeviceToHost), "err");
++                        }
++                        const bool same_ids = std::memcmp(ids[0].data(), ids[1].data(), ids[0].size() * 4) == 0;
++                        const bool same_w = std::memcmp(w[0].data(), w[1].data(), w[0].size() * 4) == 0;
++                        const bool same_plan = std::memcmp(plan[0].data(), plan[1].data(), plan_words * 4) == 0;
++                        const bool same_flags = skip[0] == skip[1] && perr[0] == perr[1];
++                        // both paths seen: a built plan (skip == ring / counts[1] == entries) and a refused one
++                        const bool built = mode == 0 ? skip[0] == ring : perr[0] == 0;
++                        if (holes == 0 && !built) ++bad_paths;   // every expert resident: the plan must be built
++                        ++cases;
++                        if (!(same_ids && same_w && same_plan && same_flags)) {
++                            std::printf("    *** rows=%d kind=%d holes=%d %s %s: ids %s weights %s plan %s skip %u/%u "
++                                        "plan_err %u/%u ***\n",
++                                        n_tok, kind, holes, use_off ? "slot_off" : "blob", mode ? "all_resident" : "skip",
++                                        same_ids ? "=" : "DIFFER", same_w ? "=" : "DIFFER", same_plan ? "=" : "DIFFER",
++                                        skip[0], skip[1], perr[0], perr[1]);
++                            ++bad;
++                        }
++                    }
++                }
++            }
++        }
++    }
++    std::printf("route_plan_fuse: %d cases, %d failures, %d all-resident cases without a plan\n", cases, bad, bad_paths);
++    if (bad || bad_paths) return 1;
++    std::printf("route_plan_fuse_parity OK\n");
++    return 0;
++}
+-- 
+2.43.0
+

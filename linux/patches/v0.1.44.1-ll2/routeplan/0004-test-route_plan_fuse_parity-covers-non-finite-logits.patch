@@ -1,0 +1,119 @@
+From 88951bd27390495416e49fbf860c0eedc5cf5660 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:11:53 +0200
+Subject: [PATCH 4/4] test: route_plan_fuse_parity covers non-finite logits and
+ a partially resident table with a fully resident window (opt-in
+ STRATA_ROUTE_PLAN_FUSE=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/route_plan_fuse_parity.cpp | 51 ++++++++++++++++++++------
+ 1 file changed, 39 insertions(+), 12 deletions(-)
+
+diff --git a/src/kernels/route_plan_fuse_parity.cpp b/src/kernels/route_plan_fuse_parity.cpp
+index 89155fc4..1dcb98a1 100644
+--- a/src/kernels/route_plan_fuse_parity.cpp
++++ b/src/kernels/route_plan_fuse_parity.cpp
+@@ -5,18 +5,23 @@
+ // rows 1..8, random router logits: independent per row, rows sharing one base vector plus small noise (many experts
+ // picked by several rows: the plan's groups), and rows with exact ties (the lower expert wins).  Each case runs with
+ // and without a slot table (`slot_off`) and in both plan modes: with a `skip` word (ring when the plan was built) and
+-// without one (the all-resident graph's *plan_err).  A resident table with holes covers the "expert not resident"
+-// branch (skip zeroed / empty plan + plan_err).  ids, weights, every plan word, skip and plan_err are compared with
++// without one (the all-resident graph's *plan_err).  Rows with a few +Inf / NaN / -Inf logits cover the router's
++// NaN sanitising (-> -FLT_MAX, the tie-break then decides).  A resident table with random holes covers the "expert
++// not resident" branch (skip zeroed / empty plan + plan_err); one whose holes are only experts no row can pick (below
++// every row's 20th largest logit) covers a partially resident table whose window is fully resident (plan built).  ids, weights, every plan word, skip and plan_err are compared with
+ // memcmp.  GPU, synthetic, no model.
+ #include "strata/kernels/native_router.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ 
+ #include <cuda_runtime.h>
+ 
++#include <algorithm>
++#include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <functional>
+ #include <random>
+ #include <vector>
+ 
+@@ -63,10 +68,10 @@ int main() {
+     ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
+ 
+     std::normal_distribution<float> nd(0.0f, 1.0f);
+-    int cases = 0, bad = 0, bad_paths = 0;
+-    for (int rep = 0; rep < 24; ++rep) {
++    int cases = 0, bad = 0, bad_paths = 0, built_partial = 0;
++    for (int rep = 0; rep < 30; ++rep) {
+         for (int n_tok = 1; n_tok <= MAXT; ++n_tok) {
+-            const int kind = rep % 4;   // 0 independent, 1 shared base + noise, 2 ties, 3 wide scale
++            const int kind = rep % 5;   // 0 independent, 1 shared base + noise, 2 ties, 3 wide scale, 4 non-finite
+             std::vector<float> logits((size_t) n_tok * NE), base(NE);
+             for (int e = 0; e < NE; ++e) base[e] = nd(rng) * 3.0f;
+             for (int t = 0; t < n_tok; ++t)
+@@ -75,13 +80,31 @@ int main() {
+                     if (kind == 0) x = nd(rng) * 2.0f;
+                     else if (kind == 1) x = base[e] + nd(rng) * 0.05f;
+                     else if (kind == 2) x = (float) ((int) (rng() % 6)) * 0.5f;   // many equal probabilities
+-                    else x = nd(rng) * 40.0f;
++                    else if (kind == 3) x = nd(rng) * 40.0f;
++                    else {
++                        const unsigned r = rng() % 64;
++                        x = r == 0 ? INFINITY : r == 1 ? NAN : r == 2 ? -INFINITY : nd(rng) * 2.0f;
++                    }
+                     logits[(size_t) t * NE + e] = x;
+                 }
++            // experts below every row's 20th largest logit: never among a row's top-10 (softmax keeps the order)
++            std::vector<bool> unpickable(NE, kind != 4);   // NaN has no order: no holes==2 for kind 4
++            for (int t = 0; t < n_tok && kind != 4; ++t) {
++                std::vector<float> row(logits.begin() + (size_t) t * NE, logits.begin() + (size_t) (t + 1) * NE);
++                std::nth_element(row.begin(), row.begin() + 19, row.end(), std::greater<float>());
++                for (int e = 0; e < NE; ++e)
++                    if (!(logits[(size_t) t * NE + e] < row[19])) unpickable[e] = false;
++            }
+             ck(cudaMemcpy(d_logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice), "logits");
+-            for (int holes = 0; holes < 2; ++holes) {
+-                // with holes: about a third of the experts not resident (most windows then hit one)
+-                for (int e = 0; e < NE; ++e) res_holes[e] = (holes && rng() % 3 == 0) ? -1 : res_full[e];
++            for (int holes = 0; holes < 3; ++holes) {
++                // 1: about a third of the experts not resident (most windows then hit one); 2: half of the unpickable
++                // experts not resident (the window itself fully resident).  Non-finite rows skip 2: their order after
++                // the NaN sanitising is not the logits' order.
++                if (holes == 2 && kind == 4) continue;
++                for (int e = 0; e < NE; ++e) {
++                    const bool hole = holes == 1 ? rng() % 3 == 0 : holes == 2 ? unpickable[e] && rng() % 2 == 0 : false;
++                    res_holes[e] = hole ? -1 : res_full[e];
++                }
+                 ck(cudaMemcpy(d_res, res_holes.data(), NE * 4, cudaMemcpyHostToDevice), "res");
+                 for (int use_off = 0; use_off < 2; ++use_off) {
+                     for (int mode = 0; mode < 2; ++mode) {   // 0: skip word + ring, 1: all-resident (plan_err)
+@@ -122,7 +145,10 @@ int main() {
+                         const bool same_flags = skip[0] == skip[1] && perr[0] == perr[1];
+                         // both paths seen: a built plan (skip == ring / counts[1] == entries) and a refused one
+                         const bool built = mode == 0 ? skip[0] == ring : perr[0] == 0;
+-                        if (holes == 0 && !built) ++bad_paths;   // every expert resident: the plan must be built
++                        // every expert of the window resident: the plan must be built.  Wide-scale rows can push
++                        // softmax values to 0 (ties broken by index), so their holes==2 case is not required to build.
++                        if ((holes == 0 || (holes == 2 && kind != 3)) && !built) ++bad_paths;
++                        if (holes == 2 && built) ++built_partial;
+                         ++cases;
+                         if (!(same_ids && same_w && same_plan && same_flags)) {
+                             std::printf("    *** rows=%d kind=%d holes=%d %s %s: ids %s weights %s plan %s skip %u/%u "
+@@ -137,8 +163,9 @@ int main() {
+             }
+         }
+     }
+-    std::printf("route_plan_fuse: %d cases, %d failures, %d all-resident cases without a plan\n", cases, bad, bad_paths);
+-    if (bad || bad_paths) return 1;
++    std::printf("route_plan_fuse: %d cases, %d failures, %d all-resident cases without a plan, %d plans built over a "
++                "partially resident table\n", cases, bad, bad_paths, built_partial);
++    if (bad || bad_paths || built_partial == 0) return 1;
+     std::printf("route_plan_fuse_parity OK\n");
+     return 0;
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,364 @@
+From 0bf42041e4769e150cef0718b263475b120216e4 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 13:48:36 +0200
+Subject: [PATCH 1/7] hc read: staged down projection on 81 / 162 blocks,
+ bitwise the same (opt-in STRATA_GR_DOWN_SPLIT=2|4)
+
+The staged down projection runs 8 rows a block, 41 blocks: half of an RTX 3090's 82 SMs idle, and each busy SM
+reads 8 rows of weights and runs 8 rows x T tokens of shared-memory dots (2 LDS.128 per 8 FMA, the per-SM
+shared-memory bandwidth grows with T). STRATA_GR_DOWN_SPLIT=2 / 4 gives a block 4 / 2 rows (81 / 162 blocks).
+Each row is still one warp with the same chunks per lane in the same order and the same xor tree, so every
+output is the same bits. Only for the exact-token launches (multi-GR on); 4 is taken as 2 above 4 tokens.
+Default path: all 89 fused_gr kernels SASS-identical to g3-1441-ll (cuobjdump, the staged kernels' names gained
+a trailing ROWS = 8). gr_parity ctest arms: down_split2, down_split4_pf2 (with the production switches),
+down_split2_pf3; fused_gr_bench's cold run ends with SPLIT lines (41 / 81 / 162 blocks in one process, bitwise
+against 41, with times).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      |   8 ++
+ include/strata/kernels/fused_gr.hpp |   3 +
+ src/kernels/cuda/fused_gr.cu        | 138 ++++++++++++++++++++++++----
+ src/kernels/fused_gr_bench.cpp      |  66 +++++++++++++
+ 4 files changed, 197 insertions(+), 18 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 842565fc..45237565 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -972,6 +972,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   set_tests_properties(gr_parity_down_pf2 PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_PF=2")
+   add_test(NAME gr_parity_down_pf3 COMMAND gr_parity --selftest)
+   set_tests_properties(gr_parity_down_pf3 PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_PF=3")
++  # the staged down projection on 81 / 162 blocks (STRATA_GR_DOWN_SPLIT=2 / 4), alone and with the production switches
++  add_test(NAME gr_parity_down_split2 COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_down_split2 PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_SPLIT=2")
++  add_test(NAME gr_parity_down_split4_pf2 COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_down_split4_pf2 PROPERTIES ENVIRONMENT
++                       "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_SPLIT=4;STRATA_GR_DOWN_PF=2;STRATA_GR_FAST=1;STRATA_GR_NORM_FAST=1")
++  add_test(NAME gr_parity_down_split2_pf3 COMMAND gr_parity --selftest)
++  set_tests_properties(gr_parity_down_split2_pf3 PROPERTIES ENVIRONMENT "STRATA_HC_SPLIT=2;STRATA_GR_DOWN_SPLIT=2;STRATA_GR_DOWN_PF=3")
+ 
+   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
+   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
+diff --git a/include/strata/kernels/fused_gr.hpp b/include/strata/kernels/fused_gr.hpp
+index 00324247..67f4469e 100644
+--- a/include/strata/kernels/fused_gr.hpp
++++ b/include/strata/kernels/fused_gr.hpp
+@@ -66,6 +66,9 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+ 
+ /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
+ void fused_gr_set_fast(int on);
++/// The bench only: the staged down projection on 2 or 4 times the blocks (STRATA_GR_DOWN_SPLIT, bitwise the same);
++/// 0 or 1 = the 41 blocks, -1 = STRATA_GR_DOWN_SPLIT.
++void fused_gr_set_down_split(int n);
+ /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing
+ /// every output with the plain read's operations in its order, so bitwise the plain read's and the single-token
+ /// read's: plain (0.1.31's default: the norm one block per token, the down projection on 41 blocks), split (the norm
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index ce96675c..d93f8b70 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -801,22 +801,45 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
+ }
+ 
+ // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
++// NT = the block's threads (THREADS, or fewer under STRATA_GR_DOWN_SPLIT below).
++template <int NT = THREADS>
+ __device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t) {
+-    for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
++    for (int i = t; i < T * (H_TILE / 4); i += NT) {
+         const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
+         const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
+         cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
+     }
+ }
+ 
+-template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+-__global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
++// The rows of the down projection a block of ROWS warps owns (one warp a row): blocks 0 .. LR / ROWS - 1 the rows of
++// w_down, then the HC inject rows (one block of 8 or 4 warps, or two of 2).  ROWS == WARPS is the 41-block grid of the
++// plain read, and these expressions fold to its own (blockIdx.x == DOWN_BLOCKS, row = warp, warp >= HC).
++template <int ROWS>
++constexpr int down_grid() { return LR / ROWS + (HC + ROWS - 1) / ROWS; }
++template <int ROWS>
++__device__ __forceinline__ void down_row_of(const GrMulti& m, int warp, bool& inject_block, int& row, bool& active) {
++    static_assert(LR % ROWS == 0 && (ROWS >= HC || HC % ROWS == 0), "whole blocks of rows");
++    constexpr int MAIN = LR / ROWS;
++    if (ROWS >= HC) {
++        inject_block = blockIdx.x == MAIN;
++        row = inject_block ? warp : blockIdx.x * ROWS + warp;
++        active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
++    } else {
++        inject_block = blockIdx.x >= MAIN;
++        row = inject_block ? ((int) blockIdx.x - MAIN) * ROWS + warp : blockIdx.x * ROWS + warp;
++        active = !(inject_block && m.a[0].w_inject == nullptr);
++    }
++}
++
++// ROWS (STRATA_GR_DOWN_SPLIT, below): rows (= warps) a block; the default 8 is the plain read's 41 blocks
++template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, int ROWS = WARPS>
++__global__ void __launch_bounds__(ROWS * 32) gr_down_staged_kernel(GrMulti m) {
+     extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+     const int T = EXACT_T ? MAX_T : m.T;
+-    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+-    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+-    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
++    bool inject_block, active;
++    int row;
++    down_row_of<ROWS>(m, warp, inject_block, row, active);
+     const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+     const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+     const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
+@@ -828,9 +851,9 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+ #pragma unroll
+         for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+     }
+-    stage_htile(m, T, 0, hbuf, t);
++    stage_htile<ROWS * 32>(m, T, 0, hbuf, t);
+     cp_async_commit();
+-    stage_htile(m, T, 1, hbuf + buf_f4, t);
++    stage_htile<ROWS * 32>(m, T, 1, hbuf + buf_f4, t);
+     cp_async_commit();
+ #pragma unroll 1
+     for (int h = 0; h < N_HTILES; ++h) {
+@@ -857,7 +880,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+             }
+         }
+         __syncthreads();                                // every warp is done with buffer h & 1
+-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
++        if (h + 2 < N_HTILES) stage_htile<ROWS * 32>(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
+         if (h + 1 < N_HTILES) {
+ #pragma unroll
+@@ -887,14 +910,14 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+ // tile h + 1) is gone.  The activations' staging, the barriers and every sum are the staged kernel's (a lane
+ // accumulates the chunks lane + 32 q of tile h in ascending h, then q), so the same bits.  Only for the exact-token
+ // launches of 1..6 tokens: (PF + 1) x 5 uint4 a thread beside the token sums.
+-template <int T, int PF>
+-__global__ void __launch_bounds__(THREADS) gr_down_staged_pf_kernel(GrMulti m) {
++template <int T, int PF, int ROWS = WARPS>
++__global__ void __launch_bounds__(ROWS * 32) gr_down_staged_pf_kernel(GrMulti m) {
+     static_assert(PF >= 1 && PF < N_HTILES, "the prefetch distance is 1..7 tiles");
+     extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+-    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+-    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+-    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
++    bool inject_block, active;
++    int row;
++    down_row_of<ROWS>(m, warp, inject_block, row, active);
+     const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+     const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+     const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
+@@ -909,9 +932,9 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_pf_kernel(GrMulti m) {
+             for (int q = 0; q < HQ; ++q) wr[p][q] = __ldg(w4 + p * (H_TILE / 8) + lane + 32 * q);
+         }
+     }
+-    stage_htile(m, T, 0, hbuf, t);
++    stage_htile<ROWS * 32>(m, T, 0, hbuf, t);
+     cp_async_commit();
+-    stage_htile(m, T, 1, hbuf + buf_f4, t);
++    stage_htile<ROWS * 32>(m, T, 1, hbuf + buf_f4, t);
+     cp_async_commit();
+ #pragma unroll
+     for (int h = 0; h < N_HTILES; ++h) {
+@@ -937,7 +960,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_pf_kernel(GrMulti m) {
+             }
+         }
+         __syncthreads();                                // every warp is done with buffer h & 1
+-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
++        if (h + 2 < N_HTILES) stage_htile<ROWS * 32>(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
+     }
+     if (!active) return;
+@@ -967,6 +990,79 @@ int gr_down_pf() {
+     }();
+     return pf;
+ }
++// STRATA_GR_DOWN_SPLIT=2 / 4 (opt-in): the staged down projection on 2 / 4 times the blocks - 4 / 2 rows (warps) a
++// block instead of 8, so 81 / 162 blocks instead of 41 on the card's SMs (an RTX 3090 has 82: the 41-block grid leaves
++// half of them idle, and each busy one reads its 8 rows' weights and runs 8 rows x T tokens of shared-memory dots).
++// Every row is still one warp with the same chunks per lane in the same order and the same xor tree, so every output
++// is the same bits; only how many rows share a block's staged activations changes.  Only the launches with an
++// exact token count (multi-GR on, the default); 4 is taken as 2 for launches of more than 4 tokens (two blocks of
++// 2 x T x 5 KiB would not share an SM).  Anything else = 1, the 41 blocks.  fused_gr_set_down_split (the bench) overrides it.
++int g_down_split = -1;
++int gr_down_split() {
++    static const int env = [] {
++        const char* v = std::getenv("STRATA_GR_DOWN_SPLIT");
++        const int n = v != nullptr ? std::atoi(v) : 1;
++        return n == 2 || n == 4 ? n : 1;
++    }();
++    return g_down_split == 2 || g_down_split == 4 ? g_down_split : (g_down_split >= 0 ? 1 : env);
++}
++template <int PF, int ROWS>
++void launch_down_split_pf(int ct, const GrMulti& c, size_t smem, cudaStream_t st) {
++    constexpr int G = down_grid<ROWS>(), NT = ROWS * 32;
++    switch (ct) {
++        case 1: gr_down_staged_pf_kernel<1, PF, ROWS><<<G, NT, smem, st>>>(c); break;
++        case 2: gr_down_staged_pf_kernel<2, PF, ROWS><<<G, NT, smem, st>>>(c); break;
++        case 3: gr_down_staged_pf_kernel<3, PF, ROWS><<<G, NT, smem, st>>>(c); break;
++        case 4: gr_down_staged_pf_kernel<4, PF, ROWS><<<G, NT, smem, st>>>(c); break;
++        case 5: gr_down_staged_pf_kernel<5, PF, ROWS><<<G, NT, smem, st>>>(c); break;
++        default: gr_down_staged_pf_kernel<6, PF, ROWS><<<G, NT, smem, st>>>(c); break;
++    }
++}
++// the split launch of ct tokens (exact token count): PF tiles of weights in flight for 1..6 tokens (PF 1 = the staged
++// kernel's distance), the generic staged kernel for 7 and 8
++template <int ROWS>
++void launch_down_split(int ct, int pf, const GrMulti& c, size_t smem, cudaStream_t st) {
++    if (ct > 6) {
++        gr_down_staged_kernel<kFusedGrMaxT, false, ROWS><<<down_grid<ROWS>(), ROWS * 32, smem, st>>>(c);
++        return;
++    }
++    if (pf == 3) launch_down_split_pf<3, ROWS>(ct, c, smem, st);
++    else if (pf == 2) launch_down_split_pf<2, ROWS>(ct, c, smem, st);
++    else launch_down_split_pf<1, ROWS>(ct, c, smem, st);
++}
++// the shared-memory opt-in of the split kernels, once per device when a split is first asked for
++template <int ROWS>
++void set_split_attr(int optin) {
++    auto set = [&](auto kernel, int max_t) {
++        int ws = (int) (2 * max_t * H_TILE * sizeof(float));
++        if (optin > 0 && ws > optin) ws = optin;
++        if (ws > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ws);
++        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
++    };
++    set(gr_down_staged_pf_kernel<1, 1, ROWS>, 1); set(gr_down_staged_pf_kernel<2, 1, ROWS>, 2);
++    set(gr_down_staged_pf_kernel<3, 1, ROWS>, 3); set(gr_down_staged_pf_kernel<4, 1, ROWS>, 4);
++    set(gr_down_staged_pf_kernel<5, 1, ROWS>, 5); set(gr_down_staged_pf_kernel<6, 1, ROWS>, 6);
++    set(gr_down_staged_pf_kernel<1, 2, ROWS>, 1); set(gr_down_staged_pf_kernel<2, 2, ROWS>, 2);
++    set(gr_down_staged_pf_kernel<3, 2, ROWS>, 3); set(gr_down_staged_pf_kernel<4, 2, ROWS>, 4);
++    set(gr_down_staged_pf_kernel<5, 2, ROWS>, 5); set(gr_down_staged_pf_kernel<6, 2, ROWS>, 6);
++    set(gr_down_staged_pf_kernel<1, 3, ROWS>, 1); set(gr_down_staged_pf_kernel<2, 3, ROWS>, 2);
++    set(gr_down_staged_pf_kernel<3, 3, ROWS>, 3); set(gr_down_staged_pf_kernel<4, 3, ROWS>, 4);
++    set(gr_down_staged_pf_kernel<5, 3, ROWS>, 5); set(gr_down_staged_pf_kernel<6, 3, ROWS>, 6);
++    set(gr_down_staged_kernel<kFusedGrMaxT, false, ROWS>, kFusedGrMaxT);
++}
++void ensure_split_attr() {
++    static std::atomic<bool> done[64];
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || done[dev].load()) return;
++    int optin = 0;
++    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
++    optin = strata::smem_optin_of(optin);   // STRATA_EMULATE_CC (tests only)
++    set_split_attr<4>(optin);
++    set_split_attr<2>(optin);
++    cudaGetLastError();      // drop any error the attempt left behind
++    done[dev].store(true);
++}
++
+ template <int PF>
+ void launch_down_staged_pf(int ct, const GrMulti& c, size_t smem, cudaStream_t st) {
+     switch (ct) {
+@@ -1190,7 +1286,12 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long
+             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels.
+             // STRATA_GR_DOWN_PF=2|3: those launches with 2 or 3 tiles of weights in flight (the same sums, same order)
+             const int pf = exact_t && ct <= 6 ? gr_down_pf() : 1;
+-            if (pf == 2) launch_down_staged_pf<2>(ct, c, smem, st);
++            const int dsplit = exact_t ? gr_down_split() : 1;   // STRATA_GR_DOWN_SPLIT=2|4: 81 / 162 blocks
++            if (dsplit > 1) {
++                ensure_split_attr();
++                if (dsplit == 4 && ct <= 4) launch_down_split<2>(ct, pf, c, smem, st);
++                else launch_down_split<4>(ct, pf, c, smem, st);
++            } else if (pf == 2) launch_down_staged_pf<2>(ct, c, smem, st);
+             else if (pf == 3) launch_down_staged_pf<3>(ct, c, smem, st);
+             else if (exact_t && ct == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+             else if (exact_t && ct == 2) gr_down_staged_kernel<2, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+@@ -2069,6 +2170,7 @@ static bool gr_fast() {
+ int g_gr_fast = -1;
+ #endif
+ void fused_gr_set_fast(int on) { g_gr_fast = on; }
++void fused_gr_set_down_split(int n) { g_down_split = n; }
+ 
+ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
+                          int stamp_i0) {
+diff --git a/src/kernels/fused_gr_bench.cpp b/src/kernels/fused_gr_bench.cpp
+index 8ec78dab..6004e30c 100644
+--- a/src/kernels/fused_gr_bench.cpp
++++ b/src/kernels/fused_gr_bench.cpp
+@@ -6,6 +6,8 @@
+ // cold in the engine) and prints the per-stage split (norm / down / up) from the GPU stamps.
+ // The read is the plain one unless STRATA_HC_SPLIT=1 / 2 names split / staged; the staged read's opt-in switches
+ // (STRATA_GR_NORM_FAST, STRATA_GR_DOWN_PF) are read once, so compare a switch by the printed hashes of two runs.
++// The cold run ends with the SPLIT lines: the staged down projection on 41 / 81 / 162 blocks (STRATA_GR_DOWN_SPLIT)
++// in this one process, each against the 41 blocks bit for bit, with its time (needs STRATA_HC_SPLIT=2).
+ #include "strata/kernels/fused_gr.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ 
+@@ -268,6 +270,70 @@ int main(int argc, char** argv) {
+             std::printf("COLD(%d sets) fast %d T %d | read %6.1f us (events) | stamps median: norm %5.1f down %5.1f up %5.1f us (incl. a stamp kernel each)\n",
+                         cold_sets, f, T, 1e3 * ms / iters, med(n_), med(d_), med(u_));
+         }
++        // SPLIT: the staged down projection on 41 / 81 / 162 blocks (fused_gr_set_down_split 0 / 2 / 4, the bitwise-equal
++        // STRATA_GR_DOWN_SPLIT), each arm's outputs against the 41-block arm's bit for bit, then its cold time.  The rest
++        // of the read is what the environment says (STRATA_HC_SPLIT, STRATA_GR_FAST, STRATA_GR_DOWN_PF, ...).
++        K::fused_gr_set_fast(-1);
++        const int arms[3] = {0, 2, 4};
++        for (int T = t_lo; T <= t_hi; ++T) {
++            for (int c = 0; c < cold_sets; ++c)
++                for (int t = 0; t < T; ++t) {
++                    K::FusedGrArgs& a = as[(size_t) c * 8 + t];
++                    a.q8_down = nullptr; a.q8_up = nullptr;
++                }
++            std::vector<float> ref;
++            for (int arm : arms) {
++                K::fused_gr_set_down_split(arm);
++                // bitwise: every set once from the same R, every output (R in place, lo, rs, inject, mixed) hashed in order
++                std::vector<float> got;
++                for (int c = 0; c < cold_sets; ++c) {
++                    cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
++                    cudaMemset(dlo, 0xff, (size_t) TM * LR * 4);
++                    cudaMemset(drs, 0xff, (size_t) TM * HC * 4);
++                    cudaMemset(dio, 0xff, (size_t) TM * HC * 4);
++                    cudaMemset(dmix, 0xff, (size_t) TM * N * 4);
++                    K::fused_gr_read_multi(&as[(size_t) c * 8], T, dxn, s);
++                    cudaStreamSynchronize(s);
++                    const size_t o = got.size();
++                    got.resize(o + (size_t) T * (D + LR + HC + HC + N));
++                    float* p = got.data() + o;
++                    cudaMemcpy(p, dR, (size_t) T * D * 4, cudaMemcpyDeviceToHost); p += (size_t) T * D;
++                    cudaMemcpy(p, dlo, (size_t) T * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) T * LR;
++                    cudaMemcpy(p, drs, (size_t) T * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) T * HC;
++                    cudaMemcpy(p, dio, (size_t) T * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) T * HC;
++                    cudaMemcpy(p, dmix, (size_t) T * N * 4, cudaMemcpyDeviceToHost);
++                }
++                const bool err = cudaGetLastError() != cudaSuccess;
++                if (arm == 0) ref = got;
++                const bool same = !err && got.size() == ref.size() && std::memcmp(got.data(), ref.data(), got.size() * 4) == 0;
++                if (!same) ++failures;
++                for (int rep = 0; rep < 2; ++rep) {
++                    for (int i = 0; i < iters; ++i) {
++                        K::gpu_stamp(dst, i * 4, s);
++                        K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s, dst, i * 4 + 1);
++                        K::gpu_stamp(dst, i * 4 + 3, s);
++                    }
++                    cudaStreamSynchronize(s);
++                }
++                cudaMemcpy(hst.data(), dst, hst.size() * 8, cudaMemcpyDeviceToHost);
++                double best = 1e30;
++                for (int rep = 0; rep < 3; ++rep) {
++                    cudaEventRecord(e0, s);
++                    for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s);
++                    cudaEventRecord(e1, s);
++                    cudaEventSynchronize(e1);
++                    float ms = 0;
++                    cudaEventElapsedTime(&ms, e0, e1);
++                    best = std::fmin(best, 1e3 * ms / iters);
++                }
++                std::vector<double> d_;
++                for (int i = 1; i < iters; ++i) d_.push_back((double) (hst[(size_t) i * 4 + 2] - hst[(size_t) i * 4 + 1]));
++                std::sort(d_.begin(), d_.end());
++                std::printf("SPLIT down %d T %d | read %6.1f us (events, best of 3) | down stamp median %5.1f us | %s\n", arm, T,
++                            best, d_[d_.size() / 2] / 1e3, err ? "CUDA ERROR" : (same ? "bitwise equal to down 0" : "DIFFERS from down 0"));
++            }
++            K::fused_gr_set_down_split(-1);
++        }
+     }
+     std::printf("fused_gr_bench: %d differing\n", failures);
+     return failures ? 1 : 0;
+-- 
+2.43.0
+

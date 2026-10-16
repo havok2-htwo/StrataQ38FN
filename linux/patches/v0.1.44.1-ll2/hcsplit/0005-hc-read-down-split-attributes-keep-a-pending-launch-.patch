@@ -1,0 +1,34 @@
+From 194f94acc3729e3f9ec17cef7ad85a17bae4bc7c Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:13:53 +0200
+Subject: [PATCH 5/7] hc read: down split attributes keep a pending launch
+ error for the caller (opt-in STRATA_GR_DOWN_SPLIT=2|4)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/cuda/fused_gr.cu | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 46ec155f..adc9df7f 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -1054,12 +1054,14 @@ void ensure_split_attr() {
+     static std::atomic<bool> done[64];
+     int dev = 0;
+     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || done[dev].load()) return;
++    // an error a launch before left (the norm kernel just launched): keep it for the caller's check and try next time
++    if (cudaPeekAtLastError() != cudaSuccess) return;
+     int optin = 0;
+     cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+     optin = strata::smem_optin_of(optin);   // STRATA_EMULATE_CC (tests only)
+     set_split_attr<4>(optin);
+     set_split_attr<2>(optin);
+-    cudaGetLastError();      // drop any error the attempt left behind
++    cudaGetLastError();      // drop any error the attempt left behind (only its own: none was pending)
+     done[dev].store(true);
+ }
+ 
+-- 
+2.43.0
+

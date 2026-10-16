@@ -1,0 +1,69 @@
+From 9a842828999aa34be8e77690e0b4dc6963e36ee3 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:09:19 +0200
+Subject: [PATCH] serve: split stages test their own-buffer room against a
+ settable reserve (opt-in STRATA_SPLIT_OWN_RESERVE_MIB=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index c6d68d64..b2e4cddb 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -2134,6 +2134,21 @@ static bool pcie_auto_split_ok() {
+     return on;
+ }
+ 
++/// #340's room test: a split stage keeps its own prompt buffers when its card has the buffers + this much free (the
++/// verify windows, the draft head and the cuBLAS/hipBLAS workspaces made after it).  Default 1.5 GiB; opt-in
++/// STRATA_SPLIT_OWN_RESERVE_MIB=N tests the room with N MiB instead (a layer split that only misses the default).
++static uint64_t split_own_reserve() {
++    static const uint64_t b = []() -> uint64_t {
++        const char* v = std::getenv("STRATA_SPLIT_OWN_RESERVE_MIB");
++        const long long n = v != nullptr && *v != '\0' ? std::atoll(v) : -1;
++        if (n < 0) return 3ull << 29;
++        std::fprintf(stderr, "strata serve: STRATA_SPLIT_OWN_RESERVE_MIB=%lld: a stage keeps its own prompt buffers "
++                             "with %lld MiB free beside them (default 1536)\n", n, n);
++        return (uint64_t) n << 20;
++    }();
++    return b;
++}
++
+ // 0.1.43: the HIP defaults of the decode speed push (route tail skip, measured PCIe share) were measured on gfx1201 (Radeon AI PRO
+ // R9700) and apply on gfx1200 / gfx1201 only; every other AMD part (gfx11, gfx906, ...) keeps its earlier behaviour.  CUDA: always true.
+ [[maybe_unused]] static bool decode_defaults_arch_ok() {
+@@ -7688,7 +7703,7 @@ int main(int argc, char** argv) {
+                     const strata::core::OnDevice on(dev);
+                     size_t fb = 0, tb = 0;
+                     if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+-                        if ((uint64_t) fb >= need + (3ull << 29)) continue;
++                        if ((uint64_t) fb >= need + split_own_reserve()) continue;
+                     } else (void) cudaGetLastError();
+                 }
+                 // its tail slots, as the scan's `cache_slots_for` counts them
+@@ -8112,8 +8127,8 @@ int main(int argc, char** argv) {
+                 // every expert of its layers, so auto stopped short of its VRAM) keeps them as its own instead of
+                 // borrowing cache slots: nothing of it is lent, streamed during the prompt or refilled after it.
+                 // Room = the buffers + 1.5 GiB (the verify windows, the draft head, hipBLAS/cuBLAS workspaces made
+-                // after this).  Layer splits only - one GPU keeps its loan exactly as before.
+-                // STRATA_SPLIT_OWN_BUFFERS=0: every stage borrows (0.1.30/0.1.31).
++                // after this; STRATA_SPLIT_OWN_RESERVE_MIB sets another).  Layer splits only - one GPU keeps its loan
++                // exactly as before.  STRATA_SPLIT_OWN_BUFFERS=0: every stage borrows (0.1.30/0.1.31).
+                 static const bool own_ok = [] {
+                     const char* v = std::getenv("STRATA_SPLIT_OWN_BUFFERS");
+                     return v == nullptr || v[0] != '0';
+@@ -8124,7 +8139,7 @@ int main(int argc, char** argv) {
+                         size_t fb = 0, tb = 0;
+                         if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                         const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk, srcp != nullptr);
+-                        if ((uint64_t) fb >= need + (3ull << 29)) {
++                        if ((uint64_t) fb >= need + split_own_reserve()) {
+                             std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
+                                                  "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
+                                          (double) need / 1073741824.0, (double) fb / 1073741824.0);
+-- 
+2.43.0
+

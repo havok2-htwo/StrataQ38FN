@@ -1,0 +1,37 @@
+From 56342093cace29715c9841926fbf74f581ae16fe Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:13:53 +0200
+Subject: [PATCH 4/7] hc read: up split kernel without the min-blocks bound on
+ HIP, where it means waves per EU (opt-in STRATA_GR_UP_SPLIT=2|4)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/cuda/fused_gr.cu | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 955b6989..46ec155f 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -1531,10 +1531,17 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) { gr_up_
+ // so the whole grid is resident at once (4 / 8 blocks an SM on 82 SMs), and an instantiation per token count (the
+ // token loop and the lo staging unrolled at compile time).  Each row is still 8 lanes with the same chunks, the same
+ // combination and the same xor tree, each column's 4 streams sum in one block in the same order: the same bits.
++// (HIP: the second argument would be waves per EU, a much tighter register cap - the block size alone there)
++#if defined(__HIPCC__)
++#define STRATA_UP_SPLIT_BOUNDS(COLS) __launch_bounds__(up_fast_threads<COLS>())
++#else
++#define STRATA_UP_SPLIT_BOUNDS(COLS) __launch_bounds__(up_fast_threads<COLS>(), THREADS * 4 / up_fast_threads<COLS>())
++#endif
+ template <int COLS, int MAX_T, bool EXACT_T>
+-__global__ void __launch_bounds__(up_fast_threads<COLS>(), THREADS * 4 / up_fast_threads<COLS>()) gr_up_fast_split_kernel(GrMulti m) {
++__global__ void STRATA_UP_SPLIT_BOUNDS(COLS) gr_up_fast_split_kernel(GrMulti m) {
+     gr_up_fast_body<COLS, MAX_T, EXACT_T>(m);
+ }
++#undef STRATA_UP_SPLIT_BOUNDS
+ template <int COLS>
+ void launch_up_split_cols(const GrMulti& m, bool generic, cudaStream_t st) {
+     constexpr int G = N / COLS, NT = up_fast_threads<COLS>();
+-- 
+2.43.0
+

@@ -1,0 +1,134 @@
+From 95a33b1f3b9a21d955082d219e9278d8633f48f6 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:13:53 +0200
+Subject: [PATCH 3/7] hc read: startup check of the up split against the 16
+ columns for 1..8 tokens, a differing card keeps them (opt-in
+ STRATA_GR_UP_SPLIT=2|4)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/cuda/fused_gr.cu | 92 ++++++++++++++++++++++++++++--------
+ 1 file changed, 71 insertions(+), 21 deletions(-)
+
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 5c47e22c..955b6989 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -1212,6 +1212,16 @@ int gr_up_split() {
+     }();
+     return g_up_split == 2 || g_up_split == 4 ? g_up_split : (g_up_split >= 0 ? 1 : env);
+ }
++// fused_gr_selftest checks the up split against the 16 columns for 1..8 tokens: a card where they differ keeps the 16
++// columns (g_up_split_bad), and the check's reference reads run with the 16 columns (t_up_split_off)
++std::atomic<bool> g_up_split_bad[64];
++thread_local bool t_up_split_off = false;
++int up_split_here() {
++    const int us = gr_up_split();
++    if (us == 1 || t_up_split_off) return 1;
++    int dev = 0;
++    return cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64 && !g_up_split_bad[dev].load() ? us : 1;
++}
+ }  // namespace
+ static bool gr_fast();
+ namespace {
+@@ -1325,7 +1335,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long
+     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+ #if STRATA_GR_FAST_BUILD
+     if (fast) {
+-        const int us = gr_up_split();   // STRATA_GR_UP_SPLIT=2|4: 320 / 640 blocks
++        const int us = up_split_here();   // STRATA_GR_UP_SPLIT=2|4: 320 / 640 blocks (unless the check found a difference)
+         if (us > 1 && m.a[0].q8_mixed == nullptr) launch_up_split(m, us, no_multi_gr, st);
+         else gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+     } else
+@@ -2517,28 +2527,68 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
+     };
+     ok_variant[2] = ok_variant[3] = ok;
+     bool single_ok = ok;
+-    for (int apply = 0; apply < 2 && ok; ++apply) {
+-        for (int T = 1; T <= TM && ok; ++T) {
+-            FusedGrArgs a[NV][TM];
+-            for (int v = 0; v < NV; ++v) {
+-                const size_t span = (size_t) ((uint8_t*) (set[v].mixed + (size_t) TM * N) - (uint8_t*) set[v].R_out);
+-                ok = ok && cudaMemsetAsync(set[v].R_out, 0xFF, span, st) == cudaSuccess;   // the whole set
+-                for (int k = 0; k < T; ++k) {
+-                    FusedGrArgs& x = a[v][k];
+-                    x.R = d_R + (size_t) k * D; x.R_out = set[v].R_out + (size_t) k * D; x.apply = apply != 0;
+-                    x.bo_prev = d_bo + (size_t) k * N; x.inj_prev = d_ip + (size_t) k * HC;
+-                    x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up; x.w_inject = d_inj; x.eps = 1e-6f;
+-                    x.lo = set[v].lo + (size_t) k * LR; x.rs = set[v].rs + (size_t) k * HC;
+-                    x.inject_out = set[v].inj + (size_t) k * HC; x.mixed = set[v].mixed + (size_t) k * N;
++    // fill a[v][0..T-1] for set v (the whole set set to NaN first)
++    FusedGrArgs a[NV][TM];
++    auto args_for = [&](int v, int T, int apply) {
++        const size_t span = (size_t) ((uint8_t*) (set[v].mixed + (size_t) TM * N) - (uint8_t*) set[v].R_out);
++        ok = ok && cudaMemsetAsync(set[v].R_out, 0xFF, span, st) == cudaSuccess;   // the whole set
++        for (int k = 0; k < T; ++k) {
++            FusedGrArgs& x = a[v][k];
++            x = FusedGrArgs();
++            x.R = d_R + (size_t) k * D; x.R_out = set[v].R_out + (size_t) k * D; x.apply = apply != 0;
++            x.bo_prev = d_bo + (size_t) k * N; x.inj_prev = d_ip + (size_t) k * HC;
++            x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up; x.w_inject = d_inj; x.eps = 1e-6f;
++            x.lo = set[v].lo + (size_t) k * LR; x.rs = set[v].rs + (size_t) k * HC;
++            x.inject_out = set[v].inj + (size_t) k * HC; x.mixed = set[v].mixed + (size_t) k * N;
++        }
++    };
++    auto run = [&](int v, int T, int variant) {
++        GrMulti m;
++        for (int k = 0; k < T; ++k) m.a[k] = a[v][k];
++        m.xn = set[v].xn;
++        m.T = T;
++        launch_multi(m, variant, st, nullptr, 0);
++    };
++#if STRATA_GR_FAST_BUILD
++    // STRATA_GR_UP_SPLIT (opt-in): the plain read with the up split against the plain read with the 16 columns, 1..8
++    // tokens; on a difference this card keeps the 16 columns (every variant uses the same up kernel, so the comparison
++    // of the variants below cannot see it)
++    if (ok && gr_fast() && gr_up_split() > 1) {
++        int dev = 0;
++        cudaGetDevice(&dev);
++        std::string w;
++        bool up_ok = true;
++        for (int apply = 0; apply < 2 && ok && up_ok; ++apply)
++            for (int T = 1; T <= TM && ok && up_ok; ++T) {
++                args_for(0, T, apply);
++                args_for(1, T, apply);
++                t_up_split_off = true;
++                run(0, T, kHcPlain);
++                t_up_split_off = false;
++                run(1, T, kHcPlain);
++                if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
++                    why[0] = "a kernel of the check failed";
++                    ok = false;
++                    break;
+                 }
++                if (!all_same(set[0], set[1], T, apply, w)) up_ok = false;
+             }
+-            for (int v = 0; v < 3; ++v) {
+-                GrMulti m;
+-                for (int k = 0; k < T; ++k) m.a[k] = a[v][k];
+-                m.xn = set[v].xn;
+-                m.T = T;
+-                launch_multi(m, v + 1, st, nullptr, 0);
+-            }
++        if (ok && !up_ok && dev >= 0 && dev < 64) {
++            g_up_split_bad[dev].store(true);
++            std::fprintf(stderr, "strata hc: CUDA%d: the up projection keeps 16 columns, STRATA_GR_UP_SPLIT=%d differs: %s\n",
++                         dev, gr_up_split(), w.c_str());
++        }
++    }
++#endif
++    for (int apply = 0; apply < 2 && ok; ++apply) {
++        for (int T = 1; T <= TM && ok; ++T) {
++            for (int v = 0; v < NV; ++v) args_for(v, T, apply);
++            // the plain read is the reference with the 16-column up projection (STRATA_GR_UP_SPLIT: the split and
++            // staged reads with the up split are compared against it)
++            t_up_split_off = true;
++            run(0, T, kHcPlain);
++            t_up_split_off = false;
++            for (int v = 1; v < 3; ++v) run(v, T, v + 1);
+             if (T == 1) fused_gr_read(a[3][0], st);
+             if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
+                 why[0] = "a kernel of the check failed";
+-- 
+2.43.0
+
