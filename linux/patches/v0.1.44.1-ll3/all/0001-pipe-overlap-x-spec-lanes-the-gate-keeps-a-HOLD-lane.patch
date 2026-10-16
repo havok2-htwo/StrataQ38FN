@@ -1,0 +1,54 @@
+From ee4037378e988cf658dbc0ba3b3f69f250a49ade Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:21:07 +0200
+Subject: [PATCH] pipe overlap x spec lanes: the gate keeps a HOLD lane slot
+ out of an overlapped read, refuses live lanes, and checks the lane drafters'
+ K/V in the KVS disjointness test
+
+With STRATA_PIPE_OVERLAP=1 the second user's BGEN was read overlapped, and pump decoded the
+held lane slot in batch windows beside the read, so STRATA_SPEC_LANES_HOLD's exactness drive
+no longer ran admission -> lane windows only.  The read now stays serial while a lane slot is
+held.  lanes_live is refused too (never true there: every line but BSTOP/BYIELD drains the
+lanes), and overlap_kvs_check adds lane_mtp beside slot_mtp (lane catch-ups write those
+drafters' K/V during the read).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 91335384..ec19f390 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14816,10 +14816,13 @@ int main(int argc, char** argv) {
+                         for (int64_t j = 0; j < u->qsa_alloc; ++j) spans_of(u->qsa_states[u->qsa_ord0 + j], true, b);
+                     disjoint = strata::program::kv_spans_disjoint(a, b);
+                 }
+-                if (disjoint && !slot_mtp.empty()) {   // the drafter's own geometry: its buffers as points only
++                // (STRATA_SPEC_LANES: the lane drafters too - carved from the lane slots' sessions, and a batch window of
++                // a lane slot writes its drafter's K/V beside the read: lane_catchup)
++                if (disjoint && (!slot_mtp.empty() || !lane_mtp.empty())) {   // the drafter's own geometry: points only
+                     std::vector<KvSpan> a, b;
+                     spans_of(mtp.kv_state(), false, a);
+                     for (const auto& d : slot_mtp) spans_of(d->kv_state(), false, b);
++                    for (const auto& d : lane_mtp) spans_of(d->kv_state(), false, b);
+                     disjoint = strata::program::kv_spans_disjoint(a, b);
+                 }
+                 return strata::program::overlap_kvs_allows(pipe_overlap_env(), pipe_overlap_kvs_env(), o.kv_resident > 0,
+@@ -14842,6 +14845,12 @@ int main(int argc, char** argv) {
+             auto overlap_gate = [&](int64_t a0, int64_t b0, std::string& why) -> bool {
+                 if (admit_slot < 0) { why = "not a batch admission (a request beside the slots)"; return false; }
+                 if (pipe_inflight()) { why = "slot groups in flight"; return false; }
++                // STRATA_SPEC_LANES: every line but BSTOP/BYIELD drains the lanes first, so they are never live here (and
++                // lanes_may_begin waits while ov_active); said, should that ever change.  STRATA_SPEC_LANES_HOLD: a held
++                // lane slot must not decode in batch windows beside this read (pump would run it), or the exactness
++                // drive's lane slot is no longer admission -> lane windows only: the read stays serial then
++                if (lanes_live) { why = "the spec lanes are running (STRATA_SPEC_LANES)"; return false; }
++                if (lanes_hold_now()) { why = "a lane slot is held (STRATA_SPEC_LANES_HOLD)"; return false; }
+                 // the expert tables frozen: no loan (a lent slot holds prompt buffers, its expert runs on the CPU),
+                 // every expert in VRAM now and no swap pending, so every stage runs its zero-doorbell graph and the
+                 // prompt path reads the same cache slots unchanged (nothing below moves an expert while it reads)
+-- 
+2.43.0
+
