@@ -1,0 +1,209 @@
+From ba10759179258e32650388ef31728e28cd2c52e5 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 00:59:43 +0200
+Subject: [PATCH 4/5] verify: the carve in a host header, persist_offset and a
+ carve/keep-range test (opt-in STRATA_SPEC_LANES=2..4)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      |  4 ++
+ include/strata/core/arena_carve.hpp | 35 +++++++++++++++
+ include/strata/core/verify.hpp      |  7 +++
+ src/core/verify.cpp                 | 17 ++------
+ tests/core/arena_carve_test.cpp     | 67 +++++++++++++++++++++++++++++
+ 5 files changed, 116 insertions(+), 14 deletions(-)
+ create mode 100644 include/strata/core/arena_carve.hpp
+ create mode 100644 tests/core/arena_carve_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b44107a5..740378aa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -302,6 +302,10 @@ if(STRATA_BUILD_TESTS)
+   add_executable(spec_lanes_test tests/program/spec_lanes_test.cpp)
+   target_include_directories(spec_lanes_test PRIVATE include)
+   add_test(NAME spec_lanes_test COMMAND spec_lanes_test)
++  # STRATA_SPEC_LANES' shared arenas: the verifier's carve, its signature and poison_arena's keep range (header-only, CPU)
++  add_executable(arena_carve_test tests/core/arena_carve_test.cpp)
++  target_include_directories(arena_carve_test PRIVATE include)
++  add_test(NAME arena_carve_test COMMAND arena_carve_test)
+   # STRATA_SLOT_CHAIN_REUSE / STRATA_GIVEBACK_CHECKS: which checkpoints an idle batch slot hands to a request, the order
+   # of a slot's sources (against the loop as it was, switch off) and what a give-back does with the slot (header-only, CPU)
+   add_executable(slot_chain_test tests/program/slot_chain_test.cpp)
+diff --git a/include/strata/core/arena_carve.hpp b/include/strata/core/arena_carve.hpp
+new file mode 100644
+index 00000000..2894e8cd
+--- /dev/null
++++ b/include/strata/core/arena_carve.hpp
+@@ -0,0 +1,35 @@
++// include/strata/core/arena_carve.hpp - the verifier's device-arena carve (header-only, host: no CUDA).
++//
++// Verifier::init lays every device buffer out in one arena: a counting pass (base null) sizes it, a second pass with
++// the allocation's base hands out the pointers.  Each buffer starts 256-aligned.  The signature is an FNV-1a hash of
++// every buffer's offset and size, so two verifiers with the same signature lay their buffers out alike
++// (Verifier::carve_signature; STRATA_SPEC_LANES' shared arenas check it before a verifier carves another's arena).
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace strata::core::arena_carve {
++
++struct Bump {
++    uint8_t* base = nullptr;
++    uint64_t used = 0;
++    uint64_t sig = 1469598103934665603ull;   // FNV-1a over every buffer's offset and size
++    template <typename T> T* take(uint64_t n) {
++        T* p = base ? (T*) (base + used) : nullptr;
++        const uint64_t sz = (n * sizeof(T) + 255) & ~255ull;
++        sig = (sig ^ used) * 1099511628211ull;
++        sig = (sig ^ sz) * 1099511628211ull;
++        used += sz;
++        return p;
++    }
++};
++
++/// Verifier::poison_arena's precondition: inside the arena [a, a + bytes) the buffers a window reads before it writes
++/// them - argmax_rows' scratch (`keep0`) and the constant 1 (`one`) - lie in that order, followed by the buffer carved
++/// next (`keep1`), so filling [a, keep0) and [keep1, a + bytes) leaves exactly those two alone.
++inline bool keep_range_ok(const uint8_t* a, size_t bytes, const uint8_t* keep0, const uint8_t* one, const uint8_t* keep1) {
++    return a != nullptr && a <= keep0 && keep0 < one && one < keep1 && keep1 <= a + bytes;
++}
++
++}  // namespace strata::core::arena_carve
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index f9464751..8ae51d83 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -304,6 +304,13 @@ public:
+     size_t arena_bytes() const { return arena_bytes_; }
+     uint64_t carve_signature() const { return carve_sig_; }
+     bool arena_external() const { return arena_ext_; }
++    /// The offset of the arena's first buffer that outlives a window (argmax_rows' self-resetting counter, then the
++    /// constant 1; poison_arena keeps both): what lies below it is the windows' scratch, which another user of the
++    /// arena (the solo pipeline's GDN snapshots in lane 2's, STRATA_SPEC_LANES) may overwrite between windows.  After
++    /// `init` (before it: 0).
++    size_t persist_offset() const {
++        return arena_ != nullptr && arg_scratch_ != nullptr ? (size_t) (arg_scratch_ - (const uint8_t*) arena_) : 0;
++    }
+     /// STRATA_LC_POISON (testing): queue on `s` a fill of every arena byte with `byte`, except the buffers a window
+     /// reads before it writes them: one_ (the constant 1) and argmax_rows' scratch (its counter resets itself to 0 at
+     /// the end of each launch, so the next launch needs it 0).  cudaMemsetAsync only (no kernel).  Nothing in flight.
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 4cf1161b..37ed418b 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2,6 +2,7 @@
+ #include "strata/core/batch_rows.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/core/verify.hpp"
++#include "strata/core/arena_carve.hpp"
+ #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+ #include "strata/core/host_graph_launch.hpp"
+ #endif
+@@ -178,19 +179,7 @@ inline bool g_early_sample() { static const bool on = [] { const char* v = std::
+ inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+ #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
+ 
+-struct Bump {
+-    uint8_t* base = nullptr;
+-    uint64_t used = 0;
+-    uint64_t sig = 1469598103934665603ull;   // FNV-1a over every buffer's offset and size (Verifier::carve_signature)
+-    template <typename T> T* take(uint64_t n) {
+-        T* p = base ? (T*) (base + used) : nullptr;
+-        const uint64_t sz = (n * sizeof(T) + 255) & ~255ull;
+-        sig = (sig ^ used) * 1099511628211ull;
+-        sig = (sig ^ sz) * 1099511628211ull;
+-        used += sz;
+-        return p;
+-    }
+-};
++using Bump = strata::core::arena_carve::Bump;   // (strata/core/arena_carve.hpp: the carve and its signature)
+ 
+ // #649 (HIP, opt-in A/Bs for the gfx1030 verify timeouts; CUDA never reads them)
+ //   STRATA_VERIFY_COHERENT=1  the handshake words and rows in explicitly coherent (fine-grained) host memory
+@@ -910,7 +899,7 @@ bool Verifier::poison_arena(cudaStream_t s, int byte, std::string& err) {
+     uint8_t* const a = (uint8_t*) arena_;
+     uint8_t* const keep0 = arg_scratch_;           // argmax_rows' scratch, then one_ (carve: adjacent, in this order)
+     uint8_t* const keep1 = (uint8_t*) hist_snap_;  // the buffer carved after one_
+-    if (!(a <= keep0 && keep0 < (uint8_t*) one_ && (uint8_t*) one_ < keep1 && keep1 <= a + arena_bytes_)) {
++    if (!strata::core::arena_carve::keep_range_ok(a, arena_bytes_, keep0, (const uint8_t*) one_, keep1)) {
+         err = "verify: poison: the carve is not the one poison_arena knows";
+         return false;
+     }
+diff --git a/tests/core/arena_carve_test.cpp b/tests/core/arena_carve_test.cpp
+new file mode 100644
+index 00000000..170b34a1
+--- /dev/null
++++ b/tests/core/arena_carve_test.cpp
+@@ -0,0 +1,67 @@
++// The verifier's arena carve (include/strata/core/arena_carve.hpp): the counting pass and the carving pass agree, every
++// buffer is 256-aligned, the signature tells two layouts apart, and poison_arena's keep range is what it checks.
++// Host only: no model, no GPU.
++#include "strata/core/arena_carve.hpp"
++
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++namespace ac = strata::core::arena_carve;
++
++namespace {
++int failures = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++// a carve shaped like Verifier::init's tail: scratch rows (T), the head's logits, argmax_rows' scratch, one_, hist_snap_
++struct Ptrs { float* rows; float* logits; uint8_t* arg; int32_t* one; float* hist; };
++Ptrs carve(ac::Bump& b, uint64_t T, uint64_t vocab) {
++    Ptrs p;
++    p.rows = b.take<float>(T * 4096);
++    p.logits = b.take<float>(T * vocab);
++    p.arg = b.take<uint8_t>(T * 24 + 8);
++    p.one = b.take<int32_t>(4);
++    p.hist = b.take<float>(T * 64);
++    return p;
++}
++}  // namespace
++
++int main() {
++    ac::Bump c1, c2, c3;
++    carve(c1, 8, 1000);
++    carve(c2, 8, 1000);
++    carve(c3, 6, 1000);
++    check(c1.used == c2.used && c1.sig == c2.sig, "the same carve: the same bytes and signature");
++    check(c1.sig != c3.sig, "another T: another signature");
++    ac::Bump c4;
++    carve(c4, 8, 1001);
++    check(c4.sig != c1.sig, "another size of one buffer: another signature");
++    // the same total with the buffers in another order: still another signature (offsets are hashed)
++    ac::Bump x, y;
++    x.take<uint8_t>(256); x.take<uint8_t>(512);
++    y.take<uint8_t>(512); y.take<uint8_t>(256);
++    check(x.used == y.used && x.sig != y.sig, "another order: another signature");
++
++    std::vector<uint8_t> mem(c1.used + 256);
++    ac::Bump real;
++    real.base = mem.data();
++    const Ptrs p = carve(real, 8, 1000);
++    check(real.used == c1.used && real.sig == c1.sig, "the carving pass is the counting pass");
++    for (const void* q : {(const void*) p.rows, (const void*) p.logits, (const void*) p.arg, (const void*) p.one,
++                          (const void*) p.hist})
++        check(((const uint8_t*) q - mem.data()) % 256 == 0, "every buffer 256-aligned from the base");
++    const uint8_t* a = mem.data();
++    check(ac::keep_range_ok(a, real.used, p.arg, (const uint8_t*) p.one, (const uint8_t*) p.hist), "the keep range: ordered");
++    check(!ac::keep_range_ok(a, real.used, (const uint8_t*) p.one, p.arg, (const uint8_t*) p.hist), "swapped: refused");
++    check(!ac::keep_range_ok(a, (size_t) ((const uint8_t*) p.hist - a) - 1, p.arg, (const uint8_t*) p.one,
++                             (const uint8_t*) p.hist), "the next buffer past the end: refused");
++    check(!ac::keep_range_ok(nullptr, real.used, p.arg, (const uint8_t*) p.one, (const uint8_t*) p.hist), "no arena: refused");
++    // the persistent offset (Verifier::persist_offset) is argmax_rows' scratch: what lies below it is scratch
++    const size_t persist = (size_t) (p.arg - a);
++    check(persist > (size_t) ((const uint8_t*) p.logits - a), "the persistent tail after the logits");
++    return failures == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

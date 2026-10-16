@@ -1,0 +1,144 @@
+From 25221fc998057293c9a1426c40a79bce806cc085 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 00:31:17 +0200
+Subject: [PATCH 1/5] verify: an external arena, its carve signature and a
+ poison fill (opt-in STRATA_SPEC_LANES=2..4)
+
+set_external_arena(base, bytes, sig) before init: the verifier carves its buffers from another verifier's
+arena (not zeroed, one_ written, never freed here) and refuses a carve that is larger or laid out otherwise
+(carve_signature: FNV over every buffer's offset and size).  arena(), arena_bytes(), arena_external().
+poison_arena(stream, byte): cudaMemsetAsync over the arena except argmax_rows' self-resetting counter
+scratch and one_ (review H2).  Host code only; the default path allocates and zeroes as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/verify.hpp | 23 +++++++++++++++++
+ src/core/verify.cpp            | 47 +++++++++++++++++++++++++++++-----
+ 2 files changed, 64 insertions(+), 6 deletions(-)
+
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index bd74113a..f9464751 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -291,6 +291,23 @@ public:
+     /// `base` + cell, as the slot's batch rows do (the cells - KV writes, steps - are unchanged).  0 (the default, and
+     /// every other verifier): the cell itself, as before.  Before the first capture.
+     void set_rope_base(int32_t base) { rope_base_ = base; }
++    /// STRATA_SPEC_LANES (opt-in, the low-concurrency modes): carve this verifier's device buffers out of `base`
++    /// (`bytes` long), the arena of another verifier of the same card that never runs a window while this one has a
++    /// window, a commit or a reader of its rows outstanding (the engine fences the streams at every switch).  `sig`:
++    /// the owner's carve_signature (0: not checked).  `init` then takes no arena of its own, does not zero this one
++    /// (the owner did) and writes only the constant (one_, the same bytes); it fails when the carve is larger than
++    /// `bytes` or another layout.  The owner frees it; this verifier never does.  Before `init`.
++    void set_external_arena(void* base, size_t bytes, uint64_t sig) { ext_arena_ = base; ext_bytes_ = bytes; ext_sig_ = sig; }
++    /// The device arena (`init`'s, or the one set_external_arena gave), its bytes and a hash of its carve (the offsets
++    /// and sizes of every buffer: two verifiers with the same signature lay their buffers out alike).  After `init`.
++    void* arena() const { return arena_; }
++    size_t arena_bytes() const { return arena_bytes_; }
++    uint64_t carve_signature() const { return carve_sig_; }
++    bool arena_external() const { return arena_ext_; }
++    /// STRATA_LC_POISON (testing): queue on `s` a fill of every arena byte with `byte`, except the buffers a window
++    /// reads before it writes them: one_ (the constant 1) and argmax_rows' scratch (its counter resets itself to 0 at
++    /// the end of each launch, so the next launch needs it 0).  cudaMemsetAsync only (no kernel).  Nothing in flight.
++    bool poison_arena(cudaStream_t s, int byte, std::string& err);
+     /// All the stage's experts are in its VRAM cache (the zero-doorbell graph is its normal one; ar_live: right now)
+     bool all_resident() const { return all_resident_; }
+     /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
+@@ -562,6 +579,12 @@ private:
+ 
+     // device
+     void* arena_ = nullptr;
++    size_t arena_bytes_ = 0;               ///< the carve's bytes (arena_bytes)
++    uint64_t carve_sig_ = 0;               ///< carve_signature
++    void* ext_arena_ = nullptr;            ///< set_external_arena (null: init allocates its own)
++    size_t ext_bytes_ = 0;
++    uint64_t ext_sig_ = 0;
++    bool arena_ext_ = false;               ///< arena_ is another verifier's: never freed here
+     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
+     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 9da4c2f2..4cf1161b 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -181,9 +181,13 @@ inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv(
+ struct Bump {
+     uint8_t* base = nullptr;
+     uint64_t used = 0;
++    uint64_t sig = 1469598103934665603ull;   // FNV-1a over every buffer's offset and size (Verifier::carve_signature)
+     template <typename T> T* take(uint64_t n) {
+         T* p = base ? (T*) (base + used) : nullptr;
+-        used += (n * sizeof(T) + 255) & ~255ull;
++        const uint64_t sz = (n * sizeof(T) + 255) & ~255ull;
++        sig = (sig ^ used) * 1099511628211ull;
++        sig = (sig ^ sz) * 1099511628211ull;
++        used += sz;
+         return p;
+     }
+ };
+@@ -557,7 +561,7 @@ Verifier::~Verifier() {
+     if (df_fork_) cudaEventDestroy(df_fork_);
+     for (cudaEvent_t e : df_join_)
+         if (e) cudaEventDestroy(e);
+-    if (arena_) cudaFree(arena_);
++    if (arena_ && !arena_ext_) cudaFree(arena_);   // (set_external_arena: the owner's)
+     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_};
+     for (void* h : hosts)
+@@ -737,11 +741,23 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+     };
+     Bump count;
+     carve(count);
+-    if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
+-        err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
+-        return false;
++    arena_bytes_ = count.used;
++    carve_sig_ = count.sig;
++    if (ext_arena_ != nullptr) {   // set_external_arena: another verifier's arena (zeroed by it; one_ is written below)
++        if (count.used > ext_bytes_ || (ext_sig_ != 0 && ext_sig_ != carve_sig_)) {
++            err = "verify: the shared arena (" + std::to_string(ext_bytes_ >> 20) + " MiB) is not laid out like this "
++                  "verifier's (" + std::to_string(count.used >> 20) + " MiB" + (ext_sig_ != 0 && ext_sig_ != carve_sig_ ? ", another carve" : "") + ")";
++            return false;
++        }
++        arena_ = ext_arena_;
++        arena_ext_ = true;
++    } else {
++        if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
++            err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
++            return false;
++        }
++        cudaMemset(arena_, 0, count.used);
+     }
+-    cudaMemset(arena_, 0, count.used);
+     if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
+         trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
+         if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
+@@ -888,6 +904,25 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+     return true;
+ }
+ 
++bool Verifier::poison_arena(cudaStream_t s, int byte, std::string& err) {
++    if (arena_ == nullptr) return true;
++    const OnDevice on_device(device_);
++    uint8_t* const a = (uint8_t*) arena_;
++    uint8_t* const keep0 = arg_scratch_;           // argmax_rows' scratch, then one_ (carve: adjacent, in this order)
++    uint8_t* const keep1 = (uint8_t*) hist_snap_;  // the buffer carved after one_
++    if (!(a <= keep0 && keep0 < (uint8_t*) one_ && (uint8_t*) one_ < keep1 && keep1 <= a + arena_bytes_)) {
++        err = "verify: poison: the carve is not the one poison_arena knows";
++        return false;
++    }
++    if (cudaMemsetAsync(a, byte & 0xff, (size_t) (keep0 - a), s) != cudaSuccess ||
++        cudaMemsetAsync(keep1, byte & 0xff, (size_t) (a + arena_bytes_ - keep1), s) != cudaSuccess) {
++        (void) cudaGetLastError();
++        err = "verify: poison: a fill failed";
++        return false;
++    }
++    return true;
++}
++
+ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+ 
+ // ================================ THE WINDOW, AS CAPTURED ================================
+-- 
+2.43.0
+

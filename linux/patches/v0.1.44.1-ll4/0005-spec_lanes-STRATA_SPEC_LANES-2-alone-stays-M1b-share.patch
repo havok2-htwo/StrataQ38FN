@@ -1,0 +1,516 @@
+From f60f4ea568cd57be365b21aa80532bab148fb781 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 00:59:43 +0200
+Subject: [PATCH 5/5] spec_lanes: STRATA_SPEC_LANES=2 alone stays M1b, shared
+ VRAM by default for 3-4; review fixes (opt-in STRATA_SPEC_LANES=2..4)
+
+STRATA_LC_SHARE defaults on only for 3 and 4 lanes; with it off every lane has
+its own arena, KEEP=0, M1b's boot rule, no boot capture of the solo pipeline's
+graphs and lane graphs up to --spec, so production's STRATA_SPEC_LANES=2 +
+STRATA_SOLO_PIPELINE=1 is M1b. Lanes 2 and 3's drafters load after the expert
+caches and count in the lane fit. GDN snapshots in lane 2's arena stay below
+its persistent tail. The post-build check treats an unreadable card as short.
+A failed snapshot move-back frees what it moved. HOLD=2 is M1b's rule again.
+STRATA_SPEC_LANES folds the solo pipeline in only where the lanes can run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/program/spec_lanes.hpp |  46 ++++++--
+ src/program/generate.cpp              | 164 ++++++++++++++++++--------
+ tests/program/spec_lanes_test.cpp     |  38 ++++--
+ 3 files changed, 183 insertions(+), 65 deletions(-)
+
+diff --git a/include/strata/program/spec_lanes.hpp b/include/strata/program/spec_lanes.hpp
+index 0daab1de..2ed8193c 100644
+--- a/include/strata/program/spec_lanes.hpp
++++ b/include/strata/program/spec_lanes.hpp
+@@ -74,12 +74,17 @@ inline bool gate(const Slot* lanes, int L, bool others_active, bool one) {
+ /// STRATA_SPEC_LANES_HOLD=k (testing): fresh lane slots wait (no batch window runs them) until k of them have been
+ /// admitted, so every one runs admission -> lane windows only.  True while 1 <= n < k lane slots decode, each fresh
+ /// and lane_ok, and nothing else.  (k = 2 is M1b's HOLD=1: one lone fresh lane slot.)
++/// (review: k = 2 is exactly M1b's rule - a lone fresh lane slot waits whether or not it may run in a lane; k >= 3
++/// holds only lane_ok slots, since a slot that may not run in a lane would keep the others waiting for nothing)
+ inline bool hold(const Slot* lanes, int L, bool others_active, int k) {
+-    const int n = lane_count(lanes, L, others_active);
+-    if (n < 1 || n >= k) return false;
+-    for (int j = 0; j < L; ++j)
+-        if (lanes[j].active && !lanes[j].fresh) return false;
+-    return true;
++    if (others_active) return false;
++    int n = 0;
++    for (int j = 0; j < L; ++j) {
++        if (!lanes[j].active) continue;
++        if (!lanes[j].fresh || (k != 2 && !lanes[j].lane_ok)) return false;
++        ++n;
++    }
++    return n >= 1 && n < k;
+ }
+ /// STRATA_SPEC_LANES_HOLD's value: unset / empty / "0": off (0); "1": M1b's (2); k = 2..L: k; more than L: L.
+ inline int env_hold(const char* v, int L) {
+@@ -88,7 +93,22 @@ inline int env_hold(const char* v, int L) {
+     return std::min(std::max(k, 2), std::max(L, 2));
+ }
+ 
+-// ---- The shared VRAM (STRATA_SPEC_LANES with STRATA_LC_SHARE, the default).  The modes never run at once (every
++/// The shared-VRAM profile's default (STRATA_LC_SHARE unset; review of the low-concurrency modes): on for 3 and 4
++/// lanes, off for 2 - STRATA_SPEC_LANES=2 alone is M1b as deployed (an arena per lane, KEEP=0, M1b's boot rule, the
++/// solo pipeline's graphs captured at its first request), so a binary swap under production's config changes nothing.
++inline bool share_default(int lanes) { return lanes >= 3; }
++/// A switch with a default: unset: `def`; set: its number, non-zero on (so "" and "0" are off, as before).
++inline bool env_flag(const char* v, bool def) {
++    if (v == nullptr) return def;
++    long n = 0;
++    bool neg = false;
++    const char* c = v;
++    if (*c == '-' || *c == '+') neg = *c++ == '-';
++    while (*c >= '0' && *c <= '9') n = n * 10 + (*c++ - '0');
++    return (neg ? -n : n) != 0;
++}
++
++// ---- The shared VRAM (STRATA_SPEC_LANES with STRATA_LC_SHARE: the default for 3 and 4 lanes).  The modes never run at once (every
+ // line but BSTOP/BYIELD drains the lanes; the solo path runs only with nothing else), so a lane's verifier carves its
+ // buffers from the arena of a verifier that is idle while the lanes run: lane 0 from the stage's main verifier (the
+ // batch windows', the serial solo windows'), lane 1 from the solo pipeline's second verifier (when there is one).
+@@ -102,20 +122,24 @@ inline int own_arenas(int L, bool share, bool has_b) {
+     return std::max(0, L - (has_b ? 2 : 1));
+ }
+ 
+-/// Do the solo pipeline's two GDN snapshots of a front stage (`snap_bytes` each, 256-aligned) fit in lane 2's arena?
+-inline bool snaps_in_lane(int L, bool share, bool has_b, int64_t snap_bytes, int64_t arena_bytes) {
++/// Do the solo pipeline's two GDN snapshots of a front stage (`snap_bytes` each, 256-aligned) fit in lane 2's arena
++/// below its first buffer that outlives a window (`room`: Verifier::persist_offset - argmax_rows' counter and the
++/// constant 1 sit there, and nothing may overwrite them; review)?
++inline bool snaps_in_lane(int L, bool share, bool has_b, int64_t snap_bytes, int64_t room) {
+     const int64_t one = (snap_bytes + 255) & ~(int64_t) 255;
+-    return share && has_b && L >= 3 && snap_bytes > 0 && 2 * one <= arena_bytes;
++    return share && has_b && L >= 3 && snap_bytes > 0 && 2 * one <= room;
+ }
+ 
+ /// What L lanes take on one card (bytes, estimated before they are made): their own arenas (`arena` each, with the
+ /// verifier object `obj`), each lane's graphs and objects (`per_lane`), less the snapshots (`snap_total`, both
+ /// buffers) that move into lane 2's arena instead of their own allocation.
+-inline int64_t lanes_cost(int L, bool share, bool has_b, int64_t arena, int64_t per_lane, int64_t snap_total) {
++/// (`room`: the arena's bytes below its persistent buffers, Verifier::persist_offset; snaps_in_lane)
++inline int64_t lanes_cost(int L, bool share, bool has_b, int64_t arena, int64_t per_lane, int64_t snap_total,
++                          int64_t room) {
+     if (L <= 0) return 0;
+     const int own = own_arenas(L, share, has_b);
+     int64_t c = (int64_t) own * arena + (int64_t) L * per_lane;
+-    if (snap_total > 0 && snaps_in_lane(L, share, has_b, snap_total / 2, arena)) c -= snap_total;
++    if (snap_total > 0 && snaps_in_lane(L, share, has_b, snap_total / 2, room)) c -= snap_total;
+     return c;
+ }
+ 
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 9c901322..35229d4c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -247,22 +247,32 @@ bool mrope_slots_env() {
+ // the lane slots (0, GS, 2 GS, 3 GS: where the server puts the first users) decode and nothing else, each runs as its
+ // own solo-MTP stream - its own verifier per stage on the slot's sessions, its own drafter - and the streams' windows
+ // interleave on the stages; otherwise the batch pump as before (strata/program/spec_lanes.hpp).  It folds the solo
+-// pipeline in (STRATA_SOLO_PIPELINE, unless that says otherwise): one user decodes pipelined on the solo path.  The
+-// lanes' verifiers share the arenas of verifiers idle while they run (STRATA_LC_SHARE).  0: off; -1: not supported.
++// pipeline in (STRATA_SOLO_PIPELINE, unless that says otherwise) where the lanes can run: one user decodes pipelined on
++// the solo path.  The lanes' verifiers share the arenas of verifiers idle while they run (STRATA_LC_SHARE: the default
++// for 3 and 4).  0: off; -1: not supported.
+ int spec_lanes_env() {
+     static const int n = strata::program::spec_lanes::env_lanes(std::getenv("STRATA_SPEC_LANES"));
+     return n;
+ }
+-bool solo_pipeline_env() {
+-    static const bool on = strata::program::solo_pipeline::env_on_with_lanes(std::getenv("STRATA_SOLO_PIPELINE"),
+-                                                                             spec_lanes_env());
+-    return on;
++// `lanes_may`: the configuration lets the lanes run (the checks known before the split's stages are made; review: a
++// configuration that refuses the lanes does not get the solo pipeline folded in - its second verifiers, snapshots and
++// reserve - from STRATA_SPEC_LANES alone).  Read once per value.
++bool solo_pipeline_env(bool lanes_may) {
++    static const bool on[2] = {
++        strata::program::solo_pipeline::env_on_with_lanes(std::getenv("STRATA_SOLO_PIPELINE"), 0),
++        strata::program::solo_pipeline::env_on_with_lanes(std::getenv("STRATA_SOLO_PIPELINE"), spec_lanes_env())};
++    return on[lanes_may ? 1 : 0];
+ }
+-// STRATA_LC_SHARE=0 (with STRATA_SPEC_LANES; read once): every lane verifier with an arena of its own, as M1b (the A/B
+-// arm of the shared arenas and their way out).  Default: lane 0 carves the stage's main verifier's arena, lane 1 the
+-// solo pipeline's second verifier's, the solo pipeline's GDN snapshots move into lane 2's.
++// STRATA_LC_SHARE (with STRATA_SPEC_LANES; read once): the shared-VRAM profile - lane 0 carves the stage's main
++// verifier's arena, lane 1 the solo pipeline's second verifier's, the solo pipeline's GDN snapshots move into lane 2's;
++// the lanes keep running while one lane slot decodes (STRATA_SPEC_LANES_KEEP), the solo pipeline's graphs are captured
++// at boot, the lanes' graphs go up to the MTP's window, and the boot's rule counts what is left after the lanes.
++// Default (review): on for STRATA_SPEC_LANES=3 and 4, off for 2 - then every lane verifier has an arena of its own and
++// the rest is M1b's as deployed (KEEP=0, M1b's boot rule, the solo pipeline's graphs at its first request), so
++// STRATA_SPEC_LANES=2 alone stays M1b.  STRATA_LC_SHARE=1 / =0 says so for any N.
+ bool lc_share_env() {
+-    static const bool on = [] { const char* v = std::getenv("STRATA_LC_SHARE"); return v == nullptr || std::atoi(v) != 0; }();
++    static const bool on = strata::program::spec_lanes::env_flag(
++        std::getenv("STRATA_LC_SHARE"), strata::program::spec_lanes::share_default(spec_lanes_env()));
+     return on;
+ }
+ // STRATA_CKPT_POOL=1 (read once; off by default): the serve loop keeps the running-state vectors of the conversation
+@@ -4071,6 +4081,16 @@ int main(int argc, char** argv) {
+         return o.mtp_draft_vocab.empty() ? std::filesystem::exists(std::filesystem::path(o.mtp) / "draft_vocab.bin", ec)
+                                          : std::filesystem::exists(o.mtp_draft_vocab, ec);
+     }();
++    // STRATA_SPEC_LANES folds the solo pipeline in only where the lanes can run (what is known here of lanes_asked below)
++    const bool lanes_may = [&] {
++        const char* bm = std::getenv("STRATA_BATCH_MTP");
++        const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
++        return spec_lanes_env() >= 2 && o.serve && o.batch > 0 && !o.mtp.empty() && o.spec >= 2 &&
++               !split_devs.empty() && !split_same && !helpers && !o.remote_expert_opt && o.peer_device < 1 &&
++               !o.adapt_async && o.mtp_q4.empty() && !strata::core::coupled_draft_env() && !o.batch_mtp &&
++               !(bm != nullptr && bm[0] != '\0' && bm[0] != '0');
++    }();
++    const bool solo_env = solo_pipeline_env(lanes_may);
+     const bool pw_auto = o.pipeline_windows < 0;
+     if (pw_auto) {
+         static const char* ae = std::getenv("STRATA_PIPELINE_AUTO");
+@@ -4094,10 +4114,10 @@ int main(int argc, char** argv) {
+         // STRATA_PIPELINE_AUTO=0 keeps it off here too (an explicit --pipeline-windows 2 still turns it on)
+         o.pipeline_windows = strata::program::solo_pipeline::resolve_windows(o.pipeline_windows,
+                                                                              !(ae != nullptr && std::atoi(ae) == 0), o.batch,
+-                                                                             solo_pipeline_env());
++                                                                             solo_env);
+     }
+     // STRATA_SOLO_PIPELINE=1: --pipeline-windows 2 beside --batch slots (the solo path only; see solo_pipeline_env)
+-    const bool solo_pl_asked = strata::program::solo_pipeline::asked(o.pipeline_windows, o.batch, solo_pipeline_env());
++    const bool solo_pl_asked = strata::program::solo_pipeline::asked(o.pipeline_windows, o.batch, solo_env);
+     if (o.pipeline_windows > 0) {
+         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+         const char* off = !o.serve ? "it needs --serve"
+@@ -4347,7 +4367,7 @@ int main(int argc, char** argv) {
+     // (review: the refusals that are known here already count, so a configuration the lanes refuse later keeps nothing
+     // back; the rest - the slot groups, the slot sessions - is decided where the drafters load and said there)
+     // STRATA_SPEC_LANES=N (N = 2..4: up to N lanes, one per slot group; the low-concurrency modes): N verifiers more
+-    // per stage, but with STRATA_LC_SHARE (the default) lane 0 carves the stage's main verifier's arena and lane 1 the
++    // per stage, but with STRATA_LC_SHARE (the default for 3 and 4) lane 0 carves the stage's main verifier's arena and lane 1 the
+     // solo pipeline's second verifier's, so only the lanes past those take an arena (~100 MiB) of their own; every lane
+     // its window and commit graphs (up to the MTP's window: ~25 MiB) - kLaneOwnMib and kLaneShareMib per lane as the
+     // estimate (never more than M1b's two lanes held back: 400 MiB).  STRATA_LC_SHARE=0: M1b's 200 MiB per lane.
+@@ -5333,6 +5353,21 @@ int main(int argc, char** argv) {
+     int n_lanes = 0;   // the lanes made (STRATA_SPEC_LANES=N asks for up to N; the slot groups and the boot's VRAM rule decide)
+     bool lanes_on = false;
+     std::vector<std::unique_ptr<strata::core::MtpDrafter>> lane_mtp;
++    // lane j's drafter (slot lane_slot[j]'s K/V layout and PLE history, the solo drafter's weights and draft limit)
++    auto load_lane_drafter = [&](int j, std::string& e) -> bool {
++        const int s_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
++        auto d = std::make_unique<strata::core::MtpDrafter>();
++        d->set_force_capture(true);
++        d->set_hnorm_per_stream(o.mtp_hnorm_stream);
++        if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) lane_slot[j]], o.spec, e, o.mtp_window, &mtp)) {
++            (void) cudaGetLastError();
++            return false;
++        }
++        if (s_mtp < o.spec) d->set_max_drafts(s_mtp - 1);
++        d->set_ple_session(bslot_ss[0][(size_t) lane_slot[j]].get());
++        lane_mtp.push_back(std::move(d));
++        return true;
++    };
+     if (!o.mtp.empty()) {
+         if (o.spec < 2) {
+             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
+@@ -5407,24 +5442,16 @@ int main(int argc, char** argv) {
+             if (lanes_on && n_lanes < lanes_max_asked)
+                 std::fprintf(stderr, "strata generate: STRATA_SPEC_LANES=%d: %d slot groups, so up to %d lanes\n",
+                              lanes_max_asked, o.batch_groups, n_lanes);
+-            const int s_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+-            for (int j = 0; j < n_lanes && lanes_on; ++j) {
+-                auto d = std::make_unique<strata::core::MtpDrafter>();
+-                d->set_force_capture(true);
+-                d->set_hnorm_per_stream(o.mtp_hnorm_stream);
+-                if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) lane_slot[j]], o.spec, err, o.mtp_window,
+-                             &mtp)) {
+-                    (void) cudaGetLastError();
++            // M1b's two drafters here, before the caches; lanes 2 and 3's after them, where the boot decides how many
++            // lanes fit (review: never at the expert caches' cost - experts stay resident, the lanes go instead)
++            for (int j = 0; j < std::min(n_lanes, 2) && lanes_on; ++j)
++                if (!load_lane_drafter(j, err)) {
+                     std::fprintf(stderr, "strata generate: STRATA_SPEC_LANES: lane %d's drafter (slot %d): %s%s\n", j,
+                                  lane_slot[j], err.c_str(), vram_free_note().c_str());
+                     why = "a lane's drafter did not load";
+                     lanes_on = false;
+                     break;
+                 }
+-                if (s_mtp < o.spec) d->set_max_drafts(s_mtp - 1);
+-                d->set_ple_session(bslot_ss[0][(size_t) lane_slot[j]].get());
+-                lane_mtp.push_back(std::move(d));
+-            }
+             if (!lanes_on) {
+                 lane_mtp.clear();
+                 n_lanes = 0;
+@@ -5436,8 +5463,9 @@ int main(int argc, char** argv) {
+                 std::string ls;
+                 for (int j = 0; j < n_lanes; ++j) ls += (j == 0 ? "" : ",") + std::to_string(lane_slot[j]);
+                 std::fprintf(stderr, "strata generate: STRATA_SPEC_LANES=%d: lanes on slots %s, their drafters on CUDA%d "
+-                                     "(%.0f MiB of private K/V state and buffers each, sharing the solo drafter's weights); "
+-                                     "%.2f GiB free there\n", lanes_max_asked, ls.c_str(), mtp.device(),
++                                     "(%.0f MiB of private K/V state and buffers each, sharing the solo drafter's weights; "
++                                     "lanes 2 and 3's after the caches); %.2f GiB free there\n", lanes_max_asked, ls.c_str(),
++                             mtp.device(),
+                              (double) lane_mtp.front()->vram_bytes() / 1048576.0, (double) fb / 1073741824.0);
+             }
+         }
+@@ -9042,7 +9070,7 @@ int main(int argc, char** argv) {
+         // the VRAM free after the boot is what stays free and the lanes' room below counts them (a capture syncs its
+         // stream; nothing is in flight).  The main verifiers record their pipelined windows in set_pl_mode, as the solo
+         // path does before its first window, and leave it.  A failure is said and leaves it to the first request, as before.
+-        if (pipe && solo_pl && lanes_asked) {
++        if (pipe && solo_pl && lanes_asked && lc_share_env()) {   // (the shared-VRAM profile; M1b: at the first request)
+             std::vector<int64_t> f0;
+             for (int st = 0; st < n_stages; ++st) f0.push_back(card_free_mib(st));
+             std::string e2;
+@@ -9083,7 +9111,7 @@ int main(int argc, char** argv) {
+         // in the slot's own M-RoPE region (set_rope_base, as the slot's batch rows) - their hand-offs (one per lane and
+         // stage boundary), one stream per stage the lanes share (their windows and commits queue on it in the order
+         // they come), each lane's pool routing, and the drafters bound to row buffers of their own.
+-        // The shared VRAM (STRATA_LC_SHARE, the default; spec_lanes.hpp): the modes never run at once - every line but
++        // The shared VRAM (STRATA_LC_SHARE, the default for 3 and 4 lanes; spec_lanes.hpp): the modes never run at once - every line but
+         // BSTOP/BYIELD drains the lanes, the solo path runs alone, the pump only once they have drained, and lane_begin
+         // fences every stream that touched the arenas (lc_fence) - so lane 0's verifier carves the stage's main verifier's
+         // arena and lane 1's the solo pipeline's second verifier's (set_external_arena: the same carve, checked by its
+@@ -9113,8 +9141,9 @@ int main(int argc, char** argv) {
+         const int lane_max_t = std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT));
+         // (review M3) a lane's windows are the MTP's (spec_lanes::window_size caps them at S_mtp): its graphs up to that
+         // (the suffix drafter's longer lookup windows are the solo path's)
+-        const int lane_cap_t = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+         const bool lc_share = lc_share_env();
++        // (STRATA_LC_SHARE=0, M1b's profile: up to --spec, as M1b captured them)
++        const int lane_cap_t = !lc_share ? o.spec : o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+         const bool lc_has_b = pipe && solo_pl;   // the solo pipeline's second verifiers (lane 1's arena)
+         // the verifier whose arena lane j's verifier on stage st carves (null: an arena of its own)
+         auto lane_host = [&](int j, int st) -> strata::core::Verifier* {
+@@ -9140,6 +9169,24 @@ int main(int argc, char** argv) {
+             n_lanes = 0;
+         }
+         std::vector<int64_t> lane_free0;   // MiB free per card before the lanes' verifiers
++        // lanes 2 and 3's drafters, here after the caches (review: the caches never shrink for them; what they take is
++        // counted below like the rest of the lanes, and the lanes that do not fit give theirs back).  One that does not
++        // load: fewer lanes.
++        std::vector<int64_t> lane_late_b;   // [j]: lane j's drafter's bytes when it loaded here (0: before the caches)
++        if (lanes_on) {
++            lane_late_b.assign((size_t) n_lanes, 0);
++            for (int j = (int) lane_mtp.size(); j < n_lanes; ++j) {
++                std::string e2;
++                const strata::core::OnDevice on_m(mtp.device());
++                if (!load_lane_drafter(j, e2)) {
++                    std::fprintf(stderr, "strata serve: STRATA_SPEC_LANES: lane %d's drafter (slot %d) did not load (%s): "
++                                         "up to %d lanes\n", j, lane_slot[j], e2.c_str(), j);
++                    n_lanes = j;
++                    break;
++                }
++                lane_late_b[(size_t) j] = (int64_t) lane_mtp.back()->vram_bytes();
++            }
++        }
+         if (lanes_on) {
+             std::vector<int64_t> fr;
+             for (int st = 0; st < n_stages; ++st) {
+@@ -9151,17 +9198,25 @@ int main(int argc, char** argv) {
+             }
+             // per lane and card: its window and commit graphs and the verifier object (~25 + 3 MiB with the graphs up to
+             // the MTP's window; the last card: the drafter's prefill and chain graphs too, ~13 MiB); per arena of its own
+-            // the main verifier's size
++            // the main verifier's size; less the drafters loaded above for lanes that L leaves out (they go).
++            // STRATA_LC_SHARE=0 (M1b's profile): M1b's rule for L lanes - 200 MiB each, the floor before them
+             auto lane_cost = [&](int st, int L) -> int64_t {
++                int64_t back = 0;
++                if (lane_dev(st) == mtp.device())
++                    for (int j = std::max(L, 0); j < (int) lane_late_b.size(); ++j) back += lane_late_b[(size_t) j];
++                if (!lc_share) return (int64_t) L * (kLaneVerMib << 20) - back;
+                 const int64_t A = (int64_t) stage_ver(st).arena_bytes();
+                 const int64_t per = (st + 1 == n_stages ? 41 : 28) << 20;
+                 const int64_t snap = st < pl_nf && pl_snap_ok && pl_snaps[(size_t) st].buf[0] != nullptr
+                                          ? (pl_snaps[(size_t) st].buf[1] != nullptr ? 2 : 1) * (int64_t) pl_snaps[(size_t) st].bytes
+                                          : 0;
+-                return strata::program::spec_lanes::lanes_cost(L, lc_share, lc_has_b, A, per, snap);
++                // (lane 2's arena is carved like the main verifier's: the snapshots go below its persistent tail)
++                return strata::program::spec_lanes::lanes_cost(L, lc_share, lc_has_b, A, per, snap,
++                                                                (int64_t) stage_ver(st).persist_offset()) - back;
+             };
+-            const int L = fr.empty() ? 0
+-                        : strata::program::spec_lanes::fit_lanes(n_lanes, n_stages, fr.data(), lc_lazy_mib << 20,
++            const int64_t lazy_b = lc_share ? lc_lazy_mib << 20 : 0;
++            const int L = fr.empty() || n_lanes < 2 ? 0
++                        : strata::program::spec_lanes::fit_lanes(n_lanes, n_stages, fr.data(), lazy_b,
+                                                                  lc_floor_mib << 20, lane_cost);
+             std::string per_card;
+             for (int st = 0; st < (int) fr.size(); ++st) {
+@@ -9176,7 +9231,7 @@ int main(int argc, char** argv) {
+                          per_card.c_str(), strata::program::spec_lanes::own_arenas(std::max(L, 2), lc_share, lc_has_b),
+                          strata::program::spec_lanes::own_arenas(std::max(L, 2), lc_share, lc_has_b) == 1 ? "" : "s",
+                          lc_share ? "shared with idle verifiers (STRATA_LC_SHARE)" : "none (STRATA_LC_SHARE=0)",
+-                         (long long) lc_floor_mib, (long long) lc_lazy_mib, L, L == 1 ? "" : "s", lanes_max_asked);
++                         (long long) lc_floor_mib, (long long) (lazy_b >> 20), L, L == 1 ? "" : "s", lanes_max_asked);
+             if (L < 2) {
+                 std::fprintf(stderr, "strata serve: WARNING: STRATA_SPEC_LANES is off: too little VRAM for two lanes (the "
+                                      "room kept out of the expert caches stays out; drop STRATA_SPEC_LANES on this split)\n");
+@@ -9329,6 +9384,7 @@ int main(int argc, char** argv) {
+             // own (a lane 2 that goes): nothing is in flight at boot, the snapshots hold nothing yet, and no graph holds
+             // their address (the solo loop copies them by address).  False: no room for them (the solo path serial).
+             auto lc_snaps_place = [&](bool into) -> bool {
++                std::vector<int> back;   // (out: the stages moved back by this call, freed again if a later one fails)
+                 for (int st = 0; st < pl_nf; ++st) {
+                     PlSnap& sn = pl_snaps[(size_t) st];
+                     const strata::core::OnDevice on(sn.dev);
+@@ -9336,7 +9392,9 @@ int main(int argc, char** argv) {
+                     const size_t one = (sn.bytes + 255) & ~(size_t) 255;
+                     if (into) {
+                         strata::core::Verifier& v2 = lane_ver(2, st);
+-                        if (sn.buf[0] == nullptr || v2.device() != sn.dev || (size_t) nb * one > v2.arena_bytes()) continue;
++                        // (review) below the arena's persistent tail - argmax_rows' counter and the constant 1 - never
++                        // over it: the snapshots would overwrite what lane 2's next window reads first
++                        if (sn.buf[0] == nullptr || v2.device() != sn.dev || (size_t) nb * one > v2.persist_offset()) continue;
+                         cudaFree(sn.buf[0]);
+                         if (nb == 2) cudaFree(sn.buf[1]);
+                         sn.buf[0] = (float*) v2.arena();
+@@ -9357,10 +9415,18 @@ int main(int argc, char** argv) {
+                                     pl_snaps[(size_t) s2].buf[0] = pl_snaps[(size_t) s2].buf[1] = nullptr;
+                                     lc_snap_in[(size_t) s2] = 0;
+                                 }
++                            // (review) the solo path stays serial: the ones this call already moved back go too
++                            for (const int s2 : back) {
++                                PlSnap& sb = pl_snaps[(size_t) s2];
++                                const strata::core::OnDevice on2(sb.dev);
++                                for (float*& q : sb.buf)
++                                    if (q != nullptr) { cudaFree(q); q = nullptr; }
++                            }
+                             return false;
+                         }
+                         sn.buf[0] = b0;
+                         if (nb == 2) sn.buf[1] = b1;
++                        back.push_back(st);
+                     }
+                 }
+                 return true;
+@@ -9403,13 +9469,15 @@ int main(int argc, char** argv) {
+                 lc_snaps_place(true);
+             }
+             // the boot's rule, checked: every card keeps the floor after what is still made lazily; else the top lane goes
+-            while (built && n_lanes >= 2) {
++            // (STRATA_LC_SHARE=0, M1b's profile: M1b's rule, before the lanes only; a card whose free VRAM cannot be
++            // read counts as short, as before the lanes)
++            while (built && lc_share && n_lanes >= 2) {
+                 std::string short_on;
+                 for (int st = 0; st < n_stages; ++st) {
+                     const int64_t f = card_free_mib(st);
+-                    if (f >= 0 && !strata::program::spec_lanes::room_ok(f, lc_lazy_mib, lc_floor_mib))
++                    if (f < 0 || !strata::program::spec_lanes::room_ok(f, lc_lazy_mib, lc_floor_mib))
+                         short_on += (short_on.empty() ? "CUDA" : ", CUDA") + std::to_string(lane_dev(st)) + " " +
+-                                    std::to_string((long long) f) + " MiB";
++                                    (f < 0 ? std::string("(not read)") : std::to_string((long long) f) + " MiB");
+                 }
+                 if (short_on.empty()) break;
+                 std::fprintf(stderr, "strata serve: STRATA_SPEC_LANES: free after %d lanes: %s - below %lld + %lld MiB: lane "
+@@ -12663,12 +12731,12 @@ int main(int argc, char** argv) {
+             return v != nullptr && v[0] != '\0' && v[0] != '0';
+         }();
+         // STRATA_SPEC_LANES_KEEP=0: the lanes drain as soon as fewer than the start's lane slots decode (M1b: the pump
+-        // then runs the rest); default: running lanes go on while one lane slot decodes and nothing else, so a user who is
+-        // done never stops the others (and the last one runs on in its lane until its BSTOP / the next line)
+-        static const bool lanes_keep = [] {
+-            const char* v = std::getenv("STRATA_SPEC_LANES_KEEP");
+-            return v == nullptr || std::atoi(v) != 0;
+-        }();
++        // then runs the rest); 1: running lanes go on while one lane slot decodes and nothing else, so a user who is
++        // done never stops the others (and the last one runs on in its lane until its BSTOP / the next line: serial
++        // solo-spec windows, not the pipelined solo path's - the server keeps the slot).  Default: the profile's
++        // (STRATA_LC_SHARE: on for 3 and 4 lanes, off - M1b - for 2)
++        static const bool lanes_keep = strata::program::spec_lanes::env_flag(std::getenv("STRATA_SPEC_LANES_KEEP"),
++                                                                             lc_share_env());
+         // the fewest lane slots the lanes start for: two (M1b's two lanes: both), one with STRATA_SPEC_LANES_ONE; with
+         // KEEP=0 and two lanes exactly M1b's gate (both lane slots)
+         const int lanes_n_min = lanes_one ? 1 : 2;
+@@ -12706,12 +12774,14 @@ int main(int argc, char** argv) {
+         // HOLD=k (up to four lanes): fresh lane slots wait until k of them are admitted (1: M1b's, two)
+         const int lanes_hold_k = strata::program::spec_lanes::env_hold(std::getenv("STRATA_SPEC_LANES_HOLD"), std::max(n_lanes, 2));
+         const bool lanes_hold = lanes_hold_k > 0;
+-        if (lanes_on && (lanes_nostart || lanes_hold || !lanes_keep || lc_poison != 0))
++        if (lanes_on && (lanes_nostart || lanes_hold || lanes_keep != lc_share_env() || lc_poison != 0))
+             std::fprintf(stderr, "strata serve: STRATA_SPEC_LANES=%d:%s%s%s%s (testing knobs)\n", n_lanes,
+                          lanes_nostart ? " NOSTART - the lanes never start" : "",
+                          lanes_hold ? (" HOLD - fresh lane slots wait until " + std::to_string(lanes_hold_k) +
+                                        " are admitted").c_str() : "",
+-                         !lanes_keep ? " KEEP=0 - the lanes drain when a lane slot ends (M1b)" : "",
++                         lanes_keep == lc_share_env() ? ""
++                         : !lanes_keep ? " KEEP=0 - the lanes drain when a lane slot ends (M1b)"
++                                       : " KEEP=1 - the lanes go on while one lane slot decodes",
+                          lc_poison != 0 ? (" POISON - the shared arenas filled with 0x" +
+                                            [&] { char b[8]; std::snprintf(b, sizeof b, "%02x", lc_poison); return std::string(b); }() +
+                                            " at every switch").c_str() : "");
+diff --git a/tests/program/spec_lanes_test.cpp b/tests/program/spec_lanes_test.cpp
+index 814ff7b2..49a86e40 100644
+--- a/tests/program/spec_lanes_test.cpp
++++ b/tests/program/spec_lanes_test.cpp
+@@ -99,6 +99,19 @@ int main() {
+         h[1].fresh = true;
+         check(!sl::hold(h, 4, true, 3), "another slot decodes: not held");
+         check(!sl::hold(h, 4, false, 0), "off");
++        // (review) k 2 is M1b's rule: a lone fresh lane slot waits whether or not it may run in a lane; k 3 only lane_ok
++        sl::Slot hx[4] = {{true, false, true}, {}, {}, {}};
++        check(sl::hold(hx, 4, false, 2), "k 2: a lone fresh image request held (M1b)");
++        check(!sl::hold(hx, 4, false, 3), "k 3: a slot that may not run in a lane is not held");
++        hx[0].fresh = false;
++        check(!sl::hold(hx, 4, false, 2), "k 2: not fresh: not held");
++    }
++    // the profile's defaults: STRATA_SPEC_LANES=2 alone is M1b (no sharing), 3 and 4 share
++    {
++        check(!sl::share_default(2) && sl::share_default(3) && sl::share_default(4), "share default: 3 and 4");
++        check(sl::env_flag(nullptr, true) && !sl::env_flag(nullptr, false), "flag unset: the default");
++        check(!sl::env_flag("", true) && !sl::env_flag("0", true), "flag empty / 0: off");
++        check(sl::env_flag("1", false) && sl::env_flag("2", false) && !sl::env_flag("x", true), "flag 1, 2 on; junk off");
+     }
+     // the shared arenas: what a card allocates for L lanes
+     {
+@@ -114,17 +127,22 @@ int main() {
+         check(!sl::snaps_in_lane(3, true, false, S, A), "no solo pipeline: no snapshots");
+         check(!sl::snaps_in_lane(3, true, true, 60ll << 20, A), "snapshots larger than half an arena: their own");
+         check(!sl::snaps_in_lane(3, true, true, 0, A), "the last stage: none");
++        // (review) bounded by the persistent tail (argmax_rows' counter, the constant 1), not the whole arena
++        check(sl::snaps_in_lane(3, true, true, 50ll << 20, A), "2 x 50 MiB in a 100 MiB arena: fits the whole arena");
++        check(!sl::snaps_in_lane(3, true, true, 50ll << 20, A - (1ll << 20)), "but not below a tail 1 MiB from the end");
++        check(sl::snaps_in_lane(3, true, true, (50ll << 20) - 256, A - 512), "the boundary itself: fits");
++        check(!sl::snaps_in_lane(3, true, true, (50ll << 20) - 255, A - 512), "one aligned row past it: not");
+         const int64_t G = 25ll << 20;
+-        check(sl::lanes_cost(2, true, true, A, G, 2 * S) == 2 * G, "2 lanes: their graphs only");
+-        check(sl::lanes_cost(3, true, true, A, G, 2 * S) == A + 3 * G - 2 * S, "3 lanes: one arena, less the snapshots");
+-        check(sl::lanes_cost(4, true, true, A, G, 2 * S) == 2 * A + 4 * G - 2 * S, "4 lanes: two arenas");
+-        check(sl::lanes_cost(2, false, true, A, G, 2 * S) == 2 * A + 2 * G, "M1b's allocation");
+-        check(sl::lanes_cost(0, true, true, A, G, 2 * S) == 0, "no lanes: 0");
++        check(sl::lanes_cost(2, true, true, A, G, 2 * S, A) == 2 * G, "2 lanes: their graphs only");
++        check(sl::lanes_cost(3, true, true, A, G, 2 * S, A) == A + 3 * G - 2 * S, "3 lanes: one arena, less the snapshots");
++        check(sl::lanes_cost(4, true, true, A, G, 2 * S, A) == 2 * A + 4 * G - 2 * S, "4 lanes: two arenas");
++        check(sl::lanes_cost(2, false, true, A, G, 2 * S, A) == 2 * A + 2 * G, "M1b's allocation");
++        check(sl::lanes_cost(0, true, true, A, G, 2 * S, A) == 0, "no lanes: 0");
+         // the region formula of the design: k*A + max(0, S - (k-1)*A) with k = max(1, L-1) (ver_b's arena included)
+         for (int L = 2; L <= 4; ++L) {
+             const int k = std::max(1, L - 1);
+             const int64_t region = (int64_t) k * A + std::max<int64_t>(0, 2 * S - (int64_t) (k - 1) * A);
+-            const int64_t ours = A + sl::lanes_cost(L, true, true, A, 0, 2 * S) + 2 * S;   // ver_b + lanes + snapshots
++            const int64_t ours = A + sl::lanes_cost(L, true, true, A, 0, 2 * S, A) + 2 * S;   // ver_b + lanes + snapshots
+             check(region == ours, "the design's region formula");
+         }
+     }
+@@ -133,7 +151,7 @@ int main() {
+         const int64_t MiB = 1ll << 20, A = 100 * MiB, G = 25 * MiB, S = 30 * MiB;
+         // (the lane drafters load before the caches; the second verifiers, the snapshots and their graphs are made
+         // before the lanes: `free` is what is left then)
+-        auto cost = [&](int i, int L) { return sl::lanes_cost(L, true, true, A, G + 3 * MiB, i < 3 ? 2 * S : 0); };
++        auto cost = [&](int i, int L) { return sl::lanes_cost(L, true, true, A, G + 3 * MiB, i < 3 ? 2 * S : 0, A - MiB); };
+         const int64_t f32[4] = {1090 * MiB, 1180 * MiB, 2050 * MiB, 1460 * MiB};   // ~production at 32K, at boot
+         const int L32 = sl::fit_lanes(4, 4, f32, 141 * MiB, 768 * MiB, cost);
+         check(L32 == 3, "32K: four asked, three fit");
+@@ -143,6 +161,12 @@ int main() {
+         const int64_t tiny[4] = {800 * MiB, 800 * MiB, 800 * MiB, 800 * MiB};
+         check(sl::fit_lanes(4, 4, tiny, 141 * MiB, 768 * MiB, cost) == 0, "no room: none");
+         check(sl::room_ok(1000 * MiB, 141 * MiB, 768 * MiB) && !sl::room_ok(900 * MiB, 141 * MiB, 768 * MiB), "room_ok");
++        // STRATA_LC_SHARE off (M1b's rule, generalised): 200 MiB per lane, the floor before them, nothing lazy
++        auto m1b = [&](int, int L) { return (int64_t) L * 200 * MiB; };
++        const int64_t f1168[4] = {1168 * MiB, 1300 * MiB, 2000 * MiB, 1400 * MiB};
++        check(sl::fit_lanes(2, 4, f1168, 0, 768 * MiB, m1b) == 2, "M1b: 400 + 512 + 256 = 1168 MiB free: two lanes");
++        const int64_t f1167[4] = {1167 * MiB, 1300 * MiB, 2000 * MiB, 1400 * MiB};
++        check(sl::fit_lanes(2, 4, f1167, 0, 768 * MiB, m1b) == 0, "M1b: 1167 MiB: none");
+     }
+ 
+     // the window size: the serial loop's rule (drafts while their probability is >= spec_min_p), the context room
+-- 
+2.43.0
+

@@ -13,9 +13,15 @@ Modes (each prints its verdicts as lines starting with '==> ', ending in PASS, F
   boot     start, READY, one short GEN, the engine's own boot lines (loans, VRAM free with everything loaded, the
            M1a / M1b cost lines), nvidia-smi, QUIT.  --expect off|m1a|m1b; --base <boot JSON of the env-off boot>
   solo     GEN requests in a fixed order (--seq ref|m1a|fm), tokens and each request's log lines -> --out JSON
-  lanes    the M1b exactness drive: per pair BGEN 0, wait for BADM 0 1, BGEN 4 (STRATA_SPEC_LANES_HOLD keeps slot 0
-           untouched in between), both slots' tokens until BDONE -> --out JSON (--pairs all|one|ov)
-  compare  --ref <solo JSON> --got <solo or lanes JSON>: token identity per request / per lane slot
+  lanes    the lane exactness drive: per group BGEN into each of its slots in turn (0, 4[, 8[, 12]]), each waiting
+           for its BADM (STRATA_SPEC_LANES_HOLD=k, k = the group's size, keeps the earlier slots untouched), every
+           slot's tokens until BDONE -> --out JSON (--pairs all|one|ov: M1b's pairs; g2s|g3|g4: groups of 2/3/4)
+  switch   window-lanes4.sh's mode switches on one engine (STRATA_SPEC_LANES_HOLD=2): GEN (1 user, pipelined), then
+           the lane slots one after the other while the earlier ones decode (2 -> 3 -> 4 lanes), BSTOP down to two,
+           then one, then GEN again (1 -> 2 -> 3 -> 4 -> 2 -> 1) -> --out JSON
+  compare  --ref <solo JSON> --got <solo, lanes or switch JSON>: token identity per request / per lane slot (a lane
+           slot's lane phase: its contiguous lane windows from its admission on, from the 'lanes start' / 'lanes ran'
+           lines)
   prefill  prefill speed by prompt length (slot 15, phases idle and dec15 = 15 slots decoding beside the read)
   sweep    per-arm speed from results/sweep.jsonl (ab_quick labels): agg tok/s, per-user decode p50, deltas
   abcheck  ab_quick's reply-identity brackets -> PASS / FAIL (or INFO)
@@ -32,7 +38,10 @@ TOOLS = "/media/raid0/StrataQ38FN/Strata-1441/tools"
 sys.path.insert(0, TOOLS)
 import vision_batch_check as V  # noqa: E402
 
-TIER_ROOT = "/media/raid0/strata-kvspill-bench/lanes"
+# (window-lanes4.sh sets LANES_TIER_ROOT to its own dir under /media/raid0/strata-kvspill-bench)
+TIER_ROOT = os.environ.get("LANES_TIER_ROOT") or "/media/raid0/strata-kvspill-bench/lanes"
+if not TIER_ROOT.startswith("/media/raid0/strata-kvspill-bench/"):
+    raise SystemExit(f"LANES_TIER_ROOT {TIER_ROOT}: not under /media/raid0/strata-kvspill-bench (never production's)")
 MAXCTX = 262144
 # exactness settings of every token comparison (both sides): no adaptive swaps, no PCIe share, no suffix drafter
 # (its drafts would make the serial reference's windows differ from the lanes' for a reason that is not the lanes)
@@ -45,9 +54,19 @@ SOLO_SEQ = ["s_short1", "s_short2", "s_1k2", "s_4k", "s_16k", "s_48k", "t_short"
 FM_SEQ = ["s_short1", "s_1k2", "s_4k", "t_short", "s_16k"]
 PAIRS = {"all": ["L_short", "L_long", "L_t07", "L_32k", "L_32kr", "L_pcie", "L_vis"],
          "one": ["L_short", "L_long", "L_t07", "L_32k"],
-         "ov": ["L_short", "L_32kr"]}
+         "ov": ["L_short", "L_32kr"],
+         # window-lanes4.sh (up to four lanes): 2 lanes in the shared profile, 3 and 4 lanes (HOLD=2 / 3 / 4)
+         "g2s": ["L_short", "L_t07", "L_32k", "L_32kr", "L_vis"],
+         "g3": ["G3_short", "G3_t07", "G3_32k", "G3_32kr"],
+         "g4": ["G4_short", "G4_mix", "G4_32k"]}
 LANE_REF_SEQ = [f"{p}.{s}" for p in PAIRS["all"] for s in (0, 4)]
-SEQS = {"ref": SOLO_SEQ + LANE_REF_SEQ, "m1a": SOLO_SEQ, "fm": FM_SEQ}
+G_REF_SEQ = [f"{g}.{s}" for g in PAIRS["g3"] for s in (0, 4, 8)] + [f"{g}.{s}" for g in PAIRS["g4"] for s in (0, 4, 8, 12)]
+SW_SLOTS = (0, 4, 8, 12)
+SW_MAX_NEW = 1500
+SW_STEP = 48                      # tokens per user between two mode switches
+SW_REF_SEQ = ["sw_s1"] + [f"sw.{s}" for s in SW_SLOTS] + ["sw_s2"]
+SEQS = {"ref": SOLO_SEQ + LANE_REF_SEQ, "m1a": SOLO_SEQ, "fm": FM_SEQ,
+        "ref4": SOLO_SEQ + LANE_REF_SEQ + G_REF_SEQ + SW_REF_SEQ}
 
 LOG_KEEP = re.compile(r"pipelined=|KV streaming:|strata serve: prompt \d+ tokens|conversation cache: (restored|parked)|strata pipeline: \d+ windows|"
                       r"STRATA_SPEC_LANES|STRATA_SOLO_PIPELINE|overlapped read|no progress for|ERR|WARNING")
@@ -176,8 +195,43 @@ def build_cases(tok, pics):
     if pics:
         add("V_imgA", P.image("A", V.Q_IMAGE), max_new=48, emb=pics["A"]["file"])
         add("V_imgB", P.image("B", V.Q_IMAGE2), max_new=48, emb=pics["B"]["file"])
+    # window-lanes4.sh: groups of 3 (slots 0, 4, 8) and 4 (0, 4, 8, 12): greedy, T=0.7 seed 1234, a > 32K context in
+    # the first (held) and in the last admission
+    add("G3_short.0", P.text(16))
+    add("G3_short.4", P.text(17))
+    add("G3_short.8", P.text(18))
+    add("G3_t07.0", P.text(19), T07)
+    add("G3_t07.4", P.text_like(1200, 30, Q_LONG))
+    add("G3_t07.8", P.text(20), T07)
+    add("G3_32k.0", P.text_like(40000, 31, Q_LONG))
+    add("G3_32k.4", P.text(21))
+    add("G3_32k.8", P.text(22), T07)
+    add("G3_32kr.0", P.text(23))
+    add("G3_32kr.4", P.text(24), T07)
+    add("G3_32kr.8", P.text_like(40000, 32, Q_LONG))
+    add("G4_short.0", P.text(25))
+    add("G4_short.4", P.text(26))
+    add("G4_short.8", P.text(27))
+    add("G4_short.12", P.text(28))
+    add("G4_mix.0", P.text(29), T07)
+    add("G4_mix.4", P.text_like(1200, 33, Q_LONG))
+    add("G4_mix.8", P.text(30), T07)
+    add("G4_mix.12", P.text_like(4000, 34, Q_LONG))
+    add("G4_32k.0", P.text(31))
+    add("G4_32k.4", P.text_like(40000, 35, Q_LONG))
+    add("G4_32k.8", P.text(32), T07)
+    add("G4_32k.12", P.text(33))
+    # the mode switches (mode_switch): long replies (an agenda item by item), so every user still decodes at the
+    # switches; slot 8 has > 32K of context; the two GEN around them are the 1-user (pipelined) mode
+    add("sw_s1", P.text_like(1200, 40, Q_LONG), max_new=300)
+    add("sw.0", P.text_like(2000, 36, Q_LONG), max_new=SW_MAX_NEW)
+    add("sw.4", P.text_like(1500, 37, Q_LONG), T07, max_new=SW_MAX_NEW)
+    add("sw.8", P.text_like(40000, 38, Q_LONG), max_new=SW_MAX_NEW)
+    add("sw.12", P.text_like(2500, 39, Q_LONG), T07, max_new=SW_MAX_NEW)
+    add("sw_s2", P.text_like(1600, 41, Q_LONG), max_new=300)
     lens = {k: len(v["ids"]) for k, v in c.items()}
-    for k, lo in (("s_48k", 48000), ("r_turn1", 34000), ("L_32k.0", 34000), ("L_32kr.4", 34000)):
+    for k, lo in (("s_48k", 48000), ("r_turn1", 34000), ("L_32k.0", 34000), ("L_32kr.4", 34000), ("G3_32k.0", 34000),
+                  ("G3_32kr.8", 34000), ("G4_32k.4", 34000), ("sw.8", 34000)):
         if lens[k] < lo:
             raise SystemExit(f"{k}: {lens[k]} tokens, wanted >= {lo}")
     if len(c["r_follow"]["ids"]) <= 32768:
@@ -284,6 +338,7 @@ def mode_boot(a, cfg):
         time.sleep(0.5)
         res["gen"] = {"tokens": len(r["tokens"]), "log": [l for l in e.log_text(mark).splitlines() if LOG_KEEP.search(l)]}
         res["smi"] = smi()
+        res["rss_mib"] = rss_mib(e.p.pid)
     finally:
         e.quit()
     text = Path(a.log).read_text(errors="replace")
@@ -309,18 +364,60 @@ def mode_boot(a, cfg):
                    f"pipelined=1 {'yes' if pl1 else 'NO'}")
     elif a.expect == "m1b":
         on = e.info.get("spec_lanes") == "2" and e.info.get("lane_slots") == "0,4"
-        off = [l for l in f["lines"] if "STRATA_SPEC_LANES=2 is off" in l or "too little room" in l]
+        off = [l for l in f["lines"] if "STRATA_SPEC_LANES=2 is off" in l or "STRATA_SPEC_LANES is off" in l
+               or "too little room" in l]
         keep = [l for l in f["lines"] if "keeping it in VRAM" in l]
         took = any("lane verifiers, hand-offs, the drafters' graphs" in l for l in f["lines"])
         ok = ok and on and not off and not keep and took
         why.append(f"INFO spec_lanes=2 lane_slots=0,4 {'yes' if on else 'NO'}, cost line {'yes' if took else 'NO'}, "
                    f"off/too-little-room lines {len(off)}, 'keeping it in VRAM' {len(keep)}")
+    elif a.expect == "lc":
+        # window-lanes4.sh: up to four lanes (STRATA_SPEC_LANES=N): the lanes on, how many the boot fitted, the solo
+        # pipeline folded in (the first GEN pipelined), no lane dropped for want of a drafter
+        n = int(e.info.get("spec_lanes") or 0)
+        off = [l for l in f["lines"] if "STRATA_SPEC_LANES is off" in l or "is not supported" in l]
+        took = any("lane verifiers, hand-offs, the drafters' graphs" in l for l in f["lines"])
+        pl1 = any("request pipelined=1" in l for l in res["gen"]["log"])
+        drops = [l for l in f["lines"] if re.search(r"lane \d+ goes|did not load", l)]
+        ok = ok and n >= max(2, a.want_lanes) and (a.max_lanes == 0 or n <= a.max_lanes) and not off and took \
+            and (pl1 or not a.want_pipelined)
+        why.append(f"INFO spec_lanes={n} lane_slots={e.info.get('lane_slots')} (want >= {max(2, a.want_lanes)}"
+                   f"{', <= ' + str(a.max_lanes) if a.max_lanes else ''}), cost line {'yes' if took else 'NO'}, off lines "
+                   f"{len(off)}, first GEN pipelined=1 {'yes' if pl1 else 'NO'}{'' if a.want_pipelined else ' (not asked)'}, "
+                   f"lanes dropped at boot {len(drops)}")
+        res["lanes"] = n
+        save(a.out, res)
+    if a.want_pipelined and a.expect in ("m1b",):
+        pl1 = any("request pipelined=1" in l for l in res["gen"]["log"])
+        ok = ok and pl1
+        why.append(f"first GEN pipelined=1 {'yes' if pl1 else 'NO'}")
     delta = ""
     bj = json.loads(Path(a.base).read_text()) if a.base and Path(a.base).is_file() else None
+    bname = a.base_name or "env-off"
+    extra = []        # verdicts of their own (they do not gate the later steps: the main line does)
     if bj:
         b = bj["free"]
-        delta = " (vs env-off: " + ", ".join(f"{c} {f['free'].get(c, 0) - b.get(c, 0):+d}" for c in cards) + " MiB)"
-    if a.expect in ("m1a", "m1b"):
+        d = {c: f["free"].get(c, 0) - b.get(c, 0) for c in cards}
+        delta = f" (vs {bname}: " + ", ".join(f"{c} {d[c]:+d}" for c in cards) + " MiB)"
+        if a.vram_tol:
+            within = all(f["free"].get(c) is not None and b.get(c) is not None and abs(d[c]) <= a.vram_tol for c in cards)
+            extra.append(f"VRAM free within +-{a.vram_tol} MiB of {bname} on every card: "
+                         f"{', '.join(f'{c} {d[c]:+d}' for c in cards)} MiB {verdict(within)}")
+    elif a.vram_tol:
+        extra.append(f"VRAM vs {bname}: no {bname} boot JSON FAIL")
+    if a.all_resident:
+        full = f["res_pct"] is not None and all(x == 100 for x in f["res_pct"])
+        ok = ok and full
+        why.append(f"experts 100 % resident {'yes' if full else 'NO (' + str(f['res_pct']) + ')'}")
+    if res.get("rss_mib") is not None:
+        brss = (bj or {}).get("rss_mib")
+        drss = res["rss_mib"] - brss if brss is not None else None
+        why.append(f"engine RSS {res['rss_mib']} MiB" + (f" ({drss:+d} vs {bname})" if drss is not None else ""))
+        if a.rss_max:
+            extra.append(f"host RAM: engine RSS after the first GEN {res['rss_mib']} MiB, "
+                         + (f"{drss:+d} MiB vs {bname} (want <= +{a.rss_max}) {verdict(drss <= a.rss_max)}"
+                            if drss is not None else f"no {bname} RSS INFO"))
+    if a.expect in ("m1a", "m1b", "lc") and a.base:     # (no --base: this boot is the base itself)
         # the room an arm keeps must not push experts out of VRAM: its exactness drives compare with an env-off
         # reference whose experts were resident (CPU vs GPU expert math would be a difference that is not the arm's).
         # Both boots must have said '<N>% of the experts resident' and the values must be equal; no env-off boot
@@ -328,11 +425,23 @@ def mode_boot(a, cfg):
         rb, rg = (bj or {}).get("res_pct"), f["res_pct"]
         same = bj is not None and rb is not None and rg is not None and rb == rg
         ok = ok and same
-        why.append(f"experts resident {rg}% vs env-off {rb if bj else '(no env-off boot JSON)'}% "
+        why.append(f"experts resident {rg}% vs {bname} {rb if bj else '(no ' + bname + ' boot JSON)'}% "
                    f"{'same' if same else 'DIFFERENT or missing'}")
     say(f"==> boot {a.label}: no loan on {f['no_loan']}/4 cards, {len(f['borrows'])} borrow lines, VRAM free with "
         f"everything loaded {'/'.join(str(x) for x in free)} MiB{delta}, LOW lines {len(f['low'])}"
         f"{'; ' + '; '.join(why) if why else ''} {verdict(ok)}")
+    for x in extra:
+        say(f"==> boot {a.label}: {x}")
+
+
+def rss_mib(pid):
+    try:
+        for l in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if l.startswith("VmRSS:"):
+                return int(l.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def mode_solo(a, cfg):
@@ -391,10 +500,82 @@ def mode_solo(a, cfg):
         f"{verdict(n == len(seq) and not out['errors'])}")
 
 
-def lane_pair(e, cases, pname, pics, rec):
-    """One pair: (pictures first for L_vis), BGEN 0, BADM 0 1, BGEN 4, then both slots to their BDONE."""
-    c0, c4 = cases[f"{pname}.0"], cases[f"{pname}.4"]
-    if pname == "L_vis":
+START_RE = re.compile(r"slot (\d+) at (\d+) \((with drafts|no drafts), drafter (\w+)\)")
+RAN_RE = re.compile(r"slot (\d+): (\d+) windows, (\d+) tokens")
+
+
+def parse_phases(seg):
+    """The lane phases in log order: each 'lanes start:' line (slot -> [position, drafts, drafter]) with the 'lanes
+    ran' line that ends it (slot -> [windows, tokens]; a slot without windows in that phase may be left out of it).
+    Slot keys are strings (as they come back from the JSON)."""
+    phases = []
+    for l in seg:
+        if "STRATA_SPEC_LANES: lanes start:" in l:
+            phases.append({"start": {m.group(1): [int(m.group(2)), m.group(3), m.group(4)] for m in START_RE.finditer(l)},
+                           "ran": None})
+        elif "STRATA_SPEC_LANES: lanes ran" in l:
+            ran = {m.group(1): [int(m.group(2)), int(m.group(3))] for m in RAN_RE.finditer(l)}
+            if phases and phases[-1]["ran"] is None:
+                phases[-1]["ran"] = ran
+            else:                       # (a 'lanes ran' without its start line: STRATA_SPEC_LANES_LOG off?)
+                phases.append({"start": {}, "ran": ran, "orphan": True})
+    return phases
+
+
+def lane_cover(phases, s, prompt, ntok):
+    """How much of slot s's reply its lanes produced, from its admission on: k = the admission's token + every lane
+    phase's tokens while each phase starts where the one before ended (no batch window in between).  The tokens[:k]
+    are the lane phase (they must equal serial solo spec's); lane_only: the whole reply (k = all its tokens)."""
+    ph = [p for p in phases if s in p["start"]]
+    res = {"k": min(1, ntok), "first": None, "phases": len(ph), "gap": None, "sizes": [len(p["start"]) for p in ph]}
+    if not ph:
+        res["gap"] = "no lane start"
+        res["lane_only"] = ntok <= 1
+        return res
+    first = ph[0]["start"][s]
+    res["first"] = first
+    if first[0] - prompt not in (0, 1):
+        res["gap"] = f"the first lane start at {first[0]}, the prompt is {prompt}: batch windows before it"
+        res["lane_only"] = ntok <= 1
+        return res
+    k, prev = 1, None
+    for i, p in enumerate(ph):
+        pos = p["start"][s][0]
+        if prev is not None and pos != prev:
+            res["gap"] = f"lane phase {i + 1} starts at {pos}, phase {i} ended at {prev}: batch windows in between"
+            break
+        if p.get("ran") is None:
+            res["gap"] = f"lane phase {i + 1} has no 'lanes ran' line"
+            break
+        t = (p["ran"].get(s) or [0, 0])[1]
+        k += t
+        prev = pos + t
+    res["k"] = min(k, ntok)
+    res["lane_only"] = k >= ntok
+    return res
+
+
+def group_slots(cases, g):
+    return sorted(int(k.rsplit(".", 1)[1]) for k in cases if "." in k and k.rsplit(".", 1)[0] == g)
+
+
+def lane_log_settle(e, mark, timeout=3.0):
+    """Until every 'lanes start' since mark has its 'lanes ran' line (the last drain writes it after the BDONE)."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        t = e.log_text(mark)
+        if t.count("STRATA_SPEC_LANES: lanes start:") <= t.count("STRATA_SPEC_LANES: lanes ran"):
+            break
+        time.sleep(0.1)
+    time.sleep(0.2)
+    return [l for l in e.log_text(mark).splitlines() if LOG_KEEP.search(l)]
+
+
+def lane_group(e, cases, g, pics, rec):
+    """One group: (pictures first for L_vis), BGEN into each of its slots in turn, each to its BADM (HOLD=k, k = the
+    group's size: the earlier slots stay untouched), then every slot to its BDONE."""
+    slots = group_slots(cases, g)
+    if g == "L_vis":
         if not pics:
             rec["skip"] = "no pictures (encode step failed)"
             return
@@ -408,45 +589,27 @@ def lane_pair(e, cases, pname, pics, rec):
         e.wait_done(1)
         rec["pictures"] = {"A": len(ra["tokens"]), "B": len(rb["tokens"])}
     mark = e.log_size()
-    r0 = e.admit(0, c0["max_new"], c0["ids"], keys=c0["keys"], name=f"{pname}.0")
-    a0 = len(r0["tokens"])
-    r4 = e.admit(4, c4["max_new"], c4["ids"], keys=c4["keys"], name=f"{pname}.4")
-    rec["held"] = len(r0["tokens"]) == a0          # no BT of slot 0 before slot 4's BADM
-    rec["slot0_tokens_at_badm4"] = len(r0["tokens"])
-    done, lane_n = set(), {}
-    for s, r in ((0, r0), (4, r4)):
-        if not r["cont"]:
-            done.add(s)
-            lane_n[s] = len(r["tokens"])
-    while len(done) < 2:
-        line = e.next()
-        if line.startswith("ERR"):
-            e.errs.append(line)
-            raise V.EngineError(line)
-        e._line(line)
-        if line.startswith("BDONE "):
-            s = int(line.split()[1])
-            if s in (0, 4) and s not in done:
-                done.add(s)
-                lane_n.setdefault(s, len(e.slot_tok.get(s, [])))
-                o = 4 - s
-                if o not in done:   # the other slot leaves the lanes here (default gate: both lane slots)
-                    lane_n[o] = len(e.slot_tok.get(o, []))
-    time.sleep(0.3)
-    seg = [l for l in e.log_text(mark).splitlines() if LOG_KEEP.search(l)]
-    starts = []
-    for l in seg:
-        if "lanes start:" in l:
-            starts.append([(int(m.group(1)), int(m.group(2)), m.group(3), m.group(4))
-                           for m in re.finditer(r"slot (\d+) at (\d+) \((with drafts|no drafts), drafter (\w+)\)", l)])
-    rec["slots"] = {str(s): {"tokens": list(r["tokens"]), "lane_n": lane_n.get(s), "prompt_tokens": len(c["ids"]),
-                             "bdone": r.get("bdone"), "reused": r.get("reused")}
-                    for s, r, c in ((0, r0, c0), (4, r4, c4))}
-    rec["lanes_start"] = starts
+    recs, own = {}, {}
+    for s in slots:
+        c = cases[f"{g}.{s}"]
+        recs[s] = e.admit(s, c["max_new"], c["ids"], keys=c["keys"], name=f"{g}.{s}")
+        own[s] = len(recs[s]["tokens"])
+    at_last = {s: len(recs[s]["tokens"]) for s in slots}
+    rec["held"] = all(at_last[s] == own[s] for s in slots)       # no BT of an earlier slot before the last BADM
+    rec["tokens_at_last_badm"] = {str(s): at_last[s] for s in slots}
+    for s in slots:
+        e.wait_done(s)
+    seg = lane_log_settle(e, mark)
+    rec["phases"] = parse_phases(seg)
+    rec["slots"] = {str(s): {"tokens": list(recs[s]["tokens"]), "prompt_tokens": len(cases[f"{g}.{s}"]["ids"]),
+                             "keys": cases[f"{g}.{s}"]["keys"], "bdone": recs[s].get("bdone"),
+                             "finish": recs[s].get("finish"), "reused": recs[s].get("reused")} for s in slots}
+    for s, x in rec["slots"].items():
+        x["cover"] = lane_cover(rec["phases"], s, x["prompt_tokens"], len(x["tokens"]))
     rec["lanes_ran"] = [l[l.find("lanes ran"):][:300] for l in seg if "lanes ran" in l]
     rec["ov_off"] = [l[l.find("overlapped read off"):][:200] for l in seg if "overlapped read off" in l]
     rec["ov_on"] = sum("overlapped read of" in l for l in seg)
-    rec["log"] = seg[:60]
+    rec["log"] = seg[:80]
 
 
 def mode_lanes(a, cfg):
@@ -461,31 +624,135 @@ def mode_lanes(a, cfg):
         for p in pairs:
             rec = out["pairs"].setdefault(p, {})
             try:
-                lane_pair(e, cases, p, pics, rec)
+                lane_group(e, cases, p, pics, rec)
             except (V.EngineError, RuntimeError) as x:
                 out["errors"].append(f"{p}: {x}")
                 rec["error"] = str(x)
                 say(f"{p}: ERROR {x}")
                 if not e.alive():
                     break
+                try:
+                    e.drain_all()       # (the next group starts with every slot idle)
+                except V.EngineError:
+                    break
                 continue
             if "skip" in rec:
                 say(f"{p}: SKIP ({rec['skip']})")
                 continue
             s = rec["slots"]
-            say(f"{p}: slot 0 {len(s['0']['tokens'])} tokens (lane phase {s['0']['lane_n']}), slot 4 "
-                f"{len(s['4']['tokens'])} (lane phase {s['4']['lane_n']}); held {rec['held']}; lanes start "
-                f"{rec['lanes_start'][:2]}; ran {len(rec['lanes_ran'])}; overlapped reads {rec['ov_on']}, refused "
-                f"{len(rec['ov_off'])}")
-            for l in rec["lanes_ran"][:2]:
+            say(f"{p}: " + "; ".join(f"slot {k} {len(x['tokens'])} tokens (lane phase {x['cover']['k']}"
+                                     f"{'' if x['cover']['lane_only'] else ', ' + str(x['cover']['gap'])})"
+                                     for k, x in s.items())
+                + f"; held {rec['held']}; lane phases {[len(ph['start']) for ph in rec['phases']]}; overlapped reads "
+                  f"{rec['ov_on']}, refused {len(rec['ov_off'])}")
+            for l in rec["lanes_ran"][:3]:
                 say("    " + l)
             save(a.out, out)
     finally:
         save(a.out, out)
         e.quit()
     done = sum(1 for p in pairs if out["pairs"].get(p, {}).get("slots"))
-    say(f"==> lanes {a.label}: {done}/{len(pairs)} pairs ran, errors {len(out['errors'])} "
+    say(f"==> lanes {a.label}: {done}/{len(pairs)} groups ran, errors {len(out['errors'])} "
         f"{verdict(not out['errors'] and done == len([p for p in pairs if p != 'L_vis' or pics]))}")
+
+
+def solo_logged(e, c, name, kvres):
+    """A GEN with its own log slice: 'request pipelined=' and the pipeline's rollbacks."""
+    mark = e.log_size()
+    r = e.solo(c["max_new"], c["ids"], keys=c["keys"], name=name)
+    settle(e, mark, kvres)
+    seg = [l for l in e.log_text(mark).splitlines() if LOG_KEEP.search(l)]
+    m = [y for y in (re.search(r"request pipelined=(\d) \((.*)\)", l) for l in seg) if y]
+    return {"tokens": list(r["tokens"]), "prompt_tokens": len(c["ids"]), "keys": c["keys"], "done": r.get("done"),
+            "pipelined": int(m[0].group(1)) if m else None, "pl_reason": m[0].group(2) if m else None,
+            "rolled_back": sum(int(y.group(1)) for l in seg for y in [re.search(r"(\d+) rolled back", l)] if y),
+            "spec_windows": sum(int(y.group(1)) for l in seg for y in [re.search(r"(\d+) speculative, ", l)] if y),
+            "log": seg[:30]}
+
+
+def mode_switch(a, cfg):
+    """1 -> 2 -> 3 -> 4 -> 2 -> 1 users on one engine (STRATA_SPEC_LANES_HOLD=2: the first lane slot waits for the
+    second, so both run in lanes from their admission on): GEN; BGEN into the lane slots one after the other, SW_STEP
+    tokens per user between two admissions (each BGEN drains the running lanes, reads the prompt, and the lanes start
+    again with one more); BSTOP the last ones down to two, then one (the lanes keep running: STRATA_SPEC_LANES_KEEP,
+    the shared profile's default); BSTOP the last; GEN again."""
+    tok = tokenizer(cfg)
+    cases, lens = build_cases(tok, None)
+    e = start(a, cfg, a.label)
+    kvres = "--kv-resident" in (cfg.get("args") or [])
+    ls = [int(x) for x in (e.info.get("lane_slots") or "").split(",") if x.strip().isdigit()]
+    out = {"label": a.label, "switch": True, "info": e.info, "lane_slots": ls, "lens": lens, "solo": {}, "slots": {},
+           "events": [], "errors": []}
+    recs = {}
+
+    def ev(what):
+        act = sorted(s for s in e.active if s in ls)
+        out["events"].append({"what": what, "active_lane_slots": act,
+                              "tokens": {str(s): len(e.slot_tok.get(s, [])) for s in recs}})
+        say(f"  {what}: lane slots decoding {act}, tokens so far "
+            f"{ {s: len(e.slot_tok.get(s, [])) for s in recs} }")
+
+    def more(slots, n):
+        base = {s: len(e.slot_tok.get(s, [])) for s in slots}
+        for s in slots:
+            if s in e.active:
+                e.wait_tokens(s, base[s] + n)
+
+    def stop(s):
+        if s in e.active:
+            e.bstop(s)
+        e.wait_done(s)
+
+    mark = e.log_size()
+    try:
+        say(f"[{a.label}] INFO spec_lanes={e.info.get('spec_lanes')} lane_slots={e.info.get('lane_slots')}")
+        if len(ls) < 2:
+            raise RuntimeError(f"lane_slots '{e.info.get('lane_slots')}': the lanes are off")
+        out["solo"]["sw_s1"] = solo_logged(e, cases["sw_s1"], "sw_s1", kvres)
+        ev("GEN sw_s1 done (1 user)")
+        for i, s in enumerate(ls):
+            c = cases[f"sw.{s}"]
+            recs[s] = e.admit(s, c["max_new"], c["ids"], keys=c["keys"], name=f"sw.{s}")
+            if i == 0:
+                continue                              # (held until the second one: HOLD=2)
+            ev(f"BADM {s} ({i + 1} users)")
+            more([x for x in recs if x in e.active], SW_STEP)
+            ev(f"{SW_STEP} more tokens each")
+        for s in reversed(ls[2:]):
+            stop(s)
+        ev("BSTOP down to two users")
+        more([x for x in ls[:2] if x in e.active], SW_STEP)
+        stop(ls[1])
+        ev("BSTOP down to one user")
+        more([ls[0]], SW_STEP)
+        stop(ls[0])
+        ev("BSTOP of the last user")
+        e.drain_all()
+        out["solo"]["sw_s2"] = solo_logged(e, cases["sw_s2"], "sw_s2", kvres)
+        ev("GEN sw_s2 done (1 user)")
+    except (V.EngineError, RuntimeError) as x:
+        out["errors"].append(str(x))
+        say(f"ERROR {x}")
+    finally:
+        # (a dead engine's log is read too: its last lane lines show where it stopped)
+        seg = lane_log_settle(e, mark, 3.0 if e.alive() else 0.0)
+        out["phases"] = parse_phases(seg)
+        for s, r in recs.items():
+            c = cases[f"sw.{s}"]
+            x = {"tokens": list(r["tokens"]), "prompt_tokens": len(c["ids"]), "keys": c["keys"], "bdone": r.get("bdone"),
+                 "finish": r.get("finish")}
+            x["cover"] = lane_cover(out["phases"], str(s), x["prompt_tokens"], len(x["tokens"]))
+            out["slots"][str(s)] = x
+        out["log"] = seg[:200]
+        save(a.out, out)
+        e.quit()
+    sizes = [len(p["start"]) for p in out["phases"]]
+    for s, x in out["slots"].items():
+        say(f"sw.{s}: {len(x['tokens'])} tokens ({x['finish']}), lane phase {x['cover']['k']}, phases {x['cover']['sizes']}"
+            f"{'' if x['cover']['lane_only'] else ', ' + str(x['cover']['gap'])}")
+    say(f"==> switch {a.label}: lane phases by lanes {sizes}; GEN before/after pipelined "
+        f"{[out['solo'].get(n, {}).get('pipelined') for n in ('sw_s1', 'sw_s2')]}; errors {len(out['errors'])} "
+        f"{verdict(not out['errors'] and len(out['solo']) == 2)}")
 
 
 def first_diff(x, y):
@@ -495,6 +762,8 @@ def first_diff(x, y):
 def mode_compare(a, _cfg):
     ref = json.loads(Path(a.ref).read_text())["cases"]
     got = json.loads(Path(a.got).read_text())
+    if got.get("switch"):                                       # mode_switch's run
+        return compare_switch(a, ref, got)
     if "pairs" not in got:                                      # solo vs solo
         # the denominator is the planned sequence (the run's own 'seq', else SEQS by --seq), never only what ran:
         # a request the run did not reach counts as not identical / not pipelined
@@ -550,57 +819,137 @@ def mode_compare(a, _cfg):
                 f"{verdict(ok)}")
         return
     # lanes vs the serial solo reference
-    # the planned pairs, not only those that ran: a pair the run never reached counts as 2 failed slots
+    # the planned groups, not only those that ran: a group the run never reached counts as its slots failed
     pairs = a.cases.split(",") if a.cases else list(got.get("planned") or PAIRS[a.pairs])
-    n_lane = n_full = n_all = n_start = n_held = 0
+    n_lane = n_full = n_all = n_start = n_held = n_only = 0
     for p in pairs:
         rec = got["pairs"].get(p, {})
         if "skip" in rec:
             say(f"{p}: SKIP {rec['skip']}")
             continue
+        # (the group's slots by its name, not by what the reference or the run has: planned denominators)
+        planned = ["0", "4", "8", "12"] if p.startswith("G4_") else ["0", "4", "8"] if p.startswith("G3_") else ["0", "4"]
         if not rec.get("slots"):
             say(f"{p}: no result ({rec.get('error') or 'not reached: ' + str(got.get('errors'))})")
-            n_all += 2
+            n_all += len(planned)
             continue
-        first = {}
-        for line in rec.get("lanes_start") or []:
-            for s, pos, dr, lvl in line:
-                first.setdefault(s, (pos, dr, lvl))
-        for s in ("0", "4"):
+        for s in planned:
             n_all += 1
-            g = rec["slots"][s]
+            g = rec["slots"].get(s)
+            if g is None:
+                say(f"{p} slot {s}: no result")
+                continue
             r = ref.get(f"{p}.{s}", {}).get("tokens")
-            k = g["lane_n"] if g["lane_n"] is not None else len(g["tokens"])
+            cov = g.get("cover") or lane_cover(rec.get("phases") or [], s, g["prompt_tokens"], len(g["tokens"]))
+            k = cov["k"]
             lane_ok = r is not None and k >= 2 and g["tokens"][:k] == r[:k]
             full_ok = r is not None and g["tokens"] == r
             n_lane += lane_ok
             n_full += full_ok
-            fs = first.get(int(s))
+            n_only += bool(cov["lane_only"])
+            fs = cov["first"]
             st_ok = fs is not None and fs[1] == "with drafts" and fs[2] == "level" and fs[0] - g["prompt_tokens"] in (0, 1)
             n_start += st_ok
-            say(f"{p} slot {s}: lane phase {k} of {len(g['tokens'])} tokens {'IDENTICAL' if lane_ok else 'DIFFERS'}; full "
+            say(f"{p} slot {s}: lane phase {k} of {len(g['tokens'])} tokens {'IDENTICAL' if lane_ok else 'DIFFERS'}"
+                f"{'' if cov['lane_only'] else ' (' + str(cov['gap']) + ')'}; full "
                 f"{'IDENTICAL' if full_ok else 'differs at ' + str(first_diff(r or [], g['tokens']))} (ref {len(r or [])}); "
-                f"first lane start {fs} for prompt {g['prompt_tokens']} {'ok' if st_ok else 'NOT ok'}")
+                f"lane phases {cov['sizes']}; first lane start {fs} for prompt {g['prompt_tokens']} "
+                f"{'ok' if st_ok else 'NOT ok'}")
         n_held += bool(rec.get("held"))
         if a.ov:
             say(f"{p}: overlapped reads {rec.get('ov_on')}, refused {rec.get('ov_off')}")
-    crit = n_full if a.full else n_lane
-    say(f"==> {a.what}: {crit}/{n_all} lane slots token-identical to serial solo spec "
-        f"({'full length' if a.full else 'over the lane phase; full length ' + str(n_full) + '/' + str(n_all)}) "
-        f"{verdict(crit == n_all and n_all > 0)}")
+    if a.full:   # (KEEP: the whole reply runs in lanes, admission to end, and equals serial solo spec)
+        say(f"==> {a.what}: {n_full}/{n_all} lane slots token-identical to serial solo spec over the full length, "
+            f"{n_only}/{n_all} replies wholly in lanes {verdict(n_full == n_all and n_only == n_all and n_all > 0)}")
+    else:
+        say(f"==> {a.what}: {n_lane}/{n_all} lane slots token-identical to serial solo spec over the lane phase "
+            f"(full length {n_full}/{n_all}, wholly in lanes {n_only}/{n_all}) {verdict(n_lane == n_all and n_all > 0)}")
     say(f"==> {a.what}: lanes started at each slot's admission position with drafts and a level drafter: "
         f"{n_start}/{n_all} {verdict(n_start == n_all and n_all > 0)}")
     ran = [p for p in pairs if got["pairs"].get(p, {}).get("slots")]
     if a.hold:
         want = [p for p in pairs if "skip" not in got["pairs"].get(p, {})]
-        say(f"==> {a.what}: HOLD kept slot 0 untouched until slot 4's BADM in {n_held}/{len(want)} pairs "
-            f"{verdict(n_held == len(want) and bool(want))}")
+        say(f"==> {a.what}: HOLD kept the earlier slots untouched until the last slot's BADM in {n_held}/{len(want)} "
+            f"groups {verdict(n_held == len(want) and bool(want))}")
+        # every group's first lane phase ran all its slots at once (HOLD=k with k = the group's size)
+        whole = sum(1 for p in ran if (got["pairs"][p].get("phases") or [{}])[0].get("start") is not None
+                    and len(got["pairs"][p]["phases"][0]["start"]) == len(got["pairs"][p]["slots"]))
+        say(f"==> {a.what}: the first lane phase ran every slot of its group in {whole}/{len(ran)} groups "
+            f"{verdict(whole == len(want) and bool(want))}")
     if a.ov:   # (the engine says each refusal reason once per process)
         refused = sum(any("lane slot is held" in l for l in got["pairs"][p].get("ov_off") or []) for p in ran)
         on = sum(got["pairs"][p].get("ov_on") or 0 for p in ran)
         say(f"==> {a.what}: the overlap gate refused with 'a lane slot is held' ({refused} pair logs; said once per "
             f"process) and no read beside a held lane slot overlapped ({on} overlapped reads) "
             f"{verdict(refused >= 1 and on == 0 and bool(ran))}")
+
+
+def compare_switch(a, ref, got):
+    """mode_switch's run vs the serial solo reference: the two GEN identical and pipelined; every lane slot's reply
+    wholly in lanes (KEEP, no batch window between two lane phases) and identical to serial solo spec - in full when it
+    ended by itself, as a prefix of the reference when a BSTOP ended it; the drive reached every mode."""
+    ok_solo = 0
+    for n in ("sw_s1", "sw_s2"):
+        g, r = got["solo"].get(n), ref.get(n, {}).get("tokens")
+        same = g is not None and r is not None and g["tokens"] == r
+        pl = g is not None and g.get("pipelined") == 1
+        ok_solo += same and pl
+        say(f"{n}: {'IDENTICAL' if same else 'DIFFERS at ' + str(first_diff(r or [], (g or {}).get('tokens') or []))} "
+            f"({len((g or {}).get('tokens') or [])} tokens, ref {len(r or [])}); pipelined {(g or {}).get('pipelined')} "
+            f"({(g or {}).get('pl_reason')}); rollbacks {(g or {}).get('rolled_back')}")
+    say(f"==> {a.what}: the 1-user GEN before and after the lanes token-identical and pipelined: {ok_solo}/2 "
+        f"{verdict(ok_solo == 2)}")
+    if a.need_rollback:
+        # FORCE_MISS: the two GEN's rollbacks (natural misses included) must exceed the same GEN's in the run without it
+        # (--base-got: the plain switch run) - else no miss was forced and the run proves nothing about the restores
+        names = ("sw_s1", "sw_s2")
+        rb = sum((got["solo"].get(n) or {}).get("rolled_back") or 0 for n in names)
+        spec = sum((got["solo"].get(n) or {}).get("spec_windows") or 0 for n in names)
+        nat = None
+        if a.base_got and Path(a.base_got).is_file():
+            bs = json.loads(Path(a.base_got).read_text()).get("solo") or {}
+            if all(n in bs for n in names):
+                nat = sum(bs[n].get("rolled_back") or 0 for n in names)
+        ok = rb > 0 and nat is not None and rb > nat
+        say(f"==> {a.what}: rollbacks of the two GEN with FORCE_MISS {rb} of {spec} speculative windows vs "
+            f"{nat if nat is not None else '?'} without it (--base-got) {verdict(ok)}")
+    # (planned: the lane slots the engine said it runs, each with a sw.<slot> reference; none = a FAIL below)
+    ls = [str(s) for s in got.get("lane_slots") or []]
+    n_ok = n_only = n_start = 0
+    for s in ls:
+        g = got["slots"].get(s)
+        r = ref.get(f"sw.{s}", {}).get("tokens")
+        if g is None or r is None:
+            say(f"sw.{s}: no result (ref {'yes' if r is not None else 'no'})")
+            continue
+        cov = g["cover"]
+        t, k = g["tokens"], cov["k"]
+        natural = g.get("finish") in ("stop", "length")
+        same = t == r if natural else t == r[:len(t)]
+        lane_ok = k >= 2 and t[:k] == r[:k]
+        fs = cov["first"]
+        st_ok = fs is not None and fs[1] == "with drafts" and fs[2] == "level" and fs[0] - g["prompt_tokens"] in (0, 1)
+        n_ok += same and lane_ok
+        n_only += bool(cov["lane_only"])
+        n_start += st_ok
+        say(f"sw.{s}: {len(t)} tokens ({g.get('finish')}), {'IDENTICAL' if same else 'DIFFERS at ' + str(first_diff(r, t))} "
+            f"to serial solo spec ({'in full' if natural else 'as a prefix'}, ref {len(r)}); lane phase {k} "
+            f"{'IDENTICAL' if lane_ok else 'DIFFERS'}{'' if cov['lane_only'] else ' (' + str(cov['gap']) + ')'}; lane phases "
+            f"{cov['sizes']}; first start {fs} {'ok' if st_ok else 'NOT ok'}")
+    say(f"==> {a.what}: {n_ok}/{len(ls)} lane slots token-identical to serial solo spec, {n_only}/{len(ls)} wholly in "
+        f"lanes, {n_start}/{len(ls)} started at admission with drafts {verdict(n_ok == n_only == n_start == len(ls) and len(ls) >= 2)}")
+    sizes = [len(p["start"]) for p in got.get("phases") or []]
+    want = list(range(2, len(ls) + 1))
+    downs = [x["active_lane_slots"] for x in got.get("events") or [] if x["what"].startswith("BSTOP down")]
+    reached = sizes[:len(want)] == want
+    say(f"==> {a.what}: lane phases by lanes {sizes} (want {want} up, then KEEP: no new start on the way down); lane "
+        f"slots decoding after the BSTOPs down {downs} {verdict(reached and len(sizes) == len(want))}")
+    # the way down (4 -> 2 -> 1): the users still decoding after each BSTOP (a reply that ended by itself before its
+    # switch leaves that mode untested: FAIL, the replies were meant to be long enough)
+    want_down = [ls[:2], ls[:1]]
+    got_down = [[str(x) for x in d] for d in downs]
+    say(f"==> {a.what}: the way down ran {got_down} lane slots (want {want_down}) {verdict(got_down == want_down)}")
+    say(f"==> {a.what}: errors {got.get('errors')} {verdict(not got.get('errors'))}")
 
 
 def mode_prefill(a, cfg):
@@ -760,9 +1109,20 @@ def mode_sweep(a, _cfg):
                 if a.gain_users and u == a.gain_users:
                     say(f"==> {a.tag} {kind} {u} user(s): agg {da:+.2f} % (want >= +{a.gain_min:.1f} %) "
                         f"{verdict(da >= a.gain_min)}")
+                lim = dict((int(k), float(v)) for k, v in (x.split(":") for x in a.dec_min.split(",") if x)) \
+                    if a.dec_min else {}
+                if u in lim:   # per-user decode p50 (window-lanes4.sh): no loss at 1-2 and 5+ users, a gain at 3-4
+                    say(f"==> {a.tag} {kind} {u} users: decode p50 per user {base['dec']:.1f} -> {x['dec']:.1f} tok/s "
+                        f"({dd:+.2f} %, want >= {lim[u]:+.1f} %); agg {da:+.2f} % {verdict(dd >= lim[u])}")
                 if a.flat_users and str(u) in a.flat_users.split(","):
                     say(f"==> {a.tag} {kind} {u} users: agg {da:+.2f} %, dec p50 {dd:+.2f} % (no loss beyond "
                         f"-{a.flat_tol:.1f} %) {verdict(da >= -a.flat_tol)}")
+    if a.dec_min:      # (planned levels: a level of --dec-min without rows for both arms is a FAIL, not a pass)
+        for kind in ("short", "long"):
+            for u in sorted(int(x.split(":")[0]) for x in a.dec_min.split(",") if x):
+                miss = [arm for arm in arms if (kind, u, arm) not in res]
+                if miss:
+                    say(f"==> {a.tag} {kind} {u} users: no rows for {miss} (all {a.reps} repetitions needed) FAIL")
     say(f"==> {a.tag}: request errors over all arms and levels: {errs} {verdict(errs == 0 and bool(res))}")
 
 
@@ -795,9 +1155,12 @@ def mode_lanelog(a, _cfg):
     files = [f for p in a.files for f in glob.glob(p)]
     starts = ran = wd = err = 0
     tps = []
+    sizes = collections.Counter()
     for f in files:
         for l in open(f, errors="replace"):
             starts += "STRATA_SPEC_LANES: lanes start" in l
+            if "STRATA_SPEC_LANES: lanes start:" in l:
+                sizes[len(START_RE.findall(l))] += 1
             if "STRATA_SPEC_LANES: lanes ran" in l:
                 ran += 1
                 tps += [float(x) for x in re.findall(r"\(([\d.]+) tok/s\)", l)]
@@ -806,10 +1169,17 @@ def mode_lanelog(a, _cfg):
     med = f"{st.median(tps):.1f}" if tps else "n/a"
     if a.expect == "none":
         ok = starts == 0 and wd == 0 and err == 0
+    elif a.expect == "any":    # (lane starts counted, not wanted either way: no watchdog, no ERR)
+        ok = wd == 0 and err == 0
     else:
         ok = starts > 0 and ran > 0 and wd == 0 and err == 0
     say(f"==> {a.what}: {len(files)} logs, {starts} 'lanes start', {ran} 'lanes ran' (per-slot lane tok/s median {med}), "
-        f"{wd} watchdog, {err} ERR (want {'no lane start' if a.expect == 'none' else 'lane starts'}) {verdict(ok)}")
+        f"{wd} watchdog, {err} ERR (want {'no lane start' if a.expect == 'none' else 'no watchdog, no ERR' if a.expect == 'any' else 'lane starts'}) "
+        f"{verdict(ok)}")
+    if a.want_sizes:   # (STRATA_SPEC_LANES_LOG=1: the slots per 'lanes start' line)
+        want = [int(x) for x in a.want_sizes.split(",") if x]
+        say(f"==> {a.what}: lane starts by lanes {dict(sorted(sizes.items()))} (want each of {want}) "
+            f"{verdict(all(sizes.get(w, 0) > 0 for w in want))}")
 
 
 def mode_pllog(a, _cfg):
@@ -827,8 +1197,8 @@ def mode_pllog(a, _cfg):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", required=True, choices=["encode", "boot", "solo", "lanes", "compare", "prefill", "sweep",
-                                                      "abcheck", "lanelog", "pllog"])
+    ap.add_argument("--mode", required=True, choices=["encode", "boot", "solo", "lanes", "switch", "compare", "prefill",
+                                                      "sweep", "abcheck", "lanelog", "pllog"])
     ap.add_argument("--config")
     ap.add_argument("--exe", default="")
     ap.add_argument("--label", default="run")
@@ -867,15 +1237,25 @@ def main():
     ap.add_argument("--gain-min", type=float, default=5.0)
     ap.add_argument("--flat-users", default="")
     ap.add_argument("--flat-tol", type=float, default=1.5)
+    ap.add_argument("--dec-min", default="", help="sweep: 'users:min %%,...' per-user decode p50 delta wanted")
+    ap.add_argument("--want-sizes", default="", help="lanelog: lane starts with each of these lane counts")
+    ap.add_argument("--want-lanes", type=int, default=0, help="boot lc: at least this many lanes")
+    ap.add_argument("--max-lanes", type=int, default=0, help="boot lc: at most this many lanes")
+    ap.add_argument("--want-pipelined", action="store_true", help="boot: the first GEN pipelined=1")
+    ap.add_argument("--all-resident", action="store_true", help="boot: every '%% of the experts resident' line says 100")
+    ap.add_argument("--vram-tol", type=int, default=0, help="boot: VRAM free within this many MiB of --base per card")
+    ap.add_argument("--base-name", default="", help="boot: what --base is (for the verdict lines)")
+    ap.add_argument("--rss-max", type=int, default=0, help="boot: engine RSS growth vs --base at most this many MiB")
     ap.add_argument("--file", default="")
     ap.add_argument("--strict-users", default="", help="abcheck: judge only these levels (others INFO)")
     ap.add_argument("files", nargs="*")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text()) if a.config else {}
-    if a.mode in ("boot", "solo", "lanes", "prefill") and not (a.config and a.log and a.out):
+    if a.mode in ("boot", "solo", "lanes", "switch", "prefill") and not (a.config and a.log and a.out):
         raise SystemExit("--config, --log and --out are needed")
     try:
-        {"encode": mode_encode, "boot": mode_boot, "solo": mode_solo, "lanes": mode_lanes, "compare": mode_compare,
+        {"encode": mode_encode, "boot": mode_boot, "solo": mode_solo, "lanes": mode_lanes, "switch": mode_switch,
+         "compare": mode_compare,
          "prefill": mode_prefill, "sweep": mode_sweep, "abcheck": mode_abcheck, "lanelog": mode_lanelog,
          "pllog": mode_pllog}[a.mode](a, cfg)
     except V.EngineError as x:
