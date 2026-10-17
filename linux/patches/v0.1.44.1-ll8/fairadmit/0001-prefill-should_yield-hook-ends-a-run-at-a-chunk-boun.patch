@@ -1,0 +1,69 @@
+From 45073129c434c3ad08b4ca3c44b6a62164a5f785 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:58:21 +0200
+Subject: [PATCH 1/7] prefill: should_yield hook ends a run at a chunk boundary
+ (opt-in STRATA_READ_YIELD=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/prefill/prefill.hpp | 11 +++++++++++
+ src/prefill/prefill.cpp            |  7 +++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index bafa791f..15921140 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -156,6 +156,16 @@ public:
+     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
+     std::function<bool()> should_stop;
+ 
++    /// STRATA_READ_YIELD (opt-in; unset: never set, nothing changes): checked on the first stage before every chunk
++    /// but the run's first, after `should_stop`, with the position that chunk would start at.  True ends the run there
++    /// as if the prompt had ended: every stage's chunks before it finish (ple_prev written back, the chain drained by
++    /// `run`), so each stage's state holds exactly [pos0, next_pos), and `run` returns true with yielded_at() =
++    /// next_pos.  A run from next_pos on reads the same chunks the uninterrupted run would have (the chunk grid is
++    /// relative to pos0, and next_pos is on it).  Runs on the thread that calls `run`.
++    std::function<bool(int64_t next_pos)> should_yield;
++    /// Where the last `run` stopped for should_yield (-1: it read all it was given, or failed).
++    int64_t yielded_at() const { return yielded_at_; }
++
+     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
+     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
+     const float* const* embd_rows = nullptr;
+@@ -239,6 +249,7 @@ private:
+     std::string next_err_;
+     std::future<bool> next_run_;
+     int hand_buf_ = 0;
++    int64_t yielded_at_ = -1;   ///< should_yield's stop (yielded_at)
+ 
+     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+     void release();                          // the destructor's cleanup (also `reset`'s)
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index e5c2bf63..7591b001 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -2374,6 +2374,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+ 
+     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+         if (should_stop && should_stop()) { err = "cancelled"; return false; }
++        // STRATA_READ_YIELD: the run ends at this chunk boundary (the first stage only; never before its first chunk).
++        // A break, not a return: ple_prev is written back below and run() drains the later stages' chunks
++        if (should_yield && hand_in_ == nullptr && c0 > 0 && should_yield(pos0 + c0)) {
++            yielded_at_ = pos0 + c0;
++            break;
++        }
+         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
+         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
+@@ -4673,6 +4679,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+     }
+ #endif
+     for (Prefill* p = this; p != nullptr; p = p->next_) p->cuda_err_.store(0);
++    yielded_at_ = -1;
+     const bool body_ok = run_impl(tokens, n, pos0, err);
+ 
+     std::string drain_err;
+-- 
+2.43.0
+

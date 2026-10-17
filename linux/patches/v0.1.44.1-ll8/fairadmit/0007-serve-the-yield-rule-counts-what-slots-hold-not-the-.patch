@@ -1,0 +1,88 @@
+From 90f73293f85a4b8908414f8da2eeb6a7da3e16f5 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 17:05:43 +0200
+Subject: [PATCH 7/7] serve: the yield rule counts what slots hold, not the
+ admit estimate (it notes a prompt as its read is sent: a request sharing a
+ read in progress looked short; review of the ll8 merge)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py          |  9 +++++----
+ serve/test_read_yield.py | 32 ++++++++++++++++++++------------
+ 2 files changed, 25 insertions(+), 16 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index c8bec89a..05272f29 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1721,9 +1721,10 @@ class StrataEngine:
+     def _entry_new(self, e) -> int:
+         """_new_tokens of a waiting entry ([plen, arrival, new, total, ids, cache]) or of [ids, cache], computed again
+         only when a slot's held tokens changed (each assignment puts a new list there: their ids and lengths are the
+-        key), so the checks under slot_cv do not compare long token lists every time.  With STRATA_ADMIT_BY_NEW an
+-        entry's `plen` is already an estimate of its new tokens (what the server recently sent the engine): the lower
+-        of the two counts."""
++        key), so the checks under slot_cv do not compare long token lists every time.  Only what a slot holds counts,
++        also with STRATA_ADMIT_BY_NEW: its estimate (`plen` = e[0]) notes a prompt once its read is SENT, so a request
++        sharing the start of a read still in progress would look short and the read would give way to it for nothing
++        (review of the ll8 merge); the estimate orders admissions only."""
+         if e and isinstance(e[0], list):
+             ids, plen, at = e[0], len(e[0]), 1
+         elif len(e) > 4:
+@@ -1739,7 +1740,7 @@ class StrataEngine:
+                 e[at] = (key, v)
+             else:
+                 e.append((key, v))
+-        return min(v, e[0]) if at == 5 and ADMIT_BY_NEW else v
++        return v
+ 
+     def _new_tokens(self, ids: list[int] | None, plen: int = 0) -> int:
+         """STRATA_YIELD_SHORT (the caller holds slot_cv): the tokens a prompt would read - its length minus the longest
+diff --git a/serve/test_read_yield.py b/serve/test_read_yield.py
+index df956f93..5b4d474c 100644
+--- a/serve/test_read_yield.py
++++ b/serve/test_read_yield.py
+@@ -171,20 +171,28 @@ FAKE_YIELD = FAKE_BATCH.replace(
+ 
+ class WithAdmitByNew(unittest.TestCase):
+     """STRATA_YIELD_SHORT beside STRATA_ADMIT_BY_NEW (ll8-fairadmit): an entry is [est. new, arrival, ordered, total,
+-    ids, cache]; the yield rule takes the lower of the server's estimate and the slot-held count."""
++    ids, cache]; the estimate orders admissions, the yield rule counts what slots hold."""
+ 
+-    def test_the_lower_estimate_counts(self):
++    def test_the_yield_rule_counts_what_slots_hold_not_the_estimate(self):
++        """Review of the merge: the estimate notes a prompt as its read is sent - a request sharing the start of the
++        read in progress must not count as short (the read would give way to one that reads the same tokens)."""
++        from serve.admit_est import AdmitEstimate
+         e = engine(4, {"read_yield": 1, "yield_row": 4})
+-        cold = [9000, 0.0, True, 9000, list(range(7, 9007))]           # nothing held, nothing sent before
+-        sent = [150, 0.0, True, 9000, list(range(7, 9007))]            # the server sent its first 8850 tokens before
+-        with mock.patch.object(server, "YIELD_SHORT", 2048), mock.patch.object(server, "ADMIT_BY_NEW", True):
+-            self.assertEqual(e._entry_new(cold), 9000)
+-            self.assertEqual(e._entry_new(sent), 150)
+-        with mock.patch.object(server, "YIELD_SHORT", 2048), mock.patch.object(server, "ADMIT_BY_NEW", False):
+-            self.assertEqual(e._entry_new([9000, 0.0, True, 9000, list(range(7, 9007))]), 9000)
+-        e.slot_held[3] = list(range(7, 8907))                          # a slot holds more than the estimate says
+-        with mock.patch.object(server, "YIELD_SHORT", 2048), mock.patch.object(server, "ADMIT_BY_NEW", True):
+-            self.assertEqual(e._entry_new([9000, 0.0, True, 9000, list(range(7, 9007))]), 100)
++        est = AdmitEstimate(max_blocks=4096)
++        p = list(range(30000))
++        est.note(p, None)                                              # admitted: noted, read in progress
++        sib = p + list(range(50000, 50100))
++        _, rank, _ = est.estimate(sib)
++        self.assertLess(rank, 512)                                     # the order sees it as short ...
++        e.progress = (2048, 30000)
++        e.wait_lens = [[rank, 0.0, True, len(sib), sib]]
++        with mock.patch.object(server, "YIELD_SHORT", 512), mock.patch.object(server, "YIELD_MIN_LEFT", 2048), \
++                mock.patch.object(server, "ADMIT_BY_NEW", True):
++            self.assertEqual(e._entry_new(e.wait_lens[0]), 30100)    # ... the yield rule does not
++            self.assertFalse(e._shorter_waiting(30000, p))
++            e.slot_held[3] = list(p)                                   # once a slot holds the start, it is short
++            self.assertEqual(e._entry_new(e.wait_lens[0]), 100)
++            self.assertTrue(e._shorter_waiting(30000, p))
+ 
+     def test_the_running_reads_progress_matches_its_length_not_its_estimate(self):
+         e = engine(4, {"read_yield": 1, "yield_row": 4})
+-- 
+2.43.0
+

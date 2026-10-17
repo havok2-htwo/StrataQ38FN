@@ -1,0 +1,261 @@
+From f6f2a9c61203e2905d2cbcb2574eae4277d9e40c Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:00:17 +0200
+Subject: [PATCH 4/7] program: stage-2 read scheduler policy and slot rule,
+ host-tested, not wired into the engine (opt-in STRATA_READS=N later)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                        |   5 +
+ include/strata/program/read_sched.hpp |  76 ++++++++++++++
+ tests/program/read_sched_test.cpp     | 139 ++++++++++++++++++++++++++
+ 3 files changed, 220 insertions(+)
+ create mode 100644 include/strata/program/read_sched.hpp
+ create mode 100644 tests/program/read_sched_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a204e760..c9bc51b2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -284,6 +284,11 @@ if(STRATA_BUILD_TESTS)
+   add_executable(read_yield_test tests/program/read_yield_test.cpp)
+   target_include_directories(read_yield_test PRIVATE include)
+   add_test(NAME read_yield_test COMMAND read_yield_test)
++  # STRATA_READS (stage 2, not wired yet): which slots may hold a read in progress and the order of the reads' chunks
++  # (header-only, CPU)
++  add_executable(read_sched_test tests/program/read_sched_test.cpp)
++  target_include_directories(read_sched_test PRIVATE include)
++  add_test(NAME read_sched_test COMMAND read_sched_test)
+   # STRATA_PIPE_OVERLAP_KVS: the overlap gate's K/V streaming part (env, buffer disjointness; synthetic)
+   add_executable(overlap_kvs_test tests/program/overlap_kvs_test.cpp)
+   target_include_directories(overlap_kvs_test PRIVATE include)
+diff --git a/include/strata/program/read_sched.hpp b/include/strata/program/read_sched.hpp
+new file mode 100644
+index 00000000..997a72db
+--- /dev/null
++++ b/include/strata/program/read_sched.hpp
+@@ -0,0 +1,76 @@
++// include/strata/program/read_sched.hpp - STRATA_READS (stage 2 of DESIGN-fair-reads.md, NOT wired into the engine
++// yet): which reads may run at once and which one's chunk the prompt path reads next (header-only: no GPU).
++//
++// Stage 2 lets up to N prompt reads be in progress at once, each writing straight into its own slot's sessions, one
++// chunk at a time in turn.  What is decided here, without the engine:
++//   * which slots may hold a read in progress: only a slot no pad row writes (read_yield.hpp: the top row of its
++//     pipelined group), so at most one read per group (the design review's finding 2: a pad row of a group's window
++//     writes every idle slot below the group's last active one, and a read in progress there would be read on from a
++//     corrupted state - the protection is the row, not a flag);
++//   * the order of the chunks: the read with the fewest chunks left first (a short prompt is not held up behind a long
++//     one), ties in turn (the one served longest ago), and no read waits more than `max_wait` picks (a long read gets
++//     at least one chunk in every max_wait + 1).
++// Each read's chunks are read in its own order and on its own grid (the scheduler only interleaves whole chunks of
++// different reads), which is what keeps every read exact; tests/program/read_sched_test.cpp checks that and the
++// policy on a host model.
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++#include "strata/program/read_yield.hpp"
++
++namespace strata::program::read_sched {
++
++/// STRATA_READS=N: how many reads may be in progress at once (1..4; unset, empty, 0 or not a number: 1, i.e. one at
++/// a time as before), capped by the slots that can hold one (one per pipelined group, or `slots` without groups).
++inline int reads_limit(const char* v, int slots, int k) {
++    int n = (int) read_yield::env_count(v);
++    if (n < 1) n = 1;
++    if (n > 4) n = 4;
++    const int places = k > 1 ? slots / k : slots;
++    return places < 1 ? 1 : (n < places ? n : places);
++}
++
++/// May slot b take a read in progress beside `reading` (the slots with one)?  Only a pad-safe slot (read_yield's rule
++/// for groups of k), not one already reading, and while fewer than `limit` read.
++inline bool may_read(int b, int k, const std::vector<int>& reading, int limit) {
++    if (!read_yield::slot_pad_safe(b, k) || (int) reading.size() >= limit) return false;
++    for (int r : reading)
++        if (r == b) return false;
++    return true;
++}
++
++/// One read in progress, as the scheduler sees it.
++struct Read {
++    int slot = -1;
++    int64_t left = 0;    ///< chunks it still has to read
++    int64_t since = 0;   ///< the pick at which it was last served, or joined (its first chunk is due from then)
++};
++
++/// The read whose chunk goes next (an index into `reads`; -1: none has a chunk left).  `pick`: this pick's number
++/// (picks count up; the caller sets the served read's `since` to pick + 1 and its `left` one lower).  `max_wait`
++/// (>= 1): a read that has waited that many picks goes first (the one that waited longest); otherwise the fewest
++/// chunks left, ties the one waiting longest, then the lower slot.
++inline int next(const std::vector<Read>& reads, int64_t pick, int64_t max_wait) {
++    if (max_wait < 1) max_wait = 1;
++    int best = -1, starved = -1;
++    int64_t starved_wait = -1;
++    for (int i = 0; i < (int) reads.size(); ++i) {
++        const Read& r = reads[(size_t) i];
++        if (r.left <= 0) continue;
++        const int64_t waited = pick - r.since;
++        if (waited >= max_wait && waited > starved_wait) {
++            starved = i;
++            starved_wait = waited;
++        }
++        if (best < 0) { best = i; continue; }
++        const Read& b = reads[(size_t) best];
++        if (r.left != b.left) { if (r.left < b.left) best = i; continue; }
++        if (r.since != b.since) { if (r.since < b.since) best = i; continue; }
++        if (r.slot < b.slot) best = i;
++    }
++    return starved >= 0 ? starved : best;
++}
++
++}  // namespace strata::program::read_sched
+diff --git a/tests/program/read_sched_test.cpp b/tests/program/read_sched_test.cpp
+new file mode 100644
+index 00000000..34e24111
+--- /dev/null
++++ b/tests/program/read_sched_test.cpp
+@@ -0,0 +1,139 @@
++// read_sched: which slots may hold a read in progress (stage 2, STRATA_READS) and the order of the reads' chunks, on
++// a host model: every read gets its own chunks in its own order, short reads finish first, no read starves
++// (synthetic: no model, no GPU; the engine does not use it yet).
++#include "strata/program/read_sched.hpp"
++
++#include <cstdio>
++#include <random>
++#include <utility>
++#include <vector>
++
++namespace rs = strata::program::read_sched;
++namespace ry = strata::program::read_yield;
++
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
++
++struct Job {
++    int slot;
++    int64_t a0, b0, join;   // its segment, and the pick it arrives at
++};
++
++// runs the scheduler over the jobs; returns, per job, the chunks in the order it was served them and the pick each
++// one finished at; `worst`: the longest wait of any read between two of its chunks
++static void run(const std::vector<Job>& jobs, int64_t C, int64_t max_wait,
++                std::vector<std::vector<std::pair<int64_t, int64_t>>>& got, std::vector<int64_t>& done_at,
++                int64_t& worst) {
++    got.assign(jobs.size(), {});
++    done_at.assign(jobs.size(), -1);
++    std::vector<rs::Read> reads;
++    std::vector<int> job_of;
++    std::vector<int64_t> next_c;
++    worst = 0;
++    size_t joined = 0;
++    for (int64_t pick = 0;; ++pick) {
++        while (joined < jobs.size() && jobs[joined].join <= pick) {
++            const Job& j = jobs[joined];
++            reads.push_back({j.slot, (int64_t) ry::chunks(j.a0, j.b0, C).size(), pick});
++            job_of.push_back((int) joined);
++            next_c.push_back(j.a0);
++            ++joined;
++        }
++        const int i = rs::next(reads, pick, max_wait);
++        if (i < 0) {
++            if (joined == jobs.size()) break;
++            continue;
++        }
++        rs::Read& r = reads[(size_t) i];
++        worst = std::max(worst, pick - r.since);
++        const Job& j = jobs[(size_t) job_of[(size_t) i]];
++        const int64_t c0 = next_c[(size_t) i];
++        got[(size_t) job_of[(size_t) i]].emplace_back(c0, std::min(j.b0, c0 + C));
++        next_c[(size_t) i] = c0 + C;
++        r.since = pick + 1;
++        if (--r.left == 0) done_at[(size_t) job_of[(size_t) i]] = pick;
++    }
++}
++
++int main() {
++    // ---- STRATA_READS and the slots that may hold a read in progress
++    CHECK(rs::reads_limit(nullptr, 16, 4) == 1 && rs::reads_limit("0", 16, 4) == 1 && rs::reads_limit("x", 16, 4) == 1);
++    CHECK(rs::reads_limit("4", 16, 4) == 4 && rs::reads_limit("9", 16, 4) == 4 && rs::reads_limit("3", 16, 4) == 3);
++    CHECK(rs::reads_limit("4", 8, 4) == 2);          // one per group: 2 groups
++    CHECK(rs::reads_limit("4", 3, 1) == 3);          // no groups: any slot
++    CHECK(rs::may_read(3, 4, {}, 4) && rs::may_read(7, 4, {3}, 4) && !rs::may_read(2, 4, {}, 4));
++    CHECK(!rs::may_read(7, 4, {7}, 4) && !rs::may_read(15, 4, {3, 7}, 2));
++    // the reading slots are one per group, never two in one (only the top row qualifies)
++    for (int b = 0; b < 16; ++b)
++        for (int c = b + 1; c < 16; ++c)
++            if (rs::may_read(b, 4, {}, 4) && rs::may_read(c, 4, {b}, 4)) CHECK(b / 4 != c / 4);
++
++    const int64_t C = 512;
++    // ---- one long read and three short ones arriving with it: the short ones finish first, the long one is not
++    // stopped (it gets every pick the short ones leave), and every read gets its own chunks in order
++    {
++        const std::vector<Job> jobs = {{3, 0, 100000, 0}, {7, 0, 900, 0}, {11, 2000, 3100, 0}, {15, 0, 1600, 0}};
++        std::vector<std::vector<std::pair<int64_t, int64_t>>> got;
++        std::vector<int64_t> done;
++        int64_t worst = 0;
++        run(jobs, C, 4, got, done, worst);
++        for (size_t i = 0; i < jobs.size(); ++i) CHECK(got[i] == ry::chunks(jobs[i].a0, jobs[i].b0, C));
++        CHECK(done[1] < done[0] && done[2] < done[0] && done[3] < done[0]);
++        // their 2 + 3 + 4 chunks, and the long one's one in every max_wait + 1 picks in between (at most 2)
++        CHECK(done[1] <= 10 && done[2] <= 10 && done[3] <= 10);
++        CHECK(done[1] < done[2] && done[2] < done[3]);   // the shortest first
++        CHECK(worst <= 4 + 3);
++        CHECK(done[0] == (int64_t) (ry::chunks(0, 100000, C).size() + 2 + 3 + 4) - 1);   // no pick is lost
++    }
++    // ---- reads arriving over time, random lengths: own chunks in order, the wait bounded, every read finishes
++    {
++        std::mt19937_64 rng(12345);
++        for (int round = 0; round < 200; ++round) {
++            std::vector<Job> jobs;
++            int64_t t = 0;
++            const int n = 1 + (int) (rng() % 4);
++            for (int i = 0; i < n; ++i) {
++                const int64_t a0 = (int64_t) (rng() % 4096);
++                const int64_t len = 1 + (int64_t) (rng() % (i == 0 ? 60000 : 4000));
++                jobs.push_back({4 * i + 3, a0, a0 + len, t});
++                t += (int64_t) (rng() % 20);
++            }
++            const int64_t max_wait = 1 + (int64_t) (rng() % 6);
++            std::vector<std::vector<std::pair<int64_t, int64_t>>> got;
++            std::vector<int64_t> done;
++            int64_t worst = 0;
++            run(jobs, C, max_wait, got, done, worst);
++            for (size_t i = 0; i < jobs.size(); ++i) {
++                CHECK(got[i] == ry::chunks(jobs[i].a0, jobs[i].b0, C));
++                CHECK(done[i] >= 0);
++            }
++            CHECK(worst <= max_wait + n - 1);   // several reads due at once wait for each other, one pick each
++        }
++    }
++    // ---- ties go in turn: two equal reads alternate
++    {
++        std::vector<rs::Read> r = {{3, 5, 0}, {7, 5, 0}};
++        std::vector<int> order;
++        for (int64_t pick = 0; pick < 6; ++pick) {
++            const int i = rs::next(r, pick, 100);
++            order.push_back(r[(size_t) i].slot);
++            r[(size_t) i].since = pick + 1;
++            --r[(size_t) i].left;
++        }
++        // a tie goes to the lower slot; then it has fewer left and finishes first (the fewest left first)
++        CHECK((order == std::vector<int>{3, 3, 3, 3, 3, 7}));
++        // with max_wait 2 the other one is not held up longer than that
++        r = {{3, 5, 0}, {7, 5, 0}};
++        order.clear();
++        for (int64_t pick = 0; pick < 10; ++pick) {
++            const int i = rs::next(r, pick, 2);
++            order.push_back(r[(size_t) i].slot);
++            r[(size_t) i].since = pick + 1;
++            --r[(size_t) i].left;
++        }
++        CHECK((order == std::vector<int>{3, 3, 7, 3, 3, 7, 3, 7, 7, 7}));
++        CHECK(rs::next({}, 0, 4) == -1 && rs::next({{3, 0, 0}}, 0, 4) == -1);
++    }
++    if (fails == 0) std::printf("read_sched_test: ok\n");
++    return fails == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

@@ -1,0 +1,461 @@
+From 5549a72bc4e1bf3dd27cff21603ffa7dffb70c07 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:58:21 +0200
+Subject: [PATCH 3/7] serve: yield to waiting requests with few new tokens,
+ top-row slots for long reads, retry after YIELDNO (opt-in
+ STRATA_YIELD_SHORT=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py          | 122 +++++++++++++++++++---
+ serve/test_read_yield.py | 212 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 321 insertions(+), 13 deletions(-)
+ create mode 100644 serve/test_read_yield.py
+
+diff --git a/serve/server.py b/serve/server.py
+index 6a760a99..656a3ea8 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -295,6 +295,29 @@ try:
+ except ValueError:
+     ADMIT_SHORT_FIRST = 0
+ ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
++
++
++def _int_env(name: str, default: int) -> int:
++    try:
++        return int(os.environ.get(name) or default)
++    except ValueError:
++        return default
++
++
++# --batch, with an engine run with STRATA_READ_YIELD=1 (INFO read_yield=1): a prompt read in progress gives way (BYIELD,
++# #656) to a waiting request that has at most STRATA_YIELD_SHORT new tokens to read (opt-in; unset or 0: the #656 rule as
++# before - a waiting prompt under half the running one's length).  New tokens: the prompt minus the longest start of it a
++# slot holds (slot_held), so a short follow-up in a long conversation counts as short (the engine's RAM cache is not
++# seen here: the estimate errs towards not yielding).  Only while the read has STRATA_YIELD_MIN_LEFT tokens left
++# (default 4 x STRATA_YIELD_SHORT, at least 1024), at most STRATA_YIELDS_MAX times per request (default 2), asked again
++# STRATA_YIELD_RETRY_S after the engine answered YIELDNO (default 2).  A read that may give way takes a slot the engine can
++# keep it in (INFO yield_row=k: b % k == k - 1, the top row of a pipelined group), the one that widens its group least
++# (STRATA_YIELD_TOP_ROW=0: the usual slot choice, and such a read does not give way unless it lands there).
++YIELD_SHORT = max(0, _int_env("STRATA_YIELD_SHORT", 0))
++YIELD_MIN_LEFT = max(1, _int_env("STRATA_YIELD_MIN_LEFT", max(1024, 4 * YIELD_SHORT)))
++YIELDS_MAX_ENV = max(0, _int_env("STRATA_YIELDS_MAX", 2))
++YIELD_RETRY_S = _timeout_env("STRATA_YIELD_RETRY_S", 2.0) or 0.0
++YIELD_TOP_ROW = os.environ.get("STRATA_YIELD_TOP_ROW", "1") != "0"
+ STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+ STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+ 
+@@ -1339,6 +1362,10 @@ class StrataEngine:
+                 f = line.split()
+                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
+                     self._yielded = (int(f[1]), int(f[2]))
++            elif line.startswith("YIELDNO "):            # STRATA_READ_YIELD: a BYIELD the engine did not take
++                f = line.split()
++                if len(f) >= 2 and f[1].lstrip("-").isdigit():
++                    self._yield_no = int(f[1])
+             elif line.startswith("ERR"):
+                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
+                 raise ValueError(line[4:].strip())
+@@ -1484,10 +1511,10 @@ class StrataEngine:
+             self.slot_cv.notify_all()
+         return freed
+ 
+-    YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
++    YIELDS_MAX = YIELDS_MAX_ENV if YIELD_SHORT > 0 else 2   # #656: how often a request's read gives way (STRATA_YIELDS_MAX)
+ 
+     def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False,
+-                      quiet: bool = False):
++                      quiet: bool = False, ids: list[int] | None = None):
+         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
+         `after_epoch`: a request whose read gave way lets the requests waiting then go first.  `new`: a request not
+         admitted yet - while an image request waits for the engine alone, or has it (image_line), it stands back and
+@@ -1495,6 +1522,8 @@ class StrataEngine:
+         the image request waits for).  `quiet`: the image request itself, never counted as waiting (a solo request is
+         not moved into a slot for it, and no read gives way to it)."""
+         entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
++        if YIELD_SHORT > 0 and ids is not None:
++            entry.append(ids)                           # e[3]: its tokens, for _new_tokens (STRATA_YIELD_SHORT)
+         counted = stood = False                         # stood: standing back for an image request (/v1/load counts it)
+         with self.slot_cv:
+             if not quiet and not (new and self.image_line):
+@@ -1607,10 +1636,42 @@ class StrataEngine:
+         with self.slot_cv:
+             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
+ 
+-    def _shorter_waiting(self, plen: int) -> bool:
+-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
++    def _shorter_waiting(self, plen: int, prompt: list[int] | None = None) -> bool:
++        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to.
++        STRATA_YIELD_SHORT: someone waits with at most that many new tokens, and the running read (`prompt`) has at
++        least STRATA_YIELD_MIN_LEFT tokens left."""
+         with self.slot_cv:
+-            return any(e[0] * 2 <= plen for e in self.wait_lens)
++            if YIELD_SHORT <= 0 or prompt is None or not (self.info or {}).get("read_yield"):
++                return any(e[0] * 2 <= plen for e in self.wait_lens)
++            done, total = getattr(self, "progress", None) or (0, 0)
++            left = total - done if total == plen else self._new_tokens(prompt)
++            if left < YIELD_MIN_LEFT:
++                return False
++            return any(self._new_tokens(e[3] if len(e) > 3 else None, e[0]) <= YIELD_SHORT for e in self.wait_lens)
++
++    def _new_tokens(self, ids: list[int] | None, plen: int = 0) -> int:
++        """STRATA_YIELD_SHORT (the caller holds slot_cv): the tokens a prompt would read - its length minus the longest
++        start of it a slot holds (what the engine reuses from a slot; its RAM cache is not seen here)."""
++        if ids is None:
++            return plen
++        best = 0
++        for h in self.slot_held:
++            if h and best < len(h) < len(ids) and ids[:len(h)] == h:
++                best = len(h)
++        return len(ids) - best
++
++    def _yield_row(self) -> int:
++        """The engine's rule for a slot a read may give way into (INFO yield_row=k: b % k == k - 1); 0: no such engine."""
++        info = self.info or {}
++        if YIELD_SHORT <= 0 or not info.get("read_yield"):
++            return 0
++        k = info.get("yield_row")
++        return k if isinstance(k, int) and k >= 1 else 1
++
++    def _yield_slot_ok(self, slot) -> bool:
++        """STRATA_YIELD_SHORT: may the engine keep a read that gives way in this slot (no pad row writes it)."""
++        k = self._yield_row()
++        return slot is not None and (k <= 1 or slot % k == k - 1)
+ 
+     def _take_engine_alone(self, cancel, me, plen: int):
+         """The image request `me` (in image_line): waits for its turn among the image requests and for every slot to
+@@ -1756,7 +1817,7 @@ class StrataEngine:
+         prompt, left = list(ids), int(max_new)
+         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
+         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
+-        ok = yield from self._take_control(cancel, len(prompt), new=True)
++        ok = yield from self._take_control(cancel, len(prompt), new=True, ids=prompt)
+         if not ok:
+             return
+         holding, born = True, self.gen                  # (the engine it now has the control lines of)
+@@ -1769,7 +1830,7 @@ class StrataEngine:
+         try:
+             while True:   # a request in a slot that is left alone goes back to the solo path
+                 if not holding:
+-                    ok = yield from self._take_control(cancel, len(prompt))
++                    ok = yield from self._take_control(cancel, len(prompt), ids=prompt)
+                     if not ok:
+                         return
+                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
+@@ -1787,16 +1848,31 @@ class StrataEngine:
+                         with self.slot_cv:
+                             return self.waiting > 0
+ 
++                    asked_at = 0.0
++                    self._yield_no = None
++
+                     def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
+-                        nonlocal reserved
++                        nonlocal reserved, asked_at
++                        if (reserved is not None and self._yield_no == reserved and self._yield_row() and
++                                time.monotonic() - asked_at >= YIELD_RETRY_S):
++                            # STRATA_YIELD_SHORT: the engine did not take it (YIELDNO): the slot goes back, ask again later
++                            self._yield_no = None
++                            with self.slot_cv:
++                                self.slot_busy[reserved] = False
++                                self.slot_claims.discard(reserved)
++                                self.slot_cv.notify_all()
++                            reserved = None
+                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
+-                                self._shorter_waiting(len(prompt))):
++                                self._shorter_waiting(len(prompt), prompt)):
+                             with self.slot_cv:          # the slot the part read will wait in
+                                 reserved = self.pick_slot(prompt)
++                                if reserved is not None and self._yield_row() and not self._yield_slot_ok(reserved):
++                                    reserved = None     # (STRATA_YIELD_SHORT: none the engine could keep it in)
+                                 if reserved is not None:
+                                     self.slot_busy[reserved] = True
+                                     self.slot_claims.add(reserved)
+                             if reserved is not None:
++                                asked_at = time.monotonic()
+                                 self._send(f"BYIELD {reserved}")
+                     for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way):
+                         while pending:
+@@ -1871,7 +1947,7 @@ class StrataEngine:
+                             if cancel.is_set():
+                                 return
+                             if not holding:             # (one with nothing generated yet is not admitted yet)
+-                                ok = yield from self._take_control(cancel, len(prompt), new=not out)
++                                ok = yield from self._take_control(cancel, len(prompt), new=not out, ids=prompt)
+                                 if not ok:
+                                     return
+                                 holding, born = True, self.gen
+@@ -1883,7 +1959,7 @@ class StrataEngine:
+                         holding = False
+                         with self.slot_cv:
+                             epoch = self.ctl_epoch
+-                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
++                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch, ids=prompt)
+                         if not ok:
+                             return
+                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
+@@ -1904,13 +1980,21 @@ class StrataEngine:
+                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                     self._ctl_erred = False
+                     asked = False
++                    asked_at = 0.0
++                    self._yield_no = None
+ 
+                     def ask():        # as give_way above, for the slot this admission reads into
+-                        nonlocal asked
++                        nonlocal asked, asked_at
++                        if (asked and self._yield_no == slot and self._yield_row() and
++                                time.monotonic() - asked_at >= YIELD_RETRY_S):
++                            self._yield_no = None       # STRATA_YIELD_SHORT: not taken (YIELDNO): may ask again
++                            asked = False
+                         if (not asked and not embeddings and yields < self.YIELDS_MAX and
+-                                self._shorter_waiting(len(prompt))):
++                                (not self._yield_row() or self._yield_slot_ok(slot)) and
++                                self._shorter_waiting(len(prompt), prompt)):
+                             self._send(f"BYIELD {slot}")
+                             asked = True
++                            asked_at = time.monotonic()
+                     try:
+                         for x in self._control(cancel, pending.append, on_quiet=ask):
+                             while pending:
+@@ -2079,6 +2163,18 @@ class StrataEngine:
+         free = [b for b in self.slot_order if not self.slot_busy[b]]
+         if not free:
+             return None
++        k = self._yield_row() if YIELD_TOP_ROW else 0
++        if k > 1 and self._new_tokens(prompt, len(prompt)) >= YIELD_MIN_LEFT:
++            # STRATA_YIELD_SHORT: a read that may give way goes where the engine can keep it (the top row of a group:
++            # no pad row writes it), in the group it widens least (its slots below the top that are not busy become pad
++            # rows of the group's windows while it decodes); else the usual choice (it then does not give way)
++            def widens(b):
++                g0 = b - b % k
++                top = max((t for t in range(k) if self.slot_busy[g0 + t]), default=-1)
++                return k - 1 - top - 1 if top >= 0 else k - 1
++            tops = [b for b in free if b % k == k - 1]
++            if tops:
++                return min(tops, key=lambda b: (widens(b), self.slot_order.index(b)))
+         gs = getattr(self, "slot_gs", 0)
+         if gs:
+             # pipelined groups: the engine keeps no pipelined slot as a conversation cache, so nothing is worth keeping
+diff --git a/serve/test_read_yield.py b/serve/test_read_yield.py
+new file mode 100644
+index 00000000..9a3e7b3a
+--- /dev/null
++++ b/serve/test_read_yield.py
+@@ -0,0 +1,212 @@
++"""serve/test_read_yield.py - STRATA_YIELD_SHORT with an engine run with STRATA_READ_YIELD=1 (INFO read_yield=1
++yield_row=k): which waiting request a read gives way to (new tokens, not prompt length), into which slot (the top row
++of a pipelined group, where no pad row writes it), and the retry after the engine's YIELDNO.  Unset: the #656 rule as
++before.  No GPU: the unit part has no process, the service part runs test_parallel's fake engine with the YIELDNO rule.
++
++    python -m unittest serve.test_read_yield -v
++"""
++from __future__ import annotations
++
++import sys
++import threading
++import time
++import unittest
++from pathlib import Path
++from unittest import mock
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import serve.server as server  # noqa: E402
++from serve.server import StrataEngine  # noqa: E402
++from serve.test_parallel import FAKE_BATCH, ParallelService  # noqa: E402
++
++
++def engine(n, info=None, gs=0):
++    e = StrataEngine("missing-executable", [], lazy=True)
++    e.batch = n
++    e.slot_order = [g * gs + t for t in range(gs) for g in range(n // gs)] if gs else list(range(n))
++    e.slot_busy = [False] * n
++    e.slot_held = [[] for _ in range(n)]
++    e.slot_used = [0.0] * n
++    e.slot_live = [None] * n
++    e.slot_group = [b // gs if gs else 0 for b in range(n)]
++    e.slot_groups = n // gs if gs else 1
++    e.slot_gs = gs
++    e.slot_cv = threading.Condition()
++    e.wait_lens = []
++    e.info = dict(info or {})
++    return e
++
++
++class Rules(unittest.TestCase):
++    def test_new_tokens_count_what_a_slot_does_not_hold(self):
++        e = engine(4)
++        e.slot_held[2] = list(range(100))
++        self.assertEqual(e._new_tokens(list(range(130))), 30)          # a follow-up of slot 2's conversation
++        self.assertEqual(e._new_tokens(list(range(1, 131))), 130)       # not a start of it
++        self.assertEqual(e._new_tokens(list(range(100))), 100)          # a held prompt is never the whole prompt
++        self.assertEqual(e._new_tokens(None, 77), 77)
++
++    def test_unset_keeps_the_656_rule(self):
++        e = engine(4, {"read_yield": 1, "yield_row": 4})
++        e.wait_lens = [[400, 0.0, True, list(range(400))]]
++        with mock.patch.object(server, "YIELD_SHORT", 0):
++            self.assertTrue(e._shorter_waiting(1000, list(range(1000))))
++            self.assertFalse(e._shorter_waiting(700, list(range(700))))
++            self.assertEqual(e._yield_row(), 0)
++            self.assertTrue(e._yield_slot_ok(1))
++
++    def test_short_by_new_tokens(self):
++        e = engine(4, {"read_yield": 1, "yield_row": 4})
++        conv = list(range(50000))
++        e.slot_held[0] = conv
++        with mock.patch.object(server, "YIELD_SHORT", 2048), mock.patch.object(server, "YIELD_MIN_LEFT", 8192):
++            # a 50,300-token follow-up whose 50,000 a slot holds waits: 300 new tokens, worth giving way to
++            e.wait_lens = [[50300, 0.0, True, conv + list(range(9, 309))]]
++            self.assertTrue(e._shorter_waiting(100000, list(range(100000))))
++            # the #656 rule would not have (50,300 is not under half of 100,000 ... and 60,000)
++            self.assertFalse(e._shorter_waiting(60000, list(range(60000))) and 50300 * 2 <= 60000)
++            # a waiting fresh 3,000-token prompt is not short
++            e.wait_lens = [[3000, 0.0, True, list(range(7, 3007))]]
++            self.assertFalse(e._shorter_waiting(100000, list(range(100000))))
++            # an entry without tokens counts its length
++            e.wait_lens = [[1500, 0.0, True]]
++            self.assertTrue(e._shorter_waiting(100000, list(range(100000))))
++            # the running read is nearly done: no yield
++            e.progress = (95000, 100000)
++            self.assertFalse(e._shorter_waiting(100000, list(range(100000))))
++            e.progress = (10000, 100000)
++            self.assertTrue(e._shorter_waiting(100000, list(range(100000))))
++        # an engine without STRATA_READ_YIELD: the old rule even with the variable set
++        e.info = {}
++        with mock.patch.object(server, "YIELD_SHORT", 2048):
++            e.wait_lens = [[1500, 0.0, True]]
++            self.assertTrue(e._shorter_waiting(4000, list(range(4000))))
++            self.assertFalse(e._shorter_waiting(2000, list(range(2000))))
++
++    def test_slot_rule(self):
++        e = engine(16, {"read_yield": 1, "yield_row": 4}, gs=4)
++        with mock.patch.object(server, "YIELD_SHORT", 2048):
++            self.assertEqual([b for b in range(16) if e._yield_slot_ok(b)], [3, 7, 11, 15])
++            e.info["yield_row"] = 1
++            self.assertTrue(all(e._yield_slot_ok(b) for b in range(16)))
++            self.assertFalse(e._yield_slot_ok(None))
++
++    def test_a_read_that_may_give_way_takes_a_top_row_slot(self):
++        e = engine(16, {"read_yield": 1, "yield_row": 4}, gs=4)
++        long_p, short_p = list(range(20000)), list(range(300))
++        with mock.patch.object(server, "YIELD_SHORT", 2048), mock.patch.object(server, "YIELD_MIN_LEFT", 8192):
++            with e.slot_cv:
++                self.assertEqual(e.pick_slot(short_p), 0)                 # short: the usual spreading order
++                self.assertIn(e.pick_slot(long_p), (3, 7, 11, 15))        # long: a top row
++                e.slot_busy[4] = e.slot_busy[5] = e.slot_busy[6] = True   # group 1 full below its top: no pad row added
++                self.assertEqual(e.pick_slot(long_p), 7)
++                e.slot_busy[7] = True
++                e.slot_busy[9] = True                                      # group 2: one row below the top stays pad
++                self.assertEqual(e.pick_slot(long_p), 11)
++                for b in (3, 11, 15):
++                    e.slot_busy[b] = True
++                self.assertEqual(e.pick_slot(long_p), 0)                  # no top row free: the usual choice
++            with mock.patch.object(server, "YIELD_TOP_ROW", False):
++                e.slot_busy = [False] * 16
++                with e.slot_cv:
++                    self.assertEqual(e.pick_slot(long_p), 0)
++        with mock.patch.object(server, "YIELD_SHORT", 0):                 # unset: as before
++            e.slot_busy = [False] * 16
++            with e.slot_cv:
++                self.assertEqual(e.pick_slot(long_p), 0)
++
++
++# the fake engine with STRATA_READ_YIELD's answers: INFO read_yield=1 yield_row=K, YIELDNO for a slot that is not a
++# top row (and, with --yield-no-first, for the first BYIELD it gets)
++FAKE_YIELD = FAKE_BATCH.replace(
++    'groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0',
++    'groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0\n'
++    'RY = int(args[args.index("--read-yield") + 1]) if "--read-yield" in args else 0\n'
++    'NOFIRST = "--yield-no-first" in args\n'
++    'refused_once = []').replace(
++    '(f" batch_groups={groups}" if groups > 1 else ""), flush=True)',
++    '(f" batch_groups={groups}" if groups > 1 else "") + (f" read_yield=1 yield_row={RY}" if RY else ""), flush=True)'
++).replace(
++    '''                    if len(ids) - 1 - q > CH and (slot is None or ys == slot) and given is None:
++                        given = (ys, q)''',
++    '''                    if RY and (ys % RY != RY - 1 or (NOFIRST and not refused_once)):
++                        refused_once.append(ys)
++                        print(f"YIELDNO {ys}", flush=True)
++                        if log:
++                            log.write(f"YIELDNO {ys}\\n"); log.flush()
++                    elif len(ids) - 1 - q > CH and (slot is None or ys == slot) and given is None:
++                        given = (ys, q)''')
++
++
++class YieldService(ParallelService):
++    """The real StrataEngine and Service over HTTP with the fake engine's STRATA_READ_YIELD answers."""
++
++    def start(self, slots, *a, **kw):
++        with mock.patch("serve.test_parallel.FAKE_BATCH", FAKE_YIELD):
++            super().start(slots, *a, **kw)
++
++    def setUp(self):
++        self.assertIn("read_yield=1", FAKE_YIELD)
++        self.assertIn("YIELDNO", FAKE_YIELD)
++        patches = [mock.patch.object(server, "YIELD_SHORT", 200), mock.patch.object(server, "YIELD_MIN_LEFT", 256),
++                   mock.patch.object(server, "YIELD_RETRY_S", 0.05)]
++        for p in patches:
++            p.start()
++            self.addCleanup(p.stop)
++
++    def test_a_long_solo_read_gives_way_from_a_top_row_slot(self):
++        self.start(4, says_groups=2, more=["--read-yield", "2"])
++        long_q, short_q = "long " * 600, "short"
++        res = self.race(long_q, short_q)
++        self.assertEqual(res[long_q][0], "ok, done.")
++        self.assertEqual(res[short_q][0], "ok, done.")
++        self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
++        log = self.log.read_text().splitlines()
++        yields = [x.split() for x in log if x.startswith("YIELD ")]
++        self.assertTrue(yields, log)
++        self.assertEqual(int(yields[0][1]) % 2, 1, log)                     # a top row (k = 2: slots 1 and 3)
++        self.assertFalse(any(x.startswith("YIELDNO") for x in log), log)
++        # the long one went on in that slot
++        resumed = [x.split() for x in log if x.startswith("BGEN ") and int(x.split()[2]) > 2600]
++        self.assertTrue(resumed and resumed[0][1] == yields[0][1], log)
++        self.assertFalse(any(self.engine.slot_busy))
++
++    def test_asked_again_after_yieldno(self):
++        self.start(4, says_groups=2, more=["--read-yield", "2", "--yield-no-first"])
++        long_q, short_q = "long " * 600, "short"
++        res = self.race(long_q, short_q)
++        self.assertEqual(res[long_q][0], "ok, done.")
++        self.assertEqual(res[short_q][0], "ok, done.")
++        log = self.log.read_text().splitlines()
++        self.assertTrue(any(x.startswith("YIELDNO ") for x in log), log)
++        self.assertTrue(any(x.startswith("YIELD ") for x in log), log)    # the second ask was taken
++        self.assertLess(res[short_q][1], res[long_q][1] - 0.3, res)
++        self.assertFalse(any(self.engine.slot_busy))
++
++    def test_an_admission_in_a_lower_row_is_not_asked(self):
++        """A long read admitted beside a decoding slot into a slot the engine could not keep it in (STRATA_YIELD_TOP_ROW=0
++        and k = 3: only slot 2 would do): no BYIELD goes out, the short request waits as before."""
++        with mock.patch.object(server, "YIELD_TOP_ROW", False):
++            self.start(3, more=["--read-yield", "3"])
++            bg = threading.Thread(target=lambda: self.chat("LONGREPLY background", max_tokens=60))
++            bg.start()
++            time.sleep(0.05)
++            long_q, short_q = "long " * 600, "short"
++            res = self.race(long_q, short_q)
++            bg.join(30)
++        self.assertEqual(res[long_q][0], "ok, done.")
++        self.assertEqual(res[short_q][0], "ok, done.")
++        log = self.log.read_text().splitlines()
++        admitted = [x.split() for x in log if x.startswith("BGEN ") and int(x.split()[2]) > 2600]
++        self.assertTrue(admitted and int(admitted[0][1]) != 2, log)
++        self.assertFalse(any(x.startswith(("YIELD ", "YIELDNO ")) for x in log), log)
++        self.assertFalse(any(self.engine.slot_busy))
++
++
++for _name in dir(ParallelService):   # (its own tests run in test_parallel)
++    if _name.startswith("test_") and _name not in YieldService.__dict__:
++        setattr(YieldService, _name, None)
++del ParallelService
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
