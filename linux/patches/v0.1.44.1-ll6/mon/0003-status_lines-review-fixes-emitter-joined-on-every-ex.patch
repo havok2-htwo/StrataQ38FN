@@ -1,0 +1,414 @@
+From 7777a95ef85b250b54472f1ce24a4a120b2655d5 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:08:04 +0200
+Subject: [PATCH 3/3] status_lines: review fixes - emitter joined on every exit
+ (ERR stays the last word), ~2 s heartbeat with heartbeat-based stale limit,
+ lane -1 unless running in one
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/program/live_status.hpp | 71 ++++++++++++++++++++++----
+ serve/server.py                        | 41 +++++++++++----
+ serve/test_status_lines.py             | 29 ++++++++++-
+ src/program/generate.cpp               | 13 ++++-
+ tests/program/live_status_test.cpp     | 39 +++++++++++++-
+ 5 files changed, 168 insertions(+), 25 deletions(-)
+
+diff --git a/include/strata/program/live_status.hpp b/include/strata/program/live_status.hpp
+index 3a45ee52..9991e5d6 100644
+--- a/include/strata/program/live_status.hpp
++++ b/include/strata/program/live_status.hpp
+@@ -1,6 +1,6 @@
+ // STRATA_STATUS_LINES=<ms> (opt-in, default off): what the serve loop is doing now, pushed to the server as one
+ // `STAT {json}` line on stdout at most every <ms> milliseconds (and only when something changed, else a heartbeat every
+-// 10 periods).  Off (unset, empty or 0): nothing is started, nothing is stored, nothing is printed - the engine's
++// heartbeat_ms(): about 2 s, at least one period; announced as `INFO status_lines=<ms> status_heartbeat=<ms>`).  Off (unset, empty or 0): nothing is started, nothing is stored, nothing is printed - the engine's
+ // output stays byte-identical.  Only a server that knows the line sets the variable (serve/server.py takes STAT lines
+ // out of its stdout pump before anything else reads them): an older server would take an unknown line for a session
+ // command's answer.
+@@ -13,7 +13,7 @@
+ //         "lanes":{"on":<lanes configured>,"live":0|1,"n":<lanes running>,"starts":<n>,"wait":"<why>"|null},
+ //         "overlap":{"active":0|1},
+ //         "solo":null|{"mode":"solo_pl"|"solo_serial","tok":<n>,"tok_s":<x>,"offered":<n>,"accepted":<n>,"acc":<0..1>},
+-//         "slots":[{"s":<slot>,"m":"<mode>","lane":<j>|-1,"tok":<n>,"tok_s":<recent>,"tok_s_mean":<since start>,
++//         "slots":[{"s":<slot>,"m":"<mode>","lane":<j: the lane it runs in now, m = lane>|-1,"tok":<n>,"tok_s":<recent>,"tok_s_mean":<since start>,
+ //                   "offered":<n>,"accepted":<n>,"acc":<0..1>|null}, ...],
+ //         "reads":[{"slot":<slot>|-1,"done":<n>,"total":<n>,"from":<n>,"tok_s":<x>,"beside":"decode"|"paused"|"none",
+ //                   "state":"run"|"wait"|"yielded"}, ...]}
+@@ -26,9 +26,11 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
++#include <mutex>
+ #include <string>
+ #include <thread>
+ 
+@@ -64,6 +66,9 @@ inline int period_ms() {
+     return p;
+ }
+ inline bool on() { return period_ms() > 0; }
++// the heartbeat: a line at least this often when nothing changes (whole periods, about 2 s, at least one period)
++inline int heartbeat_periods(int p) { return p <= 0 ? 1 : std::max(1, (2000 + p - 1) / p); }
++inline int heartbeat_ms() { return heartbeat_periods(period_ms()) * period_ms(); }
+ 
+ inline int64_t to_ms(std::chrono::steady_clock::time_point t) {
+     return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
+@@ -342,32 +347,76 @@ inline std::string to_json(State& S, int64_t now, Rates* rates, bool with_t = tr
+ }
+ 
+ // the emitter: started once, after READY, only when on().  A line when the content changed (at most one per period),
+-// else one every 10 periods; one printf per line (stdio's lock: it cannot tear against the loop's BT lines)
++// else one every heartbeat_ms(); one printf per line (stdio's lock: it cannot tear against the loop's BT lines).
++// stop_emitter() wakes and joins it: the serve function stops it on every way out (QUIT, and an ERR's return through
++// its guard), and an atexit hook covers exit() - no STAT line follows the engine's last words, none runs into stdio's
++// teardown.
++namespace detail {
++struct Emitter {
++    std::mutex mu;
++    std::condition_variable cv;
++    std::thread* th = nullptr;   // (a pointer: never a joinable std::thread in a static destructor)
++};
++inline Emitter& emitter() {
++    static Emitter* e = new Emitter;   // (never destroyed: the atexit hook may run after statics go)
++    return *e;
++}
++}  // namespace detail
++
++inline void stop_emitter() {
++    State& S = state();
++    detail::Emitter& E = detail::emitter();
++    std::thread* th = nullptr;
++    {
++        std::lock_guard<std::mutex> g(E.mu);
++        S.stop.store(true, std::memory_order_relaxed);
++        th = E.th;
++        E.th = nullptr;
++    }
++    E.cv.notify_all();
++    if (th != nullptr) {
++        if (th->get_id() != std::this_thread::get_id()) th->join();
++        else th->detach();
++        delete th;
++    }
++}
++
+ inline void start_emitter() {
+     if (!on()) return;
+-    std::printf("INFO status_lines=%d\n", period_ms());
++    detail::Emitter& E = detail::emitter();
++    std::lock_guard<std::mutex> g(E.mu);
++    if (E.th != nullptr || state().stop.load(std::memory_order_relaxed)) return;   // (once; never after a stop)
++    std::printf("INFO status_lines=%d status_heartbeat=%d\n", period_ms(), heartbeat_ms());
+     std::fflush(stdout);
+-    std::thread([] {
++    E.th = new std::thread([] {
+         State& S = state();
++        detail::Emitter& E = detail::emitter();
+         Rates rates;
+         std::string last;
+         int quiet = 0;
+         const int p = period_ms();
+-        while (!S.stop.load(std::memory_order_relaxed)) {
+-            std::this_thread::sleep_for(std::chrono::milliseconds(p));
+-            if (S.stop.load(std::memory_order_relaxed)) break;
++        const int hb = heartbeat_periods(p);
++        for (;;) {
++            {
++                std::unique_lock<std::mutex> lk(E.mu);
++                if (E.cv.wait_for(lk, std::chrono::milliseconds(p),
++                                  [&] { return S.stop.load(std::memory_order_relaxed); }))
++                    break;
++            }
+             const int64_t now = now_ms();
+             Rates probe = rates;   // (the change test must not advance the rates)
+             const std::string body = to_json(S, now, &probe, false);
+-            if (body == last && ++quiet < 10) continue;
++            if (body == last && ++quiet < hb) continue;
+             quiet = 0;
+             last = body;
+             const std::string line = to_json(S, now, &rates, true);
++            if (S.stop.load(std::memory_order_relaxed)) break;   // (stop_emitter joins: no line after it returns)
+             std::printf("STAT %s\n", line.c_str());
+             std::fflush(stdout);
+         }
+-    }).detach();
++    });
++    static const bool hooked = (std::atexit([] { stop_emitter(); }), true);
++    (void) hooked;
+ }
+-inline void stop_emitter() { state().stop.store(true, std::memory_order_relaxed); }
+ 
+ }  // namespace strata::program::live_status
+diff --git a/serve/server.py b/serve/server.py
+index b41b9184..45d984fb 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -219,10 +219,27 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
+ RATE_WINDOW_S = 2.0
+ # STRATA_STATUS_LINES: the engine's live status (`STAT {json}` lines, engine with live_status.hpp) every this many ms.
+ # This server turns it on for the engine it starts unless the environment says otherwise (0 = off); an engine that does
+-# not know it ignores it.  A status older than STATUS_STALE_S is not shown (the engine stopped sending: an old engine,
+-# or it is gone).
++# not know it ignores it.  A status older than status_stale_s() is not shown (the engine stopped sending: an old engine,
++# or it is gone): STATUS_STALE_S, or STATUS_STALE_BEATS x the heartbeat the engine announced (`INFO status_heartbeat=`,
++# a line at least that often while nothing changes) when that is longer.
+ STATUS_LINES_MS = "500"
+ STATUS_STALE_S = 5.0
++STATUS_STALE_BEATS = 2.5
++
++
++def status_heartbeat_s(info: dict) -> float | None:
++    """The engine's announced STAT heartbeat in s (INFO status_heartbeat=<ms>; an engine with only status_lines=<ms>:
++    10 periods), None without either."""
++    for k, f in (("status_heartbeat", 1), ("status_lines", 10)):
++        v = info.get(k)
++        if isinstance(v, int) and v > 0:
++            return v * f / 1000.0
++    return None
++
++
++def status_stale_s(info: dict) -> float:
++    hb = status_heartbeat_s(info)
++    return max(STATUS_STALE_S, STATUS_STALE_BEATS * hb) if hb else STATUS_STALE_S
+ 
+ 
+ def engine_status_env(env: dict | None) -> dict | None:
+@@ -267,7 +284,7 @@ def slot_status_keys(st: dict | None, slot: int) -> dict:
+     return out
+ 
+ 
+-def engine_mode_view(st: dict | None, age_s: float | None) -> dict | None:
++def engine_mode_view(st: dict | None, age_s: float | None, heartbeat_s: float | None = None) -> dict | None:
+     """live.engine_mode: the engine's global view (lanes, overlapped read, solo decode, the reads in flight, the slots
+     per mode); None when the engine sends no status (an older engine, STRATA_STATUS_LINES=0) or it is stale."""
+     if not st:
+@@ -277,7 +294,7 @@ def engine_mode_view(st: dict | None, age_s: float | None) -> dict | None:
+         if isinstance(x, dict):
+             modes[x.get("m", "idle")] = modes.get(x.get("m", "idle"), 0) + 1
+     lanes = st.get("lanes") or {}
+-    return {"v": st.get("v"), "age_s": round(age_s, 2) if age_s is not None else None,
++    return {"v": st.get("v"), "age_s": round(age_s, 2) if age_s is not None else None, "heartbeat_s": heartbeat_s,
+             "lanes": {"configured": lanes.get("on", 0), "live": bool(lanes.get("live")), "running": lanes.get("n", 0),
+                       "starts": lanes.get("starts", 0), "wait": lanes.get("wait")},
+             "overlap": bool((st.get("overlap") or {}).get("active")),
+@@ -1092,7 +1109,7 @@ class StrataEngine:
+     def _pump(self):
+         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
+         slot_q = self.slot_q
+-        line = None
++        line = last = None                              # last: the last line that is not a STAT line
+         for line in proc.stdout:
+             # STRATA_STATUS_LINES: the engine's live status never reaches a reader of the control lines (it would
+             # reset their heartbeats and the #481 watchdog, and a session command would take it for its answer)
+@@ -1101,6 +1118,7 @@ class StrataEngine:
+                 if st is not None and self.proc is proc:
+                     self.engine_status, self.engine_status_at = st, time.monotonic()
+                 continue
++            last = line
+             # checked before batch routing: a fatal line is never a slot's own
+             if line.startswith(FATAL_PREFIXES):
+                 # release_gpu_waits invalidates the verifier, even if the native
+@@ -1122,8 +1140,9 @@ class StrataEngine:
+             lines.put(line)
+         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
+             self.ended = True                           # its output closed: it is gone, even before the OS says so
+-            if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
+-                self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
++            if last and last.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
++                self.last_err = last[4:].strip()        # (a failed batch window: every request reads its slot; a STAT
++                                                        # line after it is not its last word)
+         lines.put(None)
+         for q in slot_q:
+             q.put(None)
+@@ -2211,16 +2230,18 @@ class StrataEngine:
+         return view
+ 
+     def status_now(self) -> dict | None:
+-        """The engine's last STAT line while fresh (STATUS_STALE_S), else None."""
++        """The engine's last STAT line while fresh (status_stale_s: at least 2.5 of its heartbeats), else None."""
+         st = self.__dict__.get("engine_status")
+-        if st is None or time.monotonic() - self.__dict__.get("engine_status_at", 0.0) > STATUS_STALE_S:
++        if st is None or (time.monotonic() - self.__dict__.get("engine_status_at", 0.0)
++                          > status_stale_s(self.__dict__.get("info") or {})):
+             return None
+         return st
+ 
+     def engine_mode(self) -> dict | None:
+         """live.engine_mode (engine_mode_view) from the last fresh STAT line."""
+         st = self.status_now()
+-        return engine_mode_view(st, time.monotonic() - self.engine_status_at) if st else None
++        return (engine_mode_view(st, time.monotonic() - self.engine_status_at,
++                                 status_heartbeat_s(self.__dict__.get("info") or {})) if st else None)
+ 
+     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
+diff --git a/serve/test_status_lines.py b/serve/test_status_lines.py
+index 449e1b97..ea71cc92 100644
+--- a/serve/test_status_lines.py
++++ b/serve/test_status_lines.py
+@@ -18,7 +18,7 @@ from pathlib import Path
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ from serve.frontend import ChatTemplate  # noqa: E402
+ from serve.server import (ByteTokenizer, Service, StrataEngine, engine_mode_view, parse_status_line,  # noqa: E402
+-                          slot_status_keys)
++                          slot_status_keys, status_heartbeat_s, status_stale_s)
+ 
+ STAT = {"v": 1, "t": 1, "seq": 3,
+         "lanes": {"on": 4, "live": 1, "n": 2, "starts": 7, "wait": None},
+@@ -44,6 +44,9 @@ def st():
+ for line in sys.stdin:
+     if line.startswith('QUIT'):
+         break
++    if line.startswith('DIE'):   # an ERR exit: the engine's last words, then the emitter's lines until the process ends
++        print('ERR boom: the reason', flush=True); st(); st()
++        sys.exit(1)
+     st()
+     if line.startswith('SAVE '):
+         print('SESSION 1 2', flush=True); st()
+@@ -100,6 +103,17 @@ class StatusLinesProcess(unittest.TestCase):
+         self.assertTrue(m["overlap"])
+         self.assertEqual(m["reads"][0]["slot"], 5)
+ 
++    def test_err_stays_the_last_word_with_stat_lines_after_it(self):
++        e = self.engine()
++        with e.wlock:
++            e.proc.stdin.write("DIE\n")
++            e.proc.stdin.flush()
++        end = time.monotonic() + 5
++        while not e.ended and time.monotonic() < end:
++            time.sleep(0.01)
++        self.assertTrue(e.ended)
++        self.assertEqual(e.last_err, "boom: the reason")
++
+     def test_an_explicit_value_is_kept(self):
+         e = self.engine(env={**os.environ, "STRATA_STATUS_LINES": "0"})
+         self.assertEqual(e.info.get("status_env"), 0)
+@@ -127,6 +141,19 @@ class StatusViews(unittest.TestCase):
+         self.assertEqual(v["slot_modes"], {"lane": 2, "read_ovl": 1, "cached": 1})
+         self.assertEqual(v["lanes"]["configured"], 4)
+ 
++    def test_stale_limit_follows_the_heartbeat(self):
++        self.assertEqual(status_stale_s({}), 5.0)
++        self.assertEqual(status_stale_s({"status_lines": 500, "status_heartbeat": 2000}), 5.0)
++        self.assertEqual(status_stale_s({"status_lines": 5000, "status_heartbeat": 5000}), 12.5)
++        self.assertEqual(status_heartbeat_s({"status_lines": 1000}), 10.0)   # an engine without status_heartbeat
++        self.assertEqual(status_stale_s({"status_lines": 1000}), 25.0)
++        e = StrataEngine("strata", [], lazy=True)
++        e.info = {"status_lines": 5000, "status_heartbeat": 5000}
++        e.engine_status, e.engine_status_at = STAT, time.monotonic() - 6
++        m = e.engine_mode()
++        self.assertIsNotNone(m, "6 s old with a 5 s heartbeat is fresh")
++        self.assertEqual(m["heartbeat_s"], 5.0)
++
+     def test_slots_view_adds_keys_and_keeps_state(self):
+         e = StrataEngine("strata", [], lazy=True)
+         e.batch = 6
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 5e992692..5dc8bf79 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -11376,6 +11376,13 @@ int main(int argc, char** argv) {
+                     }
+                 }).detach();
+         }
++        // STRATA_STATUS_LINES: the emitter stops (joined) on every way out of the serve loop - QUIT and each ERR's
++        // return - before the locals declared above tear down: no STAT line after the engine's last words
++        struct LiveStatusStop {
++            ~LiveStatusStop() {
++                if (strata::program::live_status::on()) strata::program::live_status::stop_emitter();
++            }
++        } live_status_stop;
+         if (strata::program::live_status::on()) {   // STRATA_STATUS_LINES (opt-in): the slots' table and the lanes, then the emitter
+             strata::program::live_status::state().n_slots.store(std::min<int>(o.batch, strata::program::live_status::kSlots));
+             strata::program::live_status::state().lanes_on.store(lanes_on ? n_lanes : 0);
+@@ -13630,14 +13637,16 @@ int main(int argc, char** argv) {
+                 decoding += sl.active ? 1 : 0;
+                 strata::program::live_status::Slot& L = S.slots[b];
+                 L.mode.store(m, std::memory_order_relaxed);
+-                L.lane.store(lj, std::memory_order_relaxed);
++                L.lane.store(in_lane ? lj : -1, std::memory_order_relaxed);   // the lane it runs in now, else -1
+                 L.produced.store(sl.produced, std::memory_order_relaxed);
+                 L.t0_ms.store(sl.active ? strata::program::live_status::to_ms(sl.t0) : 0, std::memory_order_relaxed);
+             }
+             S.lanes_live.store(lanes_live ? 1 : 0, std::memory_order_relaxed);
+             S.lanes_n.store(n_live, std::memory_order_relaxed);
+             S.lanes_starts.store(lanes_starts, std::memory_order_relaxed);
+-            if (lanes_live || !lanes_on || !lanes_want()) S.lanes_wait.store(nullptr, std::memory_order_relaxed);
++            // (lanes_want() only while a reason is shown: no extra scan of the slots in the common case)
++            if (S.lanes_wait.load(std::memory_order_relaxed) != nullptr && (lanes_live || !lanes_on || !lanes_want()))
++                S.lanes_wait.store(nullptr, std::memory_order_relaxed);
+             S.any_decoding.store(decoding, std::memory_order_relaxed);
+             S.overlap.store(ov_active ? 1 : 0, std::memory_order_relaxed);
+             strata::program::live_status::bump(S);
+diff --git a/tests/program/live_status_test.cpp b/tests/program/live_status_test.cpp
+index 65a6e52f..c2a018ea 100644
+--- a/tests/program/live_status_test.cpp
++++ b/tests/program/live_status_test.cpp
+@@ -2,8 +2,13 @@
+ // serve loop publishes (slots, lanes, reads, solo).  Header-only, CPU: no model, no GPU.
+ #include "strata/program/live_status.hpp"
+ 
++#include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <sstream>
++#include <thread>
+ #include <string>
+ 
+ namespace ls = strata::program::live_status;
+@@ -28,6 +33,14 @@ int main() {
+     check(ls::parse_period("yes") == 0, "text is off");
+     check(ls::parse_period("500") == 500, "500 ms");
+     check(ls::parse_period("1") == 50, "at least 50 ms");
++    check(ls::heartbeat_periods(500) == 4, "500 ms: a heartbeat every 2 s");
++    check(ls::heartbeat_periods(50) == 40, "50 ms: every 2 s");
++    check(ls::heartbeat_periods(700) == 3, "700 ms: 2.1 s");
++    check(ls::heartbeat_periods(5000) == 1, "5 s: every period");
++    // stop_emitter without a running emitter: no thread, no crash, idempotent
++    ls::stop_emitter();
++    ls::stop_emitter();
++    ls::state().stop.store(false);
+ 
+     // an idle engine: no slot, no read, no solo
+     {
+@@ -114,6 +127,30 @@ int main() {
+         const double c = ls::detail::recent(&r, 0, 5, 2500, 3000);    // a new request (t0 changed)
+         check(c > 9.9 && c < 10.1, "reset on a new request");
+     }
+-    if (failures == 0) std::printf("live_status_test: all checks passed\n");
++    // the emitter (last: it switches the env on for good): INFO with the heartbeat, a STAT line, and stop_emitter joins -
++    // nothing is printed after it returns, and it returns within about a period (the wait is woken, not slept out)
++    {
++        const std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/live_status_test.out";
++        ::setenv("STRATA_STATUS_LINES", "50", 1);
++        std::fflush(stdout);
++        check(std::freopen(path.c_str(), "w", stdout) != nullptr, "stdout to a file");
++        ls::state().stop.store(false);
++        ls::start_emitter();
++        std::this_thread::sleep_for(std::chrono::milliseconds(200));
++        const auto t0 = std::chrono::steady_clock::now();
++        ls::stop_emitter();
++        const auto took = std::chrono::steady_clock::now() - t0;
++        std::fflush(stdout);
++        auto slurp = [&] { std::ifstream f(path); std::stringstream b; b << f.rdbuf(); return b.str(); };
++        const std::string out = slurp();
++        std::this_thread::sleep_for(std::chrono::milliseconds(150));
++        check(has(out, "INFO status_lines=50 status_heartbeat=2000\n"), "INFO announces period and heartbeat");
++        check(has(out, "\nSTAT {\"v\":1"), "a STAT line");
++        check(slurp() == out, "no line after stop_emitter");
++        check(took < std::chrono::milliseconds(100), "stop_emitter wakes the emitter");
++        ls::start_emitter();   // stopped for good: no second thread
++        std::remove(path.c_str());
++    }
++    if (failures == 0) std::fprintf(stderr, "live_status_test: all checks passed\n");
+     return failures == 0 ? 0 : 1;
+ }
+-- 
+2.43.0
+

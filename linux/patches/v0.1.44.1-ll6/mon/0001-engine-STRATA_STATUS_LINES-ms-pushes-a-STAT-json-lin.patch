@@ -1,0 +1,755 @@
+From 79aa007c80a891c7719ad09e5a521eb28a41260b Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:30:53 +0200
+Subject: [PATCH 1/3] engine: STRATA_STATUS_LINES=<ms> pushes a STAT {json}
+ line with the slots' modes, lanes, reads and solo decode (opt-in, default
+ output unchanged)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                         |   4 +
+ include/strata/program/live_status.hpp | 373 +++++++++++++++++++++++++
+ src/program/generate.cpp               |  63 ++++-
+ tests/program/live_status_test.cpp     | 119 ++++++++
+ 4 files changed, 558 insertions(+), 1 deletion(-)
+ create mode 100644 include/strata/program/live_status.hpp
+ create mode 100644 tests/program/live_status_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 740378aa..d9ca4b5a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -302,6 +302,10 @@ if(STRATA_BUILD_TESTS)
+   add_executable(spec_lanes_test tests/program/spec_lanes_test.cpp)
+   target_include_directories(spec_lanes_test PRIVATE include)
+   add_test(NAME spec_lanes_test COMMAND spec_lanes_test)
++  # STRATA_STATUS_LINES: the serve loop's live status and its STAT line (header-only, CPU)
++  add_executable(live_status_test tests/program/live_status_test.cpp)
++  target_include_directories(live_status_test PRIVATE include)
++  add_test(NAME live_status_test COMMAND live_status_test)
+   # STRATA_SPEC_LANES' shared arenas: the verifier's carve, its signature and poison_arena's keep range (header-only, CPU)
+   add_executable(arena_carve_test tests/core/arena_carve_test.cpp)
+   target_include_directories(arena_carve_test PRIVATE include)
+diff --git a/include/strata/program/live_status.hpp b/include/strata/program/live_status.hpp
+new file mode 100644
+index 00000000..3a45ee52
+--- /dev/null
++++ b/include/strata/program/live_status.hpp
+@@ -0,0 +1,373 @@
++// STRATA_STATUS_LINES=<ms> (opt-in, default off): what the serve loop is doing now, pushed to the server as one
++// `STAT {json}` line on stdout at most every <ms> milliseconds (and only when something changed, else a heartbeat every
++// 10 periods).  Off (unset, empty or 0): nothing is started, nothing is stored, nothing is printed - the engine's
++// output stays byte-identical.  Only a server that knows the line sets the variable (serve/server.py takes STAT lines
++// out of its stdout pump before anything else reads them): an older server would take an unknown line for a session
++// command's answer.
++//
++// The serve loop (main thread) and the prompt read's thread store into State with relaxed atomics (no lock, no sync,
++// nothing on the GPU); the emitter thread reads it and prints.  A value can be one window stale - this is a monitor.
++//
++// The line (v = 1; new keys may be added, none is renamed or removed; idle slots are left out):
++//   STAT {"v":1,"t":<ms>,"seq":<n>,
++//         "lanes":{"on":<lanes configured>,"live":0|1,"n":<lanes running>,"starts":<n>,"wait":"<why>"|null},
++//         "overlap":{"active":0|1},
++//         "solo":null|{"mode":"solo_pl"|"solo_serial","tok":<n>,"tok_s":<x>,"offered":<n>,"accepted":<n>,"acc":<0..1>},
++//         "slots":[{"s":<slot>,"m":"<mode>","lane":<j>|-1,"tok":<n>,"tok_s":<recent>,"tok_s_mean":<since start>,
++//                   "offered":<n>,"accepted":<n>,"acc":<0..1>|null}, ...],
++//         "reads":[{"slot":<slot>|-1,"done":<n>,"total":<n>,"from":<n>,"tok_s":<x>,"beside":"decode"|"paused"|"none",
++//                   "state":"run"|"wait"|"yielded"}, ...]}
++// Slot modes: idle, cached (idle, holds its conversation), yielded (its read gave way), batch (the batch windows /
++// pipelined groups), lane (a spec lane), parking (its conversation's capture in flight), reading (its prompt is being
++// read, the slots paused), read_ovl (read beside the slots' decode, STRATA_PIPE_OVERLAP).  A read that belongs to a slot
++// sets that slot's mode; reads[] has one entry per read in flight (concurrent reads: more entries, nothing else changes).
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <thread>
++
++namespace strata::program::live_status {
++
++constexpr int kSlots = 64;
++constexpr int kReads = 8;
++
++enum Mode : int { idle = 0, cached = 1, yielded = 2, batch = 3, lane = 4, parking = 5 };
++enum ReadState : int { read_free = 0, read_run = 1, read_wait = 2, read_yielded = 3 };
++
++inline const char* mode_name(int m) {
++    switch (m) {
++        case cached: return "cached";
++        case yielded: return "yielded";
++        case batch: return "batch";
++        case lane: return "lane";
++        case parking: return "parking";
++        default: return "idle";
++    }
++}
++
++// the switch: unset, empty, 0 or not a number -> 0 (off); else the period in ms (at least 50)
++inline int parse_period(const char* v) {
++    if (v == nullptr || v[0] == '\0') return 0;
++    const int ms = std::atoi(v);
++    if (ms <= 0) return 0;
++    return ms < 50 ? 50 : ms;
++}
++
++inline int period_ms() {
++    static const int p = parse_period(std::getenv("STRATA_STATUS_LINES"));
++    return p;
++}
++inline bool on() { return period_ms() > 0; }
++
++inline int64_t to_ms(std::chrono::steady_clock::time_point t) {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
++}
++inline int64_t now_ms() { return to_ms(std::chrono::steady_clock::now()); }
++
++struct Slot {
++    std::atomic<int> mode{idle}, lane{-1};
++    std::atomic<int64_t> produced{0}, t0_ms{0}, offered{0}, accepted{0};
++};
++struct Read {
++    std::atomic<int> state{read_free}, slot{-1}, overlapped{0};
++    std::atomic<int64_t> done{0}, total{0}, from{0}, t0_ms{0};
++};
++struct Solo {
++    std::atomic<int> active{0}, pipelined{0};
++    std::atomic<int64_t> produced{0}, offered{0}, accepted{0}, t0_ms{0};
++};
++struct State {
++    std::atomic<int> n_slots{0}, lanes_on{0}, lanes_live{0}, lanes_n{0}, overlap{0}, any_decoding{0};
++    std::atomic<int64_t> lanes_starts{0};
++    std::atomic<const char*> lanes_wait{nullptr};   // a string literal (the gate's reason) or null
++    std::atomic<int> main_read{-1};                 // the reads[] entry the serve loop's read updates
++    std::atomic<uint64_t> seq{0};
++    std::atomic<bool> stop{false};
++    Slot slots[kSlots];
++    Read reads[kReads];
++    Solo solo;
++};
++inline State& state() {
++    static State s;
++    return s;
++}
++
++// ---- the writers (each a few relaxed stores; the caller checks on() first where it would compute anything)
++inline void bump(State& S = state()) { S.seq.fetch_add(1, std::memory_order_relaxed); }
++
++// a prompt read starts (slot: the batch slot it continues in, -1: a request beside the slots); its entry index
++inline int read_begin(int slot, int64_t total, int64_t from, State& S = state()) {
++    int i = 0;
++    for (; i < kReads; ++i)
++        if (S.reads[i].state.load(std::memory_order_relaxed) == read_free) break;
++    if (i == kReads) i = 0;   // (cannot happen today: one read at a time)
++    Read& R = S.reads[i];
++    R.slot.store(slot, std::memory_order_relaxed);
++    R.total.store(total, std::memory_order_relaxed);
++    R.from.store(from, std::memory_order_relaxed);
++    R.done.store(from, std::memory_order_relaxed);
++    R.t0_ms.store(now_ms(), std::memory_order_relaxed);
++    R.overlapped.store(0, std::memory_order_relaxed);
++    R.state.store(read_run, std::memory_order_relaxed);
++    S.main_read.store(i, std::memory_order_relaxed);
++    bump(S);
++    return i;
++}
++inline void read_progress(int64_t done, State& S = state()) {
++    const int i = S.main_read.load(std::memory_order_relaxed);
++    if (i < 0 || i >= kReads) return;
++    S.reads[i].done.store(done, std::memory_order_relaxed);
++    bump(S);
++}
++inline void read_overlapped(bool ov, State& S = state()) {
++    const int i = S.main_read.load(std::memory_order_relaxed);
++    if (i >= 0 && i < kReads) S.reads[i].overlapped.store(ov ? 1 : 0, std::memory_order_relaxed);
++    S.overlap.store(ov ? 1 : 0, std::memory_order_relaxed);
++    bump(S);
++}
++inline void read_end(State& S = state()) {
++    const int i = S.main_read.exchange(-1, std::memory_order_relaxed);
++    if (i >= 0 && i < kReads) S.reads[i].state.store(read_free, std::memory_order_relaxed);
++    bump(S);
++}
++// a request beside the slots decodes (pipelined or serial)
++inline void solo_begin(bool pipelined, State& S = state()) {
++    S.solo.pipelined.store(pipelined ? 1 : 0, std::memory_order_relaxed);
++    S.solo.produced.store(0, std::memory_order_relaxed);
++    S.solo.offered.store(0, std::memory_order_relaxed);
++    S.solo.accepted.store(0, std::memory_order_relaxed);
++    S.solo.t0_ms.store(now_ms(), std::memory_order_relaxed);
++    S.solo.active.store(1, std::memory_order_relaxed);
++    bump(S);
++}
++inline void solo_progress(int64_t produced, int64_t offered, int64_t accepted, State& S = state()) {
++    S.solo.produced.store(produced, std::memory_order_relaxed);
++    S.solo.offered.store(offered, std::memory_order_relaxed);
++    S.solo.accepted.store(accepted, std::memory_order_relaxed);
++    bump(S);
++}
++// the request ended, whichever way: its read and its solo decode are over
++inline void request_end(State& S = state()) {
++    read_end(S);
++    S.overlap.store(0, std::memory_order_relaxed);
++    S.solo.active.store(0, std::memory_order_relaxed);
++    bump(S);
++}
++inline void slot_drafts(int b, int64_t offered, int64_t accepted, State& S = state()) {
++    if (b < 0 || b >= kSlots) return;
++    S.slots[b].offered.fetch_add(offered, std::memory_order_relaxed);
++    S.slots[b].accepted.fetch_add(accepted, std::memory_order_relaxed);
++}
++inline void slot_admitted(int b, State& S = state()) {
++    if (b < 0 || b >= kSlots) return;
++    S.slots[b].offered.store(0, std::memory_order_relaxed);
++    S.slots[b].accepted.store(0, std::memory_order_relaxed);
++}
++
++// ---- the reader: one JSON object from State.  `Rates` keeps the previous sample per slot (the recent tok/s)
++struct Rates {
++    int64_t at_ms[kSlots + 1] = {};
++    int64_t produced[kSlots + 1] = {};
++    int64_t t0[kSlots + 1] = {};
++    double rate[kSlots + 1] = {};
++};
++
++namespace detail {
++inline void num(std::string& s, double v) {
++    char b[32];
++    std::snprintf(b, sizeof b, "%.1f", v);
++    s += b;
++}
++inline void num(std::string& s, int64_t v) { s += std::to_string((long long) v); }
++inline void frac(std::string& s, int64_t acc, int64_t off) {
++    if (off <= 0) { s += "null"; return; }
++    char b[32];
++    std::snprintf(b, sizeof b, "%.3f", (double) acc / (double) off);
++    s += b;
++}
++// the recent rate of counter `i` (EMA over the samples; reset when a new request starts there)
++inline double recent(Rates* r, int i, int64_t produced, int64_t t0, int64_t now) {
++    if (r == nullptr) return 0.0;
++    if (r->t0[i] != t0 || produced < r->produced[i] || r->at_ms[i] == 0) {
++        r->t0[i] = t0;
++        r->produced[i] = produced;
++        r->at_ms[i] = now;
++        const double dt = (double) (now - t0);
++        r->rate[i] = dt > 0 && t0 > 0 ? 1000.0 * (double) produced / dt : 0.0;
++        return r->rate[i];
++    }
++    const int64_t dt = now - r->at_ms[i];
++    if (dt < 100) return r->rate[i];
++    const double inst = 1000.0 * (double) (produced - r->produced[i]) / (double) dt;
++    r->rate[i] = 0.5 * r->rate[i] + 0.5 * inst;
++    r->produced[i] = produced;
++    r->at_ms[i] = now;
++    return r->rate[i];
++}
++}  // namespace detail
++
++// with_t: the "t" and "seq" keys (the emitter compares the rest to decide whether anything changed)
++inline std::string to_json(State& S, int64_t now, Rates* rates, bool with_t = true) {
++    using detail::num;
++    std::string s;
++    s.reserve(1024);
++    s += "{\"v\":1";
++    if (with_t) {
++        s += ",\"t\":";
++        num(s, now);
++        s += ",\"seq\":";
++        s += std::to_string((unsigned long long) S.seq.load(std::memory_order_relaxed));
++    }
++    const int lanes_live = S.lanes_live.load(std::memory_order_relaxed);
++    const char* wait = S.lanes_wait.load(std::memory_order_relaxed);
++    s += ",\"lanes\":{\"on\":";
++    num(s, (int64_t) S.lanes_on.load(std::memory_order_relaxed));
++    s += ",\"live\":";
++    num(s, (int64_t) lanes_live);
++    s += ",\"n\":";
++    num(s, (int64_t) S.lanes_n.load(std::memory_order_relaxed));
++    s += ",\"starts\":";
++    num(s, S.lanes_starts.load(std::memory_order_relaxed));
++    s += ",\"wait\":";
++    if (wait != nullptr && !lanes_live) {
++        s += '"';
++        for (const char* c = wait; *c; ++c)
++            if (*c != '"' && *c != '\\' && (unsigned char) *c >= 0x20) s += *c;
++        s += '"';
++    } else {
++        s += "null";
++    }
++    s += "},\"overlap\":{\"active\":";
++    num(s, (int64_t) S.overlap.load(std::memory_order_relaxed));
++    s += "},\"solo\":";
++    if (S.solo.active.load(std::memory_order_relaxed)) {
++        const int64_t prod = S.solo.produced.load(std::memory_order_relaxed);
++        const int64_t off = S.solo.offered.load(std::memory_order_relaxed);
++        const int64_t acc = S.solo.accepted.load(std::memory_order_relaxed);
++        const int64_t t0 = S.solo.t0_ms.load(std::memory_order_relaxed);
++        s += "{\"mode\":\"";
++        s += S.solo.pipelined.load(std::memory_order_relaxed) ? "solo_pl" : "solo_serial";
++        s += "\",\"tok\":";
++        num(s, prod);
++        s += ",\"tok_s\":";
++        num(s, detail::recent(rates, kSlots, prod, t0, now));
++        s += ",\"offered\":";
++        num(s, off);
++        s += ",\"accepted\":";
++        num(s, acc);
++        s += ",\"acc\":";
++        detail::frac(s, acc, off);
++        s += '}';
++    } else {
++        s += "null";
++    }
++    // the reads first: a slot that is read shows that
++    const int n_slots = std::min(S.n_slots.load(std::memory_order_relaxed), kSlots);
++    int read_of[kSlots];
++    for (int b = 0; b < kSlots; ++b) read_of[b] = -1;
++    std::string reads = "[";
++    const bool decoding = S.any_decoding.load(std::memory_order_relaxed) != 0;
++    for (int i = 0; i < kReads; ++i) {
++        const Read& R = S.reads[i];
++        const int st = R.state.load(std::memory_order_relaxed);
++        if (st == read_free) continue;
++        const int slot = R.slot.load(std::memory_order_relaxed);
++        const int64_t done = R.done.load(std::memory_order_relaxed), from = R.from.load(std::memory_order_relaxed);
++        const int64_t t0 = R.t0_ms.load(std::memory_order_relaxed);
++        const bool ov = R.overlapped.load(std::memory_order_relaxed) != 0;
++        if (slot >= 0 && slot < kSlots) read_of[slot] = i;
++        if (reads.size() > 1) reads += ',';
++        reads += "{\"slot\":";
++        num(reads, (int64_t) slot);
++        reads += ",\"done\":";
++        num(reads, done);
++        reads += ",\"total\":";
++        num(reads, R.total.load(std::memory_order_relaxed));
++        reads += ",\"from\":";
++        num(reads, from);
++        reads += ",\"tok_s\":";
++        num(reads, now > t0 && done > from ? 1000.0 * (double) (done - from) / (double) (now - t0) : 0.0);
++        reads += ",\"beside\":\"";
++        reads += ov ? "decode" : decoding ? "paused" : "none";
++        reads += "\",\"state\":\"";
++        reads += st == read_wait ? "wait" : st == read_yielded ? "yielded" : "run";
++        reads += "\"}";
++    }
++    reads += ']';
++    s += ",\"slots\":[";
++    bool first = true;
++    for (int b = 0; b < n_slots; ++b) {
++        const Slot& L = S.slots[b];
++        const int m = L.mode.load(std::memory_order_relaxed);
++        const int ri = read_of[b];
++        if (m == idle && ri < 0) continue;
++        if (!first) s += ',';
++        first = false;
++        s += "{\"s\":";
++        num(s, (int64_t) b);
++        s += ",\"m\":\"";
++        s += ri >= 0 ? (S.reads[ri].overlapped.load(std::memory_order_relaxed) ? "read_ovl" : "reading") : mode_name(m);
++        s += "\",\"lane\":";
++        num(s, (int64_t) L.lane.load(std::memory_order_relaxed));
++        if (ri < 0 && (m == batch || m == lane)) {
++            const int64_t prod = L.produced.load(std::memory_order_relaxed);
++            const int64_t t0 = L.t0_ms.load(std::memory_order_relaxed);
++            const int64_t off = L.offered.load(std::memory_order_relaxed);
++            const int64_t acc = L.accepted.load(std::memory_order_relaxed);
++            s += ",\"tok\":";
++            num(s, prod);
++            s += ",\"tok_s\":";
++            num(s, detail::recent(rates, b, prod, t0, now));
++            s += ",\"tok_s_mean\":";
++            num(s, now > t0 && t0 > 0 ? 1000.0 * (double) prod / (double) (now - t0) : 0.0);
++            s += ",\"offered\":";
++            num(s, off);
++            s += ",\"accepted\":";
++            num(s, acc);
++            s += ",\"acc\":";
++            detail::frac(s, acc, off);
++        }
++        s += '}';
++    }
++    s += "],\"reads\":";
++    s += reads;
++    s += '}';
++    return s;
++}
++
++// the emitter: started once, after READY, only when on().  A line when the content changed (at most one per period),
++// else one every 10 periods; one printf per line (stdio's lock: it cannot tear against the loop's BT lines)
++inline void start_emitter() {
++    if (!on()) return;
++    std::printf("INFO status_lines=%d\n", period_ms());
++    std::fflush(stdout);
++    std::thread([] {
++        State& S = state();
++        Rates rates;
++        std::string last;
++        int quiet = 0;
++        const int p = period_ms();
++        while (!S.stop.load(std::memory_order_relaxed)) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(p));
++            if (S.stop.load(std::memory_order_relaxed)) break;
++            const int64_t now = now_ms();
++            Rates probe = rates;   // (the change test must not advance the rates)
++            const std::string body = to_json(S, now, &probe, false);
++            if (body == last && ++quiet < 10) continue;
++            quiet = 0;
++            last = body;
++            const std::string line = to_json(S, now, &rates, true);
++            std::printf("STAT %s\n", line.c_str());
++            std::fflush(stdout);
++        }
++    }).detach();
++}
++inline void stop_emitter() { state().stop.store(true, std::memory_order_relaxed); }
++
++}  // namespace strata::program::live_status
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 35229d4c..5e992692 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -85,6 +85,7 @@
+ #include "strata/program/solo_pipeline.hpp"
+ #include "strata/program/spec_lanes.hpp"
+ #include "strata/program/slot_chain.hpp"
++#include "strata/program/live_status.hpp"
+ #include "strata/kernels/cvec.hpp"
+ #include "strata/core/progress.hpp"
+ #include "strata/core/device.hpp"
+@@ -10232,6 +10233,7 @@ int main(int argc, char** argv) {
+             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
+             const int64_t done = p0 + T;
+             pp_reached = done;
++            if (strata::program::live_status::on()) strata::program::live_status::read_progress(done);   // STRATA_STATUS_LINES
+             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
+                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
+@@ -11374,6 +11376,11 @@ int main(int argc, char** argv) {
+                     }
+                 }).detach();
+         }
++        if (strata::program::live_status::on()) {   // STRATA_STATUS_LINES (opt-in): the slots' table and the lanes, then the emitter
++            strata::program::live_status::state().n_slots.store(std::min<int>(o.batch, strata::program::live_status::kSlots));
++            strata::program::live_status::state().lanes_on.store(lanes_on ? n_lanes : 0);
++            strata::program::live_status::start_emitter();   // (INFO status_lines=<ms> first, then STAT lines after READY)
++        }
+         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+         std::fflush(stdout);
+         std::string line;
+@@ -11955,6 +11962,8 @@ int main(int argc, char** argv) {
+                 bt_rows += keep[active[a]];
+                 bt_accepted += keep[active[a]] - 1;
+             }
++            if (strata::program::live_status::on() && batch_mtp)   // STRATA_STATUS_LINES: each slot-window offered one proposal
++                for (int a = 0; a < A; ++a) strata::program::live_status::slot_drafts(active[a], 1, keep[active[a]] - 1);
+             for (int t = 0; t < A; ++t) {
+                 const int b = active[t];
+                 BSlot& sl = bs[(size_t) b];
+@@ -12847,6 +12856,7 @@ int main(int argc, char** argv) {
+                     const strata::core::OnDevice on(v.device());
+                     if (v.all_resident() && !v.ar_live()) why = "experts are out of VRAM (a loan, a shrink or a swap)";
+                 }
++            if (strata::program::live_status::on()) strata::program::live_status::state().lanes_wait.store(why);   // STRATA_STATUS_LINES (a literal or null)
+             if (why == nullptr) return true;
+             if (lanes_refused != why)
+                 std::fprintf(stderr, "strata batch: STRATA_SPEC_LANES: the lanes wait (%s); the batch windows go on\n", why);
+@@ -13046,6 +13056,7 @@ int main(int argc, char** argv) {
+             L.tokens += vd.emit;
+             L.offered += L.T - 1;
+             L.accepted += vd.a;
++            if (strata::program::live_status::on()) strata::program::live_status::slot_drafts(b, L.T - 1, vd.a);   // STRATA_STATUS_LINES
+             if (vd.fin != nullptr) {
+                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                 std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, vd.fin, ms);
+@@ -13599,8 +13610,41 @@ int main(int argc, char** argv) {
+             }
+             return true;
+         };
++        // STRATA_STATUS_LINES (opt-in): the slots' modes, the lanes and the overlap as the loop sees them now, for the
++        // emitter (live_status.hpp); relaxed stores, nothing else.  Off: returns at once
++        auto live_publish = [&] {
++            if (!strata::program::live_status::on()) return;
++            strata::program::live_status::State& S = strata::program::live_status::state();
++            int n_live = 0, decoding = 0;
++            const int nb = std::min<int>((int) bs.size(), strata::program::live_status::kSlots);
++            for (int b = 0; b < nb; ++b) {
++                const BSlot& sl = bs[(size_t) b];
++                const int lj = lane_of(b);
++                const bool in_lane = lanes_live && lj >= 0 && lanes[lj].on;
++                int m = strata::program::live_status::idle;
++                if (sl.active) m = in_lane ? strata::program::live_status::lane : strata::program::live_status::batch;
++                else if (slot_park_on && spark[(size_t) b] && spark[(size_t) b]->pending) m = strata::program::live_status::parking;
++                else if (sl.partial) m = strata::program::live_status::yielded;
++                else if (sl.cached) m = strata::program::live_status::cached;
++                n_live += in_lane ? 1 : 0;
++                decoding += sl.active ? 1 : 0;
++                strata::program::live_status::Slot& L = S.slots[b];
++                L.mode.store(m, std::memory_order_relaxed);
++                L.lane.store(lj, std::memory_order_relaxed);
++                L.produced.store(sl.produced, std::memory_order_relaxed);
++                L.t0_ms.store(sl.active ? strata::program::live_status::to_ms(sl.t0) : 0, std::memory_order_relaxed);
++            }
++            S.lanes_live.store(lanes_live ? 1 : 0, std::memory_order_relaxed);
++            S.lanes_n.store(n_live, std::memory_order_relaxed);
++            S.lanes_starts.store(lanes_starts, std::memory_order_relaxed);
++            if (lanes_live || !lanes_on || !lanes_want()) S.lanes_wait.store(nullptr, std::memory_order_relaxed);
++            S.any_decoding.store(decoding, std::memory_order_relaxed);
++            S.overlap.store(ov_active ? 1 : 0, std::memory_order_relaxed);
++            strata::program::live_status::bump(S);
++        };
+         for (;;) {
+             line_drain_ms = 0.0;
++            live_publish();   // STRATA_STATUS_LINES (off: nothing)
+             // STRATA_SPEC_LANES: the gate broke (another slot decodes, a request that may not run in a lane, the last lane
+             // slot ended; KEEP=0: fewer lane slots than the start's): the lanes end before anything else runs
+             if (lanes_live && !lanes_want_keep() && !lane_drain()) return 1;
+@@ -13710,7 +13754,10 @@ int main(int argc, char** argv) {
+             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
+                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
+                 save_profile("periodic");
+-            if (line == "QUIT") break;
++            if (line == "QUIT") {
++                if (strata::program::live_status::on()) strata::program::live_status::stop_emitter();   // STRATA_STATUS_LINES: no line after the loop
++                break;
++            }
+             // the watchdog watches a request from here until this iteration ends, whichever way it ends
+             struct BusyScope {
+                 BusyScope() {
+@@ -13719,6 +13766,7 @@ int main(int argc, char** argv) {
+                     strata::core::progress_at("request");
+                 }
+                 ~BusyScope() {
++                    if (strata::program::live_status::on()) strata::program::live_status::request_end();   // STRATA_STATUS_LINES: its read and solo decode are over
+                     strata::core::progress().busy.store(false);
+                     strata::core::progress().allow_until_ms.store(0);
+                     strata::core::progress_at("idle");
+@@ -14822,6 +14870,7 @@ int main(int argc, char** argv) {
+             pp_total = n;
+             pp_from = read_from;
+             pp_reached = read_from;
++            if (strata::program::live_status::on()) strata::program::live_status::read_begin(admit_slot, n, read_from);   // STRATA_STATUS_LINES
+             pp_exact = true;   // a restore, a checkpoint mount or a zeroed session: the state is exactly at read_from
+             pp_t0 = r0;
+             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
+@@ -14959,6 +15008,7 @@ int main(int argc, char** argv) {
+                 pl_drain();   // nothing in flight: both stages' commits and the drafter's rows have landed
+                 pl_mtp_live[0] = pl_mtp_live[1] = false;
+                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
++                if (strata::program::live_status::on()) strata::program::live_status::read_progress(b);   // STRATA_STATUS_LINES
+                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
+                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                 strata::core::progress_beat();
+@@ -15021,6 +15071,7 @@ int main(int argc, char** argv) {
+                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
+                 if (!ver.wait_commit(e)) return false;
+                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
++                if (strata::program::live_status::on()) strata::program::live_status::read_progress(b);   // STRATA_STATUS_LINES
+                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
+                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                 strata::core::progress_beat();
+@@ -15424,6 +15475,7 @@ int main(int argc, char** argv) {
+                                   for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_no_capture(false);
+                                   ov_active = false;
+                                   ov_reading.store(false);
++                                  if (strata::program::live_status::on()) strata::program::live_status::read_overlapped(false);   // STRATA_STATUS_LINES
+                               },
+                               join_s,
+                               std::thread{}};
+@@ -15437,6 +15489,7 @@ int main(int argc, char** argv) {
+                                         (long long) b0);
+                 ov_active = true;
+                 ov_reading.store(true);
++                if (strata::program::live_status::on()) strata::program::live_status::read_overlapped(true);   // STRATA_STATUS_LINES
+                 guard.w = std::thread([&] {
+                     strata::aux_cpus::pin_current_thread();   // --aux-cpus (off: nothing), as the prompt path's stage threads
+                     try {
+@@ -15472,6 +15525,7 @@ int main(int argc, char** argv) {
+                     while (!done.load(std::memory_order_acquire)) {
+                         if (!pump(true)) { pump_ok = false; break; }   // pump answered ERR
+                         scan_ctl_lines();
++                        live_publish();   // STRATA_STATUS_LINES (off: nothing)
+                         const int64_t b = ov_read_beat.load(std::memory_order_relaxed);
+                         if (b != beat_seen) {
+                             beat_seen = b;
+@@ -15839,6 +15893,7 @@ int main(int argc, char** argv) {
+                 }
+                 if (sp_ok && merge_at >= 0) {   // the server's progress reaches the prompt's end, as after its last window
+                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
++                    if (strata::program::live_status::on()) strata::program::live_status::read_progress(to);   // STRATA_STATUS_LINES
+                     std::printf("PP %lld %lld %.0f %.1f\n", (long long) to, (long long) pp_total, ms,
+                                 ms > 0.0 ? 1000.0 * (double) (to - pp_from) / ms : 0.0);
+                     std::fflush(stdout);
+@@ -15901,6 +15956,7 @@ int main(int argc, char** argv) {
+                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
+                                      "them\n", (long long) il_parts + 1, il_ms);
+             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
++            if (strata::program::live_status::on()) strata::program::live_status::read_end();   // STRATA_STATUS_LINES: the prompt is read
+             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
+             std::fflush(stdout);
+             // the verify windows: the first holds the last prompt token alone (STRATA_ADMIT_MERGE_FIRST: the prompt
+@@ -16032,6 +16088,8 @@ int main(int argc, char** argv) {
+                                  : pl_serial != nullptr ? pl_serial : cancelled ? "cancelled"
+                                  : produced_n >= max_new ? "nothing left to decode" : solo_pl_why.c_str());
+             }
++            if (strata::program::live_status::on() && admit_slot < 0 && !cancelled && produced_n < max_new)   // STRATA_STATUS_LINES
++                strata::program::live_status::solo_begin(pl_want && pl_serial == nullptr && solo_pl_why.empty());
+             if (pl_want && pl_serial == nullptr && solo_pl_why.empty() && !cancelled && produced_n < max_new) {
+                 pl_ran = true;
+                 std::vector<int64_t> solo_pl_cap0;   // STRATA_SOLO_PIPELINE: the graphs' VRAM, said at the first capture
+@@ -16548,6 +16606,7 @@ int main(int argc, char** argv) {
+                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
+                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
+                     }
++                    if (strata::program::live_status::on() && admit_slot < 0) strata::program::live_status::solo_progress(produced_n, draft_offered, draft_accepted);
+                     std::fflush(stdout);
+                     if (nf) finish = "nonfinite";
+                     else if (eos) finish = "stop";
+@@ -16866,6 +16925,7 @@ int main(int argc, char** argv) {
+                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
+                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                 }
++                if (strata::program::live_status::on() && admit_slot < 0) strata::program::live_status::solo_progress(produced_n, draft_offered, draft_accepted);
+                 std::fflush(stdout);
+                 ++rounds;
+                 if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
+@@ -17118,6 +17178,7 @@ int main(int argc, char** argv) {
+                     sl.produced = 1;
+                     sl.max_new = admit_max_new;
+                     sl.t0 = Clock::now();
++                    if (strata::program::live_status::on()) strata::program::live_status::slot_admitted(admit_slot);   // STRATA_STATUS_LINES
+                     sl.ids = live;
+                     if (batch_mtp) {
+                         if (!slot_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x,
+diff --git a/tests/program/live_status_test.cpp b/tests/program/live_status_test.cpp
+new file mode 100644
+index 00000000..65a6e52f
+--- /dev/null
++++ b/tests/program/live_status_test.cpp
+@@ -0,0 +1,119 @@
++// STRATA_STATUS_LINES (include/strata/program/live_status.hpp): the switch and the STAT line's JSON for the modes the
++// serve loop publishes (slots, lanes, reads, solo).  Header-only, CPU: no model, no GPU.
++#include "strata/program/live_status.hpp"
++
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++namespace ls = strata::program::live_status;
++
++namespace {
++int failures = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++bool has(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
++}  // namespace
++
++int main() {
++    // the switch: unset, empty, 0, negative and text are off; small periods are raised to 50 ms
++    check(ls::parse_period(nullptr) == 0, "unset is off");
++    check(ls::parse_period("") == 0, "empty is off");
++    check(ls::parse_period("0") == 0, "0 is off");
++    check(ls::parse_period("-5") == 0, "negative is off");
++    check(ls::parse_period("yes") == 0, "text is off");
++    check(ls::parse_period("500") == 500, "500 ms");
++    check(ls::parse_period("1") == 50, "at least 50 ms");
++
++    // an idle engine: no slot, no read, no solo
++    {
++        ls::State S;
++        S.n_slots.store(16);
++        const std::string j = ls::to_json(S, 1000, nullptr, true);
++        check(has(j, "\"v\":1"), "versioned");
++        check(has(j, "\"t\":1000"), "the time");
++        check(has(j, "\"slots\":[]"), "idle slots are left out");
++        check(has(j, "\"reads\":[]"), "no read");
++        check(has(j, "\"solo\":null"), "no solo");
++        check(has(j, "\"wait\":null"), "no lane wait");
++        check(!has(ls::to_json(S, 1000, nullptr, false), "\"t\":"), "without t");
++    }
++    // two lanes running, one batch slot with MTP drafts, a cached slot, a read overlapped beside decode in slot 5
++    {
++        ls::State S;
++        S.n_slots.store(16);
++        S.lanes_on.store(4);
++        S.lanes_live.store(1);
++        S.lanes_n.store(2);
++        S.any_decoding.store(3);
++        S.slots[0].mode.store(ls::lane);
++        S.slots[0].lane.store(0);
++        S.slots[0].produced.store(300);
++        S.slots[0].t0_ms.store(0 + 1);
++        S.slots[0].offered.store(100);
++        S.slots[0].accepted.store(70);
++        S.slots[4].mode.store(ls::lane);
++        S.slots[4].lane.store(1);
++        S.slots[1].mode.store(ls::batch);
++        S.slots[2].mode.store(ls::cached);
++        S.slots[8].mode.store(ls::parking);
++        S.slots[9].mode.store(ls::yielded);
++        const int i = ls::read_begin(5, 30000, 1000, S);
++        check(i == 0, "the first read takes entry 0");
++        ls::read_progress(8192, S);
++        ls::read_overlapped(true, S);
++        const std::string j = ls::to_json(S, 10001, nullptr, true);
++        check(has(j, "\"lanes\":{\"on\":4,\"live\":1,\"n\":2"), "lanes");
++        check(has(j, "{\"s\":0,\"m\":\"lane\",\"lane\":0,\"tok\":300"), "slot 0 in lane 0");
++        check(has(j, "\"acc\":0.700"), "acceptance");
++        check(has(j, "{\"s\":1,\"m\":\"batch\""), "slot 1 in the batch windows");
++        check(has(j, "{\"s\":2,\"m\":\"cached\""), "slot 2 cached");
++        check(has(j, "{\"s\":8,\"m\":\"parking\""), "slot 8 parking");
++        check(has(j, "{\"s\":9,\"m\":\"yielded\""), "slot 9 gave way");
++        check(has(j, "{\"s\":5,\"m\":\"read_ovl\""), "slot 5 read beside decode");
++        check(has(j, "\"reads\":[{\"slot\":5,\"done\":8192,\"total\":30000,\"from\":1000"), "the read's progress");
++        check(has(j, "\"beside\":\"decode\",\"state\":\"run\""), "beside decode, running");
++        check(has(j, "\"overlap\":{\"active\":1}"), "overlap");
++        ls::read_overlapped(false, S);
++        check(has(ls::to_json(S, 10001, nullptr), "\"m\":\"reading\""), "a read with the slots paused");
++        check(has(ls::to_json(S, 10001, nullptr), "\"beside\":\"paused\""), "paused beside");
++        // a second (concurrent) read: another entry, nothing else changes
++        const int k = ls::read_begin(6, 500, 0, S);
++        check(k == 1, "a second read takes entry 1");
++        const std::string j2 = ls::to_json(S, 10001, nullptr);
++        check(has(j2, "{\"slot\":5,") && has(j2, "{\"slot\":6,"), "two reads listed");
++        ls::request_end(S);   // ends the current (main) read only
++        const std::string j3 = ls::to_json(S, 10001, nullptr);
++        check(!has(j3, "{\"slot\":6,") && has(j3, "{\"slot\":5,"), "request_end ends its own read");
++    }
++    // a solo request, pipelined, and the lanes waiting for a reason (quotes are dropped from it)
++    {
++        ls::State S;
++        S.lanes_on.store(4);
++        S.lanes_wait.store("a \"prompt\" read overlaps");
++        ls::solo_begin(true, S);
++        ls::solo_progress(120, 100, 68, S);
++        const std::string j = ls::to_json(S, ls::now_ms(), nullptr);
++        check(has(j, "\"solo\":{\"mode\":\"solo_pl\",\"tok\":120"), "solo pipelined");
++        check(has(j, "\"acc\":0.680"), "solo acceptance");
++        check(has(j, "\"wait\":\"a prompt read overlaps\""), "lane wait reason, escaped");
++        ls::request_end(S);
++        check(has(ls::to_json(S, ls::now_ms(), nullptr), "\"solo\":null"), "solo ends with the request");
++    }
++    // recent tok/s: an EMA over the samples, reset by a new request
++    {
++        ls::Rates r;
++        const double a = ls::detail::recent(&r, 0, 10, 1000, 2000);   // 10 tokens in 1 s since t0
++        check(a > 9.9 && a < 10.1, "first sample: the mean since t0");
++        const double b = ls::detail::recent(&r, 0, 40, 1000, 3000);   // +30 in 1 s
++        check(b > 19.9 && b < 20.1, "EMA of 10 and 30");
++        const double c = ls::detail::recent(&r, 0, 5, 2500, 3000);    // a new request (t0 changed)
++        check(c > 9.9 && c < 10.1, "reset on a new request");
++    }
++    if (failures == 0) std::printf("live_status_test: all checks passed\n");
++    return failures == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

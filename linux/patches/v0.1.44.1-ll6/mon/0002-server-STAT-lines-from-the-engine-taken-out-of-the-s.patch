@@ -1,0 +1,389 @@
+From c1908d8d293862ef20e6383e477fc136550ad30e Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:38:52 +0200
+Subject: [PATCH 2/3] server: STAT lines from the engine taken out of the
+ stdout pump; slot modes, lanes, reads and solo as new keys in /metrics and
+ /v1/load
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py            | 119 ++++++++++++++++++++++++++--
+ serve/test_status_lines.py | 158 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 271 insertions(+), 6 deletions(-)
+ create mode 100644 serve/test_status_lines.py
+
+diff --git a/serve/server.py b/serve/server.py
+index 6a760a99..b41b9184 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -217,6 +217,73 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
+ # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
+ # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
+ RATE_WINDOW_S = 2.0
++# STRATA_STATUS_LINES: the engine's live status (`STAT {json}` lines, engine with live_status.hpp) every this many ms.
++# This server turns it on for the engine it starts unless the environment says otherwise (0 = off); an engine that does
++# not know it ignores it.  A status older than STATUS_STALE_S is not shown (the engine stopped sending: an old engine,
++# or it is gone).
++STATUS_LINES_MS = "500"
++STATUS_STALE_S = 5.0
++
++
++def engine_status_env(env: dict | None) -> dict | None:
++    """The engine's environment with STRATA_STATUS_LINES set (a value already there, here or in ours, is kept)."""
++    if "STRATA_STATUS_LINES" in (env if env is not None else os.environ):
++        return env
++    return {**(env if env is not None else os.environ), "STRATA_STATUS_LINES": STATUS_LINES_MS}
++
++
++def parse_status_line(line: str) -> dict | None:
++    """`STAT {json}` -> the dict (v 1+), None for anything that is not one."""
++    if not line.startswith("STAT "):
++        return None
++    try:
++        d = json.loads(line[5:])
++    except ValueError:
++        return None
++    return d if isinstance(d, dict) and isinstance(d.get("v"), int) else None
++
++
++def slot_status_keys(st: dict | None, slot: int) -> dict:
++    """The engine's view of one batch slot as new keys for slots_view (none when the engine sends no status):
++    mode (idle, cached, yielded, batch, lane, parking, reading, read_ovl), lane, engine tok/s, drafts and the read."""
++    if not st:
++        return {}
++    out = {"mode": "idle"}
++    for x in st.get("slots") or ():
++        if isinstance(x, dict) and x.get("s") == slot:
++            out["mode"] = x.get("m", "idle")
++            if x.get("lane", -1) is not None and x.get("lane", -1) >= 0:
++                out["lane"] = x["lane"]
++            for k_in, k_out in (("tok_s", "engine_tok_s"), ("tok_s_mean", "engine_tok_s_mean"), ("acc", "acc"),
++                                ("offered", "drafts_offered"), ("accepted", "drafts_accepted")):
++                if x.get(k_in) is not None:
++                    out[k_out] = x[k_in]
++            break
++    for r in st.get("reads") or ():
++        if isinstance(r, dict) and r.get("slot") == slot:
++            out.update(read_done=r.get("done"), read_total=r.get("total"), read_tok_s=r.get("tok_s"),
++                       read_beside=r.get("beside"), read_state=r.get("state"))
++            break
++    return out
++
++
++def engine_mode_view(st: dict | None, age_s: float | None) -> dict | None:
++    """live.engine_mode: the engine's global view (lanes, overlapped read, solo decode, the reads in flight, the slots
++    per mode); None when the engine sends no status (an older engine, STRATA_STATUS_LINES=0) or it is stale."""
++    if not st:
++        return None
++    modes: dict[str, int] = {}
++    for x in st.get("slots") or ():
++        if isinstance(x, dict):
++            modes[x.get("m", "idle")] = modes.get(x.get("m", "idle"), 0) + 1
++    lanes = st.get("lanes") or {}
++    return {"v": st.get("v"), "age_s": round(age_s, 2) if age_s is not None else None,
++            "lanes": {"configured": lanes.get("on", 0), "live": bool(lanes.get("live")), "running": lanes.get("n", 0),
++                      "starts": lanes.get("starts", 0), "wait": lanes.get("wait")},
++            "overlap": bool((st.get("overlap") or {}).get("active")),
++            "solo": st.get("solo"),
++            "reads": [r for r in (st.get("reads") or ()) if isinstance(r, dict)],
++            "slot_modes": modes}
+ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
+ # #481: a running request whose engine prints nothing (no T, PP or any other line) for this long has lost step with the
+ # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
+@@ -854,6 +921,9 @@ class StrataEngine:
+         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
+         self.silent_note = None
+         self.last_err = None
++        self.engine_status = None        # STRATA_STATUS_LINES: the engine's last STAT line (a dict) and when it came
++        self.engine_status_at = 0.0
++        self._ctl_live = None            # the slot_live dict of the admission on the control lines (its PP lines)
+         try:                            # a ready-made engine's BUILD.json says its version
+             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
+         except (OSError, ValueError):
+@@ -885,7 +955,8 @@ class StrataEngine:
+             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+         spawned_at = time.monotonic()
+         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+-                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
++                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1,
++                          env=engine_status_env(env), **pin)
+         contain(self.proc)                               # ends with the server, however it ends (Windows)
+         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
+         # stays for _pump (one reader at a time)
+@@ -1023,6 +1094,13 @@ class StrataEngine:
+         slot_q = self.slot_q
+         line = None
+         for line in proc.stdout:
++            # STRATA_STATUS_LINES: the engine's live status never reaches a reader of the control lines (it would
++            # reset their heartbeats and the #481 watchdog, and a session command would take it for its answer)
++            if line.startswith("STAT "):
++                st = parse_status_line(line)
++                if st is not None and self.proc is proc:
++                    self.engine_status, self.engine_status_at = st, time.monotonic()
++                continue
+             # checked before batch routing: a fatal line is never a slot's own
+             if line.startswith(FATAL_PREFIXES):
+                 # release_gpu_waits invalidates the verifier, even if the native
+@@ -1322,6 +1400,10 @@ class StrataEngine:
+                     self.progress = (int(f[1]), int(f[2]))
+                     self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
+                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
++                    sl = self._ctl_live if self._ctl_mode == "batch" else None
++                    if sl is not None:                   # the slot being read: its own progress (/metrics slots)
++                        sl["prompt_read"], sl["prompt_total"] = int(f[1]), int(f[2])
++                        sl["prefill_tok_s"] = self.prefill_tok_s_mean
+                 if not stopped and cancel.is_set():
+                     # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
+                     # silence, which a stream of PP lines never allows): the engine read the whole prompt first
+@@ -1688,6 +1770,7 @@ class StrataEngine:
+                 phase = "solo"
+                 self._note_where("alone")
+                 self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
++                self._ctl_live = None
+                 self._ctl_erred = False
+                 try:
+                     for x in self._control(cancel, pending.append):
+@@ -1782,6 +1865,7 @@ class StrataEngine:
+                     phase = "solo"
+                     self._note_where("solo")
+                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
++                    self._ctl_live = None
+                     self._ctl_erred = False
+                     def others():
+                         with self.slot_cv:
+@@ -1902,6 +1986,7 @@ class StrataEngine:
+                     phase = "admit"
+                     self._note_where("slot", slot)
+                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
++                    self._ctl_live = live
+                     self._ctl_erred = False
+                     asked = False
+ 
+@@ -2108,17 +2193,35 @@ class StrataEngine:
+     def slots_view(self) -> list[dict]:
+         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
+         now, view = time.time(), []
++        st = self.status_now()
+         for b in range(self.batch):
+             r = self.slot_live[b]
+             if r is None:
+-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
++                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b]),
++                             **slot_status_keys(st, b)})
+                 continue
+             ft = r.get("first_token")
+-            view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
+-                         "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
+-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
++            x = {"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
++                 "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
++                 "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None}
++            if r["state"] == "reading" and r.get("prompt_total"):   # its PP lines (any engine)
++                x.update(read_done=r["prompt_read"], read_total=r["prompt_total"], read_tok_s=r.get("prefill_tok_s"))
++            x.update(slot_status_keys(st, b))                       # STRATA_STATUS_LINES: the engine's own view
++            view.append(x)
+         return view
+ 
++    def status_now(self) -> dict | None:
++        """The engine's last STAT line while fresh (STATUS_STALE_S), else None."""
++        st = self.__dict__.get("engine_status")
++        if st is None or time.monotonic() - self.__dict__.get("engine_status_at", 0.0) > STATUS_STALE_S:
++            return None
++        return st
++
++    def engine_mode(self) -> dict | None:
++        """live.engine_mode (engine_mode_view) from the last fresh STAT line."""
++        st = self.status_now()
++        return engine_mode_view(st, time.monotonic() - self.engine_status_at) if st else None
++
+     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
+         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
+@@ -3954,8 +4057,10 @@ class Service:
+         level = "idle" if load < 0.25 else "low" if load < 0.5 else "busy" if load < 0.8 else "saturated"
+         loaded = self.loaded()                                 # unloaded: a request waits for the model load first
+         would_wait = exclusive or waiting > 0 or free == 0 or not loaded
++        # STRATA_STATUS_LINES: what the engine is doing (lanes, overlapped read, solo decode, reads); only when it says
++        mode = e.engine_mode() if hasattr(type(e), "engine_mode") else None
+         return {"load_pct": round(100 * load), "level": level, "would_wait": would_wait, "image_alone": exclusive,
+-                "loaded": loaded,
++                "loaded": loaded, **({"engine_mode": mode} if mode else {}),
+                 "slots": {"total": total, "busy": running, "decoding": decoding, "reading_prompt": running - decoding,
+                           "free": free, "waiting": waiting},
+                 "tok_s": {"now": round(rate, 1), "peak": round(peak, 1) if peak else None,
+@@ -4075,6 +4180,8 @@ class Service:
+                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
+             if running and state == "idle":
+                 live["state"] = "generating"
++        if hasattr(type(self.engine), "engine_mode"):   # STRATA_STATUS_LINES: what the engine is doing (None: no status)
++            live["engine_mode"] = self.engine.engine_mode()
+         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
+             live["replicas"] = self.engine.replica_view()
+         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
+diff --git a/serve/test_status_lines.py b/serve/test_status_lines.py
+new file mode 100644
+index 00000000..449e1b97
+--- /dev/null
++++ b/serve/test_status_lines.py
+@@ -0,0 +1,158 @@
++"""serve/test_status_lines.py - STRATA_STATUS_LINES: the engine's `STAT {json}` lines are taken out of the stdout pump
++before any reader of the control lines sees them (a request, a session save), and show in /metrics as new keys only
++(fake engine process: no GPU, no pack).
++
++    python -m unittest serve.test_status_lines -v
++"""
++from __future__ import annotations
++
++import json
++import os
++import sys
++import tempfile
++import threading
++import time
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from serve.frontend import ChatTemplate  # noqa: E402
++from serve.server import (ByteTokenizer, Service, StrataEngine, engine_mode_view, parse_status_line,  # noqa: E402
++                          slot_status_keys)
++
++STAT = {"v": 1, "t": 1, "seq": 3,
++        "lanes": {"on": 4, "live": 1, "n": 2, "starts": 7, "wait": None},
++        "overlap": {"active": 1},
++        "solo": None,
++        "slots": [{"s": 0, "m": "lane", "lane": 0, "tok": 300, "tok_s": 41.2, "tok_s_mean": 39.0,
++                   "offered": 100, "accepted": 70, "acc": 0.7},
++                  {"s": 4, "m": "lane", "lane": 1, "tok": 12, "tok_s": 40.0, "tok_s_mean": 40.0,
++                   "offered": 0, "accepted": 0, "acc": None},
++                  {"s": 5, "m": "read_ovl", "lane": -1},
++                  {"s": 2, "m": "cached", "lane": -1}],
++        "reads": [{"slot": 5, "done": 8192, "total": 30000, "from": 0, "tok_s": 1450.0, "beside": "decode",
++                   "state": "run"}]}
++
++# a fake `strata --serve`: says what STRATA_STATUS_LINES it got, then puts a STAT line before and between every answer
++FAKE = r'''
++import json, os, sys
++stat = json.loads(sys.argv[sys.argv.index('--stat') + 1])
++print('INFO status_env=%s' % os.environ.get('STRATA_STATUS_LINES', 'unset'), flush=True)
++print('READY 4096 stop', flush=True)
++def st():
++    print('STAT ' + json.dumps(stat, separators=(',', ':')), flush=True)
++for line in sys.stdin:
++    if line.startswith('QUIT'):
++        break
++    st()
++    if line.startswith('SAVE '):
++        print('SESSION 1 2', flush=True); st()
++        print('SAVED 3 4096 1.0', flush=True)
++        continue
++    if line.startswith('GEN'):
++        print('PP 1 1 5 200.0', flush=True); st()
++        print('T 90', flush=True); st()
++        print('DONE 1 1 0 1 stop 0 0 0', flush=True); st()
++'''
++
++
++class StatusLinesProcess(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        py = self.root / 'native.py'
++        if os.name == 'nt':
++            py.write_text(FAKE)
++            self.script = self.root / 'native.cmd'
++            self.script.write_text(f'@"{sys.executable}" "{py}" %*\r\n')
++        else:
++            self.script = py
++            py.write_text('#!' + sys.executable + '\n' + FAKE)
++            py.chmod(0o700)
++
++    def engine(self, env=None):
++        e = StrataEngine(str(self.script), ['--stat', json.dumps(STAT)], env=env)
++        self.addCleanup(e.close)
++        return e
++
++    def test_server_turns_it_on_and_keeps_stat_off_the_control_lines(self):
++        saved = os.environ.pop("STRATA_STATUS_LINES", None)
++        self.addCleanup(lambda: saved is not None and os.environ.__setitem__("STRATA_STATUS_LINES", saved))
++        e = self.engine()
++        self.assertEqual(e.info.get("status_env"), 500)
++        svc = Service(e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / 'chat_template.jinja'))
++        out = list(svc.run([1], False, [], 8, {}, threading.Event()))
++        self.assertTrue(out, "the request ends normally with STAT lines between its PP, T and DONE")
++        # a session save reads its own answer: any unknown line there would end the engine (out_of_step)
++        r = e.session_file("save", str(self.root / "s.bin"))
++        self.assertEqual(r["tokens"], 3)
++        self.assertTrue(e.alive())
++        end = time.monotonic() + 2
++        while e.engine_status is None and time.monotonic() < end:
++            time.sleep(0.01)
++        self.assertEqual(e.engine_status["lanes"]["n"], 2)
++        while not e.lines.empty():
++            line = e.lines.get_nowait()
++            self.assertFalse(line is not None and line.startswith("STAT "), "a STAT line reached the control lines")
++        m = e.engine_mode()
++        self.assertTrue(m["lanes"]["live"])
++        self.assertTrue(m["overlap"])
++        self.assertEqual(m["reads"][0]["slot"], 5)
++
++    def test_an_explicit_value_is_kept(self):
++        e = self.engine(env={**os.environ, "STRATA_STATUS_LINES": "0"})
++        self.assertEqual(e.info.get("status_env"), 0)
++
++
++class StatusViews(unittest.TestCase):
++    def test_parse(self):
++        self.assertIsNone(parse_status_line("STAT not json\n"))
++        self.assertIsNone(parse_status_line("STAT [1]\n"))
++        self.assertIsNone(parse_status_line("BT 0 1\n"))
++        self.assertEqual(parse_status_line("STAT " + json.dumps(STAT) + "\n")["seq"], 3)
++
++    def test_slot_keys(self):
++        self.assertEqual(slot_status_keys(None, 0), {})
++        k = slot_status_keys(STAT, 0)
++        self.assertEqual((k["mode"], k["lane"], k["acc"], k["engine_tok_s"]), ("lane", 0, 0.7, 41.2))
++        k = slot_status_keys(STAT, 5)
++        self.assertEqual((k["mode"], k["read_done"], k["read_total"], k["read_beside"]), ("read_ovl", 8192, 30000, "decode"))
++        self.assertNotIn("lane", k)
++        self.assertEqual(slot_status_keys(STAT, 9), {"mode": "idle"})
++
++    def test_mode_view(self):
++        self.assertIsNone(engine_mode_view(None, None))
++        v = engine_mode_view(STAT, 0.25)
++        self.assertEqual(v["slot_modes"], {"lane": 2, "read_ovl": 1, "cached": 1})
++        self.assertEqual(v["lanes"]["configured"], 4)
++
++    def test_slots_view_adds_keys_and_keeps_state(self):
++        e = StrataEngine("strata", [], lazy=True)
++        e.batch = 6
++        e.slot_held = [[] for _ in range(6)]
++        e.slot_live = [None] * 6
++        now = time.time()
++        e.slot_live[0] = {"slot": 0, "state": "decoding", "prompt_tokens": 10, "generated": 300,
++                          "started": now - 10, "first_token": now - 8}
++        e.slot_live[5] = {"slot": 5, "state": "reading", "prompt_tokens": 30000, "generated": 0,
++                          "started": now - 2, "first_token": None, "prompt_read": 4096, "prompt_total": 30000,
++                          "prefill_tok_s": 1200.0}
++        # no status (an older engine): the PP lines' progress only, no mode key
++        v = e.slots_view()
++        self.assertEqual([x["state"] for x in v], ["decoding", "idle", "idle", "idle", "idle", "reading"])
++        self.assertEqual((v[5]["read_done"], v[5]["read_total"]), (4096, 30000))
++        self.assertNotIn("mode", v[0])
++        # a fresh status: new keys, `state` as it was
++        e.engine_status, e.engine_status_at = STAT, time.monotonic()
++        v = e.slots_view()
++        self.assertEqual([x["state"] for x in v], ["decoding", "idle", "idle", "idle", "idle", "reading"])
++        self.assertEqual((v[0]["mode"], v[2]["mode"], v[5]["mode"], v[5]["read_done"]), ("lane", "cached", "read_ovl", 8192))
++        # a stale one is not shown
++        e.engine_status_at = time.monotonic() - 60
++        self.assertNotIn("mode", e.slots_view()[0])
++        self.assertIsNone(e.engine_mode())
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
