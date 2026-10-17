@@ -4,7 +4,7 @@
 # in the agent mix - the one place stage 1 was not measured yet (TESTLOG #88: stage 2 failed there).
 #   PROD = production as it runs (production.json read now, server Strata-143-prod, the drop-in's STRATA_* env)
 #   F    = binary strata-g3-1441j-reads2 (sha256 b403479110173fcf, the one #88 measured stage 1 with; STRATA_READS unset)
-#          + STRATA_READ_YIELD=1, server Strata-ll8-fairadmit (ll6-reads serve + ll6-admit, merge 2cf7434d) with
+#          + STRATA_READ_YIELD=1, server Strata-ll8-fairadmit (ll6-reads serve + ll6-admit, merge 2cf7434d + review fix 90f73293) with
 #          STRATA_YIELD_SHORT=$YS STRATA_YIELDS_MAX=$YM
 #   FE   = F + STRATA_ADMIT_BY_NEW=1 on the server
 # Steps: 1 agent mix PROD F FE FE F PROD (one server start each: bench_multiturn 16x3 greedy --doc $MT_DOC,
@@ -20,7 +20,7 @@ R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs; OUT=$L/results/fa; CF=$OUT
 URL=http://127.0.0.1:8090; TPORT=8091; PY=$R/Strata/.venv/bin/python; DRV=$L/lanes_stdin.py; RT=$L/reads_tools.py
 FT=$L/fair_tools.py
 WT=$R/Strata-ll8-fairadmit; NEW=$R/Strata/engine/strata-g3-1441j-reads2
-NEW_SHA=b403479110173fcf; WANT_COMMIT=2cf7434d
+NEW_SHA=b403479110173fcf; WANT_COMMIT=90f73293
 YS=${YS:-2048}                                              # STRATA_YIELD_SHORT of the FAIR arms
 # STRATA_YIELDS_MAX of the FAIR arms: the server's default (2 stops per read) lets only the first two of w1's four
 # spaced shorts past the 125K read (the 3rd and 4th wait it out) and x1's third short; 4 = one stop per short there
