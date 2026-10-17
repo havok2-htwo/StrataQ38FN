@@ -1,0 +1,1487 @@
+From b4da30f9167e856a41e5af6bb504b9de80379eb2 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:13:11 +0200
+Subject: [PATCH 1/2] serve: shorter prompt reads phase 1 - warm checkpoint
+ pool, late turn checkpoint, BGEN without the drain (opt-in
+ STRATA_SR_CKPT_WARM=1, STRATA_SR_CKPT_LATE=1, STRATA_SR_NODRAIN=1; umbrella
+ STRATA_SHORT_READS=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                         |   6 +
+ include/strata/core/mtp.hpp            |   3 +
+ include/strata/program/short_reads.hpp | 190 +++++++
+ src/core/mtp.cpp                       |  10 +
+ src/program/generate.cpp               | 655 ++++++++++++++++++++++---
+ tests/program/short_reads_test.cpp     | 225 +++++++++
+ 6 files changed, 1033 insertions(+), 56 deletions(-)
+ create mode 100644 include/strata/program/short_reads.hpp
+ create mode 100644 tests/program/short_reads_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 740378aa..1fec67a3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -316,6 +316,12 @@ if(STRATA_BUILD_TESTS)
+   add_executable(message_cut_test tests/program/message_cut_test.cpp)
+   target_include_directories(message_cut_test PRIVATE include)
+   add_test(NAME message_cut_test COMMAND message_cut_test)
++  # STRATA_SHORT_READS (STRATA_SR_CKPT_WARM / _LATE / STRATA_SR_NODRAIN): the switches, the warm pool's sizes, the late
++  # checkpoint's staging against a direct save (a host model), its identity across moves, the no-drain line check and
++  # its layouts (header-only, CPU)
++  add_executable(short_reads_test tests/program/short_reads_test.cpp)
++  target_include_directories(short_reads_test PRIVATE include)
++  add_test(NAME short_reads_test COMMAND short_reads_test)
+ 
+   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
+   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index bfcdce26..77fc9e70 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -96,6 +96,9 @@ public:
+     /// `n` rows (a prompt chunk) and capture its graphs for 1..max_t rows now, so prefill() of up to `n` rows neither
+     /// frees, allocates nor captures (each of them waits for the device).  Free when done already.
+     bool reserve_prefill_records(int64_t n, std::string& err);
++    /// STRATA_SR_NODRAIN: would reserve_prefill_records(n) be free now (the records sized, every graph captured)?  Looks
++    /// only; changes nothing.
++    bool prefill_records_ready(int64_t n) const;
+     /// STRATA_PIPE_OVERLAP_MTP_PRIO (an A/B knob): 1 = the drafter's stream at the device's greatest priority, 0 = at
+     /// the default one; -1 (default) = as set_force_capture decides.  Before `load`.
+     void set_stream_priority(int p) { stream_prio_ = p; }
+diff --git a/include/strata/program/short_reads.hpp b/include/strata/program/short_reads.hpp
+new file mode 100644
+index 00000000..a6208b22
+--- /dev/null
++++ b/include/strata/program/short_reads.hpp
+@@ -0,0 +1,190 @@
++// include/strata/program/short_reads.hpp - shorter prompt reads beside many slots, phase 1 (opt-in, all exact): the
++// switches, the warm checkpoint pool's sizes, the late turn checkpoint's staging layout and the no-drain admission's
++// gate.  Header-only (CPU): the rules the engine follows, tested without a model or a GPU
++// (tests/program/short_reads_test.cpp).
++//
++//   T0a STRATA_SR_CKPT_WARM=1|N   the checkpoint pool (STRATA_CKPT_POOL) keeps N (1: 2) checkpoints with their
++//                                 running-state vectors already allocated and faulted in, refilled on a thread of
++//                                 its own after each take: a save or a slot's copy never resizes fresh vectors
++//                                 (~15 ms for a save, ~55 ms for a copy measured).  Every byte is overwritten by the
++//                                 save or the copy, so the checkpoints are the same.
++//   T0b STRATA_SR_CKPT_LATE=1     a turn checkpoint (the cuts of a prompt read: turn, root, message, pin) is first
++//                                 copied on the device into a staging buffer per stage (a few hundred us), and from
++//                                 there to the host on threads of their own, while the first window, the slot copy
++//                                 and BADM go on.  The device copy reads the state at the same point the save read it
++//                                 (after the same device syncs), and nothing but the late copy writes the checkpoint
++//                                 until it is done: every reader of the checkpoint's bytes waits for it first.
++//   T0c STRATA_SR_NODRAIN=1       a text BGEN with slot groups in flight does not drain them at the line when a dry
++//                                 run shows that the overlapped read could start beside them without a capture (every
++//                                 stage holds every layout the read's pump may need, the drafter's prompt records are
++//                                 ready).  The request's own steps that might wait on a device, move the expert
++//                                 tables or touch another slot drain the groups first (a deferred drain), so only a
++//                                 read whose way to the overlapped read is host work and its own sessions skips it.
++//   STRATA_SHORT_READS=1          the umbrella: each of the three is on unless its own switch says otherwise.
++#pragma once
++
++#include "strata/core/conversation_cache.hpp"
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <vector>
++
++namespace strata::program::short_reads {
++
++/// A switch's text: unset (nullptr) is "not said"; empty and "0..." are off, anything else on.
++inline bool text_on(const char* v) { return v != nullptr && v[0] != '\0' && v[0] != '0'; }
++
++/// A sub-step's switch with the umbrella: its own value when set, else the umbrella's.  Neither set: off.
++inline bool env_on(const char* own, const char* umbrella) { return own != nullptr ? text_on(own) : text_on(umbrella); }
++
++/// T0a: how many warm checkpoints the pool keeps (0: off).  "1" (or the umbrella alone) is 2, a number N >= 2 is N,
++/// capped at 8 (each is the size of one checkpoint, ~118 MB with a layer split's parts).
++inline int warm_reserve(const char* own, const char* umbrella) {
++    if (!env_on(own, umbrella)) return 0;
++    const int n = own != nullptr ? std::atoi(own) : 1;
++    if (n <= 1) return 2;
++    return n > 8 ? 8 : n;
++}
++
++/// The pool's keep limit with T0a: at least the reserve (the default pool keeps 2).
++inline size_t pool_cap(size_t cap, int reserve) { return reserve > 0 && (size_t) reserve > cap ? (size_t) reserve : cap; }
++
++/// Does the pool want another warm checkpoint (`free_n` kept now)?
++inline bool warm_wants(size_t free_n, int reserve) { return reserve > 0 && free_n < (size_t) reserve; }
++
++/// The running state one session's part of a checkpoint holds, in bytes: the GDN rows, the PLE history (0 without
++/// one), and per owned QSA layer its indexer tail, its dead row and its block position.  The sizes
++/// conversation_checkpoint_save resizes its vectors to (ConversationStateSizes and the session's carve).
++struct PartSizes {
++    size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
++    size_t layers = 0;
++    size_t bytes() const { return gdn + ple + layers * (tail + dead + block_pos); }
++};
++
++/// T0a: a checkpoint part's vectors at their sizes (zero-filled: their pages are faulted in), ready for a save or a
++/// copy to overwrite every byte.
++inline void presize(strata::core::ConversationCheckpoint& c, const PartSizes& z) {
++    c.gdn.resize(z.gdn);
++    c.ple.resize(z.ple);
++    c.tails.resize(z.layers * z.tail);
++    c.dead.resize(z.layers * z.dead);
++    c.block_pos.resize(z.layers * z.block_pos);
++}
++
++/// T0a: a whole warm checkpoint: the first part's vectors in `c`, every later stage's in c.stage_parts.
++inline strata::core::ConversationCheckpoint warm_checkpoint(const std::vector<PartSizes>& parts) {
++    strata::core::ConversationCheckpoint c;
++    if (parts.empty()) return c;
++    presize(c, parts[0]);
++    c.stage_parts.resize(parts.size() - 1);
++    for (size_t k = 1; k < parts.size(); ++k) presize(c.stage_parts[k - 1], parts[k]);
++    return c;
++}
++
++/// T0b: where a session's running state comes from on the device (the same pointers conversation_checkpoint_save
++/// reads: the session's gdn_state and ple_hist, and per owned QSA layer its idx_tail, idx_dead and idx_block_pos).
++struct PartSources {
++    const void* gdn = nullptr;
++    const void* ple = nullptr;
++    std::vector<const void*> tail, dead, block_pos;   ///< one per owned QSA layer
++};
++
++/// T0b: one copy of the late checkpoint: `bytes` from the device source `dev` to the staging buffer at `off`, and later
++/// from there into the checkpoint's host vector at `host`.
++struct StageRegion {
++    uint8_t* host = nullptr;
++    const void* dev = nullptr;
++    size_t off = 0, bytes = 0;
++};
++
++/// T0b: the copies of one part, in the order conversation_checkpoint_save makes them (gdn, ple, then per layer tail,
++/// dead, block_pos), packed in the staging buffer in that order.  `c`'s vectors must be presized to `z` (presize).
++/// False when a source is missing for a nonzero size or a vector has another size: the caller saves as before.
++inline bool stage_plan(strata::core::ConversationCheckpoint& c, const PartSizes& z, const PartSources& s,
++                       std::vector<StageRegion>& out) {
++    out.clear();
++    if (c.gdn.size() != z.gdn || c.ple.size() != z.ple || c.tails.size() != z.layers * z.tail ||
++        c.dead.size() != z.layers * z.dead || c.block_pos.size() != z.layers * z.block_pos)
++        return false;
++    if (s.tail.size() != z.layers || s.dead.size() != z.layers || s.block_pos.size() != z.layers) return false;
++    size_t off = 0;
++    auto add = [&](uint8_t* host, const void* dev, size_t bytes) -> bool {
++        if (bytes == 0) return true;
++        if (dev == nullptr || host == nullptr) return false;
++        out.push_back(StageRegion{host, dev, off, bytes});
++        off += bytes;
++        return true;
++    };
++    if (!add(c.gdn.data(), s.gdn, z.gdn) || !add(c.ple.data(), s.ple, z.ple)) return false;
++    for (size_t j = 0; j < z.layers; ++j)
++        if (!add(c.tails.data() + j * z.tail, s.tail[j], z.tail) ||
++            !add(c.dead.data() + j * z.dead, s.dead[j], z.dead) ||
++            !add(c.block_pos.data() + j * z.block_pos, s.block_pos[j], z.block_pos))
++            return false;
++    return off == z.bytes();
++}
++
++/// T0b: is `c` (or one of its parts) the checkpoint whose bytes the late copy still writes?  It is known by the
++/// address of its first part's GDN vector, which a move of the checkpoint (into a slot, or inside a vector that grows
++/// or erases) keeps, and which no other live checkpoint shares.
++inline bool is_late(const strata::core::ConversationCheckpoint& c, const void* late) {
++    return late != nullptr && !c.gdn.empty() && (const void*) c.gdn.data() == late;
++}
++inline bool holds_late(const std::vector<strata::core::ConversationCheckpoint>& v, const void* late) {
++    if (late == nullptr) return false;
++    for (const auto& c : v)
++        if (is_late(c, late)) return true;
++    return false;
++}
++
++/// T0c: what the BGEN line knows when it decides whether to leave the groups in flight.  Each field true is a reason
++/// to drain as before (`why` says the first).
++struct NoDrainLine {
++    bool switch_on = false;        ///< STRATA_SR_NODRAIN (or the umbrella)
++    bool overlap_on = false;       ///< STRATA_PIPE_OVERLAP and pipelined slot groups
++    bool text_bgen = false;        ///< the line is a text BGEN (a BGENI's picture rebuilds the M-RoPE table)
++    bool in_flight = false;        ///< slot groups in flight (nothing to skip otherwise)
++    bool lanes = false;            ///< the spec lanes run or a lane slot is held
++    bool mrope_rebuild = false;    ///< the M-RoPE table is not the identity (a text request after a picture)
++    bool adapt_busy = false;       ///< an asynchronous adaptive round is in flight (adapt_tick would land it)
++    bool nan_flush = false;        ///< #879: the request drops every cached state first
++    bool dry_run_ok = false;       ///< the overlapped read could start now without a capture (the dry run)
++};
++inline const char* no_drain_refusal(const NoDrainLine& l) {
++    if (!l.switch_on) return "off";
++    if (!l.overlap_on) return "no overlapped reads (STRATA_PIPE_OVERLAP with pipelined slot groups)";
++    if (!l.text_bgen) return "not a text batch admission";
++    if (!l.in_flight) return "no slot groups in flight";
++    if (l.lanes) return "the spec lanes";
++    if (l.mrope_rebuild) return "the M-RoPE table is rebuilt";
++    if (l.adapt_busy) return "an adaptive round in flight";
++    if (l.nan_flush) return "a non-finite flush (#879)";
++    if (!l.dry_run_ok) return "the overlapped read would need a capture or is refused";
++    return nullptr;
++}
++
++/// T0c: the layouts the overlapped read's pump may launch beside the read, all of which must be captured on every
++/// stage before it may start with groups in flight: each group's full width; each active group's widths 1 .. its own
++/// width (min with GS - 1: a group may shrink to them, as overlap_prepare captures them); and each group in flight its
++/// launch width (its later stages run it at that width).  (base, S) pairs, base = group * GS.
++inline std::vector<std::pair<int, int>> needed_layouts(int GS, const std::vector<int>& own_width,
++                                                       const std::vector<int>& inflight_width) {
++    std::vector<std::pair<int, int>> want;
++    const size_t groups = own_width.size();
++    auto add = [&](int base, int S) {
++        if (S < 1 || S > GS) return;
++        for (const auto& w : want)
++            if (w.first == base && w.second == S) return;
++        want.emplace_back(base, S);
++    };
++    for (size_t gi = 0; gi < groups; ++gi) {
++        const int base = (int) gi * GS;
++        for (int S = 1; S <= own_width[gi] && S <= GS - 1; ++S) add(base, S);
++        add(base, GS);
++        if (gi < inflight_width.size() && inflight_width[gi] > 0) add(base, inflight_width[gi]);
++    }
++    return want;
++}
++
++}  // namespace strata::program::short_reads
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index ca2b2cb3..86a29159 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -1402,6 +1402,16 @@ bool MtpDrafter::reserve_prefill_records(int64_t n, std::string& err) {
+     return true;
+ }
+ 
++bool MtpDrafter::prefill_records_ready(int64_t n) const {
++    if (g_ == nullptr) return false;
++    const bool per_group_sync = prefill_per_group_sync();
++    const int64_t per_row = 1 + 4 + g_->n_head;
++    if (!per_group_sync && pf_cap_ < n * per_row) return false;
++    for (int T = 1; T <= max_t_; ++T)
++        if (!(per_group_sync ? prefill_exec_[T] : prefill_dev_exec_[T])) return false;
++    return true;
++}
++
+ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
+                          bool sync) {
+ #if defined(STRATA_GPU_METAL)
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 35229d4c..f7d5f809 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -85,6 +85,7 @@
+ #include "strata/program/solo_pipeline.hpp"
+ #include "strata/program/spec_lanes.hpp"
+ #include "strata/program/slot_chain.hpp"
++#include "strata/program/short_reads.hpp"
+ #include "strata/kernels/cvec.hpp"
+ #include "strata/core/progress.hpp"
+ #include "strata/core/device.hpp"
+@@ -296,6 +297,31 @@ bool ckpt_threads_env() {
+     }();
+     return on;
+ }
++// Shorter prompt reads beside many slots, phase 1 (include/strata/program/short_reads.hpp; read once, each off by
++// default, STRATA_SHORT_READS=1 the umbrella for the three).  STRATA_SR_CKPT_WARM=1|N (T0a): the checkpoint pool keeps
++// N (1: 2) checkpoints allocated and faulted in, refilled on a thread of its own.  Needs the pool (STRATA_CKPT_POOL or
++// STRATA_SLOT_CKPT_MOVE)
++int sr_ckpt_warm_env() {
++    static const int n = strata::program::short_reads::warm_reserve(std::getenv("STRATA_SR_CKPT_WARM"),
++                                                                     std::getenv("STRATA_SHORT_READS"));
++    return n;
++}
++// STRATA_SR_CKPT_LATE=1 (T0b): a turn checkpoint is copied into a staging buffer on each stage's device and from there
++// to the host on threads of their own while the request goes on to its first window and BADM; every reader of it
++// waits for that copy first.  Needs the pool (STRATA_CKPT_POOL or STRATA_SLOT_CKPT_MOVE)
++bool sr_ckpt_late_env() {
++    static const bool on = strata::program::short_reads::env_on(std::getenv("STRATA_SR_CKPT_LATE"),
++                                                                std::getenv("STRATA_SHORT_READS"));
++    return on;
++}
++// STRATA_SR_NODRAIN=1 (T0c): a text BGEN leaves the slot groups in flight when its overlapped read could start beside
++// them without a capture; the request drains them at its first step that needs it (a deferred drain).  Needs
++// STRATA_PIPE_OVERLAP
++bool sr_nodrain_env() {
++    static const bool on = strata::program::short_reads::env_on(std::getenv("STRATA_SR_NODRAIN"),
++                                                                std::getenv("STRATA_SHORT_READS"));
++    return on;
++}
+ // STRATA_SLOT_CKPT_MOVE=1 (read once; off by default): a batch admission MOVES its own turn checkpoint into the slot
+ // instead of copying it (~112 MB of host vectors).  The main session's chain no longer holds it, so the request path
+ // looks for it in the slots' checkpoints too: while the main session's cells still hold its tokens it is restored there
+@@ -1833,12 +1859,23 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
+     return false;
+ }
+ 
++static void spread_engine_thread();   // (below: the warm pool's thread goes where the copy threads go)
+ /// STRATA_CKPT_POOL: the storage of dropped checkpoints, for the next save or slot copy to reuse.  `give` keeps a
+ /// checkpoint's vectors (its tokens, pictures and marks cleared), `take` hands one back (an empty checkpoint when none
+ /// is kept).  At most `cap` are kept (a batch admission drops and takes about two), the rest are freed as before.
+ class CheckpointPool {
+ public:
+     explicit CheckpointPool(bool on, size_t cap = 2) : on_(on), cap_(cap) {}
++    CheckpointPool(const CheckpointPool&) = delete;
++    CheckpointPool& operator=(const CheckpointPool&) = delete;
++    ~CheckpointPool() {
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            stop_ = true;
++        }
++        warm_cv_.notify_all();
++        if (warm_th_.joinable()) warm_th_.join();
++    }
+     bool on() const { return on_; }
+     void give(ConvCheckpoint&& c) {
+         if (!on_ || c.gdn.empty()) return;
+@@ -1847,12 +1884,44 @@ public:
+         if (free_.size() < cap_) free_.push_back(std::move(c));
+     }
+     ConvCheckpoint take() {
+-        std::lock_guard<std::mutex> lk(mu_);
+-        if (!on_ || free_.empty()) return ConvCheckpoint{};
+-        ConvCheckpoint c = std::move(free_.back());
+-        free_.pop_back();
++        bool refill = false;
++        ConvCheckpoint c;
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            if (!on_) return c;
++            if (reserve_ > 0) ++takes_;
++            if (free_.empty()) {
++                if (reserve_ > 0) ++misses_;
++            } else {
++                c = std::move(free_.back());
++                free_.pop_back();
++            }
++            refill = strata::program::short_reads::warm_wants(free_.size(), reserve_);
++        }
++        if (refill) warm_cv_.notify_one();   // (T0a: the warm thread makes the next one now)
+         return c;
+     }
++    /// STRATA_SR_CKPT_WARM (T0a): keep `reserve` checkpoints with every part's vectors allocated at `parts`' sizes and
++    /// faulted in, made on a thread of its own whenever fewer are kept (at once, and after each take).  The keep limit
++    /// rises to the reserve.  A save or a copy overwrites every byte of a taken one, as of any pooled one.
++    void set_warm(int reserve, const std::vector<strata::program::short_reads::PartSizes>& parts) {
++        if (!on_ || reserve <= 0 || parts.empty()) return;
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            reserve_ = reserve;
++            cap_ = strata::program::short_reads::pool_cap(cap_, reserve);
++            parts_ = parts;
++            if (!warm_th_.joinable()) warm_th_ = std::thread([this] { warm_loop(); });
++        }
++        warm_cv_.notify_one();
++    }
++    /// T0a's counts: takes since the start, takes that found the pool empty, warm checkpoints made
++    void warm_counts(uint64_t& takes, uint64_t& misses, uint64_t& made) {
++        std::lock_guard<std::mutex> lk(mu_);
++        takes = takes_;
++        misses = misses_;
++        made = made_;
++    }
+     /// v.erase(remove_if(v, drop)) with the dropped ones given to the pool (the kept ones keep their order)
+     template <class Drop> void erase_if(std::vector<ConvCheckpoint>& v, Drop drop) {
+         size_t w = 0;
+@@ -1865,10 +1934,50 @@ public:
+     }
+ private:
+     static void clear_marks(ConvCheckpoint& c) { strata::core::conversation_checkpoint_clear_marks(c); }
++    void warm_loop() {
++        spread_engine_thread();   // off the host thread's CPU (--aux-cpus, else every CPU the process may use)
++        std::unique_lock<std::mutex> lk(mu_);
++        for (;;) {
++            warm_cv_.wait(lk, [&] { return stop_ || strata::program::short_reads::warm_wants(free_.size(), reserve_); });
++            if (stop_) return;
++            const std::vector<strata::program::short_reads::PartSizes> parts = parts_;
++            lk.unlock();
++            ConvCheckpoint c;
++            bool made = false;
++            try {
++                c = strata::program::short_reads::warm_checkpoint(parts);   // (zero-filled: the pages are in)
++                made = true;
++            } catch (...) {
++            }
++            lk.lock();
++            if (stop_) return;
++            if (!made) {   // no memory for it: the pool goes on as without the switch, said once
++                reserve_ = 0;
++                std::fprintf(stderr, "strata serve: STRATA_SR_CKPT_WARM: a warm checkpoint could not be allocated; the "
++                                     "pool is no longer kept warm\n");
++                continue;
++            }
++            if (free_.size() < cap_) {
++                free_.push_back(std::move(c));
++                ++made_;
++            } else {
++                lk.unlock();
++                c = ConvCheckpoint{};   // (freed outside the lock)
++                lk.lock();
++            }
++        }
++    }
+     bool on_;
+     size_t cap_;
+     std::mutex mu_;
+     std::vector<ConvCheckpoint> free_;
++    // STRATA_SR_CKPT_WARM (T0a); reserve_ 0: off
++    int reserve_ = 0;
++    std::vector<strata::program::short_reads::PartSizes> parts_;
++    uint64_t takes_ = 0, misses_ = 0, made_ = 0;
++    bool stop_ = false;
++    std::condition_variable warm_cv_;
++    std::thread warm_th_;   // last: started once the members above exist
+ };
+ 
+ /// A thread the engine starts for host copies: off the host thread's one CPU (aux_cpus.hpp), to the aux CPUs (--aux-cpus)
+@@ -9533,6 +9642,35 @@ int main(int argc, char** argv) {
+         // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused.  STRATA_SLOT_CKPT_MOVE turns it on too: a moved
+         // checkpoint frees nothing at the next prune, so every save would fault in fresh pages (17 -> 40-60 ms)
+         CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env());
++        // the running state one session's part of a checkpoint holds (the sizes conversation_checkpoint_save resizes to)
++        auto sr_part_sizes = [&](const strata::core::SessionState& s) {
++            const ConvStateSizes z = conv_state_sizes(g, s);
++            strata::program::short_reads::PartSizes p;
++            p.gdn = z.gdn;
++            p.ple = s.ple_hist != nullptr ? z.ple : 0;
++            p.tail = z.tail;
++            p.dead = z.dead;
++            p.block_pos = z.block_pos;
++            p.layers = (size_t) std::max<int64_t>(s.qsa_alloc, 0);
++            return p;
++        };
++        // STRATA_SR_CKPT_WARM (T0a): the pool's warm checkpoints, one part per stage
++        if (const int warm = sr_ckpt_warm_env(); warm > 0 && o.prompt_cache > 0) {
++            if (!ckpt_pool.on()) {
++                std::fprintf(stderr, "strata serve: STRATA_SR_CKPT_WARM is off: it needs the checkpoint pool "
++                                     "(STRATA_CKPT_POOL=1 or STRATA_SLOT_CKPT_MOVE=1)\n");
++            } else {
++                std::vector<strata::program::short_reads::PartSizes> parts;
++                parts.push_back(sr_part_sizes(ss));
++                for (auto& st : stages) parts.push_back(sr_part_sizes(st->ss));
++                size_t bytes = 0;
++                for (const auto& p : parts) bytes += p.bytes();
++                ckpt_pool.set_warm(warm, parts);
++                std::fprintf(stderr, "strata serve: STRATA_SR_CKPT_WARM=%d: the checkpoint pool keeps %d checkpoints of "
++                                     "%.1f MiB warm (%zu part%s), refilled on a thread of its own\n", warm, warm,
++                             (double) bytes / 1048576.0, parts.size(), parts.size() == 1 ? "" : "s");
++            }
++        }
+         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+@@ -10038,9 +10176,160 @@ int main(int argc, char** argv) {
+             return false;
+         };
+         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
+-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
++        // ---- STRATA_SR_CKPT_LATE (T0b): the late turn checkpoint.  checkpoint_at(..., late = true) copies each stage's
++        // part on its device into that stage's staging buffer (after the same device sync the save makes), puts the
++        // checkpoint in `checks` as the save would, and starts the copies from the staging buffers into its host
++        // vectors on sr_late_threads.  Until sr_late_wait() has seen them land, nothing reads, copies, gives away or
++        // frees that checkpoint: every place that could calls sr_late_wait() first (the next line but BSTOP/BYIELD, the
++        // next checkpoint, a BYIELD's slot copy, the admission's copy of it, the park after the request, a slot's
++        // checkpoints dropped on non-finite logits, the end of the serve loop).  A move keeps its vectors' storage, so
++        // the copies' targets stay where they are wherever it is moved (into a slot, inside a vector).
++        static_assert(std::is_nothrow_move_constructible<ConvCheckpoint>::value,
++                      "STRATA_SR_CKPT_LATE: a growing vector of checkpoints must move them, never copy");
++        struct SrLate {
++            bool want = false, tried = false, on = false;   // the switch; the staging made (or refused) once
++            std::vector<int> dev;                           // per part: its session's device
++            std::vector<void*> buf;                         // per part: the staging buffer on that device
++            std::vector<size_t> cap;
++            std::vector<cudaStream_t> stream;               // per part: its copy stream (non-blocking)
++            std::vector<std::vector<strata::program::short_reads::StageRegion>> regions;   // the copies to the host
++            std::vector<char> ok;
++            std::atomic<const void*> pending{nullptr};   // the checkpoint the copies write (short_reads::is_late), or none
++            int64_t L = 0;
++            Clock::time_point t0{};
++            uint64_t n = 0, waited = 0;      // late checkpoints; those a reader waited for
++            double wait_ms = 0.0;
++            ~SrLate() {   // (the copies have ended: sr_late_threads and the guard below wait for them first)
++                for (size_t k = 0; k < buf.size(); ++k) {
++                    const strata::core::OnDevice on(dev[k]);
++                    if (stream[k] != nullptr) (void) cudaStreamDestroy(stream[k]);
++                    if (buf[k] != nullptr) (void) cudaFree(buf[k]);
++                }
++            }
++        } sr_late;
++        sr_late.want = sr_ckpt_late_env() && o.prompt_cache > 0;
++        if (sr_late.want && !ckpt_pool.on()) {
++            sr_late.want = false;
++            std::fprintf(stderr, "strata serve: STRATA_SR_CKPT_LATE is off: it needs the checkpoint pool (STRATA_CKPT_POOL=1 "
++                                 "or STRATA_SLOT_CKPT_MOVE=1)\n");
++        }
++        ParkThreads sr_late_threads;   // (destroyed before sr_late: it waits for the copies)
++        // the batch slots' checkpoints, for a late copy that failed (set where the slots are made)
++        std::function<void(const std::function<void(std::vector<ConvCheckpoint>&)>&)> sr_late_disarm_slots;
++        std::mutex sr_late_mu;         // (a read thread's checkpoint and the host thread may both wait)
++        auto sr_session = [&](size_t k) -> strata::core::SessionState& { return k == 0 ? ss : stages[k - 1]->ss; };
++        // the staging buffers and streams, made once (at the first late checkpoint: nothing is in flight then)
++        auto sr_late_ready = [&]() -> bool {
++            if (!sr_late.want) return false;
++            if (sr_late.tried) return sr_late.on;
++            sr_late.tried = true;
++            const size_t n = stages.size() + 1;
++            sr_late.dev.assign(n, 0);
++            sr_late.buf.assign(n, nullptr);
++            sr_late.cap.assign(n, 0);
++            sr_late.stream.assign(n, nullptr);
++            sr_late.regions.assign(n, {});
++            sr_late.ok.assign(n, 0);
++            std::string why;
++            size_t total = 0;
++            for (size_t k = 0; k < n && why.empty(); ++k) {
++                const strata::core::SessionState& s = sr_session(k);
++                cudaPointerAttributes at{};
++                if (s.gdn_state == nullptr || cudaPointerGetAttributes(&at, s.gdn_state) != cudaSuccess || at.device < 0) {
++                    (void) cudaGetLastError();
++                    why = "a stage's GDN state is not on a device";
++                    break;
++                }
++                sr_late.dev[k] = at.device;
++                const size_t bytes = sr_part_sizes(s).bytes();
++                const strata::core::OnDevice on(at.device);
++                if (cudaMalloc(&sr_late.buf[k], bytes) != cudaSuccess ||
++                    cudaStreamCreateWithFlags(&sr_late.stream[k], cudaStreamNonBlocking) != cudaSuccess) {
++                    (void) cudaGetLastError();
++                    why = "no VRAM for CUDA" + std::to_string(at.device) + "'s staging buffer (" +
++                          std::to_string(bytes >> 20) + " MiB)";
++                    break;
++                }
++                sr_late.cap[k] = bytes;
++                total += bytes;
++            }
++            if (!why.empty()) {
++                std::fprintf(stderr, "strata serve: STRATA_SR_CKPT_LATE is off: %s\n", why.c_str());
++                return false;
++            }
++            sr_late.on = true;
++            std::fprintf(stderr, "strata serve: STRATA_SR_CKPT_LATE: turn checkpoints go to the host after BADM through "
++                                 "%.1f MiB of staging on %zu device(s)\n", (double) total / 1048576.0, n);
++            return true;
++        };
++        // stage part k of `c` (its session's running state, synchronized by the caller) into its staging buffer: false
++        // when it cannot be planned (the caller saves that part as before), `e` set when a copy failed
++        auto sr_late_stage = [&](size_t k, ConvCheckpoint& c, std::string& e) -> bool {
++            const strata::core::SessionState& s = sr_session(k);
++            const strata::program::short_reads::PartSizes z = sr_part_sizes(s);
++            sr_late.regions[k].clear();   // (none left from an earlier one)
++            if (z.bytes() == 0 || z.bytes() > sr_late.cap[k] || (int64_t) c.ids.size() > s.max_cells || s.max_cells < 0 ||
++                (z.layers > 0 && s.qsa_states == nullptr))
++                return false;
++            strata::program::short_reads::presize(c, z);
++            strata::program::short_reads::PartSources src;
++            src.gdn = s.gdn_state;
++            src.ple = s.ple_hist;
++            for (size_t j = 0; j < z.layers; ++j) {
++                const strata::core::QsaState& st = s.qsa_states[(size_t) s.qsa_ord0 + j];
++                src.tail.push_back(st.idx_tail);
++                src.dead.push_back(st.idx_dead);
++                src.block_pos.push_back(st.idx_block_pos);
++            }
++            std::vector<strata::program::short_reads::StageRegion>& rg = sr_late.regions[k];
++            if (!strata::program::short_reads::stage_plan(c, z, src, rg)) { rg.clear(); return false; }
++            const strata::core::OnDevice on(sr_late.dev[k]);
++            uint8_t* const b = static_cast<uint8_t*>(sr_late.buf[k]);
++            for (const auto& r : rg)
++                if (cudaMemcpyAsync(b + r.off, r.dev, r.bytes, cudaMemcpyDefault, sr_late.stream[k]) != cudaSuccess) break;
++            const cudaError_t q = cudaStreamSynchronize(sr_late.stream[k]);
++            const cudaError_t le = cudaGetLastError();
++            if (q != cudaSuccess || le != cudaSuccess) {
++                e = std::string("STRATA_SR_CKPT_LATE: the device copy: ") + cudaGetErrorString(q != cudaSuccess ? q : le);
++                rg.clear();
++            }
++            return true;
++        };
++        // T0b's fence: the late copies have landed (no-op when none is in flight).  A copy that failed leaves the
++        // checkpoint matching nothing (its tokens cleared), wherever it is now.
++        auto sr_late_wait = [&]() {
++            std::lock_guard<std::mutex> lk(sr_late_mu);
++            if (sr_late.pending.load() == nullptr) return;
++            const auto t = Clock::now();
++            sr_late_threads.wait();
++            const void* key = sr_late.pending.load();
++            sr_late.pending.store(nullptr);
++            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t).count();
++            if (ms > 0.05) {
++                ++sr_late.waited;
++                sr_late.wait_ms += ms;
++            }
++            bool good = true;
++            for (char x : sr_late.ok) good = good && x != 0;
++            if (good) return;
++            std::fprintf(stderr, "strata serve: STRATA_SR_CKPT_LATE: the copy of the checkpoint at %lld to the host failed: "
++                                 "it is not used\n", (long long) sr_late.L);
++            auto disarm = [&](std::vector<ConvCheckpoint>& v) {
++                for (ConvCheckpoint& c : v)
++                    if (strata::program::short_reads::is_late(c, key)) {
++                        c.ids.clear();
++                        c.pinned = false;
++                        for (ConvCheckpoint& part : c.stage_parts) part.ids.clear();
++                    }
++            };
++            disarm(checks);
++            if (sr_late_disarm_slots) sr_late_disarm_slots(disarm);   // (the batch slots' checkpoints, once they exist)
++        };
++        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
++                                 bool late = false) -> bool {
+             ckpt_why.clear();
+             if (o.prompt_cache <= 0 || L < 1) return true;
++            if (sr_late.want) sr_late_wait();   // STRATA_SR_CKPT_LATE: the last one's copies land first (its staging)
+             for (ConvCheckpoint& c : checks)
+                 if ((int64_t) c.ids.size() == L) {
+                     c.used = ++check_clock;
+@@ -10050,6 +10339,7 @@ int main(int argc, char** argv) {
+             ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
+             c.ids.assign(cur.begin(), cur.begin() + L);
+             c.imgs = imgs_below(req_imgs, L);
++            bool late_any = false;   // STRATA_SR_CKPT_LATE: a part went to its staging buffer (its host copy follows)
+             if (parts != nullptr) {
+                 if (parts->size() != stages.size() + 1) return false;
+                 c.gdn = std::move((*parts)[0].gdn);
+@@ -10069,6 +10359,12 @@ int main(int argc, char** argv) {
+                 std::vector<std::string> why(n);
+                 std::vector<double> sync_part(n, 0.0), part_ms(n, 0.0);
+                 std::vector<std::exception_ptr> thrown(n);   // (a failed allocation: thrown here, as without the threads)
++                // STRATA_SR_CKPT_LATE (T0b): a turn checkpoint's parts go to the staging buffers (late: the cuts' call)
++                const bool use_late = late && sr_late_ready();
++                if (use_late)   // (sr_late_wait above: no copy of an earlier one runs; its lists go)
++                    for (auto& rg : sr_late.regions) rg.clear();
++                std::vector<char> staged(n, 0);
++                std::vector<std::string> late_err(n);
+                 const std::function<void(size_t)> save_part = [&](size_t k) {
+                     try {
+                         const Clock::time_point p0 = Clock::now();
+@@ -10081,6 +10377,18 @@ int main(int argc, char** argv) {
+                         }
+                         synced[k] = 1;
+                         const Clock::time_point p1 = Clock::now();
++                        if (use_late) {   // (its own device synchronized too: the session's, should it not be this one)
++                            const strata::core::OnDevice on_s(sr_late.dev[k]);
++                            if (cudaDeviceSynchronize() == cudaSuccess &&
++                                sr_late_stage(k, k == 0 ? c : c.stage_parts[k - 1], late_err[k])) {
++                                staged[k] = 1;
++                                saved[k] = late_err[k].empty();
++                                sync_part[k] = std::chrono::duration<double, std::milli>(p1 - p0).count();
++                                part_ms[k] = std::chrono::duration<double, std::milli>(Clock::now() - p0).count();
++                                return;
++                            }
++                            (void) cudaGetLastError();
++                        }
+                         saved[k] = checkpoint_save(k == 0 ? c : c.stage_parts[k - 1], k == 0 ? ss : stages[k - 1]->ss, g);
+                         sync_part[k] = std::chrono::duration<double, std::milli>(p1 - p0).count();
+                         part_ms[k] = std::chrono::duration<double, std::milli>(Clock::now() - p0).count();
+@@ -10101,7 +10409,9 @@ int main(int argc, char** argv) {
+                     if (thrown[k]) std::rethrow_exception(thrown[k]);
+                 for (size_t k = 0; k < n; ++k) {
+                     if (!synced[k]) { ckpt_why = why[k]; return false; }
++                    if (!late_err[k].empty()) std::fprintf(stderr, "strata serve: %s\n", late_err[k].c_str());
+                     if (!saved[k]) return false;
++                    late_any = late_any || staged[k];
+                 }
+                 if (ckpt_trace) {   // sync: the first stage's (the others' are in their parts' times)
+                     const double wall = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+@@ -10117,7 +10427,9 @@ int main(int argc, char** argv) {
+                     std::fprintf(stderr, "strata trace: checkpoint at %lld: sync %.1f ms, save %.1f ms (%zu stage(s)%s, "
+                                          "each%s ms, %s)\n", (long long) L, sync_part[0], wall - sync_part[0], n,
+                                  ckpt_threads_env() ? " at once" : "", each.c_str(),
+-                                 reused ? "into a dropped checkpoint's vectors" : "new vectors");
++                                 late_any ? (reused ? "staged on the device, into a dropped checkpoint's vectors after BADM"
++                                                    : "staged on the device, new vectors")
++                                 : reused ? "into a dropped checkpoint's vectors" : "new vectors");
+                 }
+             } else {
+                 Clock::time_point t0 = Clock::now();
+@@ -10162,6 +10474,7 @@ int main(int argc, char** argv) {
+             } else if (L == tail_ckpt_len) {
+                 tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
+             }
++            const void* const late_key = late_any && !c.gdn.empty() ? (const void*) c.gdn.data() : nullptr;
+             checks.push_back(std::move(c));
+             const Clock::time_point te0 = Clock::now();
+             const size_t before_evict = checks.size();
+@@ -10195,6 +10508,35 @@ int main(int argc, char** argv) {
+                 std::fprintf(stderr, "strata trace: checkpoint at %lld: %zu evicted in %.1f ms\n", (long long) L,
+                              before_evict - checks.size(), ms);
+             }
++            // STRATA_SR_CKPT_LATE (T0b): the staged parts go to the checkpoint's host vectors on sr_late_threads while the
++            // request goes on (sr_late_wait is the fence).  Evicted at once (a tiny --prompt-cache): nothing to copy, the
++            // staged bytes are dropped; not to be found again (no first part staged): the copies run now.
++            if (late_any && (late_key == nullptr || strata::program::short_reads::holds_late(checks, late_key))) {
++                const size_t n = stages.size() + 1;
++                std::lock_guard<std::mutex> lk(sr_late_mu);
++                sr_late.ok.assign(n, 1);
++                for (size_t k = 0; k < n; ++k) if (!sr_late.regions[k].empty()) sr_late.ok[k] = 0;
++                sr_late.L = L;
++                sr_late.t0 = Clock::now();
++                ++sr_late.n;
++                sr_late_threads.start(n, [&](size_t k) {
++                    const auto& rg = sr_late.regions[k];
++                    if (rg.empty()) return;
++                    const strata::core::OnDevice on(sr_late.dev[k]);
++                    const uint8_t* const b = static_cast<const uint8_t*>(sr_late.buf[k]);
++                    bool ok = true;
++                    for (const auto& r : rg)
++                        if (cudaMemcpyAsync(r.host, b + r.off, r.bytes, cudaMemcpyDefault, sr_late.stream[k]) != cudaSuccess) {
++                            ok = false;
++                            break;
++                        }
++                    ok = cudaStreamSynchronize(sr_late.stream[k]) == cudaSuccess && ok;
++                    ok = cudaGetLastError() == cudaSuccess && ok;
++                    sr_late.ok[k] = ok ? 1 : 0;
++                });
++                sr_late.pending.store(late_key != nullptr ? late_key : (const void*) &sr_late);   // (a key nothing else has)
++            }
++            if (late_any && late_key == nullptr) sr_late_wait();
+             return true;
+         };
+         // STRATA_SPLIT_MTP_BATCH=1 (default off): the layer split's drafter is on the last stage, so E-9 (Prefill::draft_kv)
+@@ -11559,6 +11901,15 @@ int main(int argc, char** argv) {
+             int pcie_num[SplitDrive::kMax] = {};
+         };
+         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
++        // STRATA_SR_CKPT_LATE: a late copy that failed disarms its checkpoint in a slot too; and the copies land before
++        // the slots (or `checks`) go at the end of the serve loop, whichever way it ends
++        sr_late_disarm_slots = [&](const std::function<void(std::vector<ConvCheckpoint>&)>& f) {
++            for (BSlot& sl : bs) f(sl.checks);
++        };
++        struct SrLateGuard {
++            std::function<void()> f;
++            ~SrLateGuard() { if (f) f(); }
++        } sr_late_guard{[&] { if (sr_late.want) sr_late_wait(); }};
+         // STRATA_SPEC_LANES: lane j's drafter holds its slot's conversation's draft K/V for the cells below lane_dk[j]
+         // (-1: unknown); catch-ups from batch windows and the cells they found missing (a hole: drafts only)
+         int64_t lane_dk[kLM] = {-1, -1, -1, -1}, lane_cu_n[kLM] = {}, lane_cu_hole[kLM] = {};
+@@ -11968,6 +12319,7 @@ int main(int argc, char** argv) {
+                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                     sl.active = false;
+                     sl.cached = false;
++                    if (strata::program::short_reads::holds_late(sl.checks, sr_late.pending.load())) sr_late_wait();   // (STRATA_SR_CKPT_LATE)
+                     sl.checks.clear();
+                     nan_flush = true;
+                     continue;
+@@ -12442,6 +12794,7 @@ int main(int argc, char** argv) {
+                            c.imgs.empty() && std::equal(c.ids.begin(), c.ids.end(), sp.live.begin());
+                 };
+                 std::vector<ConvCheckpoint> along;
++                if (strata::program::short_reads::holds_late(sl.checks, sr_late.pending.load())) sr_late_wait();   // (STRATA_SR_CKPT_LATE)
+                 for (ConvCheckpoint& c : sl.checks) {
+                     bool copy = false;
+                     for (const ConvCheckpoint& k : sl.chain) copy = copy || (k.ids == c.ids && k.imgs == c.imgs);
+@@ -12568,6 +12921,7 @@ int main(int argc, char** argv) {
+                         std::printf("BDONE %d %lld nonfinite %.1f\n", gi * GS + t, (long long) sl.produced, ms);
+                         sl.active = false;
+                         sl.cached = false;
++                        if (strata::program::short_reads::holds_late(sl.checks, sr_late.pending.load())) sr_late_wait();   // (STRATA_SR_CKPT_LATE)
+                         sl.checks.clear();
+                         sl.parks = false;
+                         nan_flush = true;
+@@ -13021,6 +13375,7 @@ int main(int argc, char** argv) {
+                 std::fflush(stdout);
+                 sl.active = false;
+                 sl.cached = false;
++                if (strata::program::short_reads::holds_late(sl.checks, sr_late.pending.load())) sr_late_wait();   // (STRATA_SR_CKPT_LATE)
+                 sl.checks.clear();
+                 sl.parks = false;
+                 nan_flush = true;
+@@ -13307,6 +13662,8 @@ int main(int argc, char** argv) {
+         // after a request: start the capture of what the main sessions hold, if a park may want it.  Whatever keeps it
+         // from running beside the slots leaves it to the park at the next request, as without the switch.
+         auto park_async_start = [&]() {
++            // STRATA_SR_CKPT_LATE: the capture and the slot chain copy `checks` (a turn checkpoint not moved into a slot)
++            if (strata::program::short_reads::holds_late(checks, sr_late.pending.load())) sr_late_wait();
+             if (main_slot >= 0) {   // STRATA_SLOT_PARK: its slot parks this conversation; the chain goes along
+                 if (live_ok && !nan_flush) {
+                     slot_chain_start();
+@@ -13599,8 +13956,140 @@ int main(int argc, char** argv) {
+             }
+             return true;
+         };
++        // (the overlapped read's gate below, and STRATA_SR_NODRAIN's check at a BGEN line)
++        // STRATA_PIPE_OVERLAP_KVS=1 with --kv-resident: the streamed part of the gate (overlap_kvs.hpp).  Every
++        // main session's QSA states (what the read writes: VRAM pages, page map, indexer rows, host copy) against
++        // the slot sessions' of the same stage (what the windows resolve, append and attend), and the main
++        // drafter's ring against the slot drafters'.  Called only with the switch on (without it the gate refuses
++        // --kv-resident as before); the prompt path's own part is Prefill::overlap_safe(why, true).
++        auto overlap_kvs_check = [&](std::string& why) -> bool {
++            using strata::program::KvSpan;
++            using strata::program::kv_span;
++            const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
++            auto spans_of = [&](const strata::core::QsaState& st, bool sized, std::vector<KvSpan>& out) {
++                const uint64_t bb = sized ? strata::kernels::kv_block_bytes(qs, strata::core::qsa_kv_format(st)) : 0;
++                const void* pool = st.k_q != nullptr ? (const void*) st.k_q
++                                 : st.k_q4 != nullptr ? (const void*) st.k_q4 : (const void*) st.k_pool;
++                const void* host = st.host.k_q != nullptr ? (const void*) st.host.k_q
++                                 : st.host.k_q4 != nullptr ? (const void*) st.host.k_q4 : (const void*) st.host.k_pool;
++                out.push_back(kv_span(pool, (uint64_t) st.n_slots * bb));
++                out.push_back(kv_span(host, (uint64_t) st.n_pages * bb));
++                for (const void* p : {(const void*) st.page_table, (const void*) st.map.ctl, (const void*) st.map.slot_block,
++                                      (const void*) st.idx_pooled, (const void*) st.idx_tail, (const void*) st.step})
++                    out.push_back(kv_span(p, 0));
++            };
++            bool disjoint = true;
++            for (int k = 0; k < n_pipe && disjoint && k < (int) bslot_ss.size(); ++k) {
++                const strata::core::SessionState& main_k = k == 0 ? ss : stages[(size_t) k - 1]->ss;
++                std::vector<KvSpan> a, b;
++                for (int64_t j = 0; j < main_k.qsa_alloc; ++j)
++                    spans_of(main_k.qsa_states[main_k.qsa_ord0 + j], true, a);
++                for (const auto& u : bslot_ss[(size_t) k])
++                    for (int64_t j = 0; j < u->qsa_alloc; ++j) spans_of(u->qsa_states[u->qsa_ord0 + j], true, b);
++                disjoint = strata::program::kv_spans_disjoint(a, b);
++            }
++            // (STRATA_SPEC_LANES: the lane drafters too - carved from the lane slots' sessions, and a batch window of
++            // a lane slot writes its drafter's K/V beside the read: lane_catchup)
++            if (disjoint && (!slot_mtp.empty() || !lane_mtp.empty())) {   // the drafter's own geometry: points only
++                std::vector<KvSpan> a, b;
++                spans_of(mtp.kv_state(), false, a);
++                for (const auto& d : slot_mtp) spans_of(d->kv_state(), false, b);
++                for (const auto& d : lane_mtp) spans_of(d->kv_state(), false, b);
++                disjoint = strata::program::kv_spans_disjoint(a, b);
++            }
++            return strata::program::overlap_kvs_allows(pipe_overlap_env(), pipe_overlap_kvs_env(), o.kv_resident > 0,
++                                                       disjoint, why);
++        };
++        // ---- STRATA_SR_NODRAIN (T0c, short_reads.hpp).  nd_live: the BGEN line in hand left the slot groups in flight
++        // (nothing pumps them until the request's overlapped read does); every step of the request that might wait for a
++        // device, move the expert tables, run a window or touch another slot's state drains them first (nd_fence).  A
++        // request that reaches its overlapped read with nd_live set starts it beside the groups in flight, provided the
++        // gate passes and nothing needs a capture (nd_layouts_ready); else the read drains first, as before.
++        const bool nd_on = sr_nodrain_env() && pipe_overlap_env() && piped;
++        if (sr_nodrain_env() && !nd_on)
++            std::fprintf(stderr, "strata serve: STRATA_SR_NODRAIN is off: it needs STRATA_PIPE_OVERLAP=1 and pipelined slot "
++                                 "groups\n");
++        bool nd_live = false;
++        int64_t nd_skips = 0, nd_fences = 0, nd_reads = 0;   // lines that skipped the drain; deferred drains; reads beside
++        std::set<std::string> nd_refused_logged;
++        // every layout the overlapped read's pump may launch is captured on every stage, and the drafter's prompt records
++        // are ready (short_reads::needed_layouts): the read can start without a capture beside the groups in flight
++        auto nd_layouts_ready = [&](std::string& why) -> bool {
++            std::vector<int> own(pg.size(), 0), infl(pg.size(), 0);
++            for (size_t gi = 0; gi < pg.size(); ++gi) {
++                for (int t = 0; t < GS; ++t) if (bs[gi * (size_t) GS + (size_t) t].active) own[gi] = t + 1;
++                if (pg[gi].inflight) infl[gi] = pg[gi].S;
++            }
++            const auto want = strata::program::short_reads::needed_layouts(GS, own, infl);
++            for (int k = 0; k < n_pipe; ++k)
++                for (const auto& [base, S] : want)
++                    if (!stage_verifier(k).has_batch_layout(base, S)) {
++                        why = "stage " + std::to_string(k + 1) + " has no captured layout for slots " + std::to_string(base) +
++                              ".." + std::to_string(base + S - 1);
++                        return false;
++                    }
++            if (use_mtp && !mtp.prefill_records_ready(sp.chunk())) {
++                why = "the drafter's prompt records are not ready";
++                return false;
++            }
++            return true;
++        };
++        // the line's check: what the overlapped read's gate looks at that does not depend on the request (the request's
++        // own part - pictures, the admission's slot - is the gate's again at the read), and what the request would do
++        // before it that cannot run beside the groups
++        auto nd_line_ok = [&](const std::string& ln, std::string& why) -> bool {
++            strata::program::short_reads::NoDrainLine l;
++            l.switch_on = sr_nodrain_env();
++            l.overlap_on = nd_on;
++            l.text_bgen = ln.rfind("BGEN ", 0) == 0;
++            l.in_flight = pipe_inflight();
++            l.lanes = lanes_live || lanes_hold_now();
++            l.mrope_rebuild = !mrope_identity;
++            l.adapt_busy = ajob && astate != AState::Idle;
++            l.nan_flush = nan_flush;
++            l.dry_run_ok = true;
++            if (const char* r = strata::program::short_reads::no_drain_refusal(l)) { why = r; return false; }
++            for (const PfPart& p : pf_parts)
++                if (p.first >= 0 || !p.lent.empty()) { why = "a prompt path borrows expert cache slots"; return false; }
++            if (host_res.empty() || std::any_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; })) {
++                why = "experts out of VRAM";
++                return false;
++            }
++            if (!pending.empty()) { why = "adaptive swaps are in flight"; return false; }
++            for (int k = 0; k < n_pipe; ++k)
++                if (!stage_verifier(k).ar_live()) { why = "a stage runs the doorbell graph"; return false; }
++            if (o.kv_resident > 0 && !pipe_overlap_kvs_env()) { why = "K/V streaming (--kv-resident)"; return false; }
++            if (o.kv_resident > 0 && !overlap_kvs_check(why)) return false;
++            if (peer.valid() || remote_caches || remote_opt || fs_swap) { why = "peer, remote or foresight experts"; return false; }
++            if (strata::kernels::cvec().loaded()) { why = "a control vector"; return false; }
++            if (kvg.on) { why = "the elastic K/V"; return false; }
++            if (o.prefill_head_alias) { why = "--prefill-head-alias"; return false; }
++            if (std::getenv("STRATA_IDX_FP16_CHECK") || std::getenv("STRATA_CVEC_FUSE_CHECK")) { why = "a prompt-path check"; return false; }
++            if (!ple_table.concurrent_capable()) { why = "the PLE table reads on the caller's thread"; return false; }
++            if (sp.device() != stage_verifier(0).device()) { why = "the prompt path's first stage is not on stage 1's card"; return false; }
++            if (!(o.kv_resident > 0 ? sp.overlap_safe(why, true) : sp.overlap_safe(why))) return false;
++            return nd_layouts_ready(why);
++        };
++        // the deferred drain: the groups in flight finish before `what` (no-op without one); false: pump answered ERR
++        auto nd_fence = [&](const char* what) -> bool {
++            if (!nd_live) return true;
++            nd_live = false;
++            const int in_flight = (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) { return G.inflight; });
++            const auto td = Clock::now();
++            if (!pipe_drain()) return false;
++            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
++            ++nd_fences;
++            adm_drain_ms += ms;
++            if (trace) {
++                std::fprintf(stderr, "strata trace: deferred drain (STRATA_SR_NODRAIN) for %s: %d groups in flight, %.1f ms\n",
++                             what, in_flight, ms);
++                std::fflush(stderr);
++            }
++            return true;
++        };
+         for (;;) {
+             line_drain_ms = 0.0;
++            nd_live = false;   // (STRATA_SR_NODRAIN: a request that ended early leaves the groups to the loop's pump)
+             // STRATA_SPEC_LANES: the gate broke (another slot decodes, a request that may not run in a lane, the last lane
+             // slot ended; KEEP=0: fewer lane slots than the start's): the lanes end before anything else runs
+             if (lanes_live && !lanes_want_keep() && !lane_drain()) return 1;
+@@ -13639,7 +14128,24 @@ int main(int argc, char** argv) {
+                 }
+                 // a request reads its prompt through every stage: the groups in flight finish first (STRATA_PIPE_OVERLAP,
+                 // STRATA_PIPE_BYIELD_NODRAIN: not for a BYIELD, which is dropped below)
+-                if (piped && line.rfind("BSTOP ", 0) != 0 &&
++                // STRATA_SR_NODRAIN (T0c): a text BGEN whose overlapped read could start beside the groups in flight
++                // leaves them running; the request drains them where it must (nd_fence)
++                std::string nd_why;
++                if (nd_on && line.rfind("BGEN ", 0) == 0 && pipe_inflight()) {
++                    nd_live = nd_line_ok(line, nd_why);
++                    if (nd_live) {
++                        ++nd_skips;
++                        if (trace) {
++                            std::fprintf(stderr, "strata trace: drain for BGEN skipped (STRATA_SR_NODRAIN): %d groups in "
++                                                 "flight\n", (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) {
++                                                     return G.inflight; }));
++                            std::fflush(stderr);
++                        }
++                    } else if (nd_refused_logged.insert(nd_why).second) {
++                        std::fprintf(stderr, "strata batch: STRATA_SR_NODRAIN: drained for a BGEN: %s\n", nd_why.c_str());
++                    }
++                }
++                if (piped && !nd_live && line.rfind("BSTOP ", 0) != 0 &&
+                     !((pipe_overlap_env() || pipe_byield_nodrain_env()) && line.rfind("BYIELD", 0) == 0)) {
+                     const int in_flight = trace ? (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) {
+                                                       return G.inflight; }) : 0;
+@@ -13671,6 +14177,9 @@ int main(int argc, char** argv) {
+                                  (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) { return G.inflight; }));
+                 continue;
+             }
++            // STRATA_SR_CKPT_LATE (T0b): every other line may read, park, copy or drop the checkpoints: the last turn
++            // checkpoint's host copy lands first
++            if (sr_late.want) sr_late_wait();
+             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
+                 park_async_drop();   // (STRATA_PARK_ASYNC: it may move the sessions' memory)
+                 if (slot_park_on)   // (STRATA_SLOT_PARK: the slots' captures, too, are done before)
+@@ -14114,6 +14623,7 @@ int main(int argc, char** argv) {
+                     continue;
+                 }
+             }
++            if ((geni || !mrope_identity) && !nd_fence("the M-RoPE table")) return 1;   // (STRATA_SR_NODRAIN)
+             if (geni || !mrope_identity) {
+                 // positions for every cell this request can reach; the identity again for a text request
+                 std::string ve;
+@@ -14250,6 +14760,7 @@ int main(int argc, char** argv) {
+                 return 1;
+             }
+             if (o.prefill_head_alias && native_head.loaded()) {
++                if (!nd_fence("--prefill-head-alias")) return 1;   // (STRATA_SR_NODRAIN)
+                 const auto head_t0 = Clock::now();
+                 native_head.unload();
+                 sp.reset();
+@@ -14261,6 +14772,7 @@ int main(int argc, char** argv) {
+                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
+             }
+             auto kv_quiesce = adapt_quiesce;
++            if (kvg.on && !nd_fence("the elastic K/V")) return 1;   // (STRATA_SR_NODRAIN)
+             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
+                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
+                 if (!kvg_ensure(n + 256, kv_quiesce)) {
+@@ -14273,6 +14785,7 @@ int main(int argc, char** argv) {
+             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
+             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
+             // conversation and every idle batch slot go, and this prompt is read from token 0 (resume == 0 below)
++            if (nan_flush && !nd_fence("a non-finite flush")) return 1;   // (STRATA_SR_NODRAIN)
+             if (nan_flush) {
+                 park_async_drop();   // (STRATA_PARK_ASYNC: nothing of it is kept, and it reads `checks`)
+                 nan_flush = false;
+@@ -14316,6 +14829,14 @@ int main(int argc, char** argv) {
+             }
+             // STRATA_SLOT_PARK: the last admission's chain to its slot, then the images of the slots a pad row has
+             // written since they ended into the cache (this request may continue one of them)
++            // (STRATA_SR_NODRAIN: an idle slot's image put into the cache drains first; the chain settled is host work)
++            if (nd_live && slot_park_on)
++                for (int b = 0; b < (int) bs.size() && nd_live; ++b) {
++                    const BSlot& sl = bs[(size_t) b];
++                    if (!sl.active && spark[(size_t) b] && spark[(size_t) b]->pending &&
++                        (!sl.cached || slot_park_test_restore_env()) && !nd_fence("a slot's image parked"))
++                        return 1;
++                }
+             if (slot_park_on) {
+                 slot_chain_settle();
+                 if (!slot_park_flush()) {
+@@ -14433,6 +14954,7 @@ int main(int argc, char** argv) {
+             if (tier && o.prompt_cache > 0) {
+                 const auto tm = tier->best(ids, req_imgs, want_cvec);
+                 if (tm.tokens > std::max({resume, slot_tokens, parked.tokens}) + tier_min_gain) {
++                    if (!nd_fence("a conversation from the tier")) return 1;   // (STRATA_SR_NODRAIN)
+                     std::string why;
+                     bool ok = tm.parts == stages.size() + 1;
+                     if (!ok) why = "stage count";
+@@ -14478,6 +15000,7 @@ int main(int argc, char** argv) {
+             }
+             if (!from_tier && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+             if (incoming) slot_source = -1;
++            if (incoming && !nd_fence("a parked conversation")) return 1;   // (STRATA_SR_NODRAIN)
+             // Reject the entire image before parking/overwriting the outgoing
+             // state. Invalid entries can safely fall back to its existing prefix.
+             if (incoming && incoming->stage_images.size() != stages.size()) {
+@@ -14518,6 +15041,8 @@ int main(int argc, char** argv) {
+             // conversation with its reply: nothing to park here
+             const int owner = main_slot >= 0 && bs[(size_t) main_slot].parks ? main_slot : -1;
+             main_slot = -1;
++            // (STRATA_SR_NODRAIN: a park drains first; dropping the asynchronous capture only waits for its threads)
++            if (!(park_due && owner >= 0) && (apark.pending || park_due) && !nd_fence("a park")) return 1;
+             if (park_due && owner >= 0) {
+                 park_async_drop();   // (none runs: slot_chain_start copies the chain instead)
+                 std::fprintf(stderr, "strata serve: conversation cache: %zu tokens not parked here: slot %d parks them "
+@@ -14531,6 +15056,7 @@ int main(int argc, char** argv) {
+                 std::printf("ERR %s\n", err.c_str());
+                 return 1;
+             }
++            if (slot_source >= 0 && !nd_fence("a copy from a slot")) return 1;   // (STRATA_SR_NODRAIN)
+             if (slot_source >= 0) {
+                 lent_slot = -1;   // (a longer start than the main session's)
+                 // STRATA_PARK_ASYNC: K/V pages retained from a restore describe the cells this copy overwrites with
+@@ -14749,6 +15275,9 @@ int main(int argc, char** argv) {
+                 }
+             }
+             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
++            // (STRATA_SR_NODRAIN: zeroing the main sessions runs on their own streams beside the groups; a restore, a
++            // checkpoint mount or the drafter's ring drain first)
++            if (resume != 0 && !nd_fence("a restore")) return 1;
+             if (resume == 0) {
+                 strata::core::session_zero(ss, g, nullptr, main_cs);
+                 cudaStreamSynchronize(main_stream);
+@@ -15190,53 +15719,6 @@ int main(int argc, char** argv) {
+             // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
+             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
+             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
+-            // STRATA_PIPE_OVERLAP=1: may this batched prompt segment [a0, b0) be read while the pipelined slot groups go on
+-            // decoding?  Checked live before each segment (with nothing in flight): only where the read and the windows
+-            // share nothing that one writes and the other reads, so the slots' tokens and the prompt's are the ones
+-            // they get with the slots drained.  False with `why` (the first condition that fails).
+-            // STRATA_PIPE_OVERLAP_KVS=1 with --kv-resident: the streamed part of the gate (overlap_kvs.hpp).  Every
+-            // main session's QSA states (what the read writes: VRAM pages, page map, indexer rows, host copy) against
+-            // the slot sessions' of the same stage (what the windows resolve, append and attend), and the main
+-            // drafter's ring against the slot drafters'.  Called only with the switch on (without it the gate refuses
+-            // --kv-resident as before); the prompt path's own part is Prefill::overlap_safe(why, true).
+-            auto overlap_kvs_check = [&](std::string& why) -> bool {
+-                using strata::program::KvSpan;
+-                using strata::program::kv_span;
+-                const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
+-                auto spans_of = [&](const strata::core::QsaState& st, bool sized, std::vector<KvSpan>& out) {
+-                    const uint64_t bb = sized ? strata::kernels::kv_block_bytes(qs, strata::core::qsa_kv_format(st)) : 0;
+-                    const void* pool = st.k_q != nullptr ? (const void*) st.k_q
+-                                     : st.k_q4 != nullptr ? (const void*) st.k_q4 : (const void*) st.k_pool;
+-                    const void* host = st.host.k_q != nullptr ? (const void*) st.host.k_q
+-                                     : st.host.k_q4 != nullptr ? (const void*) st.host.k_q4 : (const void*) st.host.k_pool;
+-                    out.push_back(kv_span(pool, (uint64_t) st.n_slots * bb));
+-                    out.push_back(kv_span(host, (uint64_t) st.n_pages * bb));
+-                    for (const void* p : {(const void*) st.page_table, (const void*) st.map.ctl, (const void*) st.map.slot_block,
+-                                          (const void*) st.idx_pooled, (const void*) st.idx_tail, (const void*) st.step})
+-                        out.push_back(kv_span(p, 0));
+-                };
+-                bool disjoint = true;
+-                for (int k = 0; k < n_pipe && disjoint && k < (int) bslot_ss.size(); ++k) {
+-                    const strata::core::SessionState& main_k = k == 0 ? ss : stages[(size_t) k - 1]->ss;
+-                    std::vector<KvSpan> a, b;
+-                    for (int64_t j = 0; j < main_k.qsa_alloc; ++j)
+-                        spans_of(main_k.qsa_states[main_k.qsa_ord0 + j], true, a);
+-                    for (const auto& u : bslot_ss[(size_t) k])
+-                        for (int64_t j = 0; j < u->qsa_alloc; ++j) spans_of(u->qsa_states[u->qsa_ord0 + j], true, b);
+-                    disjoint = strata::program::kv_spans_disjoint(a, b);
+-                }
+-                // (STRATA_SPEC_LANES: the lane drafters too - carved from the lane slots' sessions, and a batch window of
+-                // a lane slot writes its drafter's K/V beside the read: lane_catchup)
+-                if (disjoint && (!slot_mtp.empty() || !lane_mtp.empty())) {   // the drafter's own geometry: points only
+-                    std::vector<KvSpan> a, b;
+-                    spans_of(mtp.kv_state(), false, a);
+-                    for (const auto& d : slot_mtp) spans_of(d->kv_state(), false, b);
+-                    for (const auto& d : lane_mtp) spans_of(d->kv_state(), false, b);
+-                    disjoint = strata::program::kv_spans_disjoint(a, b);
+-                }
+-                return strata::program::overlap_kvs_allows(pipe_overlap_env(), pipe_overlap_kvs_env(), o.kv_resident > 0,
+-                                                           disjoint, why);
+-            };
+             // STRATA_PIPE_OVERLAP_KVS=1 with --kv-resident, once (the first read that is prepared to overlap): each
+             // stage card's free VRAM before and after overlap_prepare's captures, which stay allocated after the read
+             auto overlap_kvs_vram = [&](std::vector<size_t>& out) {
+@@ -15251,9 +15733,15 @@ int main(int argc, char** argv) {
+                 }
+                 (void) cudaSetDevice(cur);
+             };
++            // STRATA_PIPE_OVERLAP=1: may this batched prompt segment [a0, b0) be read while the pipelined slot groups go on
++            // decoding?  Checked live before each segment (with nothing in flight): only where the read and the windows
++            // share nothing that one writes and the other reads, so the slots' tokens and the prompt's are the ones
++            // they get with the slots drained.  False with `why` (the first condition that fails).
+             auto overlap_gate = [&](int64_t a0, int64_t b0, std::string& why) -> bool {
+                 if (admit_slot < 0) { why = "not a batch admission (a request beside the slots)"; return false; }
+-                if (pipe_inflight()) { why = "slot groups in flight"; return false; }
++                // (STRATA_SR_NODRAIN: the groups the BGEN line left in flight may run on beside the read - nd_live; the
++                // read then starts only with every layout its pump may launch captured: nd_layouts_ready)
++                if (pipe_inflight() && !nd_live) { why = "slot groups in flight"; return false; }
+                 // STRATA_SPEC_LANES: every line but BSTOP/BYIELD drains the lanes first, so they are never live here (and
+                 // lanes_may_begin waits while ov_active); said, should that ever change.  STRATA_SPEC_LANES_HOLD: a held
+                 // lane slot must not decode in batch windows beside this read (pump would run it), or the exactness
+@@ -15580,10 +16068,41 @@ int main(int argc, char** argv) {
+                         why = "more admissions queued than STRATA_PIPE_OVERLAP_MAX_QUEUE";
+                         std::fprintf(stderr, "strata batch: read of %lld tokens drained: %d admissions queued behind it\n",
+                                      (long long) (b0 - a0), queued);
++                    } else if (nd_live && overlap_gate(a0, b0, why) && nd_layouts_ready(why)) {
++                        // STRATA_SR_NODRAIN (T0c): the read starts beside the groups the BGEN line left in flight.  What
++                        // overlap_prepare would capture is captured already (nd_layouts_ready): the stages only refuse
++                        // captures from here on, as after it.  read_overlapped drains the groups at its end, as always.
++                        for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_no_capture(true);
++                        nd_live = false;
++                        ++nd_reads;
++                        if (trace) {
++                            std::fprintf(stderr, "strata trace: overlapped read beside %d groups in flight "
++                                                 "(STRATA_SR_NODRAIN; %lld so far, %lld lines skipped the drain, %lld "
++                                                 "deferred drains)\n",
++                                         (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) { return G.inflight; }),
++                                         (long long) nd_reads, (long long) nd_skips, (long long) nd_fences);
++                            std::fflush(stderr);
++                        }
++                        return read_overlapped(a0, b0, e);
++                    } else if (nd_live) {   // (refused: the deferred drain, then the gate as before)
++                        if (ov_refused_logged.insert("STRATA_SR_NODRAIN: " + why).second)
++                            std::fprintf(stderr, "strata batch: STRATA_SR_NODRAIN: the read drains first: %s\n", why.c_str());
++                        if (!nd_fence("an overlapped read that the gate refused beside the groups")) {
++                            ov_err_printed = true;
++                            batch_fatal = true;
++                            return false;
++                        }
++                        why.clear();
++                        if (overlap_gate(a0, b0, why) && overlap_prepare(why)) return read_overlapped(a0, b0, e);
+                     } else if (overlap_gate(a0, b0, why) && overlap_prepare(why)) return read_overlapped(a0, b0, e);
+                     if (ov_refused_logged.insert(why).second)
+                         std::fprintf(stderr, "strata batch: overlapped read off: %s\n", why.c_str());
+                 }
++                if (!nd_fence("a read beside nothing")) {   // (STRATA_SR_NODRAIN: a serial read drains first)
++                    ov_err_printed = true;
++                    batch_fatal = true;
++                    return false;
++                }
+                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
+                 // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
+                 static const int64_t yield_chunks = [] {
+@@ -15632,6 +16151,7 @@ int main(int argc, char** argv) {
+                             sl.partial = true;
+                             sl.partial_from0 = read_from == 0 || resumed_from0;
+                             sl.cvec = cvec_cached;
++                            if (sr_late.want) sr_late_wait();   // (STRATA_SR_CKPT_LATE: a turn checkpoint among them)
+                             for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
+                                 if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
+                                         [](int32_t x, int64_t y) { return (int64_t) x == y; }))
+@@ -15666,6 +16186,8 @@ int main(int argc, char** argv) {
+                 }
+                 return true;
+             };
++            if ((!pending.empty() || peer.valid() || !req_bias.empty()) && !nd_fence("expert swaps or a logit bias"))
++                return 1;   // (STRATA_SR_NODRAIN)
+             apply_pending(true);
+             if (!adapt_tick(true)) {   // --adapt-async: the round in flight lands before the prompt lends any slot
+                 std::printf("ERR an adaptive refill failed\n");
+@@ -15809,6 +16331,12 @@ int main(int argc, char** argv) {
+                 if (to <= at) continue;
+                 err.clear();
+                 const bool win = windows_ok(at, to);
++                // (STRATA_SR_NODRAIN: the windows, a loan, a re-read drain first; an overlapped read decides in read_part)
++                if (nd_live && (win || reread_to > 0 ||
++                                std::any_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& q) {
++                                    return q.first >= 0 || !q.lent.empty(); })) &&
++                    !nd_fence(win ? "a read through the windows" : "a read with lent slots"))
++                    return 1;
+                 if (win && !refill(err)) {
+                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                     return 1;
+@@ -15863,9 +16391,11 @@ int main(int argc, char** argv) {
+                     break;
+                 }
+                 at = to;
++                if (!nd_fence("a checkpoint")) return 1;   // (STRATA_SR_NODRAIN: never live here; a backstop)
++                // (STRATA_SR_CKPT_LATE: such a checkpoint's host copy runs while the request goes on - sr_late_wait)
+                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
+                     !checkpoint_at(to, nullptr, msg_cut.as_tail && to == message_at && to != turn_at && to != root_at &&
+-                                                    to != pin_at)) {   // the tail kind leaves first
++                                                    to != pin_at, sr_late.want)) {   // the tail kind leaves first
+                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                     return 1;
+                 }
+@@ -15875,6 +16405,7 @@ int main(int argc, char** argv) {
+                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
+                                  (long long) message_at, (long long) (turn_at - message_at));
+             }
++            if (!nd_fence("the first window")) return 1;   // (STRATA_SR_NODRAIN: never live here; a backstop)
+             if (!refill(err)) {
+                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                 return 1;
+@@ -17195,6 +17726,8 @@ int main(int argc, char** argv) {
+                         sl.checks.push_back(std::move(checks[best_at]));
+                         checks.erase(checks.begin() + (std::ptrdiff_t) best_at);
+                     } else if (best != nullptr && !sl.img) {
++                        // STRATA_SR_CKPT_LATE: a copy of the turn checkpoint waits for its bytes
++                        if (strata::program::short_reads::is_late(*best, sr_late.pending.load())) sr_late_wait();
+                         if (ckpt_pool.on()) {   // a copy into a dropped checkpoint's vectors (their pages are in)
+                             ConvCheckpoint c = ckpt_pool.take();
+                             c = *best;
+@@ -17219,6 +17752,16 @@ int main(int argc, char** argv) {
+                                      req_times.save_ms, req_times.evict_ms,
+                                      prompt_ms - req_times.read_ms - req_times.windows_ms - ck, decode_ms, span(tc0, tc1),
+                                      span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
++                        if (sr_late.want || sr_ckpt_warm_env() > 0 || nd_on) {   // (STRATA_SHORT_READS' counts so far)
++                            uint64_t tk = 0, ms_ = 0, mk = 0;
++                            ckpt_pool.warm_counts(tk, ms_, mk);
++                            std::fprintf(stderr, "strata trace: short reads: warm pool %llu takes, %llu found it empty, %llu "
++                                                 "made; late checkpoints %llu, %llu waited for (%.1f ms); BGEN drains "
++                                                 "skipped %lld, deferred %lld, reads beside groups %lld\n",
++                                         (unsigned long long) tk, (unsigned long long) ms_, (unsigned long long) mk,
++                                         (unsigned long long) sr_late.n, (unsigned long long) sr_late.waited,
++                                         sr_late.wait_ms, (long long) nd_skips, (long long) nd_fences, (long long) nd_reads);
++                        }
+                     }
+                 }
+                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+diff --git a/tests/program/short_reads_test.cpp b/tests/program/short_reads_test.cpp
+new file mode 100644
+index 00000000..7a661554
+--- /dev/null
++++ b/tests/program/short_reads_test.cpp
+@@ -0,0 +1,225 @@
++// Shorter prompt reads, phase 1 (include/strata/program/short_reads.hpp): the switches and their umbrella, the warm
++// pool's sizes, the late checkpoint's staging plan against conversation_checkpoint_save's layout (a host model of the
++// device copies: stage, then copy back, must give the bytes a direct save gives), the late checkpoint's identity across
++// moves, and the no-drain line check and its layouts.  Header-only, CPU: no model, no GPU.
++#include "strata/program/short_reads.hpp"
++
++#include <cstdio>
++#include <cstring>
++#include <utility>
++#include <vector>
++
++namespace sr = strata::program::short_reads;
++using strata::core::ConversationCheckpoint;
++
++namespace {
++int failures = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++// a session's running state on the "device": one buffer per source, filled with a pattern of its own
++struct FakePart {
++    sr::PartSizes z;
++    std::vector<uint8_t> gdn, ple;
++    std::vector<std::vector<uint8_t>> tail, dead, bp;
++    sr::PartSources src() const {
++        sr::PartSources s;
++        s.gdn = gdn.empty() ? nullptr : gdn.data();
++        s.ple = ple.empty() ? nullptr : ple.data();
++        for (size_t j = 0; j < z.layers; ++j) {
++            s.tail.push_back(tail[j].data());
++            s.dead.push_back(dead[j].data());
++            s.block_pos.push_back(bp[j].data());
++        }
++        return s;
++    }
++};
++FakePart fake(const sr::PartSizes& z, uint8_t seed) {
++    FakePart f;
++    f.z = z;
++    auto fill = [&](std::vector<uint8_t>& v, size_t n, uint8_t s) {
++        v.resize(n);
++        for (size_t i = 0; i < n; ++i) v[i] = (uint8_t) (s + i * 7);
++    };
++    fill(f.gdn, z.gdn, seed);
++    fill(f.ple, z.ple, (uint8_t) (seed + 1));
++    f.tail.resize(z.layers);
++    f.dead.resize(z.layers);
++    f.bp.resize(z.layers);
++    for (size_t j = 0; j < z.layers; ++j) {
++        fill(f.tail[j], z.tail, (uint8_t) (seed + 2 + j));
++        fill(f.dead[j], z.dead, (uint8_t) (seed + 40 + j));
++        fill(f.bp[j], z.block_pos, (uint8_t) (seed + 80 + j));
++    }
++    return f;
++}
++// what conversation_checkpoint_save writes (conversation_state.cpp): gdn, ple, then per layer its tail, dead, block_pos
++// at j * size in their vectors
++ConversationCheckpoint direct_save(const FakePart& f) {
++    ConversationCheckpoint c;
++    c.gdn = f.gdn;
++    c.ple = f.ple;
++    for (size_t j = 0; j < f.z.layers; ++j) {
++        c.tails.insert(c.tails.end(), f.tail[j].begin(), f.tail[j].end());
++        c.dead.insert(c.dead.end(), f.dead[j].begin(), f.dead[j].end());
++        c.block_pos.insert(c.block_pos.end(), f.bp[j].begin(), f.bp[j].end());
++    }
++    return c;
++}
++bool same_state(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
++    return a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails && a.dead == b.dead && a.block_pos == b.block_pos;
++}
++// the late path on the host: plan, "device" copies into the staging buffer, later the copies back into the vectors
++bool staged_save(ConversationCheckpoint& c, const FakePart& f, std::vector<uint8_t>& staging) {
++    sr::presize(c, f.z);
++    std::vector<sr::StageRegion> rg;
++    if (!sr::stage_plan(c, f.z, f.src(), rg)) return false;
++    staging.assign(f.z.bytes(), 0xEE);
++    for (const auto& r : rg) std::memcpy(staging.data() + r.off, r.dev, r.bytes);
++    for (const auto& r : rg) std::memcpy(r.host, staging.data() + r.off, r.bytes);
++    return true;
++}
++}  // namespace
++
++int main() {
++    // ---- the switches: off by default; the umbrella turns each on unless its own says otherwise
++    check(!sr::env_on(nullptr, nullptr), "neither set: off (the default path)");
++    check(!sr::env_on(nullptr, "0"), "umbrella 0: off");
++    check(sr::env_on(nullptr, "1"), "umbrella alone: on");
++    check(!sr::env_on("0", "1"), "own 0 beats the umbrella");
++    check(sr::env_on("1", nullptr), "own 1 alone: on");
++    check(!sr::env_on("", "1"), "own empty: off");
++    check(sr::warm_reserve(nullptr, nullptr) == 0, "T0a off by default");
++    check(sr::warm_reserve("1", nullptr) == 2, "STRATA_SR_CKPT_WARM=1 keeps 2");
++    check(sr::warm_reserve(nullptr, "1") == 2, "the umbrella keeps 2");
++    check(sr::warm_reserve("3", nullptr) == 3, "=3 keeps 3");
++    check(sr::warm_reserve("99", nullptr) == 8, "capped at 8");
++    check(sr::warm_reserve("0", "1") == 0, "=0 beats the umbrella");
++    check(sr::pool_cap(2, 0) == 2 && sr::pool_cap(2, 2) == 2 && sr::pool_cap(2, 4) == 4, "the keep limit rises to the reserve");
++    check(sr::warm_wants(0, 2) && sr::warm_wants(1, 2) && !sr::warm_wants(2, 2) && !sr::warm_wants(0, 0),
++          "the warm thread makes one while fewer than the reserve are kept, never when off");
++
++    // ---- T0a: a warm checkpoint has every part's vectors at the save's sizes (so a save resizes nothing)
++    sr::PartSizes a;
++    a.gdn = 4096; a.ple = 640; a.tail = 96; a.dead = 32; a.block_pos = 4; a.layers = 3;
++    sr::PartSizes b = a;
++    b.ple = 0;   // a later stage: no PLE history
++    b.layers = 2;
++    const ConversationCheckpoint w = sr::warm_checkpoint({a, b, b});
++    check(w.gdn.size() == a.gdn && w.ple.size() == a.ple && w.tails.size() == 3 * a.tail && w.dead.size() == 3 * a.dead &&
++              w.block_pos.size() == 3 * a.block_pos, "warm: the first part's sizes");
++    check(w.stage_parts.size() == 2 && w.stage_parts[1].gdn.size() == b.gdn && w.stage_parts[1].ple.empty() &&
++              w.stage_parts[1].tails.size() == 2 * b.tail, "warm: one part per later stage, at its sizes");
++    check(w.ids.empty() && w.imgs.empty() && !w.pinned && !w.slot_turn, "warm: no tokens, no marks");
++    check(a.bytes() == 4096 + 640 + 3 * (96 + 32 + 4), "PartSizes::bytes");
++
++    // ---- T0b: the staged copies give the bytes the direct save gives, for every part shape
++    for (const sr::PartSizes& z : {a, b}) {
++        const FakePart f = fake(z, (uint8_t) z.layers);
++        const ConversationCheckpoint want = direct_save(f);
++        ConversationCheckpoint fresh;   // a new checkpoint (its vectors resized by presize)
++        std::vector<uint8_t> staging;
++        check(staged_save(fresh, f, staging), "late: a fresh checkpoint plans");
++        check(same_state(fresh, want), "late: a fresh checkpoint holds the direct save's bytes");
++        ConversationCheckpoint pooled = sr::warm_checkpoint({z});   // a pooled one: other bytes in it before
++        std::memset(pooled.gdn.data(), 0x5A, pooled.gdn.size());
++        if (!pooled.tails.empty()) std::memset(pooled.tails.data(), 0xA5, pooled.tails.size());
++        check(staged_save(pooled, f, staging), "late: a pooled checkpoint plans");
++        check(same_state(pooled, want), "late: every byte of a pooled checkpoint is overwritten");
++        std::vector<sr::StageRegion> rg;
++        check(sr::stage_plan(pooled, z, f.src(), rg), "late: plan again");
++        size_t off = 0;
++        bool packed = true;
++        for (const auto& r : rg) {
++            packed = packed && r.off == off && r.bytes > 0;
++            off += r.bytes;
++        }
++        check(packed && off == z.bytes(), "late: the regions tile the staging buffer in order, no gap, no overlap");
++    }
++    {   // a plan is refused (the caller saves as before) when a vector has another size or a source is missing
++        const FakePart f = fake(a, 9);
++        ConversationCheckpoint c;
++        std::vector<sr::StageRegion> rg;
++        check(!sr::stage_plan(c, a, f.src(), rg), "late: unsized vectors are refused");
++        sr::presize(c, a);
++        sr::PartSources s = f.src();
++        s.gdn = nullptr;
++        check(!sr::stage_plan(c, a, s, rg), "late: a missing source is refused");
++        s = f.src();
++        s.tail.pop_back();
++        check(!sr::stage_plan(c, a, s, rg), "late: a missing layer is refused");
++    }
++
++    // ---- T0b: the late checkpoint is known by its first part's GDN storage across the moves the serve loop makes
++    {
++        std::vector<ConversationCheckpoint> checks;
++        checks.push_back(sr::warm_checkpoint({a}));
++        checks.push_back(sr::warm_checkpoint({a}));
++        const void* key = checks[1].gdn.data();
++        check(!sr::holds_late(checks, nullptr), "late: none pending finds nothing");
++        check(sr::holds_late(checks, key) && sr::is_late(checks[1], key) && !sr::is_late(checks[0], key),
++              "late: found in the chain");
++        for (int i = 0; i < 64; ++i) checks.push_back(sr::warm_checkpoint({b}));   // the vector grows (moves)
++        check(sr::holds_late(checks, key), "late: still found after the chain grew");
++        checks.erase(checks.begin());   // an eviction in front of it (moves)
++        check(sr::is_late(checks[0], key), "late: still found after an erase moved it");
++        std::vector<ConversationCheckpoint> slot;   // STRATA_SLOT_CKPT_MOVE: into the slot
++        slot.push_back(std::move(checks[0]));
++        checks.erase(checks.begin());
++        check(!sr::holds_late(checks, key) && sr::holds_late(slot, key), "late: moved into the slot, found there only");
++        ConversationCheckpoint copy = slot[0];   // a copy is another checkpoint (its own storage)
++        check(!sr::is_late(copy, key), "late: a copy is not the pending one");
++    }
++
++    // ---- T0c: the line check says why it drains, in order; all clear: no reason
++    {
++        sr::NoDrainLine l;
++        check(std::strcmp(sr::no_drain_refusal(l), "off") == 0, "nodrain: off by default");
++        l.switch_on = true;
++        check(sr::no_drain_refusal(l) != nullptr, "nodrain: needs the overlap");
++        l.overlap_on = true;
++        l.text_bgen = true;
++        l.in_flight = true;
++        l.dry_run_ok = true;
++        check(sr::no_drain_refusal(l) == nullptr, "nodrain: a text BGEN beside groups, dry run passed");
++        auto refused = [&](bool sr::NoDrainLine::*f, bool v) {
++            sr::NoDrainLine m = l;
++            m.*f = v;
++            return sr::no_drain_refusal(m) != nullptr;
++        };
++        check(refused(&sr::NoDrainLine::text_bgen, false), "nodrain: not for BGENI or another line");
++        check(refused(&sr::NoDrainLine::in_flight, false), "nodrain: nothing in flight, nothing to skip");
++        check(refused(&sr::NoDrainLine::lanes, true), "nodrain: not with the spec lanes");
++        check(refused(&sr::NoDrainLine::mrope_rebuild, true), "nodrain: not when the M-RoPE table is rebuilt");
++        check(refused(&sr::NoDrainLine::adapt_busy, true), "nodrain: not with an adaptive round in flight");
++        check(refused(&sr::NoDrainLine::nan_flush, true), "nodrain: not before a non-finite flush");
++        check(refused(&sr::NoDrainLine::dry_run_ok, false), "nodrain: not when the read would need a capture");
++    }
++    {   // the layouts the read's pump may launch: what overlap_prepare captures, plus each in-flight group's width
++        const int GS = 4;
++        const auto want = sr::needed_layouts(GS, {2, 0, 4, 1}, {3, 0, 0, 4});
++        auto has = [&](int base, int S) {
++            for (const auto& w : want)
++                if (w.first == base && w.second == S) return true;
++            return false;
++        };
++        check(has(0, 1) && has(0, 2) && has(0, 4) && has(0, 3), "group 0: widths 1..2 (own), full, its in-flight 3");
++        check(has(4, 4) && !has(4, 1), "group 1 (idle): the full width only");
++        check(has(8, 1) && has(8, 2) && has(8, 3) && has(8, 4), "group 2 (full): 1..3 and the full width");
++        check(has(12, 1) && has(12, 4) && !has(12, 2), "group 3: its own 1, full (also its in-flight width)");
++        size_t dups = 0;
++        for (size_t i = 0; i < want.size(); ++i)
++            for (size_t j = i + 1; j < want.size(); ++j) dups += want[i] == want[j] ? 1 : 0;
++        check(dups == 0, "no layout twice");
++        check(want.size() == 4 + 1 + 4 + 2, "the count: 4 + 1 + 4 + 2");
++        const auto same = sr::needed_layouts(GS, {2, 0, 4, 1}, {});
++        check(same.size() == 3 + 1 + 4 + 2, "nothing in flight: what overlap_prepare captures");
++    }
++
++    if (failures == 0) std::printf("short_reads_test: all passed\n");
++    return failures == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+
