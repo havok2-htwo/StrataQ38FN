@@ -1,0 +1,29 @@
+From 063af1fd7a5f508d1d666f93080547fd4d7d2443 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 16:47:38 +0200
+Subject: [PATCH] batch: background reads wait at most one pick per other read
+ (STRATA_READS: an 11K read starved 80 s at 4x)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 545ad340..d0e9a501 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14095,7 +14095,9 @@ int main(int argc, char** argv) {
+                 const ReadCtx& x = *bg_reads[i];
+                 view.push_back({(int) i, rp::chunks_left(x.parts, x.done.load(), x.chunk), x.since});
+             }
+-            const int pick = rs::next(view, bg_pick, 4 * (int64_t) bg_reads.size());
++            // a held read waits at most one pick per other read: with 4x (8 picks of ~330 ms between two of its
++            // chunks) an 11K first-turn read starved for 80 s behind a long one (results/reads2, uid 2)
++            const int pick = rs::next(view, bg_pick, (int64_t) bg_reads.size());
+             if (pick < 0) { bg_events(); return true; }
+             ReadCtx& r = *bg_reads[(size_t) pick];
+             const bool share = bg_reads.size() > 1;
+-- 
+2.43.0
+
