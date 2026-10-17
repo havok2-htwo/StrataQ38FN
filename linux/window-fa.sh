@@ -290,7 +290,7 @@ for A in F FE; do
     judge mix_ttft_$A mix_PROD_1,mix_${A}_1,mix_${A}_2,mix_PROD_2 "$PY" -I "$RT" --mode abttft --since-line "$SWEEP0" --tag fam \
         --arms-list SP-PROD,MX-$A --reps 2
 done
-for f in "$OUT"/engine-mix-MX-F*-r*.log; do [ -f "$f" ] && log "    [yields] ==> $(basename $f): $(grep -c 'BYIELD' "$f") BYIELD lines, $(grep -c 'YIELDNO' "$f") YIELDNO, $(grep -c '^ERR\| ERR ' "$f") ERR INFO"; done
+for f in "$OUT"/engine-mix-MX-F*-r*.log; do [ -f "$f" ] && log "    [yields] ==> $(basename $f): $(LC_ALL=C grep -ac 'gives way at' "$f") give-ways, $(grep -c 'YIELDNO' "$f") YIELDNO, $(grep -c '^ERR\| ERR ' "$f") ERR INFO"; done
 for f in "$OUT"/fa-mix-MX-FE*.txt "$L"/results/server-fa-mix-MX-FE*.out; do [ -f "$f" ] && log "    [admit] ==> $(basename $f): $(grep -c '\[strata\] admit: total' "$f") admit lines INFO"; done
 
 # ---- 2. the win with the merged server (vs #88's PROD / FAIR runs) -----------------------------------------------------
