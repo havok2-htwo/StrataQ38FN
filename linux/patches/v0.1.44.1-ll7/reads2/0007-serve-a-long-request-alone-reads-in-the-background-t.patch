@@ -1,0 +1,69 @@
+From c87b2d7b562f9e93ca258d7eab551dd5156b0b9a Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:54:05 +0200
+Subject: [PATCH 07/11] serve: a long request alone reads in the background too
+ (opt-in STRATA_SERVER_READS=1, STRATA_READS_SOLO=0 keeps the solo read)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py     |  7 +++++++
+ serve/test_reads.py | 16 ++++++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/serve/server.py b/serve/server.py
+index 92a985f2..2c8b9434 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -328,8 +328,12 @@ YIELD_RETRY_S = _timeout_env("STRATA_YIELD_RETRY_S", 2.0) or 0.0
+ # finishes on the engine's main sessions (the last part, the first token), as a read that gave way.  BRDONE <park>
+ # cancel|err: the background read was dropped (err: the request is read here instead).  Its admission slot is free
+ # meanwhile; only the park slot stays reserved.  Never for a request with pictures.
++# A long request alone on the engine goes the same way (STRATA_READS_SOLO, default 1 with STRATA_SERVER_READS; 0: it
++# reads on the solo path as before), so requests arriving during its read are served meanwhile; once it decodes alone
++# in its slot it goes back to the solo path as any slot does (_may_go_solo).
+ SERVER_READS = os.environ.get("STRATA_SERVER_READS", "") not in ("", "0")
+ READS_BG_MIN = max(1, _int_env("STRATA_READS_BG_MIN", 8192))
++READS_SOLO = os.environ.get("STRATA_READS_SOLO", "1") not in ("", "0")
+ STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+ STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+ 
+@@ -2034,6 +2038,9 @@ class StrataEngine:
+                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
+                 with self.slot_cv:
+                     alone = not any(self.slot_busy) and self.waiting == 0
++                    if (alone and left > 1 and READS_SOLO and not out and not embeddings and self._reads_row() and
++                            self._new_tokens(prompt) >= READS_BG_MIN and self._reads_park_pick(None) is not None):
++                        alone = False                       # STRATA_SERVER_READS: read in the background (a slot)
+                 if alone and left > 1:
+                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                     self._last_done = None                  # (#879: this request's DONE decides below)
+diff --git a/serve/test_reads.py b/serve/test_reads.py
+index 3a60f382..799f75ca 100644
+--- a/serve/test_reads.py
++++ b/serve/test_reads.py
+@@ -194,6 +194,22 @@ class ReadsService(ParallelService):
+         self.assertFalse(any(self.engine.slot_busy), self.engine.slot_busy)
+         self.assertEqual(self.engine.bg_parks, set())
+ 
++    def test_a_long_request_alone_reads_in_the_background_too(self):
++        self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
++        long_q, short_q = "long " * 600, "short"
++        res = self.race(long_q, short_q)
++        self.assertEqual(res[long_q][0], "ok, done.")
++        self.assertEqual(res[short_q][0], "ok, done.")
++        self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
++        log = self.log.read_text().splitlines()
++        self.assertTrue(log and log[0].startswith("BREAD "), log)            # not a solo GEN: an admission with bg=
++        with mock.patch.object(server, "READS_SOLO", False):
++            r = self.chat("long " * 601)
++        self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
++        self.assertTrue(self.log.read_text().splitlines()[-1].startswith("GEN None"), self.log.read_text())
++        time.sleep(0.3)
++        self.assertFalse(any(self.engine.slot_busy), self.engine.slot_busy)
++
+     def test_short_prompts_are_read_on_the_control_lines(self):
+         self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
+         bg = self._busy_slot()
+-- 
+2.43.0
+

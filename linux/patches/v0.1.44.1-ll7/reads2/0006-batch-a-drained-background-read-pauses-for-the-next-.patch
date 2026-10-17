@@ -1,0 +1,91 @@
+From 96216c627e2d56b9d18e7538292f1e9c0643d679 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:54:05 +0200
+Subject: [PATCH 06/11] batch: a drained background read pauses for the next
+ line itself, quantum only while others wait, default 32 chunks (opt-in
+ STRATA_READS=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 54dae680..28962f32 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -235,12 +235,13 @@ int reads_env() {
+     return n;
+ }
+ bool reads_on() { return reads_env() >= 1; }
+-// STRATA_READS_QUANTUM=q (default 8): a background read gives way to another held read after q chunks of a run (at a
+-// boundary that keeps its chunks); 0: a run reads its part to the end
++// STRATA_READS_QUANTUM=q (default 32): a background read gives way to another held read after q chunks of a turn (at a
++// boundary that keeps its chunks; each turn costs a drain of the groups and of the prompt path's stages); 0: a turn
++// reads its parts to the end
+ int64_t reads_quantum_env() {
+     static const int64_t q = [] {
+         const char* v = std::getenv("STRATA_READS_QUANTUM");
+-        return v != nullptr && *v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
++        return v != nullptr && *v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 32;
+     }();
+     return q;
+ }
+@@ -14025,7 +14026,8 @@ int main(int argc, char** argv) {
+         // the runs of one turn of read r: its parts from where it stands, each a run from where it stands in it; a run
+         // stops at a boundary stop_ok allows when `quiesce` is set (a line came), when its quantum is read and another
+         // read waits (`share`), or at STRATA_READS_TEST_PAUSE_EVERY; r.done is where every stage's state is after it
+-        auto bg_runs = [&](ReadCtx& r, std::atomic<bool>& quiesce, bool share, std::string& e) -> bool {
++        // `lines`: the run is on the main thread (drained), so it looks at the line queue itself
++        auto bg_runs = [&](ReadCtx& r, std::atomic<bool>& quiesce, bool share, bool lines, std::string& e) -> bool {
+             namespace rp = strata::program::read_plan;
+             const int64_t C = std::max<int64_t>(r.chunk, 1), quantum = reads_quantum_env(), test_k = reads_test_pause_env();
+             int64_t in_turn = 0;   // chunks read this turn
+@@ -14037,6 +14039,10 @@ int main(int argc, char** argv) {
+                 const int64_t base = in_turn;
+                 sp.should_yield = [&, pt, from, base](int64_t q) -> bool {
+                     const int64_t k = (q - from) / C;   // chunks of this run read
++                    if (lines && !quiesce.load()) {
++                        std::lock_guard<std::mutex> lk(in_mu);
++                        if (!in_lines.empty()) quiesce.store(true);
++                    }
+                     const bool want = quiesce.load() || (share && quantum > 0 && base + k >= quantum) ||
+                                       (test_k > 0 && k >= test_k);
+                     return want && rp::stop_ok(q, pt.a, pt.b, C);
+@@ -14114,11 +14120,13 @@ int main(int argc, char** argv) {
+             const auto t0 = Clock::now();
+             std::atomic<bool> quiesce{false}, abort_read{false};
+             bg_bind(&r, &abort_read);
+-            if (exclusive) {   // the groups drained: on this thread, a quantum (lines wait for it)
++            if (exclusive) {   // the groups drained: on this thread, until a line comes (or a quantum, for the groups or
++                               // another held read)
+                 std::string e;
+                 bool ok = false;
++                const bool groups_wait = batch_on();
+                 try {
+-                    ok = bg_runs(r, quiesce, true, e);
++                    ok = bg_runs(r, quiesce, share || groups_wait, true, e);
+                 } catch (const std::exception& x) {
+                     ok = false;
+                     e = std::string("the background read threw: ") + x.what();
+@@ -14126,7 +14134,7 @@ int main(int argc, char** argv) {
+                 }
+                 bg_bind(nullptr, nullptr);
+                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+-                bg_excl_next = Clock::now() + std::chrono::microseconds((int64_t) (500.0 * ms));   // the groups' share
++                if (groups_wait) bg_excl_next = Clock::now() + std::chrono::microseconds((int64_t) (500.0 * ms));   // their share
+                 if (!ok && !r.cancelled.load()) {
+                     if (cudaPeekAtLastError() != cudaSuccess || sp.chain_cuda_error() != 0) {   // #224
+                         std::fprintf(stderr, "strata batch: background read: a CUDA fault (%s)\n", e.c_str());
+@@ -14165,7 +14173,7 @@ int main(int argc, char** argv) {
+             std::thread w([&] {
+                 strata::aux_cpus::pin_current_thread();
+                 try {
+-                    wok = bg_runs(r, quiesce, share, we);
++                    wok = bg_runs(r, quiesce, share, false, we);
+                 } catch (const std::exception& x) {
+                     wok = false;
+                     we = std::string("the background read threw: ") + x.what();
+-- 
+2.43.0
+

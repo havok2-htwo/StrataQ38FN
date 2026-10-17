@@ -1,0 +1,34 @@
+From c0a460c4bc46ea5b65c0a9b40320122fff132ee4 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:50:44 +0200
+Subject: [PATCH 05/11] batch: a background read refused beside the groups
+ reads drained at once when nothing decodes (opt-in STRATA_READS=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index bc4a8169..54dae680 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14091,11 +14091,10 @@ int main(int argc, char** argv) {
+                     r.gate_t0 = now;
+                     std::fprintf(stderr, "strata batch: background read in slot %d waits: %s\n", r.park, why.c_str());
+                 }
+-                if (now - r.gate_t0 < std::chrono::milliseconds(reads_gate_wait_ms_env()) || now < bg_excl_next) {
+-                    // the groups go on meanwhile (or, with none decoding, a short wait)
+-                    if (batch_on() || pipe_inflight()) return pump(true);
+-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+-                    return true;
++                // (with nothing decoding there is nothing to wait for: the drained read costs the slots nothing)
++                const bool idle = !batch_on() && !pipe_inflight();
++                if (!idle && (now - r.gate_t0 < std::chrono::milliseconds(reads_gate_wait_ms_env()) || now < bg_excl_next)) {
++                    return pump(true);   // the groups go on meanwhile
+                 }
+                 exclusive = true;
+             } else {
+-- 
+2.43.0
+

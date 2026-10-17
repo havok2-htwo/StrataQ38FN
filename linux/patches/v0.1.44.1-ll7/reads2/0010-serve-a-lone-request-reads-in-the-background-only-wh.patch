@@ -1,0 +1,199 @@
+From d9e25df3e6195ef08e25d207fc915ddc3894e02a Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 14:47:01 +0200
+Subject: [PATCH 10/11] serve: a lone request reads in the background only when
+ asked and only when the main session does not hold it, a left read keeps its
+ park until the engine's word (opt-in STRATA_SERVER_READS=1,
+ STRATA_READS_SOLO=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py     | 63 ++++++++++++++++++++++++++++++++++-----------
+ serve/test_reads.py | 17 +++++++++++-
+ 2 files changed, 64 insertions(+), 16 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 2c8b9434..d0717db9 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -328,12 +328,14 @@ YIELD_RETRY_S = _timeout_env("STRATA_YIELD_RETRY_S", 2.0) or 0.0
+ # finishes on the engine's main sessions (the last part, the first token), as a read that gave way.  BRDONE <park>
+ # cancel|err: the background read was dropped (err: the request is read here instead).  Its admission slot is free
+ # meanwhile; only the park slot stays reserved.  Never for a request with pictures.
+-# A long request alone on the engine goes the same way (STRATA_READS_SOLO, default 1 with STRATA_SERVER_READS; 0: it
+-# reads on the solo path as before), so requests arriving during its read are served meanwhile; once it decodes alone
+-# in its slot it goes back to the solo path as any slot does (_may_go_solo).
++# A long request alone on the engine may go the same way (STRATA_READS_SOLO=1, opt-in; default 0: it reads on the solo
++# path as before), so requests arriving during its read are served meanwhile; once it decodes alone in its slot it goes
++# back to the solo path as any slot does (_may_go_solo).  Only with at least STRATA_READS_BG_MIN tokens the engine
++# would read: what a slot holds and the start of the last solo prompt (the main session's) are not counted.
+ SERVER_READS = os.environ.get("STRATA_SERVER_READS", "") not in ("", "0")
+ READS_BG_MIN = max(1, _int_env("STRATA_READS_BG_MIN", 8192))
+-READS_SOLO = os.environ.get("STRATA_READS_SOLO", "1") not in ("", "0")
++READS_SOLO = os.environ.get("STRATA_READS_SOLO", "0") not in ("", "0")
++READS_RELEASE_S = 600.0     # a left request's background read: its park slot is freed after this long without a BPP
+ STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+ STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+ 
+@@ -949,6 +951,11 @@ class StrataEngine:
+                     k, _, v = kv.partition("=")
+                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+             if line.startswith("READY"):
++                if (self.info or {}).get("force_bg") and not SERVER_READS:
++                    # STRATA_READS_FORCE_BG hands admissions to the background without bg=: only a server that
++                    # finishes them (STRATA_SERVER_READS=1) may drive it; any other would answer them empty
++                    print("[strata] the engine runs STRATA_READS_FORCE_BG (a test knob) but STRATA_SERVER_READS is "
++                          "off: its background reads would end their requests empty - unset one of them", flush=True)
+                 f = line.split()
+                 self.max_context = int(f[1])
+                 self.can_stop = "stop" in f[2:]
+@@ -1057,6 +1064,7 @@ class StrataEngine:
+         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
+         self._yielded = None                            # (slot, tokens read): the last request on them gave way
+         self._bread = None                              # (slot, park, tokens read): it went to the background (BREAD)
++        self._solo_ids: list[int] = []                  # STRATA_READS_SOLO: the last solo prompt (the main session's)
+         self.wlock = threading.Lock()                   # stdin writes from several request threads
+         self.pump = threading.Thread(target=self._pump, daemon=True)
+         self.pump.start()
+@@ -1735,6 +1743,22 @@ class StrataEngine:
+                 best = len(h)
+         return len(ids) - best
+ 
++    def _solo_new_tokens(self, ids: list[int]) -> int:
++        """STRATA_READS_SOLO (the caller holds slot_cv): _new_tokens, and less the start of the prompt the last solo
++        request read (the main session holds it, or its checkpoints do: a follow-up turn of a solo conversation reads
++        only its new part there).  An under-estimate keeps the request solo, as without the switch."""
++        v = self._new_tokens(ids)
++        h = self._solo_ids
++        n = min(len(h), len(ids) - 1)
++        if n <= 0:
++            return v
++        lo, B = 0, 4096
++        while lo + B <= n and ids[lo:lo + B] == h[lo:lo + B]:
++            lo += B
++        while lo < n and ids[lo] == h[lo]:
++            lo += 1
++        return min(v, len(ids) - lo)
++
+     def _yield_row(self) -> int:
+         """The engine's rule for a slot a read may give way into (INFO yield_row=k: b % k == k - 1); 0: no such engine."""
+         info = self.info or {}
+@@ -1786,9 +1810,11 @@ class StrataEngine:
+ 
+     def _bg_wait(self, park: int, cancel, live: dict):
+         """STRATA_SERVER_READS: waits for the background read in `park` (its lines come on the slot's queue), yielding
+-        None heartbeats; a cancel sends BSTOP <park> once.  Returns ("ready", h), ("cancel", why) or ("err", why)."""
+-        q = self.slot_q[park]
+-        stopped = False
++        None heartbeats; a cancel sends BSTOP <park> once.  Returns ("ready", h), ("cancel", why) or ("err", why).
++        The park leaves bg_parks when the engine said so (BREADY/BRDONE); a request that leaves before that (the
++        generator closed) keeps it there until _release_bg_when_done sees the engine's word."""
++        q, parks = self.slot_q[park], self.bg_parks
++        stopped = ended = False
+         beat = time.monotonic()
+         try:
+             while True:
+@@ -1814,28 +1840,32 @@ class StrataEngine:
+                     beat = time.monotonic()
+                     yield None
+                 elif line.startswith("BREADY "):
++                    ended = True
+                     return ("ready", int(f[2]) if len(f) >= 3 and f[2].isdigit() else 0)
+                 elif line.startswith("BRDONE "):
++                    ended = True
+                     return (f[2] if len(f) >= 3 else "err", " ".join(f[3:]))
+         finally:
+-            with self.slot_cv:
+-                self.bg_parks.discard(park)
+-                self.slot_cv.notify_all()
++            if ended:
++                with self.slot_cv:
++                    parks.discard(park)
++                    self.slot_cv.notify_all()
+ 
+     def _release_bg_when_done(self, park: int):
+         """STRATA_SERVER_READS: a request left while its read was in the background: BSTOP the read and free its park
+-        slot once the engine says BRDONE (or BREADY: it was done anyway), in the background."""
++        slot once the engine says BRDONE (or BREADY: it was done anyway), in the background.  The wait ends early only
++        when no progress line (BPP) came for READS_RELEASE_S; it acts on this engine's sets (a restart has its own)."""
+         if park >= len(self.slot_q):
+             return
+         try:
+             self._send(f"BSTOP {park}")
+         except EngineDied:
+             pass
+-        q, busy, releasing = self.slot_q[park], self.slot_busy, self.slot_releasing
++        q, busy, releasing, parks = self.slot_q[park], self.slot_busy, self.slot_releasing, self.bg_parks
+         releasing.add(park)
+ 
+         def wait():
+-            end = time.monotonic() + 600.0
++            end = time.monotonic() + READS_RELEASE_S
+             while time.monotonic() < end:
+                 try:
+                     line = q.get(timeout=5.0)
+@@ -1843,8 +1873,9 @@ class StrataEngine:
+                     continue
+                 if line is None or line.startswith(("BRDONE ", "BREADY ")):
+                     break
++                end = time.monotonic() + READS_RELEASE_S    # (BPP: it still reads; a paused read says nothing)
+             with self.slot_cv:
+-                self.bg_parks.discard(park)
++                parks.discard(park)
+                 busy[park] = False
+                 releasing.discard(park)
+                 self.slot_cv.notify_all()
+@@ -2039,12 +2070,14 @@ class StrataEngine:
+                 with self.slot_cv:
+                     alone = not any(self.slot_busy) and self.waiting == 0
+                     if (alone and left > 1 and READS_SOLO and not out and not embeddings and self._reads_row() and
+-                            self._new_tokens(prompt) >= READS_BG_MIN and self._reads_park_pick(None) is not None):
++                            self._solo_new_tokens(prompt) >= READS_BG_MIN and self._reads_park_pick(None) is not None):
+                         alone = False                       # STRATA_SERVER_READS: read in the background (a slot)
+                 if alone and left > 1:
+                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                     self._last_done = None                  # (#879: this request's DONE decides below)
+                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
++                    if SERVER_READS and READS_SOLO:
++                        self._solo_ids = [] if embeddings else list(prompt)
+                     phase = "solo"
+                     self._note_where("solo")
+                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+diff --git a/serve/test_reads.py b/serve/test_reads.py
+index 799f75ca..70637ee3 100644
+--- a/serve/test_reads.py
++++ b/serve/test_reads.py
+@@ -197,7 +197,8 @@ class ReadsService(ParallelService):
+     def test_a_long_request_alone_reads_in_the_background_too(self):
+         self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
+         long_q, short_q = "long " * 600, "short"
+-        res = self.race(long_q, short_q)
++        with mock.patch.object(server, "READS_SOLO", True):
++            res = self.race(long_q, short_q)
+         self.assertEqual(res[long_q][0], "ok, done.")
+         self.assertEqual(res[short_q][0], "ok, done.")
+         self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
+@@ -210,6 +211,20 @@ class ReadsService(ParallelService):
+         time.sleep(0.3)
+         self.assertFalse(any(self.engine.slot_busy), self.engine.slot_busy)
+ 
++    def test_a_solo_conversation_follow_up_stays_solo(self):
++        # the main session holds the last solo prompt: a follow-up turn reads only its new part, never a background
++        self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
++        with mock.patch.object(server, "READS_SOLO", True):
++            self.engine._solo_ids = []
++            with self.engine.slot_cv:
++                self.assertGreaterEqual(self.engine._solo_new_tokens([5] * 1000), 1000)
++            self.engine._solo_ids = [5] * 900 + [6]
++            with self.engine.slot_cv:
++                self.assertEqual(self.engine._solo_new_tokens([5] * 900 + [6] + [7] * 99), 99)
++                self.assertEqual(self.engine._solo_new_tokens([5] * 10 + [8] * 90), 90)
++                self.assertEqual(self.engine._solo_new_tokens([5] * 901), 1)
++        self.assertFalse(server.READS_SOLO)                                  # opt-in
++
+     def test_short_prompts_are_read_on_the_control_lines(self):
+         self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
+         bg = self._busy_slot()
+-- 
+2.43.0
+

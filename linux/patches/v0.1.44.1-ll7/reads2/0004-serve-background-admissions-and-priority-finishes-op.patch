@@ -1,0 +1,623 @@
+From 99602e75f0185fb5f06e95383c927d8ddef6b21a Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:47:26 +0200
+Subject: [PATCH 04/11] serve: background admissions and priority finishes
+ (opt-in STRATA_SERVER_READS=1)
+
+An admission with STRATA_READS_BG_MIN new tokens or more (default 8192) on an engine with INFO reads names a reserved
+top-row slot (bg=<park>); after BREAD the control lines and the admission slot go back, the request waits on the park
+slot's lines (BPP, BREADY, BRDONE), then takes the lines before every other waiting request and finishes with
+yslot=<park> (or in the park slot itself).  BRDONE err: read again on the lines without bg=; a client that leaves
+meanwhile BSTOPs the read and frees the park slot at its BRDONE.  serve/test_reads.py with a fake engine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py     | 214 ++++++++++++++++++++++++++++++++++-
+ serve/test_reads.py | 265 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 476 insertions(+), 3 deletions(-)
+ create mode 100644 serve/test_reads.py
+
+diff --git a/serve/server.py b/serve/server.py
+index 6b8c6aae..92a985f2 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -319,6 +319,17 @@ YIELD_SHORT = max(0, _int_env("STRATA_YIELD_SHORT", 0))
+ YIELD_MIN_LEFT = max(1, _int_env("STRATA_YIELD_MIN_LEFT", max(1024, 4 * YIELD_SHORT)))
+ YIELDS_MAX_ENV = max(0, _int_env("STRATA_YIELDS_MAX", 2))
+ YIELD_RETRY_S = _timeout_env("STRATA_YIELD_RETRY_S", 2.0) or 0.0
++# --batch, with an engine run with STRATA_READS=N (INFO reads=N reads_row=k): STRATA_SERVER_READS=1 (opt-in; unset: never)
++# lets an admission with at least STRATA_READS_BG_MIN new tokens (default 8192) read its batched parts in the background:
++# its BGEN names a free top-row slot (bg=<park>, reserved here: its own slot when that is one); the engine copies the part
++# read so far there and ends the request (BREAD <slot> <park> <q>, DONE cancel, BADM 0), reads the rest between its
++# lines while the slots decode and other admissions come and go (BPP <park> ... progress), then says BREADY <park> <h>.
++# The request then takes the control lines before every other waiting one and is sent again with yslot=<park>: it
++# finishes on the engine's main sessions (the last part, the first token), as a read that gave way.  BRDONE <park>
++# cancel|err: the background read was dropped (err: the request is read here instead).  Its admission slot is free
++# meanwhile; only the park slot stays reserved.  Never for a request with pictures.
++SERVER_READS = os.environ.get("STRATA_SERVER_READS", "") not in ("", "0")
++READS_BG_MIN = max(1, _int_env("STRATA_READS_BG_MIN", 8192))
+ STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+ STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+ 
+@@ -830,6 +841,7 @@ class StrataEngine:
+     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
+     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+     standing = 0                         # new requests standing back while an image request has the engine (/v1/load)
++    prio_waiting = 0                     # STRATA_SERVER_READS: finishes of background reads waiting for the lines
+ 
+     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
+     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
+@@ -1035,9 +1047,12 @@ class StrataEngine:
+             self.ctl_epoch = 0                          # how often the control lines were taken
+             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
+             self.image_line: list[object] = []          # image requests waiting for (or having) the engine alone
++            self.prio_waiting = 0                       # STRATA_SERVER_READS: finishes of background reads waiting
++        self.bg_parks: set[int] = set()                 # STRATA_SERVER_READS: park slots the engine reads into now
+         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
+         self._yielded = None                            # (slot, tokens read): the last request on them gave way
++        self._bread = None                              # (slot, park, tokens read): it went to the background (BREAD)
+         self.wlock = threading.Lock()                   # stdin writes from several request threads
+         self.pump = threading.Thread(target=self._pump, daemon=True)
+         self.pump.start()
+@@ -1059,7 +1074,7 @@ class StrataEngine:
+                 except OSError:
+                     pass
+                 break                           # publish EOF, never the trailing DONE
+-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
++            if line.startswith(("BT ", "BDONE ", "BPP ", "BREADY ", "BRDONE ")) and slot_q:   # a batch slot's own lines
+                 try:
+                     slot_q[int(line.split()[1])].put(line)
+                     continue
+@@ -1363,6 +1378,10 @@ class StrataEngine:
+                 f = line.split()
+                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
+                     self._yielded = (int(f[1]), int(f[2]))
++            elif line.startswith("BREAD "):              # STRATA_READS: handed to the background: <slot> <park> <q>
++                f = line.split()
++                if len(f) >= 4 and all(x.lstrip("-").isdigit() for x in f[1:4]):
++                    self._bread = (int(f[1]), int(f[2]), int(f[3]))
+             elif line.startswith("YIELDNO "):            # STRATA_READ_YIELD: a BYIELD the engine did not take
+                 f = line.split()                         # (<slot> later|final; an older engine: no reason = later)
+                 if len(f) >= 2 and f[1].lstrip("-").isdigit():
+@@ -1516,18 +1535,21 @@ class StrataEngine:
+     YIELDS_MAX = YIELDS_MAX_ENV if YIELD_SHORT > 0 else 2   # #656: how often a request's read gives way (STRATA_YIELDS_MAX)
+ 
+     def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False,
+-                      quiet: bool = False, ids: list[int] | None = None):
++                      quiet: bool = False, ids: list[int] | None = None, prio: bool = False):
+         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
+         `after_epoch`: a request whose read gave way lets the requests waiting then go first.  `new`: a request not
+         admitted yet - while an image request waits for the engine alone, or has it (image_line), it stands back and
+         is not counted as waiting meanwhile (a read that gave way to it would otherwise wait for it, holding the slot
+         the image request waits for).  `quiet`: the image request itself, never counted as waiting (a solo request is
+-        not moved into a slot for it, and no read gives way to it)."""
++        not moved into a slot for it, and no read gives way to it).  `prio` (STRATA_SERVER_READS): the finish of a
++        background read - every other request lets it have the lines first."""
+         entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
+         if YIELD_SHORT > 0 and ids is not None:
+             entry.append(ids)                           # e[3]: its tokens, for _new_tokens (STRATA_YIELD_SHORT)
+         counted = stood = False                         # stood: standing back for an image request (/v1/load counts it)
+         with self.slot_cv:
++            if prio:
++                self.prio_waiting += 1
+             if not quiet and not (new and self.image_line):
+                 self.waiting += 1
+                 self.wait_lens.append(entry)
+@@ -1567,7 +1589,16 @@ class StrataEngine:
+                         turn = False                    # STRATA_YIELD_SHORT: a paused read lets the whole burst go first
+                     if turn and counted and new and ADMIT_SHORT_FIRST > 0:
+                         turn = self._admit_next() is entry
++                    if prio:                            # STRATA_SERVER_READS: a finish goes first
++                        turn = counted or quiet
++                    elif turn and self.prio_waiting > 0:
++                        turn = False
+                 if turn and self.ctl.acquire(timeout=0.5):
++                    if not prio and self.prio_waiting > 0:   # STRATA_SERVER_READS: a finish came while it waited
++                        self.ctl.release()
++                        with self.slot_cv:
++                            self.slot_cv.notify_all()
++                        continue
+                     if counted and new and ADMIT_SHORT_FIRST > 0:
+                         with self.slot_cv:              # a shorter one came while this one waited in acquire()
+                             first = self._admit_next() is entry
+@@ -1597,6 +1628,9 @@ class StrataEngine:
+                         self.wait_lens.remove(entry)
+                 if stood:
+                     self.standing = max(0, self.standing - 1)
++                if prio:
++                    self.prio_waiting = max(0, self.prio_waiting - 1)
++                    self.slot_cv.notify_all()
+         with self.slot_cv:
+             self.ctl_epoch += 1
+             self.slot_cv.notify_all()
+@@ -1722,6 +1756,96 @@ class StrataEngine:
+             return None
+         return min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+ 
++    def _reads_row(self) -> int:
++        """STRATA_SERVER_READS: the engine's rule for a slot a background read may read into (INFO reads_row=k: b % k ==
++        k - 1); 0: no background reads (the switch off, or an engine without STRATA_READS)."""
++        info = self.info or {}
++        if not SERVER_READS or not self.batch or not info.get("reads"):
++            return 0
++        k = info.get("reads_row")
++        return k if isinstance(k, int) and k >= 1 else 1
++
++    def _reads_park_pick(self, own):
++        """STRATA_SERVER_READS (the caller holds slot_cv): the slot a background read reads into - the admission's own
++        when it is a top row, else a free top-row slot (empty first, then the one used longest ago).  None: none free,
++        or the engine holds as many background reads as it takes (INFO reads)."""
++        k = self._reads_row()
++        if k <= 0 or len(self.bg_parks) >= int((self.info or {}).get("reads") or 0):
++            return None
++        ok = lambda b: k <= 1 or b % k == k - 1
++        if own is not None and ok(own):
++            return own
++        free = [b for b in self.slot_order if not self.slot_busy[b] and ok(b) and b not in self.bg_parks]
++        if not free:
++            return None
++        return min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
++
++    def _bg_wait(self, park: int, cancel, live: dict):
++        """STRATA_SERVER_READS: waits for the background read in `park` (its lines come on the slot's queue), yielding
++        None heartbeats; a cancel sends BSTOP <park> once.  Returns ("ready", h), ("cancel", why) or ("err", why)."""
++        q = self.slot_q[park]
++        stopped = False
++        beat = time.monotonic()
++        try:
++            while True:
++                try:
++                    line = q.get(timeout=0.5)
++                except queue.Empty:
++                    if cancel.is_set() and not stopped:
++                        self._send(f"BSTOP {park}")
++                        stopped = True
++                    if time.monotonic() - beat >= 10.0:
++                        beat = time.monotonic()
++                        yield None
++                    continue
++                if line is None:
++                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
++                f = line.split()
++                if line.startswith("BPP "):
++                    if len(f) >= 3 and f[2].isdigit():
++                        live["read"] = int(f[2])
++                    if cancel.is_set() and not stopped:
++                        self._send(f"BSTOP {park}")
++                        stopped = True
++                    beat = time.monotonic()
++                    yield None
++                elif line.startswith("BREADY "):
++                    return ("ready", int(f[2]) if len(f) >= 3 and f[2].isdigit() else 0)
++                elif line.startswith("BRDONE "):
++                    return (f[2] if len(f) >= 3 else "err", " ".join(f[3:]))
++        finally:
++            with self.slot_cv:
++                self.bg_parks.discard(park)
++                self.slot_cv.notify_all()
++
++    def _release_bg_when_done(self, park: int):
++        """STRATA_SERVER_READS: a request left while its read was in the background: BSTOP the read and free its park
++        slot once the engine says BRDONE (or BREADY: it was done anyway), in the background."""
++        if park >= len(self.slot_q):
++            return
++        try:
++            self._send(f"BSTOP {park}")
++        except EngineDied:
++            pass
++        q, busy, releasing = self.slot_q[park], self.slot_busy, self.slot_releasing
++        releasing.add(park)
++
++        def wait():
++            end = time.monotonic() + 600.0
++            while time.monotonic() < end:
++                try:
++                    line = q.get(timeout=5.0)
++                except queue.Empty:
++                    continue
++                if line is None or line.startswith(("BRDONE ", "BREADY ")):
++                    break
++            with self.slot_cv:
++                self.bg_parks.discard(park)
++                busy[park] = False
++                releasing.discard(park)
++                self.slot_cv.notify_all()
++        threading.Thread(target=wait, daemon=True).start()
++
+     def _take_engine_alone(self, cancel, me, plen: int):
+         """The image request `me` (in image_line): waits for its turn among the image requests and for every slot to
+         be free, then takes the control lines, yielding None heartbeats.  True: it holds them and no slot is busy;
+@@ -1875,6 +1999,19 @@ class StrataEngine:
+         # STRATA_YIELD_SHORT: park - a slot reserved for this request's paused read (not the one it decodes in);
+         # yslot - the slot the next BGEN names as holding it; no_yield - the engine said YIELDNO final
+         park, yslot, no_yield = None, None, False
++        # STRATA_SERVER_READS: bg_park - the slot reserved for this request's background read (bg=); bg_off - not again
++        # (the engine dropped it: read here); bg_wait - the read is in the background now (a disconnect stops it there)
++        bg_park, bg_off, bg_wait = None, False, False
++
++        def free_bg_park():
++            nonlocal bg_park
++            if bg_park is not None and bg_park != slot:
++                with self.slot_cv:
++                    self.slot_busy[bg_park] = False
++                    self.slot_claims.discard(bg_park)
++                    self.slot_live[bg_park] = None
++                    self.slot_cv.notify_all()
++            bg_park = None
+ 
+         def free_park():
+             nonlocal park
+@@ -2038,6 +2175,16 @@ class StrataEngine:
+                         waiting = f" waiting={len(self.wait_lens)}"   # reads a long queue drained: faster per read)
+                     if yslot is not None and yslot != slot:   # STRATA_YIELD_SHORT: where its paused part waits
+                         waiting += f" yslot={yslot}"
++                    if (yslot is None and park is None and bg_park is None and not bg_off and not embeddings and
++                            self._reads_row()):
++                        with self.slot_cv:              # STRATA_SERVER_READS: may its batched parts go to the background
++                            if self._new_tokens(prompt) >= READS_BG_MIN:
++                                bg_park = self._reads_park_pick(slot)
++                                if bg_park is not None and bg_park != slot:
++                                    self.slot_busy[bg_park] = True
++                                    self.slot_claims.add(bg_park)
++                        if bg_park is not None:
++                            waiting += f" bg={bg_park}"
+                     head = (f"BGENI {slot} {left}{keys}{waiting} {embeddings}" if embeddings
+                             else f"BGEN {slot} {left}{keys}{waiting}")
+                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
+@@ -2049,6 +2196,7 @@ class StrataEngine:
+                     phase = "admit"
+                     self._note_where("slot", slot)
+                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
++                    self._bread = None
+                     self._ctl_erred = False
+                     asked = None      # the slot a BYIELD went out for
+                     asked_at = 0.0
+@@ -2116,6 +2264,59 @@ class StrataEngine:
+                         yield t
+                     if not cont and self._done_finish() == "nonfinite":   # #879
+                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
++                    bread, self._bread = self._bread, None
++                    if not cont and bread is not None and bg_park is not None and bread[1] == bg_park:
++                        # STRATA_SERVER_READS: the engine reads it in the background (BREAD): the lines and the admission
++                        # slot go back meanwhile, the park slot stays reserved; BREADY: on with the lines first
++                        if reused0 is None:
++                            reused0 = (self.last or {}).get("reused")
++                        with self.slot_cv:
++                            self.bg_parks.add(bg_park)
++                        self.ctl.release()
++                        holding = False
++                        if slot != bg_park:
++                            self.slot_live[slot] = None
++                            self.slot_used[slot] = time.time()
++                            with self.slot_cv:
++                                self.slot_busy[slot] = False
++                                self.slot_claims.discard(slot)
++                                self.slot_cv.notify_all()
++                        slot = None
++                        bg_live = {"slot": bg_park, "state": "background", "prompt_tokens": len(prompt), "generated": 0,
++                                   "started": time.time(), "first_token": None, "read": bread[2]}
++                        self.slot_live[bg_park] = bg_live
++                        self.slot_held[bg_park] = []
++                        phase, bg_wait = "bg", True
++                        how, why = yield from self._bg_wait(bg_park, cancel, bg_live)
++                        bg_wait = False
++                        phase = "none"
++                        if how == "ready" and not cancel.is_set():
++                            ok = yield from self._take_control(cancel, len(prompt), ids=prompt, prio=True)
++                            if not ok:
++                                return
++                            holding, born = True, self.gen
++                            with self.slot_cv:      # the slot it decodes in: the usual pick, else the park slot itself
++                                slot = self.pick_slot(prompt)
++                                if slot is not None:
++                                    self.slot_busy[slot] = True
++                                    self.slot_claims.add(slot)
++                                else:
++                                    slot = bg_park
++                            yslot = bg_park
++                            continue
++                        if how == "ready" or how == "cancel" or cancel.is_set():
++                            return
++                        print(f"[strata] parallel: the background read of a request was dropped ({why}); it is read "
++                              "again on the control lines", flush=True)
++                        free_bg_park()
++                        bg_off = True
++                        ok = yield from self._take_control(cancel, len(prompt), ids=prompt, prio=True)
++                        if not ok:
++                            return
++                        holding, born = True, self.gen   # (the slot loop below picks a slot with the lines held)
++                        continue
++                    if bg_park is not None:                 # (taken back, or not taken: the park slot goes back)
++                        free_bg_park()
+                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
+                         yslot = None
+                         free_park()
+@@ -2226,6 +2427,13 @@ class StrataEngine:
+                     self.slot_claims.discard(reserved)
+                     self.slot_cv.notify_all()
+             free_park()
++            if bg_wait and bg_park is not None:         # STRATA_SERVER_READS: left while its read was in the background
++                self.slot_live[bg_park] = None
++                self.slot_claims.discard(bg_park)
++                self._release_bg_when_done(bg_park)
++                bg_park = None
++            elif bg_park is not None:
++                free_bg_park()
+             if slot is not None:
+                 self.slot_live[slot] = None
+                 self.slot_used[slot] = time.time()
+diff --git a/serve/test_reads.py b/serve/test_reads.py
+new file mode 100644
+index 00000000..3a60f382
+--- /dev/null
++++ b/serve/test_reads.py
+@@ -0,0 +1,265 @@
++"""serve/test_reads.py - STRATA_SERVER_READS with an engine run with STRATA_READS=N (INFO reads=N reads_row=k): a long
++admission names a reserved top-row slot (bg=<park>), the engine reads its batched parts there in the background
++(BREAD / BPP / BREADY / BRDONE), the admission slot and the control lines go back meanwhile, and the request finishes
++with priority on the control lines (yslot=<park>).  Unset: never.  No GPU: the unit part has no process, the service
++part runs test_parallel's fake engine with background reads added.
++
++    python -m unittest serve.test_reads -v
++"""
++from __future__ import annotations
++
++import sys
++import threading
++import time
++import unittest
++from pathlib import Path
++from unittest import mock
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import serve.server as server  # noqa: E402
++from serve.test_parallel import FAKE_BATCH, ParallelService  # noqa: E402
++from serve.test_read_yield import engine  # noqa: E402
++
++
++class Rules(unittest.TestCase):
++    def test_off_without_the_switch_or_the_engine(self):
++        e = engine(16, {"reads": 2, "reads_row": 4}, gs=4)
++        with mock.patch.object(server, "SERVER_READS", False):
++            self.assertEqual(e._reads_row(), 0)
++        with mock.patch.object(server, "SERVER_READS", True):
++            self.assertEqual(e._reads_row(), 4)
++            e.info = {}
++            self.assertEqual(e._reads_row(), 0)                         # an engine without STRATA_READS
++
++    def test_the_park_slot(self):
++        e = engine(16, {"reads": 2, "reads_row": 4}, gs=4)
++        e.bg_parks = set()
++        with mock.patch.object(server, "SERVER_READS", True), e.slot_cv:
++            self.assertEqual(e._reads_park_pick(7), 7)                   # its own slot is a top row
++            self.assertIn(e._reads_park_pick(0), (3, 7, 11, 15))         # a lane slot: a free top row
++            e.slot_held[3] = [1]
++            e.slot_used = [float(b) for b in range(16)]
++            self.assertEqual(e._reads_park_pick(0), 7)
++            e.bg_parks = {7, 11}                                         # as many held as the engine takes
++            self.assertIsNone(e._reads_park_pick(0))
++            e.bg_parks = {7}
++            self.assertEqual(e._reads_park_pick(0), 11)                  # (3 holds something: 11 is empty)
++            for b in (3, 11, 15):
++                e.slot_busy[b] = True
++            self.assertIsNone(e._reads_park_pick(0))
++
++    def test_a_finish_goes_first_on_the_control_lines(self):
++        e = engine(4, {"reads": 1, "reads_row": 1})
++        e.ctl = threading.Lock()
++        e.waiting = 0
++        e.standing = 0
++        e.ctl_epoch = 0
++        e.image_line = []
++        e.alive = lambda: True
++        e.ctl.acquire()                                                  # someone has the lines
++        got = []
++        cancel = threading.Event()
++
++        def take(name, prio):
++            for _ in e._take_control(cancel, 10, ids=[1] * 10, prio=prio):
++                pass
++            got.append(name)
++            time.sleep(0.05)
++            e.ctl.release()
++        a = threading.Thread(target=take, args=("plain", False))
++        a.start()
++        time.sleep(0.2)
++        b = threading.Thread(target=take, args=("finish", True))
++        b.start()
++        time.sleep(0.2)
++        e.ctl.release()
++        a.join(10)
++        b.join(10)
++        self.assertEqual(got, ["finish", "plain"])
++        self.assertEqual(e.prio_waiting, 0)
++
++
++# the fake engine with STRATA_READS: INFO reads=N reads_row=K; a BGEN with bg=<P> is handed to the background (BREAD,
++# DONE cancel, BADM 0) and read between the lines a chunk per turn (BPP), then BREADY <P> <n - 1>; BSTOP <P> while it
++# reads: BRDONE <P> cancel; a BGEN for a slot a read reads into is refused (#1994's answer)
++FAKE_READS = FAKE_BATCH.replace(
++    'groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0',
++    'groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0\n'
++    'READS = int(args[args.index("--reads") + 1]) if "--reads" in args else 0\n'
++    'RROW = int(args[args.index("--reads-row") + 1]) if "--reads-row" in args else 1\n'
++    'ERRBG = "--bg-err" in args\n'
++    'bgr = {}   # park -> [ids, done, cancelled]').replace(
++    '(f" batch_groups={groups}" if groups > 1 else ""), flush=True)',
++    '(f" batch_groups={groups}" if groups > 1 else "") + (f" reads={READS} reads_row={RROW}" if READS else ""), flush=True)'
++).replace(
++    'log = open(args[args.index("--log") + 1], "a") if "--log" in args else None\n',
++    'log = open(args[args.index("--log") + 1], "a") if "--log" in args else None\n'
++    'def bg_step():      # one chunk of every background read (between the lines, as the engine)\n'
++    '    for P in list(bgr):\n'
++    '        ids, done, cancelled = bgr[P]\n'
++    '        if cancelled or (ERRBG and done > 4 * CH):\n'
++    '            print(f"BRDONE {P} " + ("cancel" if cancelled else "err a test failure"), flush=True)\n'
++    '            if log:\n'
++    '                log.write(f"BRDONE {P}\\n"); log.flush()\n'
++    '            del bgr[P]\n'
++    '            continue\n'
++    '        done = min(len(ids) - 1, done + CH)\n'
++    '        print(f"BPP {P} {done} {len(ids)} 1 1", flush=True)\n'
++    '        if done >= len(ids) - 1:\n'
++    '            print(f"BREADY {P} {done}", flush=True)\n'
++    '            if log:\n'
++    '                log.write(f"BREADY {P} {done}\\n"); log.flush()\n'
++    '            del bgr[P]\n'
++    '        else:\n'
++    '            bgr[P][1] = done\n'
++).replace(
++    'line = lines.get(timeout=STEP if active else None)',
++    'line = lines.get(timeout=STEP if active or bgr else None)'
++).replace(
++    '''        b = int(line.split()[1])
++        if b in active:''',
++    '''        b = int(line.split()[1])
++        if b in bgr:
++            bgr[b][2] = True
++        if b in active:'''
++).replace(
++    '''        if log:
++            log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\\n"); log.flush()''',
++    '''        if slot is not None and slot in bgr:
++            print(f"ERR BGEN: no such free slot (--batch {slots}) or a bad max_new", flush=True)
++            continue
++        bgk = [x for x in f if x.startswith("bg=")]
++        if READS and bgk and slot is not None and len(bgr) < READS:
++            P = int(bgk[0][3:])
++            bgr[P] = [ids, CH, False]
++            if log:
++                log.write(f"BREAD {slot} {P} {len(ids)}\\n"); log.flush()
++            print(f"BREAD {slot} {P} {CH}", flush=True)
++            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 0", flush=True)
++            print(f"BADM {slot} 0", flush=True)
++            continue
++        if log:
++            log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}" +
++                      "".join(" " + x for x in f if x.startswith(("yslot=", "bg="))) + "\\n"); log.flush()''')
++FAKE_READS = FAKE_READS[:FAKE_READS.rindex("    window()\n")] + "    bg_step()\n    window()\n"
++
++
++class ReadsService(ParallelService):
++    """The real StrataEngine and Service over HTTP with the fake engine's background reads."""
++
++    def start(self, slots, *a, **kw):
++        with mock.patch("serve.test_parallel.FAKE_BATCH", FAKE_READS):
++            super().start(slots, *a, **kw)
++
++    def setUp(self):
++        for needle in ("reads={READS}", "BREAD {slot}", "BREADY {P}", "bg_step()\n    window()", "if b in bgr:",
++                       "timeout=STEP if active or bgr"):
++            self.assertIn(needle, FAKE_READS)
++        patches = [mock.patch.object(server, "SERVER_READS", True), mock.patch.object(server, "READS_BG_MIN", 1000)]
++        for p in patches:
++            p.start()
++            self.addCleanup(p.stop)
++
++    def _busy_slot(self):
++        bg = threading.Thread(target=lambda: self.chat("LONGREPLY background", max_tokens=60))
++        bg.start()
++        time.sleep(0.1)
++        return bg
++
++    def test_a_long_admission_reads_in_the_background_and_a_short_one_goes_meanwhile(self):
++        self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
++        bg = self._busy_slot()
++        long_q, short_q = "long " * 600, "short"
++        res = self.race(long_q, short_q)
++        bg.join(30)
++        self.assertEqual(res[long_q][0], "ok, done.")
++        self.assertEqual(res[short_q][0], "ok, done.")
++        self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
++        log = self.log.read_text().splitlines()
++        breads = [x.split() for x in log if x.startswith("BREAD ")]
++        self.assertTrue(breads, log)
++        park = breads[0][2]
++        self.assertIn(park, ("3", "7"), log)                                 # a top row (k = 4)
++        self.assertTrue(any(x.startswith(f"BREADY {park} ") for x in log), log)
++        # the finish: the same prompt again, naming the park slot (or admitted into it), after BREADY
++        ready_at = next(i for i, x in enumerate(log) if x.startswith("BREADY "))
++        fin = [x.split() for x in log[ready_at:] if x.startswith("BGEN ") and int(x.split()[2]) > 2600]
++        self.assertTrue(fin and (fin[0][-1] == f"yslot={park}" or fin[0][1] == park), log)
++        self.assertFalse(any("bg=" in x for x in log[ready_at:] if x.startswith("BGEN ") and int(x.split()[2]) > 2600), log)
++        # the short request went while the long one was read in the background
++        bread_at = next(i for i, x in enumerate(log) if x.startswith("BREAD "))
++        short_at = [i for i, x in enumerate(log) if i > bread_at and x.startswith("BGEN ") and int(x.split()[2]) < 200]
++        self.assertTrue(short_at and bread_at < short_at[0] < ready_at, log)
++        time.sleep(0.3)
++        self.assertFalse(any(self.engine.slot_busy), self.engine.slot_busy)
++        self.assertEqual(self.engine.bg_parks, set())
++
++    def test_short_prompts_are_read_on_the_control_lines(self):
++        self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
++        bg = self._busy_slot()
++        r = self.chat("short one")
++        bg.join(30)
++        self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
++        self.assertFalse(any(x.startswith("BREAD ") for x in self.log.read_text().splitlines()))
++
++    def test_unset_never_sends_bg(self):
++        with mock.patch.object(server, "SERVER_READS", False):
++            self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
++            bg = self._busy_slot()
++            r = self.chat("long " * 600)
++            bg.join(30)
++        self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
++        log = self.log.read_text()
++        self.assertNotIn("BREAD", log)
++        self.assertNotIn("bg=", log)
++
++    def test_a_dropped_background_read_is_read_on_the_lines(self):
++        self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4", "--bg-err"])
++        bg = self._busy_slot()
++        r = self.chat("long " * 600)
++        bg.join(30)
++        self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
++        log = self.log.read_text().splitlines()
++        self.assertTrue(any(x.startswith("BRDONE ") for x in log), log)
++        after = log[next(i for i, x in enumerate(log) if x.startswith("BRDONE ")):]
++        again = [x for x in after if x.startswith("BGEN ") and int(x.split()[2]) > 2600]
++        self.assertTrue(again and "bg=" not in again[0] and "yslot=" not in again[0], log)
++        time.sleep(0.3)
++        self.assertFalse(any(self.engine.slot_busy), self.engine.slot_busy)
++
++    def test_a_client_that_leaves_during_the_background_read_stops_it(self):
++        import json
++        import socket
++        self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
++        bg = self._busy_slot()
++        host, port = self.httpd.server_address[:2]
++        body = json.dumps({"messages": [{"role": "user", "content": "long " * 700}], "max_tokens": 16,
++                           "stream": True, "reasoning_effort": "none"}).encode()
++        s = socket.create_connection((host, port), timeout=10)
++        s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
++                  b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
++        deadline = time.time() + 10
++        while time.time() < deadline and "BREAD" not in self.log.read_text():
++            time.sleep(0.02)
++        self.assertIn("BREAD", self.log.read_text())
++        s.close()                                                        # the client leaves
++        deadline = time.time() + 20
++        while time.time() < deadline and "BRDONE" not in self.log.read_text():
++            time.sleep(0.05)
++        bg.join(30)
++        self.assertIn("BRDONE", self.log.read_text())
++        deadline = time.time() + 5
++        while time.time() < deadline and any(self.engine.slot_busy):
++            time.sleep(0.05)
++        self.assertFalse(any(self.engine.slot_busy), self.engine.slot_busy)
++        r = self.chat("short after")                                     # nothing leaked: the engine still answers
++        self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
++
++
++for _name in dir(ParallelService):   # (its own tests run in test_parallel)
++    if _name.startswith("test_") and _name not in ReadsService.__dict__:
++        setattr(ReadsService, _name, None)
++del ParallelService
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

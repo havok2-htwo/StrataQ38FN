@@ -1,0 +1,973 @@
+From 1aafb60b79026c52434df8af3a9332951ba102a9 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:47:26 +0200
+Subject: [PATCH 03/11] batch: background prompt reads in a top-row slot beside
+ the groups, paused for every line, finished through the yield pin (opt-in
+ STRATA_READS=N)
+
+A BGEN with bg=<park> hands its batched parts (read_plan) to the background at the first batched part: [0, at) is
+copied into the park slot (park_yield), the request ends with BREAD <slot> <park> <at>, DONE cancel, BADM 0.  Between
+the lines the held reads run one at a time (read_sched order, STRATA_READS_QUANTUM chunks each while others wait) on a
+thread of their own with the prefill bound to the park slot's sessions, the groups pumped beside them (the overlap
+gate for that slot); any line but BSTOP/BYIELD pauses the run at a chunk boundary that keeps its chunks.  Their
+checkpoints (cuts and periodic) come from the stages' parts into the read's own list with the serial rules.  BPP
+<park> progress, BREADY <park> <h> once read: the server sends the request again with yslot=<park> and it finishes on
+the main sessions and the main verifier (stage 1's pin, cuts from resume0, windows parts, first token).  BSTOP <park>
+cancels (BRDONE <park> cancel); a read that cannot go on is dropped (BRDONE <park> err).  Refused beside the groups for
+STRATA_READS_GATE_WAIT_MS it reads a quantum with the groups drained.  Region 0 of the M-RoPE table is set back to the
+identity between lines when a picture request left it (slot regions only).  Test knobs STRATA_READS_FORCE_BG,
+STRATA_READS_TEST_PAUSE_EVERY.  Unset: bg= is ignored, nothing of it runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 787 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 781 insertions(+), 6 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 74ab7f41..bc4a8169 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -68,6 +68,8 @@
+ #endif
+ #include "strata/core/native_dense.hpp"
+ #include "strata/program/batch_read.hpp"
++#include "strata/program/read_plan.hpp"
++#include "strata/program/read_sched.hpp"
+ #include "strata/program/read_yield.hpp"
+ #include "strata/program/overlap_kvs.hpp"
+ #include "strata/program/logits_selection.hpp"
+@@ -223,6 +225,45 @@ int64_t read_yield_test_at_env() {
+     static const int64_t k = strata::program::read_yield::env_count(std::getenv("STRATA_READ_YIELD_TEST_AT"));
+     return k;
+ }
++// STRATA_READS=N (read once; off by default): background prompt reads (read_plan.hpp).  A batch admission the server
++// marks with bg=<park> hands its batched parts to the background: they are read straight into the park slot's sessions
++// between the engine's lines, beside the decoding groups, and the request is sent again (yslot=<park>) to finish on
++// the main sessions and the main verifier.  N: how many such reads the engine holds at once (read_sched::reads_limit).
++// Unset: nothing of it runs, bg= is ignored
++int reads_env() {
++    static const int n = (int) strata::program::read_yield::env_count(std::getenv("STRATA_READS"));
++    return n;
++}
++bool reads_on() { return reads_env() >= 1; }
++// STRATA_READS_QUANTUM=q (default 8): a background read gives way to another held read after q chunks of a run (at a
++// boundary that keeps its chunks); 0: a run reads its part to the end
++int64_t reads_quantum_env() {
++    static const int64_t q = [] {
++        const char* v = std::getenv("STRATA_READS_QUANTUM");
++        return v != nullptr && *v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
++    }();
++    return q;
++}
++// STRATA_READS_GATE_WAIT_MS=t (default 1000): held reads whose run beside the groups is refused that long (an expert
++// out of VRAM, a swap pending, a held lane slot, ...) read a quantum with the groups drained instead (never stuck)
++int64_t reads_gate_wait_ms_env() {
++    static const int64_t t = [] {
++        const char* v = std::getenv("STRATA_READS_GATE_WAIT_MS");
++        return v != nullptr && *v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 1000;
++    }();
++    return t;
++}
++// test knobs (with STRATA_READS): STRATA_READS_FORCE_BG=1 - every eligible admission into a top-row slot goes to the
++// background in its own slot, without bg= from the server; STRATA_READS_TEST_PAUSE_EVERY=k - a background run pauses
++// every k chunks as if a line had come (the pause and resume path without traffic)
++bool reads_force_bg_env() {
++    static const bool on = strata::program::read_yield::env_on(std::getenv("STRATA_READS_FORCE_BG"));
++    return on;
++}
++int64_t reads_test_pause_env() {
++    static const int64_t k = strata::program::read_yield::env_count(std::getenv("STRATA_READS_TEST_PAUSE_EVERY"));
++    return k;
++}
+ // STRATA_ADMIT_MERGE_FIRST=1 (read once; off by default): a batch admission reads the last prompt tokens of its last
+ // windowed part (up to a window's max_t, the last prompt token included) and its first token in ONE window instead of
+ // the part's last windows and a window of the last token alone.  A row computes what it computes in any window while
+@@ -11399,6 +11440,13 @@ int main(int argc, char** argv) {
+         if (read_yield_env() && o.batch > 0)
+             std::printf("INFO read_yield=1 yield_row=%d\n",
+                         strata::program::read_yield::yield_row(o.batch_groups > 1 && !stages.empty(), o.batch, o.batch_groups));
++        // STRATA_READS: how many background reads the engine holds at once, and the slots one may read into (b % k ==
++        // k - 1: the top row of a pipelined group, which no pad row writes)
++        if (reads_on() && o.batch > 0) {
++            const int rk = strata::program::read_yield::yield_row(o.batch_groups > 1 && !stages.empty(), o.batch, o.batch_groups);
++            std::printf("INFO reads=%d reads_row=%d\n",
++                        strata::program::read_sched::reads_limit(std::getenv("STRATA_READS"), o.batch, rk), rk);
++        }
+         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+         std::fflush(stdout);
+         std::string line;
+@@ -11567,6 +11615,11 @@ int main(int argc, char** argv) {
+             int64_t partial_next_check = -1, partial_resume0 = -1;
+             std::vector<int64_t> partial_part_next;
+             bool partial_tail_saved = false;
++            // STRATA_READS: a background read is reading into this slot (no source, no pad row, no admission meanwhile:
++            // `cached` and `partial` are false until it is done); then `bg_ready` - the read is the slot's partial part
++            // (as a yield's) and partial_tail_len the length of its tail checkpoint (-1: none)
++            bool reading = false, bg_ready = false;
++            int64_t partial_tail_len = -1;
+             // #879: it was running when non-finite logits dropped the cached state; its state may have started from
+             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
+             bool tainted = false;
+@@ -12158,6 +12211,44 @@ int main(int argc, char** argv) {
+         Clock::time_point ov_dec_t0 = Clock::now();
+         int64_t ov_dec_rows0 = 0;
+         bool ov_dec_valid = false;
++        // ---- STRATA_READS (read_plan.hpp): the background reads the engine holds.  A read is handed over inside its
++        // admission (bg_handoff: the part [0, at) copied into the park slot, BREAD), read between the lines beside the
++        // groups (bg_episode: one read's run at a time on a thread of its own, its chunks into the park slot's sessions,
++        // paused at a chunk boundary for every line but BSTOP/BYIELD), and said ready (BREADY <park> <h>) once its plan
++        // is read: the server sends the request again with yslot=<park>, and it finishes as a read that gave way does.
++        // Its state is its own (ReadCtx: the main sessions and the request's variables are the next request's); only
++        // the main thread touches `bs`, the reader's callbacks only their ReadCtx.
++        struct ReadCtx {
++            int slot = -1, park = -1;                    // the admission's slot (the server's), the slot it reads into
++            std::vector<int64_t> ids;                    // the prompt (read up to h; never resized after the hand-over)
++            std::vector<int32_t> ids32;
++            std::vector<strata::program::read_plan::Part> parts;
++            int64_t n = 0, at = 0, h = 0, chunk = 0;
++            std::atomic<int64_t> done{0};                // read up to here (a part boundary or a pause's boundary)
++            int64_t next_check = INT64_MAX, resume0 = -1;    // on_chunk's next periodic checkpoint; the cuts' origin
++            std::vector<int64_t> part_next;              // each stage's next periodic part
++            bool tail_saved = false, from0 = false, cvec = true;
++            std::mutex mu;                               // part_at: written by every stage's thread
++            std::map<int64_t, std::vector<ConvCheckpoint>> part_at;
++            std::vector<ConvCheckpoint> checks, evicted; // its own checkpoint list (read_plan::add), and what left it
++            uint64_t clock = 0;
++            int64_t tail_len = -1;
++            std::vector<strata::core::SessionState*> chain;   // the park slot's session on every stage
++            Clock::time_point t0;                        // the hand-over (BPP's ms and rate)
++            std::atomic<bool> cancelled{false};          // BSTOP for its park slot (its run's should_stop)
++            bool failed = false;
++            std::string err;
++            int64_t since = 0;                           // read_sched: the pick it was last served at
++            bool gate_failing = false;                   // its runs beside the groups are refused since gate_t0
++            Clock::time_point gate_t0, gate_checked;     // (a refused gate is looked at again after 20 ms)
++        };
++        std::vector<std::unique_ptr<ReadCtx>> bg_reads;   // (unique_ptr: the callbacks hold its address)
++        ReadCtx* bg_cur = nullptr;                         // the read whose run is in flight (set with no run in flight)
++        int64_t bg_pick = 0;                               // read_sched's pick counter
++        auto bg_of = [&](int park) -> ReadCtx* {
++            for (auto& r : bg_reads) if (r->park == park) return r.get();
++            return nullptr;
++        };
+         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
+         auto group_active = [&](int gi) {
+             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
+@@ -12182,6 +12273,7 @@ int main(int argc, char** argv) {
+                 for (int t = S0; t < S; ++t) {
+                     const int b = gi * GS + t;
+                     if (b != admit_slot && (bs[(size_t) b].cached || bs[(size_t) b].partial)) return true;
++                    if (bs[(size_t) b].reading) return true;   // STRATA_READS: a background read's slot, never padded
+                 }
+                 return false;
+             };
+@@ -12693,6 +12785,11 @@ int main(int argc, char** argv) {
+                         G.tok[t] = sl.active ? sl.x : 0;
+                         G.pos[t] = sl.active ? sl.p : 0;
+                         if (!sl.active) {
++                            if (sl.reading) {   // STRATA_READS: never (ov_layout and the top-row rule keep it out)
++                                std::printf("ERR internal: a pad row of group %d would write slot %d, which a background "
++                                            "read reads into (STRATA_READS)\n", pick, pick * GS + t);
++                                return false;
++                            }
+                             // STRATA_SLOT_PARK_VERIFY: a slot's capture is compared before the pad row writes the slot
+                             if (slot_park_on && !slot_park_verify(pick * GS + t)) {
+                                 std::printf("ERR %s\n", err.c_str());
+@@ -12876,7 +12973,8 @@ int main(int argc, char** argv) {
+         // what must hold before they start (else the pump goes on): no expert swap pending, no overlapped read, and every
+         // lane stage whose graphs are the zero-doorbell ones still all in VRAM (they are captured that way)
+         auto lanes_may_begin = [&]() -> bool {
+-            const char* why = !pending.empty() ? "expert swaps are pending" : ov_active ? "a prompt read overlaps" : nullptr;
++            const char* why = !pending.empty() ? "expert swaps are pending" : ov_active ? "a prompt read overlaps"
++                              : !bg_reads.empty() ? "background prompt reads are held (STRATA_READS)" : nullptr;
+             for (int j = 0; j < n_lanes && why == nullptr; ++j)
+                 for (int st = 0; st < n_stages && why == nullptr; ++st) {
+                     strata::core::Verifier& v = lane_ver(j, st);
+@@ -13229,7 +13327,11 @@ int main(int argc, char** argv) {
+             for (auto it = in_lines.begin(); it != in_lines.end();) {
+                 if (it->rfind("BSTOP ", 0) == 0) {
+                     const int b = std::atoi(it->c_str() + 6);
+-                    if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
++                    if (b >= 0 && b < (int) bs.size() && bs[(size_t) b].reading) {   // STRATA_READS: its run stops
++                        if (ReadCtx* r = bg_of(b)) r->cancelled.store(true);
++                    } else if (b >= 0 && b < (int) bs.size()) {
++                        bs[(size_t) b].stop = true;
++                    }
+                     it = in_lines.erase(it);
+                 } else if (it->rfind("BYIELD", 0) == 0) {
+                     if (read_yield_env()) yield_asked = std::atoi(it->c_str() + 6);   // (checked by the read: yield_arm)
+@@ -13636,17 +13738,552 @@ int main(int argc, char** argv) {
+             }
+             return true;
+         };
++        // ---- STRATA_READS: the background reads between the lines (ReadCtx above; bg_handoff in the request).  Only
++        // with reads held does any of this run: bg_reads is empty without STRATA_READS.
++        // a read leaves: the slot holds nothing of it (BRDONE <park> cancel|err <why>)
++        auto bg_drop = [&](ReadCtx& r, const char* kind, const std::string& why) {
++            BSlot& sl = bs[(size_t) r.park];
++            if (ckpt_pool.on()) {
++                for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
++                for (ConvCheckpoint& c : r.checks) ckpt_pool.give(std::move(c));
++                for (ConvCheckpoint& c : r.evicted) ckpt_pool.give(std::move(c));
++            }
++            sl.checks.clear();
++            sl.ids.clear();
++            sl.cached = sl.partial = sl.reading = sl.bg_ready = false;
++            std::fprintf(stderr, "strata batch: the background read of slot %d's request (in slot %d) ends at %lld of %lld "
++                                 "tokens: %s%s%s\n", r.slot, r.park, (long long) r.done.load(), (long long) r.h, kind,
++                         why.empty() ? "" : ": ", why.c_str());
++            std::string w = why;
++            std::replace(w.begin(), w.end(), '\n', ' ');
++            std::printf("BRDONE %d %s%s%s\n", r.park, kind, w.empty() ? "" : " ", w.c_str());
++            std::fflush(stdout);
++        };
++        // a read whose plan is read: the slot holds [0, h) as a read that gave way (the pin takes it: stage 1's resume)
++        auto bg_ready = [&](ReadCtx& r) {
++            BSlot& sl = bs[(size_t) r.park];
++            if (ckpt_pool.on())
++                for (ConvCheckpoint& c : r.evicted) ckpt_pool.give(std::move(c));
++            r.evicted.clear();
++            // the read's clock onto the main one, in its order (the cache's LRU then sees them as made now)
++            std::vector<ConvCheckpoint*> by_use;
++            for (ConvCheckpoint& c : r.checks) by_use.push_back(&c);
++            std::sort(by_use.begin(), by_use.end(), [](const ConvCheckpoint* a, const ConvCheckpoint* b) { return a->used < b->used; });
++            for (ConvCheckpoint* c : by_use) c->used = ++check_clock;
++            sl.ids.assign(r.ids32.begin(), r.ids32.begin() + r.h);
++            sl.cached = true;
++            sl.partial = true;
++            sl.partial_from0 = r.from0;
++            sl.cvec = r.cvec;
++            sl.checks = std::move(r.checks);
++            sl.partial_next_check = r.next_check;
++            sl.partial_resume0 = r.resume0;
++            sl.partial_part_next = r.part_next;
++            sl.partial_tail_saved = r.tail_saved;
++            sl.partial_tail_len = r.tail_len;
++            sl.reading = false;
++            sl.bg_ready = true;
++            sl.tainted = false;
++            if (const int j = lane_of(r.park); j >= 0) lane_dk[j] = -1;
++            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r.t0).count();
++            std::fprintf(stderr, "strata batch: the background read of slot %d's request is ready in slot %d: %lld tokens "
++                                 "read in %.0f ms since the hand-over (%.1f tok/s), %zu checkpoint(s)\n", r.slot, r.park,
++                         (long long) (r.h - r.at), ms, ms > 0 ? 1000.0 * (double) (r.h - r.at) / ms : 0.0, sl.checks.size());
++            std::printf("BREADY %d %lld\n", r.park, (long long) r.h);
++            std::fflush(stdout);
++        };
++        // after a run: the reads that are done, failed or cancelled leave the list
++        auto bg_events = [&]() {
++            for (size_t i = 0; i < bg_reads.size();) {
++                ReadCtx& r = *bg_reads[i];
++                if (r.cancelled.load()) bg_drop(r, "cancel", "");
++                else if (r.failed) bg_drop(r, "err", r.err);
++                else if (r.done.load() >= r.h) bg_ready(r);
++                else { ++i; continue; }
++                bg_reads.erase(bg_reads.begin() + (std::ptrdiff_t) i);
++            }
++        };
++        auto bg_drop_all = [&](const std::string& why) {
++            for (auto& r : bg_reads) bg_drop(*r, "err", why);
++            bg_reads.clear();
++        };
++        // region 0 of the M-RoPE table back to the identity (a picture's request left its positions there): what the next
++        // text request would do itself.  Only between the lines, with the groups drained, and only where no batch row reads
++        // region 0 (the slots' own regions: --vision with mrope_slot_n > 0)
++        auto bg_mrope_identity = [&]() -> bool {
++            if (mrope_identity) return true;
++            if (!o.vision || mrope_slot_n == 0 || d_mrope == nullptr || mrope_host.empty()) return false;
++            const int64_t cells = (int64_t) mrope_host.size() / 3;
++            for (int64_t c = 0; c < cells; ++c)
++                mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
++            cudaDeviceSynchronize();
++            bool ok = cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) ==
++                      cudaSuccess;
++            for (auto& st : stages) {
++                const strata::core::OnDevice on(st->dev);
++                cudaDeviceSynchronize();
++                ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
++                                      cudaMemcpyHostToDevice) == cudaSuccess;
++            }
++            if (!ok) return false;
++            mrope_identity = true;
++            return true;
++        };
++        // what the read itself needs (any way it is read): the chunk it was planned with on every stage (A2: a relayout
++        // or a loan changes it), region 0 the identity, its sessions as at the hand-over, no picture rows
++        auto bg_can_read = [&](ReadCtx& r, std::string& why) -> bool {
++            if (sp.chunk() != r.chunk) why = "the prompt path's chunk changed since the hand-over";
++            for (auto& st : stages)
++                if (why.empty() && st->sp.chunk() != r.chunk) why = "a stage's prompt chunk changed since the hand-over";
++            if (why.empty() && std::any_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& p) { return !p.lent.empty(); }))
++                why = "expert cache slots are lent to the prompt path";
++            if (why.empty() && !mrope_identity && !(pipe_drain() && bg_mrope_identity()))
++                why = "the M-RoPE table could not be set back to the identity";
++            return why.empty();
++        };
++        // STRATA_PIPE_OVERLAP_KVS with --kv-resident: the park slot's QSA states (what the read writes) against every other
++        // session of the same stage (the slots' the windows use, the main one) - overlap_kvs_check for a slot
++        auto bg_kvs_check = [&](int park, std::string& why) -> bool {
++            using strata::program::KvSpan;
++            using strata::program::kv_span;
++            const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
++            auto spans_of = [&](const strata::core::QsaState& st, std::vector<KvSpan>& out) {
++                const uint64_t bb = strata::kernels::kv_block_bytes(qs, strata::core::qsa_kv_format(st));
++                const void* pool = st.k_q != nullptr ? (const void*) st.k_q
++                                 : st.k_q4 != nullptr ? (const void*) st.k_q4 : (const void*) st.k_pool;
++                const void* host = st.host.k_q != nullptr ? (const void*) st.host.k_q
++                                 : st.host.k_q4 != nullptr ? (const void*) st.host.k_q4 : (const void*) st.host.k_pool;
++                out.push_back(kv_span(pool, (uint64_t) st.n_slots * bb));
++                out.push_back(kv_span(host, (uint64_t) st.n_pages * bb));
++                for (const void* p : {(const void*) st.page_table, (const void*) st.map.ctl, (const void*) st.map.slot_block,
++                                      (const void*) st.idx_pooled, (const void*) st.idx_tail, (const void*) st.step})
++                    out.push_back(kv_span(p, 0));
++            };
++            auto all_of = [&](const strata::core::SessionState& u, std::vector<KvSpan>& out) {
++                for (int64_t j = 0; j < u.qsa_alloc; ++j) spans_of(u.qsa_states[u.qsa_ord0 + j], out);
++            };
++            bool disjoint = true;
++            for (int k = 0; k < n_pipe && disjoint && k < (int) bslot_ss.size(); ++k) {
++                std::vector<KvSpan> a, b;
++                all_of(*bslot_ss[(size_t) k][(size_t) park], a);
++                all_of(k == 0 ? ss : stages[(size_t) k - 1]->ss, b);
++                for (size_t j = 0; j < bslot_ss[(size_t) k].size(); ++j)
++                    if ((int) j != park) all_of(*bslot_ss[(size_t) k][j], b);
++                disjoint = strata::program::kv_spans_disjoint(a, b);
++            }
++            return strata::program::overlap_kvs_allows(pipe_overlap_env(), pipe_overlap_kvs_env(), o.kv_resident > 0,
++                                                       disjoint, why);
++        };
++        // may the read run beside the groups (overlap_gate's request-independent part, for its park slot)
++        auto bg_gate = [&](ReadCtx& r, std::string& why) -> bool {
++            if (!piped || !pipe_overlap_env()) { why = "STRATA_PIPE_OVERLAP is off"; return false; }
++            if (lanes_live) { why = "the spec lanes are running (STRATA_SPEC_LANES)"; return false; }
++            if (lanes_hold_now()) { why = "a lane slot is held (STRATA_SPEC_LANES_HOLD)"; return false; }
++            for (const PfPart& p : pf_parts)
++                if (p.first >= 0 || !p.lent.empty()) { why = "the prompt path borrows expert cache slots"; return false; }
++            if (host_res.empty()) { why = "no expert residency table"; return false; }
++            if (const int64_t out = std::count_if(host_res.begin(), host_res.end(), [](int32_t x) { return x < 0; })) {
++                why = std::to_string(out) + " experts are out of VRAM";
++                return false;
++            }
++            if (!pending.empty()) { why = "adaptive swaps are in flight"; return false; }
++            for (int k = 0; k < n_pipe; ++k)
++                if (!stage_verifier(k).ar_live()) { why = "stage " + std::to_string(k + 1) + " runs the doorbell graph"; return false; }
++            if (o.kv_resident > 0 && !pipe_overlap_kvs_env()) { why = "K/V streaming (--kv-resident)"; return false; }
++            if (o.kv_resident > 0 && !bg_kvs_check(r.park, why)) return false;
++            if (peer.valid()) { why = "a --peer-device peer"; return false; }
++            if (remote_caches || remote_opt) { why = "remote expert caches"; return false; }
++            if (fs_swap) { why = "foresight swaps"; return false; }
++            if (strata::kernels::cvec().loaded()) { why = "a control vector"; return false; }
++            if (kvg.on) { why = "the elastic K/V"; return false; }
++            if (std::getenv("STRATA_IDX_FP16_CHECK") || std::getenv("STRATA_CVEC_FUSE_CHECK")) { why = "a prompt-path check"; return false; }
++            if (!ple_table.concurrent_capable()) { why = "the PLE table reads on the caller's thread"; return false; }
++            if (sp.device() != stage_verifier(0).device()) { why = "the prompt path's first stage is not on stage 1's card"; return false; }
++            return o.kv_resident > 0 ? sp.overlap_safe(why, true) : sp.overlap_safe(why);
++        };
++        // overlap_prepare's captures (the groups drained): every layout a group may run at beside the read
++        auto bg_prepare = [&](std::string& why) -> bool {
++            const auto t0 = Clock::now();
++            int captured = 0;
++            std::vector<int> ov_narrow(pg.size(), 0);
++            for (int gi = 0; gi < (int) pg.size(); ++gi)
++                for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) ov_narrow[(size_t) gi] = t + 1;
++            for (int k = 0; k < n_pipe; ++k) {
++                int c = 0;
++                if (!stage_verifier(k).ensure_batch_layouts(GS, (int) pg.size(), c, why, &ov_narrow)) {
++                    (void) cudaGetLastError();
++                    why = "stage " + std::to_string(k + 1) + ": " + why;
++                    return false;
++                }
++                captured += c;
++            }
++            for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_no_capture(true);
++            if (captured > 0)
++                std::fprintf(stderr, "strata batch: background read: captured %d group layout%s in %.1f ms\n", captured,
++                             captured == 1 ? "" : "s", std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
++            return true;
++        };
++        // the read's callbacks in place of the request's (the prompt path's on_chunk on the last stage, every stage's
++        // on_stage_chunk), and its sessions bound on every stage; undone after the run (null)
++        std::function<bool(const float*, int64_t, int64_t, std::string&)> bg_saved_chunk;
++        std::vector<std::function<bool(int64_t, std::string&)>> bg_saved_stage((size_t) n_pipe);
++        std::function<bool()> bg_saved_stop;
++        auto stage_sp = [&](int k) -> strata::prefill::Prefill& { return k == 0 ? sp : stages[(size_t) k - 1]->sp; };
++        auto bg_bind = [&](ReadCtx* r, std::atomic<bool>* abort_flag) {
++            namespace rp = strata::program::read_plan;
++            strata::prefill::Prefill& last = stage_sp(n_pipe - 1);
++            if (r == nullptr) {
++                for (int k = 0; k < n_pipe; ++k) {
++                    stage_sp(k).bind_session(nullptr);
++                    stage_sp(k).on_stage_chunk = std::move(bg_saved_stage[(size_t) k]);
++                }
++                last.on_chunk = std::move(bg_saved_chunk);
++                sp.should_stop = std::move(bg_saved_stop);
++                sp.should_yield = nullptr;
++                bg_cur = nullptr;
++                return;
++            }
++            bg_cur = r;
++            bg_saved_chunk = std::move(last.on_chunk);
++            bg_saved_stop = std::move(sp.should_stop);
++            sp.should_stop = [r, abort_flag] { return r->cancelled.load() || (abort_flag != nullptr && abort_flag->load()); };
++            sp.embd_rows = nullptr;   // (a picture request left its rows: the next request sets them again)
++            for (int k = 0; k < n_pipe; ++k) {
++                strata::prefill::Prefill& pk = stage_sp(k);
++                pk.bind_session(r->chain[(size_t) k]);
++                bg_saved_stage[(size_t) k] = std::move(pk.on_stage_chunk);
++                // each stage's part of a checkpoint the read takes at a cut or a periodic position (its stream is
++                // synchronized; the parts are put together on the last stage)
++                pk.on_stage_chunk = [&, r, k](int64_t done, std::string& e) -> bool {
++                    if (pipe_overlap_env()) ov_read_beat.fetch_add(1, std::memory_order_relaxed);
++                    if (o.prompt_cache <= 0) return true;
++                    bool cut = false;
++                    for (const rp::Part& p : r->parts) cut = cut || (p.ckpt && p.b == done);
++                    const bool periodic = o.prompt_cache_every > 0 && done >= r->part_next[(size_t) k];
++                    if (!cut && !periodic) return true;
++                    if (periodic) r->part_next[(size_t) k] = done + o.prompt_cache_every;
++                    ConvCheckpoint part;
++                    part.ids.assign(r->ids32.begin(), r->ids32.begin() + done);
++                    if (!checkpoint_save(part, *r->chain[(size_t) k], g)) { e = "saving a checkpoint part failed"; return false; }
++                    std::lock_guard<std::mutex> lk(r->mu);
++                    auto& v = r->part_at[done];
++                    v.resize((size_t) n_pipe);
++                    v[(size_t) k] = std::move(part);
++                    return true;
++                };
++            }
++            // the last stage: progress (BPP <park> ...), and the checkpoints into the read's own list (read_plan::add, the
++            // serial rules: the periodic one first, then the cut's).  No draft K/V (E-9): the main drafter is the next
++            // request's; drafts after the finish may be poorer, never the tokens
++            last.on_chunk = [&, r](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
++                (void) R_rows;
++                const int64_t done = p0 + T;
++                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r->t0).count();
++                std::printf("BPP %d %lld %lld %.0f %.1f\n", r->park, (long long) done, (long long) r->n, ms,
++                            ms > 0.0 ? 1000.0 * (double) (done - r->at) / ms : 0.0);
++                std::fflush(stdout);
++                strata::core::progress_at("reading a prompt in the background, done up to token", done);
++                strata::core::progress_beat();
++                if (o.prompt_cache <= 0) return true;
++                const rp::Part* cut = nullptr;
++                for (const rp::Part& p : r->parts) if (p.ckpt && p.b == done) cut = &p;
++                const bool periodic = o.prompt_cache_every > 0 && done >= r->next_check;
++                if (!periodic && cut == nullptr) return true;
++                std::vector<ConvCheckpoint> parts;
++                {
++                    std::lock_guard<std::mutex> lk(r->mu);
++                    auto it = r->part_at.find(done);
++                    if (it != r->part_at.end()) parts = std::move(it->second);
++                    r->part_at.erase(r->part_at.begin(), r->part_at.upper_bound(done));
++                }
++                bool complete = parts.size() == (size_t) n_pipe;
++                for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
++                auto assemble = [&]() {
++                    ConvCheckpoint c;
++                    c.ids.assign(r->ids32.begin(), r->ids32.begin() + done);
++                    c.gdn = std::move(parts[0].gdn);
++                    c.ple = std::move(parts[0].ple);
++                    c.tails = std::move(parts[0].tails);
++                    c.dead = std::move(parts[0].dead);
++                    c.block_pos = std::move(parts[0].block_pos);
++                    for (size_t i = 1; i < parts.size(); ++i) c.stage_parts.push_back(std::move(parts[i]));
++                    complete = false;
++                    return c;
++                };
++                if (periodic) {
++                    if (complete && !rp::bump(r->checks, done, false, r->tail_len, r->clock))
++                        rp::add(r->checks, assemble(), false, r->tail_len, r->clock, o.prompt_cache, r->evicted);
++                    r->next_check = done + o.prompt_cache_every;
++                }
++                if (cut != nullptr && !rp::bump(r->checks, done, cut->as_tail, r->tail_len, r->clock)) {
++                    if (!complete) { e = "a cut checkpoint's stage parts are missing"; return false; }
++                    rp::add(r->checks, assemble(), cut->as_tail, r->tail_len, r->clock, o.prompt_cache, r->evicted);
++                }
++                return true;
++            };
++        };
++        // the runs of one turn of read r: its parts from where it stands, each a run from where it stands in it; a run
++        // stops at a boundary stop_ok allows when `quiesce` is set (a line came), when its quantum is read and another
++        // read waits (`share`), or at STRATA_READS_TEST_PAUSE_EVERY; r.done is where every stage's state is after it
++        auto bg_runs = [&](ReadCtx& r, std::atomic<bool>& quiesce, bool share, std::string& e) -> bool {
++            namespace rp = strata::program::read_plan;
++            const int64_t C = std::max<int64_t>(r.chunk, 1), quantum = reads_quantum_env(), test_k = reads_test_pause_env();
++            int64_t in_turn = 0;   // chunks read this turn
++            for (const rp::Part& part : r.parts) {
++                const int64_t d = r.done.load();
++                if (part.b <= d) continue;
++                const int64_t from = std::max(part.a, d);
++                const rp::Part pt = part;
++                const int64_t base = in_turn;
++                sp.should_yield = [&, pt, from, base](int64_t q) -> bool {
++                    const int64_t k = (q - from) / C;   // chunks of this run read
++                    const bool want = quiesce.load() || (share && quantum > 0 && base + k >= quantum) ||
++                                      (test_k > 0 && k >= test_k);
++                    return want && rp::stop_ok(q, pt.a, pt.b, C);
++                };
++                const bool ok = sp.run(r.ids.data() + from, part.b - from, from, e);
++                sp.should_yield = nullptr;
++                if (!ok) return false;
++                const int64_t y = sp.yielded_at();
++                if (y >= 0) {   // paused: every stage holds [0, y)
++                    r.done.store(y);
++                    return true;
++                }
++                r.done.store(part.b);
++                in_turn += (part.b - from + C - 1) / C;
++                if (quiesce.load() || (share && quantum > 0 && in_turn >= quantum) || test_k > 0) return true;
++            }
++            return true;
++        };
++        // one turn of the held reads (the main loop, no line pending): the read whose turn it is (read_sched: the fewest
++        // chunks left first) runs beside the groups - pumped here - until a line comes, its quantum is read while another
++        // read waits, or it is done.  Refused beside the groups for STRATA_READS_GATE_WAIT_MS, it reads a quantum with the
++        // groups drained instead (B4: never stuck).  false: the engine ends (a window failed: pump said ERR; a stall)
++        Clock::time_point bg_excl_next = Clock::now();
++        auto bg_turn = [&]() -> bool {
++            namespace rp = strata::program::read_plan;
++            namespace rs = strata::program::read_sched;
++            bg_events();
++            if (bg_reads.empty()) return true;
++            std::vector<rs::Read> view;
++            for (size_t i = 0; i < bg_reads.size(); ++i) {
++                const ReadCtx& x = *bg_reads[i];
++                view.push_back({(int) i, rp::chunks_left(x.parts, x.done.load(), x.chunk), x.since});
++            }
++            const int pick = rs::next(view, bg_pick, 4 * (int64_t) bg_reads.size());
++            if (pick < 0) { bg_events(); return true; }
++            ReadCtx& r = *bg_reads[(size_t) pick];
++            const bool share = bg_reads.size() > 1;
++            std::string why;
++            if (!bg_can_read(r, why)) {
++                r.failed = true;
++                r.err = why;
++                bg_events();
++                return true;
++            }
++            bool exclusive = false;
++            const bool recheck = !r.gate_failing || Clock::now() - r.gate_checked >= std::chrono::milliseconds(20);
++            if (recheck) r.gate_checked = Clock::now();
++            if (!recheck || !bg_gate(r, why)) {
++                const auto now = Clock::now();
++                if (!r.gate_failing) {
++                    r.gate_failing = true;
++                    r.gate_t0 = now;
++                    std::fprintf(stderr, "strata batch: background read in slot %d waits: %s\n", r.park, why.c_str());
++                }
++                if (now - r.gate_t0 < std::chrono::milliseconds(reads_gate_wait_ms_env()) || now < bg_excl_next) {
++                    // the groups go on meanwhile (or, with none decoding, a short wait)
++                    if (batch_on() || pipe_inflight()) return pump(true);
++                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                    return true;
++                }
++                exclusive = true;
++            } else {
++                r.gate_failing = false;
++            }
++            const auto td = Clock::now();
++            if (!pipe_drain()) return false;   // (B2: the captures and the gate need the groups drained)
++            const double drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
++            if (!exclusive && !bg_prepare(why)) {
++                std::fprintf(stderr, "strata batch: background read in slot %d: not beside the groups (%s)\n", r.park,
++                             why.c_str());
++                exclusive = true;
++            }
++            r.since = bg_pick + 1;
++            ++bg_pick;
++            const int64_t d0 = r.done.load();
++            const auto t0 = Clock::now();
++            std::atomic<bool> quiesce{false}, abort_read{false};
++            bg_bind(&r, &abort_read);
++            if (exclusive) {   // the groups drained: on this thread, a quantum (lines wait for it)
++                std::string e;
++                bool ok = false;
++                try {
++                    ok = bg_runs(r, quiesce, true, e);
++                } catch (const std::exception& x) {
++                    ok = false;
++                    e = std::string("the background read threw: ") + x.what();
++                    sp.join_chain();
++                }
++                bg_bind(nullptr, nullptr);
++                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
++                bg_excl_next = Clock::now() + std::chrono::microseconds((int64_t) (500.0 * ms));   // the groups' share
++                if (!ok && !r.cancelled.load()) {
++                    if (cudaPeekAtLastError() != cudaSuccess || sp.chain_cuda_error() != 0) {   // #224
++                        std::fprintf(stderr, "strata batch: background read: a CUDA fault (%s)\n", e.c_str());
++                        std::fflush(stdout);
++                        std::fflush(stderr);
++                        std::_Exit(1);
++                    }
++                    r.failed = true;
++                    r.err = e;
++                }
++                std::fprintf(stderr, "strata batch: background read in slot %d: %lld tokens with the groups drained in %.0f "
++                                     "ms (drain %.1f ms)\n", r.park, (long long) (r.done.load() - d0), ms, drain_ms);
++                bg_events();
++                return true;
++            }
++            static const int sleep_us = [] {
++                const char* v = std::getenv("STRATA_PIPE_OVERLAP_SLEEP_US");
++                return v ? std::max(0, std::atoi(v)) : 20;
++            }();
++            static const int join_s = [] {
++                const char* v = std::getenv("STRATA_PIPE_OVERLAP_JOIN_S");
++                return v ? std::max(1, std::atoi(v)) : 30;
++            }();
++            static const int stall_s = [] {
++                const char* v = std::getenv("STRATA_WATCHDOG_S");
++                return v ? std::atoi(v) : 60;
++            }();
++            std::atomic<bool> done{false};
++            bool wok = false;
++            std::string we;
++            int wcuda = 0;
++            const int64_t rows0 = ov_rows;
++            ov_wait_seen.assign(pg.size(), 0);
++            ov_active = true;
++            ov_reading.store(true);
++            std::thread w([&] {
++                strata::aux_cpus::pin_current_thread();
++                try {
++                    wok = bg_runs(r, quiesce, share, we);
++                } catch (const std::exception& x) {
++                    wok = false;
++                    we = std::string("the background read threw: ") + x.what();
++                    sp.join_chain();
++                } catch (...) {
++                    wok = false;
++                    we = "the background read threw";
++                    sp.join_chain();
++                }
++                wcuda = (int) cudaPeekAtLastError();
++                done.store(true, std::memory_order_release);
++            });
++            bool pump_ok = true, stalled = false;
++            int64_t beat_seen = ov_read_beat.load(std::memory_order_relaxed);
++            auto beat_at = Clock::now();
++            try {
++                while (!done.load(std::memory_order_acquire)) {
++                    if (!pump(true)) { pump_ok = false; break; }
++                    scan_ctl_lines();   // (BSTOP of a slot or of this read, BYIELD dropped)
++                    if (!quiesce.load()) {   // any other line: the read pauses at its next boundary (B1: pumped meanwhile)
++                        std::lock_guard<std::mutex> lk(in_mu);
++                        if (!in_lines.empty()) quiesce.store(true);
++                    }
++                    const int64_t b = ov_read_beat.load(std::memory_order_relaxed);
++                    if (b != beat_seen) {
++                        beat_seen = b;
++                        beat_at = Clock::now();
++                    } else if (stall_s > 0 && Clock::now() - beat_at > std::chrono::seconds(stall_s)) {
++                        stalled = true;
++                        break;
++                    }
++                    if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
++                    else std::this_thread::yield();
++                }
++            } catch (const std::exception& x) {
++                std::fprintf(stderr, "strata batch: the slots' loop beside a background read threw: %s\n", x.what());
++                pump_ok = false;
++            }
++            if (stalled) {
++                strata::core::progress_allow(5 * n_pipe + join_s + 10);
++                std::fprintf(stderr, "strata serve: no chunk of the background read finished for %d s (issue #29) - "
++                                     "stopping the engine\n", stall_s);
++                stall_report(stderr, 0);
++                pump_ok = false;
++            }
++            auto release = [&] {   // the read stops at its next chunk, and no window waits on a flag nobody raises
++                strata::core::progress_allow(5 * n_pipe + join_s + 5);
++                abort_read.store(true);
++                for (int k = 0; k < n_pipe; ++k) (void) stage_verifier(k).release_gpu_waits(5000);
++            };
++            if (!pump_ok) release();
++            {
++                const auto tj = Clock::now();
++                while (!done.load(std::memory_order_acquire)) {
++                    if (Clock::now() - tj > std::chrono::seconds(join_s)) {
++                        std::fprintf(stderr, "strata batch: the background read did not end in %d s - stopping the engine\n",
++                                     join_s);
++                        std::fflush(stdout);
++                        std::fflush(stderr);
++                        std::_Exit(1);
++                    }
++                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                }
++                w.join();
++            }
++            const bool fault = !wok && (wcuda != 0 || sp.chain_cuda_error() != 0);
++            auto end_overlap = [&] {
++                for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_no_capture(false);
++                ov_active = false;
++                ov_reading.store(false);
++                bg_bind(nullptr, nullptr);
++            };
++            if (!pump_ok) {   // (pump said ERR, or the stall: the engine ends, as after an overlapped read's failure)
++                end_overlap();
++                if (!we.empty()) std::fprintf(stderr, "strata batch: background read: %s\n", we.c_str());
++                return false;
++            }
++            if (fault) {   // #224: the context is poisoned - no drain, the engine ends at once
++                release();
++                std::fprintf(stderr, "strata batch: background read: a CUDA fault (%s)\n", we.c_str());
++                std::fflush(stdout);
++                std::fflush(stderr);
++                std::_Exit(1);
++            }
++            const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
++            const auto tdr = Clock::now();
++            const bool drained = pipe_drain();
++            const double drain2_ms = std::chrono::duration<double, std::milli>(Clock::now() - tdr).count();
++            end_overlap();
++            if (!drained) return false;
++            if (!wok && !r.cancelled.load()) {
++                r.failed = true;
++                r.err = we;
++            }
++            std::fprintf(stderr, "strata batch: background read in slot %d: %lld tokens beside the groups in %.0f ms (drain "
++                                 "%.1f + %.1f ms), the slots decoded %lld rows meanwhile%s\n", r.park,
++                         (long long) (r.done.load() - d0), read_ms, drain_ms, drain2_ms, (long long) (ov_rows - rows0),
++                         quiesce.load() ? "; paused for a line" : "");
++            if (!batch_on() && bt_windows > 0) idle_report(false);
++            bg_events();
++            return true;
++        };
+         for (;;) {
+             line_drain_ms = 0.0;
+             // STRATA_SPEC_LANES: the gate broke (another slot decodes, a request that may not run in a lane, the last lane
+             // slot ended; KEEP=0: fewer lane slots than the start's): the lanes end before anything else runs
+             if (lanes_live && !lanes_want_keep() && !lane_drain()) return 1;
+-            if (batch_on() || (piped && pipe_inflight())) {
++            if (batch_on() || (piped && pipe_inflight()) || !bg_reads.empty()) {
+                 if (!try_next_line(line)) {
+                     if (lanes_live) {   // STRATA_SPEC_LANES: the lanes' turn instead of the pump's
+                         if (!lane_pump(true)) return 1;
+                         continue;
+                     }
++                    if (!bg_reads.empty()) {   // STRATA_READS: the held reads' turn (it pumps the groups itself)
++                        if (!bg_turn()) return 1;
++                        continue;
++                    }
+                     // (STRATA_SPEC_LANES_HOLD, before the start: with HOLD=k > 2 the lanes could start with two already)
+                     if (lanes_on && lanes_hold_now() && !(piped && pipe_inflight())) {
+                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+@@ -13699,6 +14336,11 @@ int main(int argc, char** argv) {
+             // request's prompt and first token as a GEN 1, then continues it in that slot
+             if (line.rfind("BSTOP ", 0) == 0) {
+                 const int b = std::atoi(line.c_str() + 6);
++                if (b >= 0 && b < (int) bs.size() && bs[(size_t) b].reading) {   // STRATA_READS: a background read ends
++                    if (ReadCtx* r = bg_of(b)) r->cancelled.store(true);
++                    bg_events();
++                    continue;
++                }
+                 if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                 continue;
+             }
+@@ -13715,6 +14357,7 @@ int main(int argc, char** argv) {
+                         if (sp && sp->pending) slot_threads.wait(*sp->item);
+                 std::string verr;
+                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
++                else if (!bg_reads.empty()) verr = "VRAM: not while background prompt reads are held (STRATA_READS)";
+                 else vram_command(line, verr);
+                 if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
+                 std::fflush(stdout);
+@@ -13733,7 +14376,8 @@ int main(int argc, char** argv) {
+                 const long b = std::strtol(line.c_str() + (bimg ? 6 : 5), &e1, 10);
+                 char* e2 = nullptr;
+                 const long long mn = std::strtoll(e1, &e2, 10);
+-                if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || mn < 1 || e2 == e1) {
++                if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || bs[(size_t) b].reading ||
++                    mn < 1 || e2 == e1) {
+                     std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", o.batch);
+                     std::fflush(stdout);
+                     continue;
+@@ -14060,6 +14704,9 @@ int main(int argc, char** argv) {
+             // yslot=B (STRATA_READ_YIELD, a server with STRATA_YIELD_SHORT): slot B holds this request's read that gave
+             // way (a slot the server reserved for the pause); absent = the admission's own slot, if it holds one
+             int req_yslot = -1;
++            // bg=B (STRATA_READS, a server with STRATA_SERVER_READS): the request's batched reading may go to the
++            // background into slot B, a free top-row slot the server reserved; absent (or without STRATA_READS) = read here
++            int req_bg = -1;
+             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
+                                      // embedding file path is the first token without an =
+                 for (;;) {
+@@ -14102,6 +14749,7 @@ int main(int argc, char** argv) {
+                     }
+                     else if (key == "waiting") req_waiting = std::atoi(tok.c_str() + eq + 1);
+                     else if (key == "yslot") req_yslot = std::atoi(tok.c_str() + eq + 1);
++                    else if (key == "bg") req_bg = std::atoi(tok.c_str() + eq + 1);
+                     // unknown keys are skipped: the ids start at the first token without '='
+                 }
+             }
+@@ -14317,6 +14965,7 @@ int main(int argc, char** argv) {
+             if (nan_flush) {
+                 park_async_drop();   // (STRATA_PARK_ASYNC: nothing of it is kept, and it reads `checks`)
+                 nan_flush = false;
++                bg_drop_all("non-finite logits (#879): what it started from may carry the poison");   // STRATA_READS
+                 const size_t n_checks = checks.size();
+                 live_ok = false;
+                 checks.clear();
+@@ -14443,7 +15092,7 @@ int main(int argc, char** argv) {
+             // from another source - a main-session checkpoint at exactly q, a sibling's longer checkpoint, the RAM cache
+             // or the SSD tier would read the rest without the read's checkpoint progress and cut origin
+             int yield_pin = -1;
+-            if (read_yield_env() && o.prompt_cache > 0 && req_imgs.empty()) {
++            if ((read_yield_env() || reads_on()) && o.prompt_cache > 0 && req_imgs.empty()) {
+                 yield_pin = strata::program::read_yield::pin_slot(bs, req_yslot, admit_slot, n, [&](const BSlot& sl) {
+                     return sl.cvec == want_cvec && !sl.tainted && starts_with(sl.ids, {});
+                 });
+@@ -14632,7 +15281,13 @@ int main(int argc, char** argv) {
+                         }
+                         bs[(size_t) slot_source].partial = false;
+                         const BSlot& ps = bs[(size_t) slot_source];
+-                        if (read_yield_env() && ps.partial_next_check >= 0 && (int64_t) ps.ids.size() == slot_tokens) {
++                        // STRATA_READS: a background read's checkpoints come with the length of their tail one
++                        if (reads_on() && ps.bg_ready) {
++                            tail_ckpt_len = ps.partial_tail_len;
++                            bs[(size_t) slot_source].bg_ready = false;
++                        }
++                        if ((read_yield_env() || reads_on()) && ps.partial_next_check >= 0 &&
++                            (int64_t) ps.ids.size() == slot_tokens) {
+                             ycarry.on = true;
+                             ycarry.next_check = ps.partial_next_check;
+                             ycarry.resume0 = ps.partial_resume0;
+@@ -16111,10 +16766,129 @@ int main(int argc, char** argv) {
+                 if (mt < 2) return -1;
+                 return std::max(a0, n - mt);
+             };
++            // STRATA_READS (bg=<park>, or STRATA_READS_FORCE_BG into a top-row admission slot): at the first batched
++            // part, before its loan, the read may go to the background (read_plan.hpp): the part read so far, [0, a0),
++            // into the park slot as a read that gave way (park_yield), the plan's batched parts to a ReadCtx, and this
++            // request ends (BREAD <slot> <park> <a0>, DONE cancel, BADM 0).  false (`why`): read here, as without it
++            bool bg_tried = false, bg_handed = false, bg_copy_failed = false;
++            int64_t bg_hand_at = -1;
++            const int bg_park = !reads_on() ? -1 : req_bg >= 0 ? req_bg
++                              : reads_force_bg_env() && admit_slot >= 0 &&
++                                        strata::program::read_yield::slot_pad_safe(admit_slot, yield_k) ? admit_slot : -1;
++            auto bg_handoff = [&](int64_t a0, std::string& why) -> bool {
++                namespace rp = strata::program::read_plan;
++                const int pk = bg_park;
++                const int limit = strata::program::read_sched::reads_limit(std::getenv("STRATA_READS"), o.batch, yield_k);
++                if (!piped || stages.empty()) why = "it needs pipelined groups on a layer split";
++                else if (!pipe_overlap_env()) why = "STRATA_PIPE_OVERLAP is off";
++                else if (admit_slot < 0) why = "not a batch admission";
++                else if (pk < 0 || pk >= (int) bs.size()) why = "no such slot";
++                else if (!strata::program::read_yield::slot_pad_safe(pk, yield_k)) why = "not the top row of its group";
++                else if (bs[(size_t) pk].active || bs[(size_t) pk].reading || (pk != admit_slot && bs[(size_t) pk].partial))
++                    why = "the slot is not free";
++                else if ((int) bg_reads.size() >= limit) why = "STRATA_READS: as many background reads held as allowed";
++                else if (o.prompt_cache <= 0) why = "no prompt cache";
++                else if (!req_imgs.empty() || sp.embd_rows != nullptr) why = "a picture in the prompt";
++                else if (reread_to > 0) why = "STRATA_CKPT_REREAD";
++                else if (req_pin > 0 || pin_at >= 0) why = "pin= (its checkpoint is pinned in the main list)";
++                else if (o.prefill_head_alias) why = "--prefill-head-alias (the prompt path is laid out per request)";
++                else if (o.vision && mrope_slot_n == 0) why = "--vision without the slots' M-RoPE regions";
++                else if (!mrope_identity) why = "the M-RoPE table holds a picture's positions";
++                else if (yield_lent()) why = "the prompt chunk follows a loan of cache slots";
++                else if (std::any_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& p) { return p.first >= 0; }))
++                    why = "the prompt path lends expert cache slots (its chunk changes per request)";
++                else if (bslot_ss.size() != stages.size() + 1) why = "no slot sessions on every stage";
++                if (why.empty())
++                    for (size_t k = 0; k < bslot_ss.size() && why.empty(); ++k) {
++                        const strata::core::SessionState& m_k = k == 0 ? ss : stages[k - 1]->ss;
++                        const strata::core::SessionState& s_k = *bslot_ss[k][(size_t) pk];
++                        if (s_k.max_cells != m_k.max_cells || (s_k.ple_hist == nullptr) != (m_k.ple_hist == nullptr) ||
++                            s_k.qsa_alloc != m_k.qsa_alloc || s_k.gdn_alloc != m_k.gdn_alloc ||
++                            s_k.qsa_ord0 != m_k.qsa_ord0 || s_k.gdn_ord0 != m_k.gdn_ord0)
++                            why = "the slot's sessions are not carved as the main ones";
++                        for (int64_t j = 0; j < m_k.qsa_alloc && why.empty(); ++j) {   // (the same K/V layout and mode)
++                            const strata::core::QsaState& a = m_k.qsa_states[m_k.qsa_ord0 + j];
++                            const strata::core::QsaState& b = s_k.qsa_states[s_k.qsa_ord0 + j];
++                            if (a.kv_mode != b.kv_mode || a.n_slots != b.n_slots || a.n_pages != b.n_pages ||
++                                a.kv_int8 != b.kv_int8 || a.kv_q4 != b.kv_q4 || a.kv_hybrid != b.kv_hybrid)
++                                why = "the slot's K/V is not laid out as the main session's";
++                        }
++                    }
++                if (!why.empty()) return false;
++                const rp::Cuts cut_set{turn_at, root_at, message_at, pin_at, msg_cut.as_tail};
++                const rp::Plan plan = rp::plan(a0, cuts, cut_set, windows_ok);
++                if (plan.parts.empty()) { why = "the part goes through the windows"; return false; }
++                const auto ty = Clock::now();
++                if (!park_yield(pk, a0, why)) {   // (the request reads on here; a CUDA fault: the caller)
++                    bg_copy_failed = true;
++                    return false;
++                }
++                yielded_at = -1;   // (not a yield: BREAD says it below)
++                yielded_slot = -1;
++                auto r = std::make_unique<ReadCtx>();
++                BSlot& sl = bs[(size_t) pk];
++                r->slot = admit_slot;
++                r->park = pk;
++                r->ids = ids;
++                r->ids32.assign(ids.begin(), ids.end());
++                r->parts = plan.parts;
++                r->n = n;
++                r->at = a0;
++                r->h = plan.h;
++                r->chunk = sp.chunk();
++                r->done.store(a0);
++                r->next_check = sl.partial_next_check;
++                r->resume0 = sl.partial_resume0;
++                r->part_next = sl.partial_part_next;
++                r->tail_saved = sl.partial_tail_saved;
++                r->from0 = sl.partial_from0;
++                r->cvec = sl.cvec;
++                // the read's own checkpoint list: what the slot took of this read (B5: none stays in the slot)
++                r->checks = std::move(sl.checks);
++                sl.checks.clear();
++                for (const ConvCheckpoint& c : r->checks) {
++                    r->clock = std::max(r->clock, c.used);
++                    if (tail_ckpt_len >= 0 && (int64_t) c.ids.size() == tail_ckpt_len) r->tail_len = tail_ckpt_len;
++                }
++                for (size_t k = 0; k < bslot_ss.size(); ++k) r->chain.push_back(bslot_ss[k][(size_t) pk].get());
++                r->t0 = Clock::now();
++                r->since = bg_pick;   // (read_sched: it joins now)
++                sl.cached = false;   // nothing reads from it, nothing pads it, nothing is admitted to it meanwhile
++                sl.partial = false;
++                sl.reading = true;
++                sl.bg_ready = false;
++                if (const int j = lane_of(pk); j >= 0) lane_dk[j] = -1;   // (the background builds no draft K/V)
++                std::fprintf(stderr, "strata batch: the prompt read goes to the background at %lld of %lld tokens: slot %d "
++                                     "reads %lld tokens in %zu part(s) up to %lld (copied in %.1f ms; STRATA_READS, %zu "
++                                     "held)\n", (long long) a0, (long long) n, pk, (long long) (plan.h - a0),
++                             plan.parts.size(), (long long) plan.h,
++                             std::chrono::duration<double, std::milli>(Clock::now() - ty).count(), bg_reads.size() + 1);
++                bg_reads.push_back(std::move(r));
++                bg_handed = true;
++                bg_hand_at = a0;
++                return true;
++            };
+             for (const int64_t to : cuts) {
+                 if (to <= at) continue;
+                 err.clear();
+                 const bool win = windows_ok(at, to);
++                if (!win && bg_park >= 0 && !bg_tried) {   // STRATA_READS: the first batched part
++                    bg_tried = true;
++                    std::string why;
++                    if (bg_handoff(at, why)) {
++                        cancelled = true;   // (DONE cancel and BADM 0 below; BREAD before them)
++                        break;
++                    }
++                    if (bg_copy_failed && cudaPeekAtLastError() != cudaSuccess) {   // the copy met a CUDA fault (#224)
++                        std::printf("ERR the copy of a background read into slot %d met a CUDA fault: %s\n", bg_park,
++                                    why.c_str());
++                        std::fflush(stdout);
++                        std::fflush(stderr);
++                        std::_Exit(1);
++                    }
++                    std::fprintf(stderr, "strata batch: bg=%d not taken, the prompt is read here: %s\n", bg_park,
++                                 why.c_str());
++                }
+                 if (win && !refill(err)) {
+                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                     return 1;
+@@ -17399,6 +18173,7 @@ int main(int argc, char** argv) {
+                 yield_asked = -1;
+             }
+             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
++            if (bg_handed) std::printf("BREAD %d %d %lld\n", admit_slot, bg_park, (long long) bg_hand_at);   // STRATA_READS
+             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
+                         (long long) produced_n,
+                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
+-- 
+2.43.0
+

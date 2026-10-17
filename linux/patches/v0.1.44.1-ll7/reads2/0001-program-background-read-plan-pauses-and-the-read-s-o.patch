@@ -1,0 +1,497 @@
+From 4922a95f27e74197560fd46efed2ee22805f2b5f Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:22:11 +0200
+Subject: [PATCH 01/11] program: background read plan, pauses and the read's
+ own checkpoint list, host-tested (opt-in STRATA_READS=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                       |   4 +
+ include/strata/program/read_plan.hpp | 151 ++++++++++++++
+ tests/program/read_plan_test.cpp     | 301 +++++++++++++++++++++++++++
+ 3 files changed, 456 insertions(+)
+ create mode 100644 include/strata/program/read_plan.hpp
+ create mode 100644 tests/program/read_plan_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c9bc51b2..544962bd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -289,6 +289,10 @@ if(STRATA_BUILD_TESTS)
+   add_executable(read_sched_test tests/program/read_sched_test.cpp)
+   target_include_directories(read_sched_test PRIVATE include)
+   add_test(NAME read_sched_test COMMAND read_sched_test)
++  # STRATA_READS: what a read hands to the background, its pauses, and its own checkpoint list (header-only, CPU)
++  add_executable(read_plan_test tests/program/read_plan_test.cpp)
++  target_include_directories(read_plan_test PRIVATE include)
++  add_test(NAME read_plan_test COMMAND read_plan_test)
+   # STRATA_PIPE_OVERLAP_KVS: the overlap gate's K/V streaming part (env, buffer disjointness; synthetic)
+   add_executable(overlap_kvs_test tests/program/overlap_kvs_test.cpp)
+   target_include_directories(overlap_kvs_test PRIVATE include)
+diff --git a/include/strata/program/read_plan.hpp b/include/strata/program/read_plan.hpp
+new file mode 100644
+index 00000000..baff19bb
+--- /dev/null
++++ b/include/strata/program/read_plan.hpp
+@@ -0,0 +1,151 @@
++// include/strata/program/read_plan.hpp - STRATA_READS (stage 2 of DESIGN-fair-reads.md): what a prompt read handed to
++// the background reads, where it stops, and how it keeps its checkpoints (header-only: it is arithmetic).
++//
++// A batch admission whose prompt has a long batched part may hand the rest of its batched reading to the background
++// (`bg=<park>` on its BGEN): the part read so far, [0, at), is copied into a free top-row slot `park` (no pad row
++// writes it), the request ends (BREAD), and the engine reads the plan's parts straight into the park slot's sessions
++// between its lines, beside the decoding groups, one part after the other - each part one prompt run from its own
++// start, as the serial cut loop reads it, so each part's chunks are the serial ones.  A run may stop at a chunk
++// boundary that keeps the rest's chunks (read_yield::pos_ok with no short-read limit: the rest of a background part
++// is always read batched) and goes on from there later.  Once the plan is read up to h, the server sends the request
++// again with yslot=<park>: it goes on from the slot as a read that gave way does (stage 1's pin), and reads the rest -
++// the windows parts, the first token - on the main sessions and the main verifier, exactly as serially.
++// tests/program/read_plan_test.cpp checks the plan, the stops and the checkpoint bookkeeping against host models of
++// generate.cpp's serial loop.
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include "strata/program/conv_cache.hpp"
++#include "strata/program/read_yield.hpp"
++
++namespace strata::program::read_plan {
++
++/// STRATA_READS=N: the engine side's switch (N >= 1; how many reads it holds at once is read_sched::reads_limit).
++inline bool reads_on(const char* v) { return read_yield::env_count(v) >= 1; }
++
++/// One part of the serial cut loop: [a, b), read batched, and whether the loop checkpoints at b (a turn, root,
++/// message or pin cut) and as the tail kind (the message cut of STRATA_MSG_CKPT_TAIL).
++struct Part {
++    int64_t a = 0, b = 0;
++    bool ckpt = false, as_tail = false;
++    bool operator==(const Part&) const = default;
++};
++
++/// The cuts the serial loop checkpoints at (generate.cpp's cut loop: `to` in {turn_at, root_at, message_at, pin_at},
++/// the tail kind for the message cut that is no other cut and STRATA_MSG_CKPT_TAIL's as_tail).
++struct Cuts {
++    int64_t turn_at = -1, root_at = -1, message_at = -1, pin_at = -1;
++    bool msg_as_tail = false;
++    bool ckpt(int64_t to) const { return to == turn_at || to == root_at || to == message_at || to == pin_at; }
++    bool as_tail(int64_t to) const {
++        return msg_as_tail && to == message_at && to != turn_at && to != root_at && to != pin_at;
++    }
++};
++
++/// What a background read reads: the batched parts from `at` on, in the serial loop's order (`cuts` as the loop walks
++/// them: a cut at or below the position reached is skipped), up to the first part the windows would read
++/// (`windows_ok(a, b)`, the serial loop's own test) or the prompt's end.  `h`: where the background read ends - that
++/// windows part's start, or the last cut.  No part (the first part goes through the windows): nothing to hand over.
++struct Plan {
++    std::vector<Part> parts;
++    int64_t h = -1;
++};
++template <class WindowsOk>
++inline Plan plan(int64_t at, const std::vector<int64_t>& cut_order, const Cuts& c, WindowsOk&& windows_ok) {
++    Plan p;
++    int64_t cur = at;
++    for (const int64_t to : cut_order) {
++        if (to <= cur) continue;
++        if (windows_ok(cur, to)) break;
++        p.parts.push_back({cur, to, c.ckpt(to), c.as_tail(to)});
++        cur = to;
++    }
++    p.h = cur;
++    return p;
++}
++
++/// Where a background part's run may stop for a pause (the engine's next line): a chunk boundary of the part past its
++/// first chunk whose rest is more than a chunk (a one-chunk run takes the single-chunk way) - read_yield::pos_ok
++/// without the short-read limit, since a background part's rest is read batched whatever its length.
++inline bool stop_ok(int64_t q, int64_t a, int64_t b, int64_t chunk) { return read_yield::pos_ok(q, a, b, chunk, 0, 0); }
++
++/// The chunks left of a plan from `done` on (the scheduler's measure: read_sched::Read::left).
++inline int64_t chunks_left(const std::vector<Part>& parts, int64_t done, int64_t chunk) {
++    chunk = std::max<int64_t>(chunk, 1);
++    int64_t n = 0;
++    for (const Part& p : parts) {
++        if (p.b <= done) continue;
++        const int64_t a = std::max(p.a, done);
++        // `a` lies on the part's grid (a run only stops on it): the chunks of [a, b)
++        n += (p.b - a + chunk - 1) / chunk;
++    }
++    return n;
++}
++
++// ---- the checkpoint bookkeeping of a background read (generate.cpp's checkpoint_at, on the read's own list).  `C` has
++// `ids` (a container with size()), `used` (uint64_t) and `pinned` (bool), as ConversationCheckpoint.  The read keeps
++// its own list (the main session's is the next request's), its own clock and its own tail length; the rules are the
++// serial ones, so the same checkpoints are kept of the same read.
++
++/// A checkpoint of length L that the list has already: its use is stamped (and a periodic one that lands on the tail
++/// one makes it a normal item), true.  checkpoint_at's first loop.
++template <class C>
++inline bool bump(std::vector<C>& list, int64_t L, bool as_tail, int64_t& tail_len, uint64_t& clock) {
++    for (C& c : list)
++        if ((int64_t) c.ids.size() == L) {
++            c.used = ++clock;
++            if (!as_tail && L == tail_len) tail_len = -1;
++            return true;
++        }
++    return false;
++}
++
++/// A new checkpoint `c` (length L) into the list: the tail kind replaces the previous tail checkpoint, then the list
++/// is evicted down to `cap` by conv_cache::eviction_victim with the tail and pin flags.  What leaves goes to
++/// `evicted` (the engine gives it back to its pool on the main thread).  checkpoint_at's second half.
++template <class C>
++inline void add(std::vector<C>& list, C&& c, bool as_tail, int64_t& tail_len, uint64_t& clock, int64_t cap,
++                std::vector<C>& evicted) {
++    const int64_t L = (int64_t) c.ids.size();
++    c.used = ++clock;
++    if (as_tail) {
++        const int64_t old_tail = tail_len;
++        for (size_t i = 0; i < list.size();) {
++            if (old_tail >= 0 && (int64_t) list[i].ids.size() == old_tail) {
++                evicted.push_back(std::move(list[i]));
++                list.erase(list.begin() + (std::ptrdiff_t) i);
++            } else {
++                ++i;
++            }
++        }
++        tail_len = L;
++    } else if (L == tail_len) {
++        tail_len = -1;
++    }
++    list.push_back(std::move(c));
++    while ((int64_t) list.size() > cap && !list.empty()) {
++        std::vector<uint64_t> stamps;
++        std::unique_ptr<bool[]> tail_flags(new bool[list.size()]);
++        std::unique_ptr<bool[]> pin_flags;
++        bool any_pin = false;
++        for (size_t i = 0; i < list.size(); ++i) {
++            stamps.push_back(list[i].used);
++            tail_flags[i] = tail_len >= 0 && (int64_t) list[i].ids.size() == tail_len;
++            any_pin = any_pin || list[i].pinned;
++        }
++        if (any_pin) {
++            pin_flags.reset(new bool[list.size()]);
++            for (size_t i = 0; i < list.size(); ++i) pin_flags[i] = list[i].pinned;
++        }
++        const size_t v = conv_cache::eviction_victim(stamps.data(), stamps.size(), cap, tail_flags.get(), pin_flags.get());
++        evicted.push_back(std::move(list[v]));
++        list.erase(list.begin() + (std::ptrdiff_t) v);
++    }
++}
++
++}  // namespace strata::program::read_plan
+diff --git a/tests/program/read_plan_test.cpp b/tests/program/read_plan_test.cpp
+new file mode 100644
+index 00000000..744dff31
+--- /dev/null
++++ b/tests/program/read_plan_test.cpp
+@@ -0,0 +1,301 @@
++// read_plan: what a prompt read hands to the background reads (STRATA_READS), that the background read of it - with
++// pauses at any boundary stop_ok allows - reads the serial loop's chunks and takes its checkpoints at the same places,
++// and the checkpoint bookkeeping of the read's own list (synthetic: no model, no GPU).
++#include "strata/program/read_plan.hpp"
++#include "strata/program/read_sched.hpp"
++#include "strata/program/read_yield.hpp"
++
++#include <algorithm>
++#include <cstdio>
++#include <random>
++#include <utility>
++#include <vector>
++
++namespace rp = strata::program::read_plan;
++namespace ry = strata::program::read_yield;
++namespace rs = strata::program::read_sched;
++
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
++
++using Chunk = std::pair<int64_t, int64_t>;
++struct Ev {   // a checkpoint the read takes: where, and which kind (periodic 'p', a cut 'c' with its tail flag)
++    int64_t at;
++    char kind;
++    bool tail;
++    bool operator==(const Ev&) const = default;
++};
++
++// generate.cpp's serial cut loop over [at, n - 1): each part read in one run (batched, chunks from the part's start)
++// or through the windows; on_chunk's periodic rule after each batched chunk (the next one due at done + every), and
++// the cut's checkpoint after the part.  Stops at the first windows part when `stop_at_windows` (what the background
++// covers), else goes through all of them (windows parts: no chunks, no periodic checkpoints).
++static void serial(int64_t at, const std::vector<int64_t>& cuts, const rp::Cuts& c, int64_t C, int64_t short_read,
++                   int64_t every, int64_t& next_check, bool stop_at_windows, std::vector<Chunk>& chunks,
++                   std::vector<Ev>& evs, int64_t& h) {
++    for (const int64_t to : cuts) {
++        if (to <= at) continue;
++        const bool win = to - at <= short_read;
++        if (win && stop_at_windows) break;
++        if (!win)
++            for (const Chunk& k : ry::chunks(at, to, C)) {
++                chunks.push_back(k);
++                if (every > 0 && k.second >= next_check) {
++                    evs.push_back({k.second, 'p', false});
++                    next_check = k.second + every;
++                }
++            }
++        at = to;
++        if (c.ckpt(to)) evs.push_back({to, 'c', c.as_tail(to)});
++    }
++    h = at;
++}
++
++// the background read of a plan: each part from where it stands, a run that may stop at any boundary stop_ok allows
++// (`stops`: the chance of a stop at each), going on from there in a new run; the periodic rule and the cuts as in the
++// engine's ReadCtx callbacks (the next check carried across the stops)
++static void background(const rp::Plan& p, int64_t C, int64_t every, int64_t& next_check, std::mt19937_64& rng,
++                       double stops, std::vector<Chunk>& chunks, std::vector<Ev>& evs, int& runs) {
++    std::uniform_real_distribution<double> u(0.0, 1.0);
++    for (const rp::Part& part : p.parts) {
++        int64_t from = part.a;
++        for (;;) {   // one run over [from, part.b)
++            ++runs;
++            int64_t stop = -1;
++            for (int64_t c0 = from; c0 < part.b; c0 += C) {
++                if (c0 > from && rp::stop_ok(c0, part.a, part.b, C) && u(rng) < stops) { stop = c0; break; }
++                const int64_t done = std::min(part.b, c0 + C);
++                chunks.push_back({c0, done});
++                if (every > 0 && done >= next_check) {
++                    evs.push_back({done, 'p', false});
++                    next_check = done + every;
++                }
++            }
++            if (stop < 0) break;
++            from = stop;
++        }
++        if (part.ckpt) evs.push_back({part.b, 'c', part.as_tail});
++    }
++}
++
++struct CK {   // the bookkeeping's view of a checkpoint
++    std::vector<int> ids;
++    uint64_t used = 0;
++    bool pinned = false;
++};
++static CK ck(int64_t L, bool pinned = false) {
++    CK c;
++    c.ids.assign((size_t) L, 7);
++    c.pinned = pinned;
++    return c;
++}
++static std::vector<int64_t> lens(const std::vector<CK>& v) {
++    std::vector<int64_t> r;
++    for (const CK& c : v) r.push_back((int64_t) c.ids.size());
++    return r;
++}
++
++int main() {
++    CHECK(!rp::reads_on(nullptr) && !rp::reads_on("") && !rp::reads_on("0") && rp::reads_on("1") && rp::reads_on("4"));
++
++    const int64_t C = 512, SR = 64;
++    auto wok = [&](int64_t a, int64_t b) { return b - a <= SR; };
++
++    // ---- the plan: a cold read with a root, a message cut (tail kind) and a turn boundary, then the header
++    {
++        rp::Cuts c;
++        c.root_at = 9000;
++        c.message_at = 60000;
++        c.turn_at = 90000;
++        c.msg_as_tail = true;
++        const int64_t n = 90040;
++        const std::vector<int64_t> cuts = {-1, c.root_at, c.message_at, c.turn_at, n - 1};
++        const rp::Plan p = rp::plan(0, cuts, c, wok);
++        CHECK(p.parts.size() == 3);
++        CHECK(p.parts[0] == (rp::Part{0, 9000, true, false}));
++        CHECK(p.parts[1] == (rp::Part{9000, 60000, true, true}));
++        CHECK(p.parts[2] == (rp::Part{60000, 90000, true, false}));
++        CHECK(p.h == 90000);   // the header (39 tokens) goes through the windows: in the finish
++        // from the root on (a read that resumed from it)
++        const rp::Plan q = rp::plan(9000, cuts, c, wok);
++        CHECK(q.parts.size() == 2 && q.parts[0].a == 9000 && q.h == 90000);
++        // a short first part: nothing to hand over (the caller hands over at a batched part only)
++        const rp::Plan r = rp::plan(89990, cuts, c, wok);
++        CHECK(r.parts.empty() && r.h == 89990);
++    }
++    // ---- no windows part: the plan runs to the prompt's end (n - 1), the finish reads only the first window
++    {
++        rp::Cuts c;
++        const int64_t n = 30001;
++        const rp::Plan p = rp::plan(1000, {-1, -1, -1, -1, n - 1}, c, wok);
++        CHECK(p.parts.size() == 1 && p.parts[0] == (rp::Part{1000, n - 1, false, false}) && p.h == n - 1);
++    }
++    // ---- a windows part between two batched ones: the background stops at the first (B8: what follows is serial)
++    {
++        rp::Cuts c;
++        c.message_at = 20000;
++        c.turn_at = 20040;
++        const int64_t n = 40000;
++        const rp::Plan p = rp::plan(0, {-1, -1, c.message_at, c.turn_at, n - 1}, c, wok);
++        CHECK(p.parts.size() == 1 && p.h == 20000);
++    }
++    // ---- a pin cut (sorted in) and a cut equal to another: one part, one checkpoint
++    {
++        rp::Cuts c;
++        c.root_at = 4000;
++        c.pin_at = 4000;
++        c.turn_at = 50000;
++        const std::vector<int64_t> cuts = {-1, -1, -1, 4000, 4000, 50000, 50100};
++        const rp::Plan p = rp::plan(0, cuts, c, wok);
++        CHECK(p.parts.size() == 3 && p.parts[0] == (rp::Part{0, 4000, true, false}) && p.parts[1].a == 4000 &&
++              p.parts[2] == (rp::Part{50000, 50100, false, false}) && p.h == 50100);
++    }
++
++    // ---- the stop rule: a chunk boundary of the part, past its first chunk, the rest more than a chunk
++    CHECK(!rp::stop_ok(0, 0, 10000, C) && rp::stop_ok(512, 0, 10000, C) && !rp::stop_ok(700, 0, 10000, C));
++    CHECK(rp::stop_ok(9000 + 1024, 9000, 60000, C) && !rp::stop_ok(9000 + 1000, 9000, 60000, C));
++    CHECK(!rp::stop_ok(59488, 9000, 60000, C));   // 512 left: one chunk
++    CHECK(rp::stop_ok(59176, 9000, 60001, C) && !rp::stop_ok(59688, 9000, 60001, C));   // 825 left, 313 left
++    CHECK(rp::stop_ok(70, 0, 100000, 1) == true);
++    // no short-read limit (the background rest is read batched): 600 left with a chunk of 512
++    CHECK(rp::stop_ok(512, 0, 1112, C) && !ry::pos_ok(512, 0, 1112, C, 1024));
++
++    // ---- chunks left (the scheduler's measure), from a part's start and from a stop on its grid
++    {
++        const std::vector<rp::Part> parts = {{0, 9000, true, false}, {9000, 60000, true, false}};
++        CHECK(rp::chunks_left(parts, 0, C) == (int64_t) (ry::chunks(0, 9000, C).size() + ry::chunks(9000, 60000, C).size()));
++        CHECK(rp::chunks_left(parts, 9000 + 2048, C) == (int64_t) ry::chunks(9000 + 2048, 60000, C).size());
++        CHECK(rp::chunks_left(parts, 60000, C) == 0);
++    }
++
++    // ---- the background read with random pauses reads the serial loop's chunks and checkpoints, up to h; the finish
++    // (serial from h, with the carried next check) then takes the rest of the serial ones
++    {
++        std::mt19937_64 rng(4242);
++        for (int round = 0; round < 3000; ++round) {
++            const int64_t n = 2000 + (int64_t) (rng() % 120000);
++            const int64_t Cr = (rng() % 3 == 0) ? 1024 : (rng() % 2 ? 512 : 2048);
++            const int64_t every = (rng() % 4 == 0) ? 0 : 1024 * (1 + (int64_t) (rng() % 16));
++            rp::Cuts c;
++            const int64_t resume = (rng() % 3 == 0) ? (int64_t) (rng() % (uint64_t) (n / 2)) : 0;
++            auto pick = [&](int64_t lo) { return lo + 1 + (int64_t) (rng() % (uint64_t) std::max<int64_t>(1, n - 2 - lo)); };
++            if (rng() % 2) c.root_at = pick(resume);
++            if (rng() % 2) c.turn_at = pick(std::max(resume, c.root_at));
++            if (rng() % 2 && c.turn_at > 0) c.message_at = std::max(resume + 1, c.turn_at - 1 - (int64_t) (rng() % 9000));
++            if (rng() % 5 == 0) c.pin_at = pick(resume);
++            c.msg_as_tail = rng() % 2;
++            std::vector<int64_t> cuts = {-1, c.root_at, c.message_at, c.turn_at, n - 1};
++            if (c.pin_at >= 0) {
++                cuts.push_back(c.pin_at);
++                std::sort(cuts.begin(), cuts.end());
++            }
++            const int64_t next0 = every > 0 ? resume + every : INT64_MAX;
++            // serial, all of it
++            std::vector<Chunk> s_chunks;
++            std::vector<Ev> s_evs;
++            int64_t s_next = next0, s_end = -1;
++            serial(resume, cuts, c, Cr, SR, every, s_next, false, s_chunks, s_evs, s_end);
++            const rp::Plan p = rp::plan(resume, cuts, c, [&](int64_t a, int64_t b) { return b - a <= SR; });
++            if (p.parts.empty()) continue;   // (the first part goes through the windows: no hand-over)
++            // the background part, paused anywhere it may be
++            std::vector<Chunk> b_chunks;
++            std::vector<Ev> b_evs;
++            int64_t b_next = next0;
++            int runs = 0;
++            background(p, Cr, every, b_next, rng, (double) (rng() % 100) / 100.0, b_chunks, b_evs, runs);
++            CHECK(runs >= (int) p.parts.size());
++            // ... then the finish from h with the carried next check (the yield pin's ycarry)
++            serial(p.h, cuts, c, Cr, SR, every, b_next, false, b_chunks, b_evs, s_end);
++            CHECK(b_chunks == s_chunks);
++            CHECK(b_evs == s_evs);
++            CHECK(b_next == s_next);
++            // h: a part boundary of the serial loop, and the start of a windows part or the prompt's end
++            CHECK(p.h == n - 1 || std::any_of(cuts.begin(), cuts.end(), [&](int64_t t) { return t > p.h && t - p.h <= SR; }));
++        }
++    }
++
++    // ---- the read's own checkpoint list: checkpoint_at's rules
++    {
++        const int64_t cap = 3;
++        std::vector<CK> list, gone;
++        uint64_t clock = 0;
++        int64_t tail = -1;
++        list.push_back(ck(1000));    // the root (index 0) the hand-over brought
++        list.back().used = ++clock;
++        rp::add(list, ck(5000), false, tail, clock, cap, gone);
++        rp::add(list, ck(9000), true, tail, clock, cap, gone);   // the message cut, tail kind
++        CHECK(tail == 9000 && lens(list) == (std::vector<int64_t>{1000, 5000, 9000}) && gone.empty());
++        rp::add(list, ck(12000), false, tail, clock, cap, gone);  // over the cap: the tail goes first (not the newest)
++        CHECK(lens(list) == (std::vector<int64_t>{1000, 5000, 12000}) && lens(gone) == (std::vector<int64_t>{9000}));
++        rp::add(list, ck(14000), false, tail, clock, cap, gone);  // then the least recently used, never the root
++        CHECK(lens(list) == (std::vector<int64_t>{1000, 12000, 14000}));
++        // a second tail checkpoint replaces the first
++        rp::add(list, ck(15000), true, tail, clock, 10, gone);
++        rp::add(list, ck(16000), true, tail, clock, 10, gone);
++        const std::vector<int64_t> now = lens(list);
++        CHECK(tail == 16000 && std::count(now.begin(), now.end(), (int64_t) 15000) == 0);
++        // bump: an existing length is stamped, a periodic one landing on the tail makes it normal
++        const uint64_t before = clock;
++        CHECK(rp::bump(list, 16000, false, tail, clock) && tail == -1 && clock == before + 1);
++        CHECK(!rp::bump(list, 17000, false, tail, clock));
++        // a pinned one is never the victim while an unpinned non-root one is there
++        std::vector<CK> l2, g2;
++        uint64_t c2 = 0;
++        int64_t t2 = -1;
++        rp::add(l2, ck(100), false, t2, c2, 3, g2);
++        rp::add(l2, ck(200, true), false, t2, c2, 3, g2);
++        rp::add(l2, ck(300), false, t2, c2, 3, g2);
++        rp::add(l2, ck(400), false, t2, c2, 3, g2);
++        CHECK(lens(l2) == (std::vector<int64_t>{100, 200, 400}) && lens(g2) == (std::vector<int64_t>{300}));
++        // random: the cap holds, the root stays (cap >= 2)
++        std::mt19937_64 rng(77);
++        std::vector<CK> l3, g3;
++        uint64_t c3 = 0;
++        int64_t t3 = -1;
++        rp::add(l3, ck(1), false, t3, c3, 4, g3);
++        for (int i = 0; i < 2000; ++i) {
++            const int64_t L = 2 + (int64_t) (rng() % 500);
++            if (!rp::bump(l3, L, rng() % 3 == 0, t3, c3)) rp::add(l3, ck(L), rng() % 3 == 0, t3, c3, 4, g3);
++            CHECK((int64_t) l3.size() <= 4 && l3.front().ids.size() == 1);
++            int tails = 0;
++            for (const CK& k : l3) tails += t3 >= 0 && (int64_t) k.ids.size() == t3;
++            CHECK(tails <= 1);
++        }
++    }
++
++    // ---- the scheduler over held background reads: the shortest rest first, each read's runs in its own order
++    {
++        const int64_t Cq = 512, Q = 4;   // a quantum: Q chunks per pick
++        struct R { rp::Plan p; int64_t done; };
++        std::vector<R> held = {{{{{0, 100000, false, false}}, 100000}, 0},
++                               {{{{3000, 5000, true, false}}, 5000}, 3000},
++                               {{{{0, 1000, false, false}}, 1000}, 0}};
++        std::vector<int> order;
++        for (int64_t pick = 0; pick < 1000; ++pick) {
++            std::vector<rs::Read> rr;
++            for (size_t i = 0; i < held.size(); ++i)
++                rr.push_back({(int) i, rp::chunks_left(held[i].p.parts, held[i].done, Cq), 0});
++            const int i = rs::next(rr, pick, 1000000);
++            if (i < 0) break;
++            order.push_back(i);
++            // one quantum of read i: up to Q chunks, stopping only where stop_ok allows
++            R& r = held[(size_t) i];
++            for (const rp::Part& part : r.p.parts) {
++                if (part.b <= r.done) continue;
++                int64_t c0 = std::max(part.a, r.done), k = 0;
++                for (; c0 < part.b; c0 += Cq, ++k)
++                    if (k >= Q && rp::stop_ok(c0, part.a, part.b, Cq)) break;
++                r.done = std::min(c0, part.b);
++                break;
++            }
++        }
++        CHECK(!order.empty() && order[0] == 2);   // 4 chunks left: first
++        // the 2000-token read before the long one gets its second pick
++        const auto first_long = std::find(order.begin(), order.end(), 0);
++        CHECK(first_long != order.end() && std::count(order.begin(), first_long, 1) >= 1);
++        for (const R& r : held) CHECK(r.done == r.p.h);
++    }
++
++    if (fails == 0) std::printf("read_plan_test: all checks passed\n");
++    return fails == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

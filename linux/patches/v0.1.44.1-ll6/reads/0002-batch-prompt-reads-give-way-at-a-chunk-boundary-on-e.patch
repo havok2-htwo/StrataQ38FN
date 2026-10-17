@@ -1,0 +1,738 @@
+From 6c9607f5a265fa8859be4eb262c2d95822e0ae0c Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:58:21 +0200
+Subject: [PATCH 2/6] batch: prompt reads give way at a chunk boundary on every
+ read path, into a top-row slot, keeping checkpoints, cuts and the slot's
+ parked conversation (opt-in STRATA_READ_YIELD=1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                        |   5 +
+ include/strata/program/read_yield.hpp |  86 ++++++++
+ src/program/generate.cpp              | 276 +++++++++++++++++++++++++-
+ tests/program/read_yield_test.cpp     | 157 +++++++++++++++
+ 4 files changed, 519 insertions(+), 5 deletions(-)
+ create mode 100644 include/strata/program/read_yield.hpp
+ create mode 100644 tests/program/read_yield_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 740378aa..a204e760 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -279,6 +279,11 @@ if(STRATA_BUILD_TESTS)
+   add_executable(batch_read_test tests/program/batch_read_test.cpp)
+   target_include_directories(batch_read_test PRIVATE include)
+   add_test(NAME batch_read_test COMMAND batch_read_test)
++  # STRATA_READ_YIELD: where a batch prompt read gives way, into which slot (no pad row), and that the read after the
++  # stop reads the same chunks, checkpoints and cuts (header-only, CPU)
++  add_executable(read_yield_test tests/program/read_yield_test.cpp)
++  target_include_directories(read_yield_test PRIVATE include)
++  add_test(NAME read_yield_test COMMAND read_yield_test)
+   # STRATA_PIPE_OVERLAP_KVS: the overlap gate's K/V streaming part (env, buffer disjointness; synthetic)
+   add_executable(overlap_kvs_test tests/program/overlap_kvs_test.cpp)
+   target_include_directories(overlap_kvs_test PRIVATE include)
+diff --git a/include/strata/program/read_yield.hpp b/include/strata/program/read_yield.hpp
+new file mode 100644
+index 00000000..25209574
+--- /dev/null
++++ b/include/strata/program/read_yield.hpp
+@@ -0,0 +1,86 @@
++// include/strata/program/read_yield.hpp - STRATA_READ_YIELD: where a batch prompt read may give way to a waiting
++// request, and into which slot (header-only: it is arithmetic).
++//
++// A long prompt read in progress stops at a chunk boundary q when the server sends `BYIELD <slot>` (a short request
++// waits behind it): the part read so far, [0, q), is copied into that slot, the request ends with `YIELDED <slot> q`,
++// and the server sends it again once the short requests are in.  The read then goes on from q in the same chunks
++// (q lies on the grid of the segment it was in), so every token and every slot's state is the one the read without
++// the stop gives; only the timing changes.  generate.cpp decides with these rules; tests/program/read_yield_test.cpp
++// checks them without a GPU.
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <utility>
++#include <vector>
++
++namespace strata::program::read_yield {
++
++/// An on/off switch: set, not empty and not starting with '0'.
++inline bool env_on(const char* v) { return v != nullptr && v[0] != '\0' && v[0] != '0'; }
++
++/// A count from the environment (STRATA_READ_YIELD_TEST_AT): unset, empty, negative or not a number: 0.
++inline int64_t env_count(const char* v) {
++    if (v == nullptr || v[0] == '\0') return 0;
++    char* end = nullptr;
++    const long long n = std::strtoll(v, &end, 10);
++    if (end == v || *end != '\0' || n <= 0) return 0;
++    return (int64_t) n;
++}
++
++/// The position rule: the read of segment [a0, b0) in chunks of `chunk` may stop at q.  q must be a chunk boundary
++/// inside the segment, past its first chunk, and the rest [q, b0) must be more than a chunk (a one-chunk run takes the
++/// prompt path's single-chunk way, which a run of more chunks does not) and more than a short read (the rest of a
++/// segment that short would go through the verify windows instead: another path, so another result).
++/// `test_at` (STRATA_READ_YIELD_TEST_AT, a test knob): only from the segment's chunk `test_at` on (0: any).
++inline bool pos_ok(int64_t q, int64_t a0, int64_t b0, int64_t chunk, int64_t short_read, int64_t test_at = 0) {
++    chunk = std::max<int64_t>(chunk, 1);
++    if (q <= a0 || q >= b0 || (q - a0) % chunk != 0) return false;
++    if (b0 - q <= std::max(chunk, short_read)) return false;
++    return test_at <= 0 || (q - a0) / chunk >= test_at;
++}
++
++/// Which slots a yielded read may wait in: slot b with b % k == k - 1 (k = 1: any).  The pipelined groups (--batch
++/// in G groups of k = batch / G slots) run a group's window over its slots up to its last active one, and each idle
++/// slot below that row gets a pad row that writes the slot's state (token 0 at position 0).  Only the top row of a
++/// group is never below an active slot of its group, so only there does the part read so far stay until the read goes
++/// on.  The serial windows (no groups) touch active slots only: any slot.
++inline int yield_row(bool piped, int batch, int groups) {
++    if (!piped || batch <= 0 || groups <= 1 || batch % groups != 0) return 1;
++    return batch / groups;
++}
++inline bool slot_pad_safe(int slot, int k) { return slot >= 0 && (k <= 1 || slot % k == k - 1); }
++
++/// The resumed read's cuts (the turn boundary, the tail-role turn, the message boundary) are searched from where the
++/// FIRST part resumed (`resume0`), not from where the read stopped: the same cuts as the read without the stop, so the
++/// segments after q and the checkpoints at them are the same (a cut at or below q is skipped, its checkpoint came
++/// along with the slot).  resume0 < 0: no yielded read.
++inline int64_t cut_from(int64_t resume, int64_t resume0) {
++    return resume0 >= 0 && resume0 < resume ? resume0 : resume;
++}
++
++/// The chunks a run over [a0, b0) reads (host model of the prompt path's loop: c0 = a0, a0 + C, ...).
++inline std::vector<std::pair<int64_t, int64_t>> chunks(int64_t a0, int64_t b0, int64_t chunk) {
++    std::vector<std::pair<int64_t, int64_t>> v;
++    chunk = std::max<int64_t>(chunk, 1);
++    for (int64_t c = a0; c < b0; c += chunk) v.emplace_back(c, std::min(b0, c + chunk));
++    return v;
++}
++
++/// The periodic checkpoint positions a read of [from, to) takes (host model of on_chunk's rule: after a chunk that
++/// reaches next_check, the next is done + every).  `next_check`: the first position due.  Returns the positions and
++/// leaves next_check at the next one due (what a yielded read carries over to its resume).
++inline std::vector<int64_t> periodic_checks(const std::vector<std::pair<int64_t, int64_t>>& read, int64_t every,
++                                            int64_t& next_check) {
++    std::vector<int64_t> v;
++    if (every <= 0) return v;
++    for (const auto& c : read)
++        if (c.second >= next_check) {
++            v.push_back(c.second);
++            next_check = c.second + every;
++        }
++    return v;
++}
++
++}  // namespace strata::program::read_yield
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 35229d4c..23e28f36 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -68,6 +68,7 @@
+ #endif
+ #include "strata/core/native_dense.hpp"
+ #include "strata/program/batch_read.hpp"
++#include "strata/program/read_yield.hpp"
+ #include "strata/program/overlap_kvs.hpp"
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
+@@ -207,6 +208,21 @@ bool pipe_byield_nodrain_env() {
+     }();
+     return on;
+ }
++// STRATA_READ_YIELD=1 (read once; off by default): a batch prompt read gives way at a chunk boundary when the server
++// sends BYIELD <slot> (#656's preemption) on every read path - the overlapped read beside the pipelined groups and the
++// pipelined read in one run included, which drop it without the switch - into a slot no pad row writes (the top row of
++// a group: read_yield.hpp), keeping the slot's parked conversation, the read's checkpoint layout and cuts and the lane
++// drafter's cells; a BYIELD it does not take is answered with YIELDNO <slot>.  Unset: as before
++bool read_yield_env() {
++    static const bool on = strata::program::read_yield::env_on(std::getenv("STRATA_READ_YIELD"));
++    return on;
++}
++// STRATA_READ_YIELD_TEST_AT=k (a test knob, with STRATA_READ_YIELD=1): a BYIELD is taken only from chunk k of the
++// segment being read on (0/unset: from its second chunk), so a test can place the stop
++int64_t read_yield_test_at_env() {
++    static const int64_t k = strata::program::read_yield::env_count(std::getenv("STRATA_READ_YIELD_TEST_AT"));
++    return k;
++}
+ // STRATA_ADMIT_MERGE_FIRST=1 (read once; off by default): a batch admission reads the last prompt tokens of its last
+ // windowed part (up to a window's max_t, the last prompt token included) and its first token in ONE window instead of
+ // the part's last windows and a window of the last token alone.  A row computes what it computes in any window while
+@@ -10005,6 +10021,11 @@ int main(int argc, char** argv) {
+         // slots' windows keep the watchdog's beating meanwhile; and whether such a read runs (the test faults)
+         std::atomic<int64_t> ov_read_beat{0};
+         std::atomic<bool> ov_reading{false};
++        // STRATA_READ_YIELD: the slot a prompt read gives way into at its next chunk boundary that allows it (-1: none;
++        // set on the main thread once the slot is checked, read by the read's thread), and a BYIELD the overlapped
++        // read's line scan took that is not checked yet (main thread)
++        std::atomic<int> ov_yield_slot{-1};
++        int yield_asked = -1;
+         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
+             std::vector<ImgKey> v;
+             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
+@@ -11374,6 +11395,10 @@ int main(int argc, char** argv) {
+                     }
+                 }).detach();
+         }
++        // STRATA_READ_YIELD: the server's slot choice for a read that may give way (BYIELD into slot b needs b % k == k - 1)
++        if (read_yield_env() && o.batch > 0)
++            std::printf("INFO read_yield=1 yield_row=%d\n",
++                        strata::program::read_yield::yield_row(o.batch_groups > 1 && !stages.empty(), o.batch, o.batch_groups));
+         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+         std::fflush(stdout);
+         std::string line;
+@@ -11536,6 +11561,12 @@ int main(int argc, char** argv) {
+             // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same
+             // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0)
+             bool partial = false, partial_from0 = false;
++            // STRATA_READ_YIELD: the yielded read's progress, so it goes on as if it had not stopped - the next periodic
++            // checkpoint due (-1: none kept), each stage's (a layer split's parts), whether its tail checkpoint was taken,
++            // and where its first part resumed (its cuts are searched from there)
++            int64_t partial_next_check = -1, partial_resume0 = -1;
++            std::vector<int64_t> partial_part_next;
++            bool partial_tail_saved = false;
+             // #879: it was running when non-finite logits dropped the cached state; its state may have started from
+             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
+             bool tainted = false;
+@@ -12667,6 +12698,11 @@ int main(int argc, char** argv) {
+                                 std::printf("ERR %s\n", err.c_str());
+                                 return false;
+                             }
++                            if (sl.partial && read_yield_env()) {   // (never a slot a yield took: read_yield.hpp)
++                                std::fprintf(stderr, "strata batch: a pad row writes slot %d, which holds a read that gave "
++                                                     "way: it reads again from what else holds it\n", pick * GS + t);
++                                sl.partial = false;
++                            }
+                             sl.cached = false;   // its pad row writes its state
+                         }
+                     }
+@@ -13196,6 +13232,7 @@ int main(int argc, char** argv) {
+                     if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                     it = in_lines.erase(it);
+                 } else if (it->rfind("BYIELD", 0) == 0) {
++                    if (read_yield_env()) yield_asked = std::atoi(it->c_str() + 6);   // (checked by the read: yield_arm)
+                     it = in_lines.erase(it);
+                 } else {
+                     ++it;
+@@ -14359,6 +14396,14 @@ int main(int argc, char** argv) {
+             int slot_source = -1;
+             int64_t slot_tokens = 0;
+             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
++            // STRATA_READ_YIELD: the yielded read this request goes on with - its checkpoint progress and the resume its
++            // cuts are searched from (BSlot::partial_*); on: it was taken over from the slot
++            struct YieldCarry {
++                bool on = false;
++                int64_t next_check = -1, resume0 = -1;
++                std::vector<int64_t> part_next;
++                bool tail_saved = false;
++            } ycarry;
+             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
+             // STRATA_SLOT_CHAIN_REUSE: slot_ck is one of the slot's chain (sl.chain), not of its own checkpoints
+             namespace sch = strata::program::slot_chain;
+@@ -14553,10 +14598,19 @@ int main(int argc, char** argv) {
+                     checks.clear();   // the main session's checkpoints were of the conversation it held before
+                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
+                     // checkpoints as if it had not stopped
++                    const bool was_partial = bs[(size_t) slot_source].partial;   // (STRATA_READ_YIELD: giveback_plan)
+                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
+                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
+                         for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
+                         bs[(size_t) slot_source].partial = false;
++                        const BSlot& ps = bs[(size_t) slot_source];
++                        if (read_yield_env() && ps.partial_next_check >= 0 && (int64_t) ps.ids.size() == slot_tokens) {
++                            ycarry.on = true;
++                            ycarry.next_check = ps.partial_next_check;
++                            ycarry.resume0 = ps.partial_resume0;
++                            ycarry.part_next = ps.partial_part_next;
++                            ycarry.tail_saved = ps.partial_tail_saved;
++                        }
+                     }
+                     // a copy of a slot's checkpoint into the main session's (STRATA_CKPT_POOL: into a dropped
+                     // checkpoint's vectors, whose pages are in)
+@@ -14607,7 +14661,8 @@ int main(int argc, char** argv) {
+                     const sch::GiveBack gb = sch::giveback_plan(
+                         slot_park_on, slot_ck_chain ? sch::Source::chain : slot_ck != nullptr ? sch::Source::own
+                                                                                             : sch::Source::end,
+-                        giveback_checks_env(), bs[(size_t) slot_source].partial, admit_slot == slot_source);
++                        giveback_checks_env(), bs[(size_t) slot_source].partial || (read_yield_env() && was_partial),
++                        admit_slot == slot_source);
+                     // STRATA_SLOT_PARK: the conversation goes on here, so the slot's image goes, and the chain its
+                     // prompt was read with comes along (the cells below each checkpoint are the ones just copied)
+                     if (gb.discard_park) slot_park_discard(slot_source);
+@@ -14831,6 +14886,15 @@ int main(int argc, char** argv) {
+                 part_at.clear();
+                 std::fill(part_next.begin(), part_next.end(), pp_next_check);
+             }
++            // STRATA_READ_YIELD: a yielded read goes on with the checkpoint positions it had (from resume + every they
++            // would move: the periodic checkpoints after the stop would land elsewhere than without it)
++            if (ycarry.on && reread_to <= 0 && req_ckpt) {
++                pp_next_check = ycarry.next_check;
++                pp_tail_saved = ycarry.tail_saved;
++                std::lock_guard<std::mutex> lk(part_mu);
++                if (ycarry.part_next.size() == part_next.size()) part_next = ycarry.part_next;
++                else std::fill(part_next.begin(), part_next.end(), pp_next_check);
++            }
+             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
+             strata::core::progress_at("reading the prompt, from token", read_from);
+             std::fflush(stdout);
+@@ -15186,6 +15250,136 @@ int main(int argc, char** argv) {
+             double il_ms = 0;
+             int64_t yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
+             int yielded_slot = -1;
++            // STRATA_READ_YIELD (read_yield.hpp): no yield is armed when a request starts.  yield_resume0: where this
++            // request's cuts are searched from (set with the cuts below; a yielded read takes it along); yield_cont_at: a
++            // yield whose copy into the slot failed - the read goes on from there (read_part)
++            ov_yield_slot.store(-1);
++            yield_asked = -1;
++            int64_t yield_resume0 = -1, yield_cont_at = -1;
++            const int yield_k = strata::program::read_yield::yield_row(piped, o.batch, o.batch_groups);
++            auto yield_no = [&](int ys, const std::string& why) {   // the server may ask again (its STRATA_YIELD_RETRY_S)
++                std::fprintf(stderr, "strata batch: BYIELD %d not taken: %s\n", ys, why.c_str());
++                std::printf("YIELDNO %d\n", ys);
++                std::fflush(stdout);
++            };
++            // a BYIELD for slot ys, on the main thread (the read's thread never reads `bs`): armed when this read may
++            // wait in ys - not decoding, this admission's own (or, for a request beside the slots, one the server
++            // reserved), text only, and a slot no pad row writes meanwhile; the position is the read's own check (the
++            // hook, at each chunk boundary).  Pictures never give way (S2: nor does the server ask for them).
++            auto yield_arm = [&](int ys) {
++                std::string why;
++                if (ys < 0 || ys >= (int) bs.size()) why = "no such slot";
++                else if (bs[(size_t) ys].active) why = "the slot is decoding";
++                else if (admit_slot >= 0 && ys != admit_slot) why = "not this admission's slot";
++                else if (!req_imgs.empty()) why = "a picture in the prompt";
++                else if (o.prompt_cache <= 0) why = "no prompt cache";
++                else if (!strata::program::read_yield::slot_pad_safe(ys, yield_k))
++                    why = "a pad row could write the slot (only the top row of a group, slot % " + std::to_string(yield_k) +
++                          " == " + std::to_string(yield_k - 1) + ", keeps a read)";
++                else if (reread_to > 0) why = "STRATA_CKPT_REREAD";
++                else
++                    for (const PfPart& p : pf_parts)
++                        if (p.first >= 0) { why = "the prompt chunk follows a loan of cache slots"; break; }
++                if (!why.empty()) {
++                    yield_no(ys, why);
++                    return;
++                }
++                ov_yield_slot.store(ys);
++                if (trace) std::fprintf(stderr, "strata trace: BYIELD %d armed\n", ys);
++            };
++            auto yield_take_asked = [&] {   // what the overlapped read's line scan took (scan_ctl_lines)
++                if (yield_asked < 0) return;
++                const int y = yield_asked;
++                yield_asked = -1;
++                if (ov_yield_slot.load() < 0) yield_arm(y);
++            };
++            // the hook of a read of [a0, b0) (Prefill::should_yield): an armed yield, at a chunk boundary that keeps the
++            // rest's chunks (read_yield::pos_ok).  Runs on the read's thread: it reads the atomic and its own copies
++            auto yield_hook = [&](int64_t a0, int64_t b0) -> std::function<bool(int64_t)> {
++                const int64_t C = std::max<int64_t>(sp.chunk(), 1), sr = req_short_read, test_at = read_yield_test_at_env();
++                std::atomic<int>* armed = &ov_yield_slot;
++                return [armed, a0, b0, C, sr, test_at](int64_t q) {
++                    return armed->load() >= 0 && strata::program::read_yield::pos_ok(q, a0, b0, C, sr, test_at);
++                };
++            };
++            // the part [0, q) of this read into slot ys, which keeps it until the server sends the request again (the
++            // groups drained, no read running).  As #656's copy, and: the conversation the slot held goes to the cache
++            // first (as at an admission), the read's checkpoint progress and cut origin come along (so it goes on as if
++            // it had not stopped), and a lane slot's drafter is known to hold cell q - 1 too.  false (`why`): not parked,
++            // the read goes on from q
++            auto park_yield = [&](int ys, int64_t q, std::string& why) -> bool {
++                if (ys < 0 || ys >= (int) bs.size() || bs[(size_t) ys].active || (admit_slot >= 0 && ys != admit_slot) ||
++                    !strata::program::read_yield::slot_pad_safe(ys, yield_k)) {
++                    why = "the slot is not free";
++                    return false;
++                }
++                if (slot_park_on) {   // (slot_park_put moves the slot's checkpoints into its image; it reports in err)
++                    const std::string keep = err;
++                    const bool ok = slot_park_put(ys, bs[(size_t) ys].cached && !bs[(size_t) ys].partial);
++                    if (!ok) why = "parking the conversation the slot held failed: " + err;
++                    err = keep;
++                    if (!ok) return false;
++                }
++                std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
++                std::string ce;
++                if (!copy_to_slot(ys, pre, ce)) {
++                    bs[(size_t) ys].cached = false;   // half written
++                    bs[(size_t) ys].partial = false;
++                    why = "the copy into the slot failed: " + ce;
++                    return false;
++                }
++                BSlot& sl = bs[(size_t) ys];
++                if (ckpt_pool.on())
++                    for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
++                sl = BSlot{};
++                sl.ids = std::move(pre);
++                sl.cached = true;
++                sl.partial = true;
++                sl.partial_from0 = read_from == 0 || resumed_from0;
++                sl.cvec = cvec_cached;
++                for (const ConvCheckpoint& c : checks)   // the root / periodic / cut checkpoints of this read
++                    if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
++                            [](int32_t x, int64_t y) { return (int64_t) x == y; }))
++                        sl.checks.push_back(c);
++                sl.partial_next_check = pp_next_check;
++                sl.partial_resume0 = yield_resume0;
++                sl.partial_tail_saved = pp_tail_saved;
++                {
++                    std::lock_guard<std::mutex> lk(part_mu);
++                    sl.partial_part_next = part_next;
++                }
++                // (E-9 wrote the drafter's cells [0, q): the chunk before q had cur[q] as its last next token)
++                if (const int j = lane_of(ys); j >= 0 && lane_dk[j] == q - 1) lane_dk[j] = q;
++                yielded_at = q;
++                yielded_slot = ys;
++                return true;
++            };
++            // after a read that stopped at q for the armed yield: parked (e = "yield"), or the read goes on from q
++            // (yield_cont_at; a CUDA fault in the copy ends the engine, #224).  Returns false either way
++            auto yield_finish = [&](int64_t q, std::string& e) -> bool {
++                const int ys = ov_yield_slot.load();
++                std::string why = "no slot armed";
++                const auto ty = Clock::now();
++                if (ys >= 0 && park_yield(ys, q, why)) {
++                    ov_yield_slot.store(-1);
++                    std::fprintf(stderr, "strata batch: the prompt read gives way at %lld of %lld tokens; slot %d holds it "
++                                         "(copied in %.1f ms, STRATA_READ_YIELD)\n", (long long) q, (long long) n, ys,
++                                 std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
++                    e = "yield";
++                    return false;
++                }
++                ov_yield_slot.store(-1);
++                if (cudaPeekAtLastError() != cudaSuccess) {
++                    batch_fatal = true;
++                    ov_cuda_fault = true;
++                    e = "the copy of a read that gave way met a CUDA fault: " + why;
++                    return false;
++                }
++                yield_no(ys, why + " (the read goes on at " + std::to_string((long long) q) + ")");
++                yield_cont_at = q;
++                e.clear();
++                return false;
++            };
+             // `BYIELD <slot>` (the server: a shorter request is waiting): at the next chunk boundary the part read so
+             // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
+             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
+@@ -15408,6 +15602,16 @@ int main(int argc, char** argv) {
+                         end_now();
+                     }
+                 };
++                // STRATA_READ_YIELD: the read's hook, unset again once its thread has ended (declared before the guard,
++                // whose destructor ends the thread)
++                struct HookReset {
++                    decltype(sp)& p;
++                    ~HookReset() { p.should_yield = nullptr; }
++                } hook_reset{sp};
++                if (read_yield_env()) {
++                    yield_take_asked();
++                    sp.should_yield = yield_hook(a0, b0);
++                }
+                 std::atomic<bool> done{false};
+                 bool wok = false;
+                 std::string we;
+@@ -15472,6 +15676,7 @@ int main(int argc, char** argv) {
+                     while (!done.load(std::memory_order_acquire)) {
+                         if (!pump(true)) { pump_ok = false; break; }   // pump answered ERR
+                         scan_ctl_lines();
++                        if (read_yield_env()) yield_take_asked();
+                         const int64_t b = ov_read_beat.load(std::memory_order_relaxed);
+                         if (b != beat_seen) {
+                             beat_seen = b;
+@@ -15556,9 +15761,10 @@ int main(int argc, char** argv) {
+                     e = we;
+                     return false;
+                 }
++                if (read_yield_env() && sp.yielded_at() >= 0) return yield_finish(sp.yielded_at(), e);   // (the groups drained)
+                 return true;
+             };
+-            auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
++            auto read_part_once = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+                 if (pipe_overlap_env() && piped && batch_on()) {
+                     // STRATA_PIPE_OVERLAP_MAX_QUEUE=n: overlap a read only while at most n further admissions wait
+                     // behind it (a read beside the groups takes longer, and admissions queue behind each other): the
+@@ -15592,6 +15798,32 @@ int main(int argc, char** argv) {
+                 }();
+                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
++                if (piece <= 0 && read_yield_env()) {
++                    // STRATA_READ_YIELD: one run, which stops at a chunk boundary for an armed BYIELD.  The hook runs on
++                    // this thread (the first stage's), so it takes the BYIELD lines itself (BSTOPs stay for the loop)
++                    struct HookReset {
++                        decltype(sp)& p;
++                        ~HookReset() { p.should_yield = nullptr; }
++                    } hook_reset{sp};
++                    std::function<bool(int64_t)> at_pos = yield_hook(a0, b0);
++                    sp.should_yield = [&, at_pos](int64_t q) -> bool {
++                        int y = -1;
++                        {
++                            std::lock_guard<std::mutex> lk(in_mu);
++                            for (auto it = in_lines.begin(); it != in_lines.end();)
++                                if (it->rfind("BYIELD", 0) == 0) {
++                                    y = std::atoi(it->c_str() + 6);
++                                    it = in_lines.erase(it);
++                                } else {
++                                    ++it;
++                                }
++                        }
++                        if (y >= 0 && ov_yield_slot.load() < 0) yield_arm(y);
++                        return at_pos(q);
++                    };
++                    if (!sp.run(ids.data() + a0, b0 - a0, a0, e)) return false;
++                    return sp.yielded_at() >= 0 ? yield_finish(sp.yielded_at(), e) : true;
++                }
+                 if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                 for (int64_t q = a0; q < b0;) {
+                     const int64_t r = std::min(b0, q + piece);
+@@ -15615,6 +15847,14 @@ int main(int argc, char** argv) {
+                             }
+                         }
+                     }
++                    if (ys >= 0 && read_yield_env()) {   // STRATA_READ_YIELD: the checks and the copy of the other paths
++                        if (ov_yield_slot.load() < 0) yield_arm(ys);
++                        if (ov_yield_slot.load() >= 0 && yield_hook(a0, b0)(q)) {
++                            if (!yield_finish(q, e) && yield_cont_at < 0) return false;   // parked, or a CUDA fault
++                            yield_cont_at = -1;   // (not parked: on with the pieces from here)
++                        }
++                        ys = -1;
++                    }
+                     if (ys >= 0) {
+                         // only where the rest is read the same way after it (more than a chunk and more than a short
+                         // read left), text only, and into a slot that is not decoding
+@@ -15666,6 +15906,17 @@ int main(int argc, char** argv) {
+                 }
+                 return true;
+             };
++            // STRATA_READ_YIELD: a yield whose copy into the slot failed goes on from where the read stopped (a chunk
++            // boundary of [a0, b0): the same chunks after it); without the switch yield_cont_at stays -1
++            auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
++                for (;;) {
++                    yield_cont_at = -1;
++                    const bool r = read_part_once(a0, b0, e);
++                    if (r || yield_cont_at < 0) return r;
++                    a0 = yield_cont_at;
++                    e.clear();
++                }
++            };
+             apply_pending(true);
+             if (!adapt_tick(true)) {   // --adapt-async: the round in flight lands before the prompt lends any slot
+                 std::printf("ERR an adaptive refill failed\n");
+@@ -15717,15 +15968,19 @@ int main(int argc, char** argv) {
+             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
+             // chat renders the same history - but not always the same header or the thinking of this reply - so that
+             // checkpoint is the one it reuses.
++            // STRATA_READ_YIELD: a yielded read searches its cuts from where its first part resumed (read_yield::cut_from:
++            // the same cuts, so the same segments past the stop); otherwise cut_resume is resume
++            const int64_t cut_resume = ycarry.on ? strata::program::read_yield::cut_from(resume, ycarry.resume0) : resume;
++            yield_resume0 = cut_resume;
+             int64_t turn_at = -1;
+             if (o.prompt_cache > 0 && o.turn_token >= 0)
+-                for (int64_t i = n - 1; i > resume; --i)
++                for (int64_t i = n - 1; i > cut_resume; --i)
+                     if (ids[(size_t) i] == o.turn_token) { turn_at = i; break; }
+             // #458 (opt-in): a short turn of --tail-role-token's role right before the new assistant turn (the
+             // server's trailing reasoning-effort turn) stays out of the checkpoint, so the next request - another
+             // effort, or the next turn of the chat - finds the conversation without it
+             if (turn_at > 0 && o.tail_role_token >= 0)
+-                for (int64_t i = turn_at - 1; i > resume; --i)
++                for (int64_t i = turn_at - 1; i > cut_resume; --i)
+                     if (ids[(size_t) i] == o.turn_token) {
+                         if (ids[(size_t) i + 1] == o.tail_role_token) turn_at = i;
+                         break;
+@@ -15751,7 +16006,7 @@ int main(int argc, char** argv) {
+             // Only add a snapshot; the existing token and image checks still decide reuse.  STRATA_MSG_CKPT_TAIL: on a
+             // layer split too, with a longer last message, as an ordinary checkpoint (message_cut)
+             const strata::program::MessageCut msg_cut = strata::program::message_cut(
+-                ids, resume, turn_at, o.turn_token, o.prompt_cache > 0, message_checkpoint, multi_gpu, msg_ckpt_tail_env());
++                ids, cut_resume, turn_at, o.turn_token, o.prompt_cache > 0, message_checkpoint, multi_gpu, msg_ckpt_tail_env());
+             const int64_t message_at = msg_cut.at;
+             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
+             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
+@@ -15879,6 +16134,13 @@ int main(int argc, char** argv) {
+                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                 return 1;
+             }
++            if (read_yield_env()) {   // STRATA_READ_YIELD: a BYIELD this read took but did not act on is answered
++                const int armed = ov_yield_slot.exchange(-1);
++                const int asked = yield_asked;
++                yield_asked = -1;
++                if (yielded_at < 0 && (armed >= 0 || asked >= 0))
++                    yield_no(armed >= 0 ? armed : asked, "the read had no chunk boundary left that allows it");
++            }
+             if (o.prefill_head_alias) {
+                 sp.reset();
+                 const auto head_t0 = Clock::now();
+@@ -17081,6 +17343,10 @@ int main(int argc, char** argv) {
+             if (o.lookup_chain > 0)
+                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
+                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
++            if (read_yield_env()) {   // (STRATA_READ_YIELD: answered when the prompt was done)
++                ov_yield_slot.store(-1);
++                yield_asked = -1;
++            }
+             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
+                         (long long) produced_n,
+diff --git a/tests/program/read_yield_test.cpp b/tests/program/read_yield_test.cpp
+new file mode 100644
+index 00000000..f9221277
+--- /dev/null
++++ b/tests/program/read_yield_test.cpp
+@@ -0,0 +1,157 @@
++// read_yield: where a batch prompt read may give way and into which slot, and that the read after the stop reads the
++// same chunks, takes the same periodic checkpoints and cuts the same segments (synthetic: no model, no GPU).
++#include "strata/program/message_boundary.hpp"
++#include "strata/program/read_yield.hpp"
++
++#include <cstdio>
++#include <utility>
++#include <vector>
++
++namespace ry = strata::program::read_yield;
++
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
++
++// the pipelined groups' pad rows (generate.cpp's pump): a group starts at the width of its last active slot, and
++// every idle slot below that width gets a pad row.  true: slot b would be written by a window of its group
++static bool padded(const std::vector<bool>& active, int k, int b) {
++    const int g0 = b - b % k;
++    int width = 0;
++    for (int t = 0; t < k; ++t)
++        if (active[(size_t) (g0 + t)]) width = t + 1;
++    return !active[(size_t) b] && b - g0 < width;
++}
++
++int main() {
++    // ---- switches
++    CHECK(!ry::env_on(nullptr) && !ry::env_on("") && !ry::env_on("0") && ry::env_on("1") && ry::env_on("yes"));
++    CHECK(ry::env_count(nullptr) == 0 && ry::env_count("") == 0 && ry::env_count("x") == 0 && ry::env_count("-3") == 0);
++    CHECK(ry::env_count("3") == 3 && ry::env_count("12a") == 0);
++
++    // ---- the position rule
++    const int64_t C = 512;
++    CHECK(!ry::pos_ok(0, 0, 100000, C, 64));             // never before the first chunk
++    CHECK(ry::pos_ok(512, 0, 100000, C, 64));
++    CHECK(!ry::pos_ok(700, 0, 100000, C, 64));           // not a chunk boundary
++    CHECK(ry::pos_ok(8192 + 1024, 8192, 100000, C, 64)); // the grid is the segment's (it starts at its cut)
++    CHECK(!ry::pos_ok(8192 + 1000, 8192, 100000, C, 64));
++    // the rest must be more than a chunk and more than a short read
++    CHECK(!ry::pos_ok(99840, 0, 100000, C, 64));         // 160 left
++    CHECK(!ry::pos_ok(99840, 0, 100352, C, 64));         // exactly one chunk left: the single-chunk path
++    CHECK(ry::pos_ok(99328, 0, 100352, C, 64));          // two chunks left
++    CHECK(!ry::pos_ok(99328, 0, 100352, C, 1536));       // ... but a short read of 1536 would take that rest
++    CHECK(!ry::pos_ok(100352, 0, 100352, C, 64));        // the end is no stop
++    // STRATA_READ_YIELD_TEST_AT=k: only from chunk k of the segment on
++    CHECK(!ry::pos_ok(1024, 0, 100000, C, 64, 3) && ry::pos_ok(1536, 0, 100000, C, 64, 3));
++    CHECK(ry::pos_ok(8192 + 1536, 8192, 100000, C, 64, 3) && !ry::pos_ok(8192 + 1024, 8192, 100000, C, 64, 3));
++    CHECK(ry::pos_ok(512, 0, 100000, 0, 0));             // (a degenerate chunk counts as 1)
++
++    // ---- the read after the stop reads the chunks the read without it reads, for every allowed stop
++    for (int64_t a0 : {0, 8192, 12345})
++        for (int64_t len : {2048, 5000, 100000, 131071}) {
++            const int64_t b0 = a0 + len;
++            const auto whole = ry::chunks(a0, b0, C);
++            for (int64_t q = a0; q <= b0; ++q) {
++                if (!ry::pos_ok(q, a0, b0, C, 64)) continue;
++                auto split = ry::chunks(a0, q, C);
++                const auto rest = ry::chunks(q, b0, C);
++                CHECK(rest.size() >= 2);                  // never the single-chunk way
++                split.insert(split.end(), rest.begin(), rest.end());
++                CHECK(split == whole);
++            }
++        }
++    // two stops in one read (STRATA_YIELDS_MAX=2): still the same chunks
++    {
++        const int64_t a0 = 4096, b0 = 4096 + 60000;
++        auto v = ry::chunks(a0, a0 + 10 * C, C);
++        CHECK(ry::pos_ok(a0 + 10 * C, a0, b0, C, 64));
++        const auto mid = ry::chunks(a0 + 10 * C, a0 + 30 * C, C);
++        CHECK(ry::pos_ok(a0 + 30 * C, a0 + 10 * C, b0, C, 64));   // the resumed run's own segment start
++        CHECK(ry::pos_ok(a0 + 30 * C, a0, b0, C, 64));            // ... is on the original grid too
++        const auto end = ry::chunks(a0 + 30 * C, b0, C);
++        v.insert(v.end(), mid.begin(), mid.end());
++        v.insert(v.end(), end.begin(), end.end());
++        CHECK(v == ry::chunks(a0, b0, C));
++    }
++
++    // ---- periodic checkpoints: carried over (BSlot::partial_next_check) they land where the read without the stop
++    // puts them; restarted from the stop (resume + every) they would not
++    {
++        const int64_t a0 = 3000, b0 = 3000 + 70000, every = 16384;
++        int64_t nc = a0 + every;
++        const auto ref = ry::periodic_checks(ry::chunks(a0, b0, C), every, nc);
++        for (int64_t q = a0 + C; q < b0; q += 7 * C) {
++            if (!ry::pos_ok(q, a0, b0, C, 64)) continue;
++            int64_t carry = a0 + every;
++            auto got = ry::periodic_checks(ry::chunks(a0, q, C), every, carry);
++            const auto after = ry::periodic_checks(ry::chunks(q, b0, C), every, carry);
++            got.insert(got.end(), after.begin(), after.end());
++            CHECK(got == ref);
++        }
++        // the restart rule moves them (why the carry is needed)
++        const int64_t q = a0 + 20 * C;
++        int64_t restart = q + every, nc1 = a0 + every;
++        auto moved = ry::periodic_checks(ry::chunks(a0, q, C), every, nc1);
++        const auto after = ry::periodic_checks(ry::chunks(q, b0, C), every, restart);
++        moved.insert(moved.end(), after.begin(), after.end());
++        CHECK(moved != ref);
++    }
++
++    // ---- the cuts after the stop: searched from the first part's resume, the same as without the stop
++    {
++        const int64_t turn = 7;
++        std::vector<int64_t> ids(40000, 1);
++        ids[9000] = turn;    // the system prompt's end (root)
++        ids[30000] = turn;   // the last message's start
++        ids[30500] = turn;   // the new turn's header (turn_at)
++        auto turn_at_from = [&](int64_t r) {
++            for (int64_t i = (int64_t) ids.size() - 1; i > r; --i)
++                if (ids[(size_t) i] == turn) return i;
++            return (int64_t) -1;
++        };
++        const int64_t resume0 = 0;
++        const int64_t t0 = turn_at_from(resume0);
++        const auto m0 = strata::program::message_cut(ids, resume0, t0, turn, true, false, false, 8192);
++        CHECK(t0 == 30500 && m0.at == 30000);
++        // a stop inside [9000, 30000): the message cut and the turn cut are still ahead, found either way
++        for (int64_t q : {int64_t(9000 + 2 * C), int64_t(29000)}) {
++            const int64_t cr = ry::cut_from(q, resume0);
++            CHECK(cr == resume0);
++            CHECK(turn_at_from(cr) == t0);
++            CHECK(strata::program::message_cut(ids, cr, turn_at_from(cr), turn, true, false, false, 8192).at == m0.at);
++        }
++        // a stop past the message cut (in [30000, 30500) no stop fits; the last segment is [30500, n - 1)): from
++        // the stop itself the turn would be missed, from resume0 it is the same, and the read loop skips it (at or
++        // below where the read goes on: its checkpoint came along with the slot)
++        const int64_t q = 30500 + 4 * C;
++        CHECK(turn_at_from(q) == -1);
++        CHECK(turn_at_from(ry::cut_from(q, resume0)) == t0);
++        CHECK(ry::cut_from(q, -1) == q);   // no yielded read: as before
++        CHECK(ry::cut_from(100, 200) == 100);
++    }
++
++    // ---- the slots a yielded read may wait in: no pad row ever writes them
++    CHECK(ry::yield_row(false, 16, 4) == 1 && ry::yield_row(true, 16, 1) == 1 && ry::yield_row(true, 16, 4) == 4);
++    CHECK(ry::yield_row(true, 16, 3) == 1 && ry::yield_row(true, 0, 4) == 1 && ry::yield_row(true, 16, 2) == 8);
++    CHECK(ry::slot_pad_safe(3, 4) && ry::slot_pad_safe(15, 4) && !ry::slot_pad_safe(2, 4) && !ry::slot_pad_safe(0, 4));
++    CHECK(ry::slot_pad_safe(0, 1) && ry::slot_pad_safe(5, 1) && !ry::slot_pad_safe(-1, 1));
++    // every pattern of active slots in 4 groups of 4: a pad-safe idle slot is never padded; every other row is
++    // padded by some pattern (the review's finding: the protection is the row, not a flag)
++    {
++        const int k = 4, B = 16;
++        std::vector<bool> reachable(B, false);
++        for (int mask = 0; mask < (1 << B); ++mask) {
++            std::vector<bool> act(B);
++            for (int b = 0; b < B; ++b) act[(size_t) b] = (mask >> b) & 1;
++            for (int b = 0; b < B; ++b)
++                if (padded(act, k, b)) {
++                    reachable[(size_t) b] = true;
++                    CHECK(!ry::slot_pad_safe(b, k));
++                }
++        }
++        for (int b = 0; b < B; ++b) CHECK(reachable[(size_t) b] == !ry::slot_pad_safe(b, k));
++    }
++
++    if (fails == 0) std::printf("read_yield_test: ok\n");
++    return fails == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

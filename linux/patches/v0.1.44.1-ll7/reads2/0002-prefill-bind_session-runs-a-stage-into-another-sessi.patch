@@ -1,0 +1,112 @@
+From 7b731a76451e9fa4e38a37112f0d38b10fd2b0ab Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:24:50 +0200
+Subject: [PATCH 02/11] prefill: bind_session runs a stage into another session
+ of its geometry, PLE history from the bound session (opt-in STRATA_READS=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/prefill/prefill.hpp |  8 ++++++++
+ src/prefill/prefill.cpp            | 22 +++++++++++++---------
+ 2 files changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 15921140..8b0c1063 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -166,6 +166,13 @@ public:
+     /// Where the last `run` stopped for should_yield (-1: it read all it was given, or failed).
+     int64_t yielded_at() const { return yielded_at_; }
+ 
++    /// STRATA_READS (opt-in; never called otherwise): this stage's runs from now on read into `ss` - another session
++    /// carved for this stage's layers with the same geometry (a batch slot's) - instead of the init session: its K/V,
++    /// recurrent states, PLE history and ple_prev.  The PLE weights, table and constants stay the init session's.  Set
++    /// on every stage before `run` and back to null after it, with no run in flight; null: the init session.
++    void bind_session(core::SessionState* ss) { bind_ss_ = ss; }
++    core::SessionState* bound_session() const { return bind_ss_; }
++
+     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
+     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
+     const float* const* embd_rows = nullptr;
+@@ -250,6 +257,7 @@ private:
+     std::future<bool> next_run_;
+     int hand_buf_ = 0;
+     int64_t yielded_at_ = -1;   ///< should_yield's stop (yielded_at)
++    core::SessionState* bind_ss_ = nullptr;   ///< bind_session (STRATA_READS)
+ 
+     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+     void release();                          // the destructor's cleanup (also `reset`'s)
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 7591b001..d2f460e1 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -2294,7 +2294,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+     Impl& m = *impl_;
+     const core::OnDevice on_device(m.device);
+     const core::ModelGeometry& g = *m.g;
+-    core::SessionState& ss = *m.ss;
++    // STRATA_READS (bind_session): the run reads into another session of this stage's geometry (a batch slot's); the
++    // PLE weights, table and constants stay the init session's (a slot session carries only its own history)
++    core::SessionState& ss = bind_ss_ != nullptr ? *bind_ss_ : *m.ss;
++    const core::PleRun& plw = m.ss->ple;
++    float* const ple_hist = bind_ss_ != nullptr ? ss.ple_hist : ss.ple.hist;
+     const auto t_start = Clock::now();
+     const int64_t LB = stage_lb_, LE = stage_le_;
+     // The direct successor's future lives on the Prefill object. Intermediate
+@@ -2355,18 +2359,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+     const bool ple_on = ple_on_();
+     const bool ple_batch = ple_batched_();
+     const int32_t prev0[2] = {prev[0], prev[1]};
+-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
++    auto ple_gather = [&m, &plw, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
+         const int64_t T = std::min(m.T, n - c0);
+         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
+         int32_t pv[2] = {at(c0), at(c0 + 1)};
+         for (int64_t t = 0; t < T; ++t) {
+             const int32_t tok = (int32_t) tokens[c0 + t];
+-            strata::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
++            strata::kernels::ngram_rows(&tok, pv, 1, plw.consts,
+                                         m.ple_rows[buf].data() + t * strata::kernels::PLE_N_HEADS);
+             pv[0] = pv[1];
+             pv[1] = tok;
+         }
+-        return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
++        return plw.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+     };
+     std::string ple_next_err;
+     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
+@@ -2774,7 +2778,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                 // files), the rest with the per-token kernels' arithmetic (native_ple_postops_batch)
+                 pt.mark(kPfPle, cs);
+                 const auto tp = Clock::now();
+-                const strata::kernels::PleWeights& pw = ss.ple.w;
++                const strata::kernels::PleWeights& pw = plw.w;
+                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
+                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
+                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
+@@ -2802,7 +2806,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
+                     if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
+                     try {
+-                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
++                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ple_hist, pw, qn, gated,
+                                                                   gate, (int) nb, m.cs);
+                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                 }
+@@ -2815,10 +2819,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     po.normalized = m.ple_norm;
+                     po.result = m.R + t * D;
+                     try {
+-                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
+-                                                   ss.ple.scratch, m.cs);
++                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ple_hist, plw.w, po,
++                                                   plw.scratch, m.cs);
+                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+-                    strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
++                    strata::kernels::ple_history_advance(ple_hist, m.ple_norm, m.cs);
+                 }
+                 stats_.ms_ple += ms_since(tp);
+             }
+-- 
+2.43.0
+

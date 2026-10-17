@@ -1,0 +1,26 @@
+From 0ca034b45f0e17f9d1cff43d3c4136eae8002ff9 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:55:23 +0200
+Subject: [PATCH 08/11] batch: a background read's per-stage checkpoint
+ schedule always has one entry per stage (opt-in STRATA_READS=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 28962f32..0bf9ad6c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -16847,6 +16847,7 @@ int main(int argc, char** argv) {
+                 r->next_check = sl.partial_next_check;
+                 r->resume0 = sl.partial_resume0;
+                 r->part_next = sl.partial_part_next;
++                if (r->part_next.size() != (size_t) n_pipe) r->part_next.assign((size_t) n_pipe, r->next_check);
+                 r->tail_saved = sl.partial_tail_saved;
+                 r->from0 = sl.partial_from0;
+                 r->cvec = sl.cvec;
+-- 
+2.43.0
+

@@ -1,0 +1,28 @@
+From 28de225d3632e9603842786fb97655d861445d95 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 14:53:38 +0200
+Subject: [PATCH 11/11] batch: a background read's evicted checkpoints are
+ freed on the chunk that evicts them (opt-in STRATA_READS=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index d5cf44f4..545ad340 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14036,6 +14036,9 @@ int main(int argc, char** argv) {
+                     if (!complete) { e = "a cut checkpoint's stage parts are missing"; return false; }
+                     rp::add(r->checks, assemble(), cut->as_tail, r->tail_len, r->clock, o.prompt_cache, r->evicted);
+                 }
++                // what left its list goes at once, as checkpoint_at's evictions do on this thread (the pool locks)
++                for (ConvCheckpoint& c : r->evicted) ckpt_pool.give(std::move(c));
++                r->evicted.clear();
+                 return true;
+             };
+         };
+-- 
+2.43.0
+

@@ -1,0 +1,102 @@
+From fca65d762a3db20a6be78c8ee1ccdb84042abfff Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 14:47:01 +0200
+Subject: [PATCH 09/11] batch: a background read refuses a control vector,
+ lands swaps before a drained turn, frees evicted checkpoints per turn, one
+ persistent reader thread (opt-in STRATA_READS=N)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 33 +++++++++++++++++++++++++++++----
+ 1 file changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 0bf9ad6c..d5cf44f4 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -11445,8 +11445,11 @@ int main(int argc, char** argv) {
+         // k - 1: the top row of a pipelined group, which no pad row writes)
+         if (reads_on() && o.batch > 0) {
+             const int rk = strata::program::read_yield::yield_row(o.batch_groups > 1 && !stages.empty(), o.batch, o.batch_groups);
+-            std::printf("INFO reads=%d reads_row=%d\n",
+-                        strata::program::read_sched::reads_limit(std::getenv("STRATA_READS"), o.batch, rk), rk);
++            // (STRATA_READS_FORCE_BG: a test knob - only a driver that sends the finish after BREAD may run it; the
++            // server warns when an engine says force_bg=1 and STRATA_SERVER_READS is off)
++            std::printf("INFO reads=%d reads_row=%d%s\n",
++                        strata::program::read_sched::reads_limit(std::getenv("STRATA_READS"), o.batch, rk), rk,
++                        reads_force_bg_env() ? " force_bg=1" : "");
+         }
+         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+         std::fflush(stdout);
+@@ -12245,6 +12248,10 @@ int main(int argc, char** argv) {
+         };
+         std::vector<std::unique_ptr<ReadCtx>> bg_reads;   // (unique_ptr: the callbacks hold its address)
+         ReadCtx* bg_cur = nullptr;                         // the read whose run is in flight (set with no run in flight)
++        // the reader of a turn beside the groups: one persistent thread (stage 0's checkpoint parts are saved on it,
++        // and a thread keeps its private copy stream per device for life - conversation_copy.hpp - so a thread per
++        // turn would leave one stream behind every turn).  Started on the first such turn
++        ParkThreads bg_worker;
+         int64_t bg_pick = 0;                               // read_sched's pick counter
+         auto bg_of = [&](int park) -> ReadCtx* {
+             for (auto& r : bg_reads) if (r->park == park) return r.get();
+@@ -13795,6 +13802,15 @@ int main(int argc, char** argv) {
+         };
+         // after a run: the reads that are done, failed or cancelled leave the list
+         auto bg_events = [&]() {
++            // a read's evicted checkpoints go now (no run in flight: only then is r.evicted the main thread's), as
++            // checkpoint_at's do at once, not at its end: a long read evicts many (one per prompt_cache_every)
++            if (bg_cur == nullptr)
++                for (auto& rr : bg_reads) {
++                    if (ckpt_pool.on())
++                        for (ConvCheckpoint& c : rr->evicted) ckpt_pool.give(std::move(c));
++                    rr->evicted.clear();
++                    rr->evicted.shrink_to_fit();
++                }
+             for (size_t i = 0; i < bg_reads.size();) {
+                 ReadCtx& r = *bg_reads[i];
+                 if (r.cancelled.load()) bg_drop(r, "cancel", "");
+@@ -14114,6 +14130,13 @@ int main(int argc, char** argv) {
+                              why.c_str());
+                 exclusive = true;
+             }
++            if (exclusive) {   // as the serial read before its prompt: queued swaps land, --adapt-async's round too
++                apply_pending(true);
++                if (!adapt_tick(true)) {
++                    std::fprintf(stderr, "strata batch: background read in slot %d: an adaptive refill failed\n", r.park);
++                    return false;
++                }
++            }
+             r.since = bg_pick + 1;
+             ++bg_pick;
+             const int64_t d0 = r.done.load();
+@@ -14170,8 +14193,9 @@ int main(int argc, char** argv) {
+             ov_wait_seen.assign(pg.size(), 0);
+             ov_active = true;
+             ov_reading.store(true);
+-            std::thread w([&] {
++            bg_worker.start(1, [&](size_t) {
+                 strata::aux_cpus::pin_current_thread();
++                (void) cudaGetLastError();   // (the thread lives on: a turn's wcuda is only this turn's error)
+                 try {
+                     wok = bg_runs(r, quiesce, share, false, we);
+                 } catch (const std::exception& x) {
+@@ -14237,7 +14261,7 @@ int main(int argc, char** argv) {
+                     }
+                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                 }
+-                w.join();
++                bg_worker.wait();
+             }
+             const bool fault = !wok && (wcuda != 0 || sp.chain_cuda_error() != 0);
+             auto end_overlap = [&] {
+@@ -16795,6 +16819,7 @@ int main(int argc, char** argv) {
+                     why = "the slot is not free";
+                 else if ((int) bg_reads.size() >= limit) why = "STRATA_READS: as many background reads held as allowed";
+                 else if (o.prompt_cache <= 0) why = "no prompt cache";
++                else if (strata::kernels::cvec().loaded()) why = "a control vector (on or off per request)";
+                 else if (!req_imgs.empty() || sp.embd_rows != nullptr) why = "a picture in the prompt";
+                 else if (reread_to > 0) why = "STRATA_CKPT_REREAD";
+                 else if (req_pin > 0 || pin_at >= 0) why = "pin= (its checkpoint is pinned in the main list)";
+-- 
+2.43.0
+
