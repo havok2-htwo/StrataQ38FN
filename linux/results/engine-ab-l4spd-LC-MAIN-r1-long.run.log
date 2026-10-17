@@ -1,0 +1,1899 @@
+[strata] 2026-10-17 01:58:05 engine started: /media/raid0/StrataQ38FN/Strata/engine/strata-g3-1441f-lanes4 --serve --pack /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs --native /media/raid0/Models/Strata-GGUF/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf --expert-profile /media/raid0/StrataQ38FN/Strata/data/expert-profile.bin --expert-cache auto --prefill 512 --spec 4 --spec-min-p 0.5 --mtp /media/raid0/StrataQ38FN/Strata-data/mtp/rt --max-context 262144 --kv int8 --resident-experts --trim-stage-weights --ple-io ram --aux-cpus 65-127 --conversation-cache-mib 131072 --conversation-cache-slots 448 --kv-resident 28672 --conversation-cache-min-free-mib 16384 --conversation-cache-min-tokens 1024 --vision --layer-split 12,25,37 --batch 16
+strata generate: memory guard: limit 200.0 GiB (source: cgroup), current 1.2 GiB, reclaimable cache credited 0.0 GiB; available 198.8 GiB (MemAvailable 241.4 GiB), floor 16384 MiB
+strata generate: layer split across 4 GPUs: CUDA0, then CUDA1,2,3 (split 12,25,37)
+strata generate: PCIe probe: 13.0 GB/s host->device (best of 13.0 13.0 13.0 13.0) -> pcie_frac 0.36 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs experts (largest blob 3.48 MB), token embedding Q8_0 in mapped host memory (644 MiB, 0.7 s)
+strata generate: layer split: CUDA0 loads the dense weights of layers 0-11 only
+strata generate: 463 MiB of weights loaded from /media/raid0/StrataQ38FN/Strata-data/packs/unsloth-ud-iq4_xs in 0.1 s (843 canonical tensors skipped: served natively)
+strata generate: 76 native projection matrices, 763.67 MiB of weights, in 0.2 s
+strata generate: PLE table locked in RAM (--ple-io ram) in 1.2 s
+strata generate: STRATA_SOLO_PIPELINE: --pipeline-windows 2 beside --batch 16: a request alone on the solo path decodes its windows pipelined across the 4 stages (the slots, the admissions and the prompt reads as before; the drafter, which all of them share, is sized for 8 rows, carries the forcing kernel and runs at its card's greatest priority - STRATA_MTP_PRIORITY=0: the default one)
+strata generate: layer split: CUDA1 loads the dense weights of layers 12-24 only
+strata generate: layer split: CUDA1 PCIe probe 13.1 GB/s (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36
+strata generate: layer split: CUDA1 holds its weights; 21.97 GiB free (its session follows the split search)
+strata generate: layer split: CUDA2 loads the dense weights of layers 25-36 only
+strata generate: layer split: CUDA2 PCIe probe 13.5 GB/s (best of 13.5 13.5 13.5 13.5) -> pcie_frac 0.37
+strata generate: layer split: CUDA2 holds its weights; 22.06 GiB free (its session follows the split search)
+strata generate: layer split: CUDA3 loads the dense weights of layers 37-47 only
+strata generate: layer split: CUDA3 PCIe probe 13.5 GB/s (best of 13.5 13.5 13.5 13.5) -> pcie_frac 0.37
+strata generate: layer split: CUDA3 holds its weights; 22.16 GiB free (its session follows the split search)
+strata generate: profile /media/raid0/StrataQ38FN/Strata/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: KV streaming: 28672 of 262144 cells per QSA layer in VRAM, the K/V in 0.77 GiB of pinned RAM
+strata generate: PLE on, table 320001536 rows of /media/raid0/Models/Strata-GGUF/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf
+strata generate: layer split: CUDA1 holds its weights, session [12, 25); 21.68 GiB free
+strata generate: layer split: CUDA2 holds its weights, session [25, 37); 21.78 GiB free
+strata generate: layer split: CUDA3 holds its weights, session [37, 48) and the head; 21.39 GiB free
+strata generate: --batch-groups auto: 4 groups of 4 slots
+strata generate: --batch: 16 slot sessions on CUDA0 (0.28 GiB each); 16.88 GiB free
+strata generate: --batch: 16 slot sessions on CUDA1 (0.28 GiB each); 17.10 GiB free
+strata generate: --batch: 16 slot sessions on CUDA2 (0.28 GiB each); 17.24 GiB free
+strata generate: --batch: 16 slot sessions on CUDA3 (0.28 GiB each); 16.85 GiB free
+strata generate: --batch 16: the slot sessions take 4.46 GiB of VRAM on CUDA0 that the expert cache would otherwise hold
+strata generate: --vision with --batch 16: the image position table holds 17 regions of 262208 rows (the main sessions' and one per slot), 51.0 MiB per GPU; image and text requests share the batch
+strata mtp: draft layer loaded, 837 MiB of VRAM (experts 675, dense 111), files read in 0.52 s (1515 MiB/s)
+strata mtp: shared draft weights, 50 MiB of private state and buffers
+strata mtp: shared draft weights, 50 MiB of private state and buffers
+strata generate: STRATA_SPEC_LANES=4: lanes on slots 0,4,8,12, their drafters on CUDA3 (50 MiB of private K/V state and buffers each, sharing the solo drafter's weights; lanes 2 and 3's after the caches); 15.88 GiB free there
+strata generate: GPU 0: NVIDIA GeForce RTX 3090, compute capability 8.6
+strata generate: experts via mmap (--mmap-experts; the GGUF shards in place, no experts.bin)
+strata generate: GPU host-callback thread started before host-core pinning
+strata generate: CPU pool tasks/phase: 192 (automatic), participating threads: 64
+strata generate: 63 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63, the host thread on 0 (draining too) (--host-core first)
+strata aux cpus: threads that are neither pool workers nor the host go to CPUs 65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127 (on; 10 threads placed so far)
+strata generate: --pipeline-windows 2: 216 MiB of CUDA0 kept out of the expert cache (the second verifier, the GDN snapshots)
+strata generate: STRATA_SPEC_LANES=4: 320 MiB of every card kept out of its expert cache (the lane verifiers: 2 arenas of their own, the rest share idle verifiers' (STRATA_LC_SHARE))
+strata generate: expert cache auto: 16.76 GiB free, 700 MiB reserved (+0 MiB for the draft head) -> 4795 slots
+strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): 48 of 48 layers
+strata: prompt MMQ sorts the full expert groups (STRATA_MMQ_GROUP_SORT=1): 48 of 48 layers
+strata generate: +256 B guard per sized slot (STRATA_MMQ_DIRECT)
+strata generate: expert cache 6144 slots, 14.27 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: the profile fill asks for 256 pairs ahead (STRATA_FILL_AHEAD)
+strata generate: pre-filled 6144 of 6144 slots from the profile in 4.2 s (3631 MB/s); slot 0 verified
+strata generate: STRATA_SOLO_PIPELINE: CUDA1 keeps 160 MiB (the second verifier) + 62.3 MiB (its GDN snapshots) out of the expert cache
+strata generate: layer split, CUDA1: 17.01 GiB free of 23.56, room for experts 15.70 GiB
+strata generate: layer split: CUDA1 runs layers 12-24, expert cache 6656 slots (14.44 GiB), 6656 of its 6656 profiled pairs; slot 0 verified
+strata generate: STRATA_SOLO_PIPELINE: CUDA2 keeps 160 MiB (the second verifier) + 56.1 MiB (its GDN snapshots) out of the expert cache
+strata generate: layer split, CUDA2: 17.16 GiB free of 23.56, room for experts 15.86 GiB
+strata generate: layer split: CUDA2 runs layers 25-36, expert cache 6144 slots (13.72 GiB), 6144 of its 6144 profiled pairs; slot 0 verified
+strata generate: STRATA_SOLO_PIPELINE: CUDA3 keeps 160 MiB (the second verifier) out of the expert cache
+strata generate: layer split, CUDA3: 15.88 GiB free of 23.56, room for experts 14.63 GiB
+strata generate: layer split: CUDA3 runs layers 37-47, expert cache 5632 slots (13.00 GiB), 5632 of its 5632 profiled pairs; slot 0 verified
+strata generate: layer split: CUDA0 runs layers 0-11
+strata generate: routing-aware prefetch on (the next layer's router, file tier)
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 63 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.44.1)
+strata generate: token graph hit path: 24576 resident experts, decided on the device
+strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+FileExpertSource: copied cache complement through layer 8/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 16/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 24/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 32/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 40/48 (0.00 GiB, 0 s)
+FileExpertSource: copied cache complement through layer 48/48 (0.00 GiB, 0 s)
+FileExpertSource: locked resident cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s
+FileExpertSource: 18432 verified additional-GPU experts remain on the mmap fallback
+strata generate: resident RAM mode: 0.00 GiB of experts in RAM (pageable), 6144 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+strata serve:   CUDA0 keeps its own prompt buffers (0.68 GiB of 2.48 GiB free): no loan
+strata serve:   CUDA1 keeps its own prompt buffers (0.68 GiB of 2.56 GiB free): no loan
+strata serve:   CUDA2 keeps its own prompt buffers (0.68 GiB of 3.44 GiB free): no loan
+strata serve:   CUDA3 keeps its own prompt buffers (0.68 GiB of 2.87 GiB free): no loan
+strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+strata serve: STRATA_SOLO_PIPELINE: CUDA0: 1663 MiB free, the second verifier ~160 MiB + the GDN snapshots 56.1 MiB
+strata serve: STRATA_SOLO_PIPELINE: CUDA1: 1741 MiB free, the second verifier ~160 MiB + the GDN snapshots 62.3 MiB
+strata serve: STRATA_SOLO_PIPELINE: CUDA2: 2641 MiB free, the second verifier ~160 MiB + the GDN snapshots 56.1 MiB
+strata serve: STRATA_SOLO_PIPELINE: CUDA3: 2063 MiB free, the second verifier ~160 MiB + the GDN snapshots 0.0 MiB
+strata hc: CUDA1: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA2: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA3: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata serve: layer split: layers 0-11 (CUDA0), 12-24 (CUDA1), 25-36 (CUDA2), 37-47 (CUDA3), one hand-off per window
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata verify: batch windows of up to 16 sequences (layers [0, 12)), one-row windows keep their rows
+strata verify: batch windows of up to 16 sequences (layers [12, 25)), one-row windows keep their rows
+strata verify: batch windows of up to 16 sequences (layers [25, 37)), one-row windows keep their rows
+strata verify: batch windows of up to 16 sequences (layers [37, 48)), one-row windows keep their rows
+strata verify: STRATA_EARLY_SAMPLE=1: sampled rows are drawn right behind the window
+strata serve: STRATA_SOLO_PIPELINE: the second verifiers, hand-offs and GDN snapshots took (verifier + snapshots) CUDA0 102 + 60 MiB (1397 MiB free), CUDA1 104 + 64 MiB (1471 MiB free), CUDA2 104 + 60 MiB (2375 MiB free), CUDA3 102 + 0 MiB (1637 MiB free)
+strata serve: --pipeline-windows 2: two verifiers per stage, 4 stages overlap across windows (decode too; the GDN snapshots beside the window)
+strata verify: capturing the 1-token window (1397 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1393 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1389 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1383 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 5-token window (1377 MiB of VRAM free)
+strata verify: captured the 5-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (1371 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1367 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1363 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1357 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1351 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 5-token window (1345 MiB of VRAM free)
+strata verify: captured the 5-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (1341 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1471 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1467 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1461 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1457 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 5-token window (1451 MiB of VRAM free)
+strata verify: captured the 5-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (1445 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1441 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1435 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1429 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1423 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 5-token window (1419 MiB of VRAM free)
+strata verify: captured the 5-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (1413 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2375 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2371 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (2367 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (2361 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 5-token window (2355 MiB of VRAM free)
+strata verify: captured the 5-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (2349 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2345 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2339 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (2335 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (2329 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 5-token window (2323 MiB of VRAM free)
+strata verify: captured the 5-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (2319 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1637 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1633 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1627 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1623 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 5-token window (1617 MiB of VRAM free)
+strata verify: captured the 5-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (1611 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1607 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1601 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1597 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1591 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 5-token window (1585 MiB of VRAM free)
+strata verify: captured the 5-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (1581 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata serve: STRATA_SOLO_PIPELINE: the pipelined windows' graphs (both verifiers per stage, the drafter's chain), captured at boot, took CUDA0 62 MiB (1335 MiB free), CUDA1 62 MiB (1409 MiB free), CUDA2 62 MiB (2313 MiB free), CUDA3 72 MiB (1565 MiB free)
+strata mtp: shared draft weights, 50 MiB of private state and buffers
+strata mtp: shared draft weights, 50 MiB of private state and buffers
+strata serve: STRATA_SPEC_LANES: CUDA0 1333 MiB free, 4 lanes ~255 MiB; CUDA1 1407 MiB free, 4 lanes ~249 MiB; CUDA2 2311 MiB free, 4 lanes ~255 MiB; CUDA3 1459 MiB free, 4 lanes ~364 MiB; 2 arenas of their own per card, the rest shared with idle verifiers (STRATA_LC_SHARE); the floor after them 768 MiB + 141 MiB still made lazily -> 4 lanes (of 4 asked)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: window up to 8 tokens, 100.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: capturing the 1-token window (1129 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1121 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1117 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1113 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1107 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1103 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1095 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1089 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1085 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1079 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1075 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1067 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1063 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1059 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1053 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1049 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1199 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1195 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1191 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1185 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1181 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1173 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1169 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1163 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1157 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1149 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1145 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1141 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1135 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1131 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1123 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1119 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2107 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2099 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (2095 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (2091 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2085 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2081 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (2073 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (2069 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2065 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2057 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (2053 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (2045 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2041 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2035 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (2031 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (2027 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1197 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1193 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1189 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1183 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1179 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1173 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1167 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1163 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1157 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1153 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1147 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1141 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1137 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (1131 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (1127 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (1123 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata serve: STRATA_SPEC_LANES=4: the lanes' window and commit graphs (up to 4 rows) took CUDA0 88 MiB, CUDA1 86 MiB, CUDA2 88 MiB, CUDA3 82 MiB
+strata serve: STRATA_SPEC_LANES=4: the lane verifiers, hand-offs, the drafters' graphs and the lanes' window graphs took CUDA0 232 MiB (1101 MiB free), CUDA1 230 MiB (1177 MiB free), CUDA2 232 MiB (2079 MiB free), CUDA3 344 MiB (1115 MiB free); lane 0 in the main verifiers' arenas, lane 1 in the second verifiers', the GDN snapshots in lane 2's
+strata serve: conversation tier: on: /media/raid0/strata-kvspill-bench/lanes4/http (warm); files=0 parts=0 disk_bytes=0 written_today=0 budget=300000000000 budget_left=300000000000 spills=0 written_bytes=0 restores=0 restores_queue=0 read_bytes=0 misses=0 drops_small=0 drops_budget=0 drops_busy=0 drops_ram=0 drops_cap=0 drops_io=0 kept=0 superseded=0 expired=0 evicted=0 pending=0 pending_bytes=0 foreign=0 verified=0
+strata serve: STRATA_PARK_ASYNC: a finished request's conversation is captured beside the slots on 4 threads (8 x 16 MiB pinned staging)
+strata serve: STRATA_MSG_CKPT_TAIL=8192: a prompt read also checkpoints in front of a last message of up to 8192 tokens (a prefix of 8192 or more)
+strata serve: adaptive overlap: off: not on a layer split
+strata serve: 1101 MiB of VRAM free with everything loaded
+strata serve: CUDA1: 1177 MiB of VRAM free with everything loaded
+strata serve: CUDA2: 2079 MiB of VRAM free with everything loaded
+strata serve: CUDA3: 1115 MiB of VRAM free with everything loaded
+strata serve: STRATA_SLOT_PARK: a pipelined slot's conversation is captured when it ends, on 4 threads (8 x 16 MiB pinned staging), and parked when the slot is overwritten
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: draft layer prompt K/V batched on CUDA3 (E-9 on the layer split, K/V mode 2)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 434 ms (343.7 tok/s), 512 generated in 3838 ms (133.4 tok/s), drafts accepted 277 of 477, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 59529.9 MB of expert reads
+strata serve: KV streaming: 99.85% of 328038 block reads hit VRAM, 2.0 MiB read from RAM
+strata serve: conversation cache: skip parking (661 tokens, below the 1024 minimum; parked=0)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 176 ms (837.5 tok/s), 512 generated in 3678 ms (139.2 tok/s), drafts accepted 283 of 464, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 99.85% of 322875 block reads hit VRAM, 2.0 MiB read from RAM
+strata serve: conversation cache: skip parking (658 tokens, below the 1024 minimum; parked=0)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 175 ms (836.1 tok/s), 512 generated in 3730 ms (137.3 tok/s), drafts accepted 290 of 491, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 99.86% of 351954 block reads hit VRAM, 2.0 MiB read from RAM
+strata serve: conversation cache: skip parking (657 tokens, below the 1024 minimum; parked=0)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 151 tokens = 0 reused + 151 read in 179 ms (842.4 tok/s), 2 generated in 28 ms (72.5 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 89.68% of 1134 block reads hit VRAM, 0.5 MiB read from RAM
+strata verify: capturing the 1-token window (1061 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1133 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2029 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (1069 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata batch: slot 0 takes 153 tokens (copied in 64.0 ms)
+strata serve: prompt 153 tokens = 152 reused + 1 read in 1 ms (1990.0 tok/s), 1 generated in 22 ms (44.8 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 90.65% of 1251 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 153 tokens not parked here: slot 0 parks them with its reply
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 0,1,2,3
+strata verify: captured the batch window over slots 4,5,6,7
+strata verify: captured the batch window over slots 8,9,10,11
+strata verify: captured the batch window over slots 12,13,14,15
+strata batch: overlapped read: captured 20 group layouts in 58.1 ms
+strata generate: STRATA_PIPE_OVERLAP_KVS=1: first overlapped read with a streamed K/V cache (--kv-resident 28672) prepared; free VRAM before->after: CUDA0 1057->1031 MiB CUDA1 1129->1099 MiB CUDA2 2023->1997 MiB CUDA3 1063->1037 MiB
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 141 tokens in 169 ms (drain 3.6 ms); the slots decoded 12 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.024 ms avg over 12 windows, ple hit n/a
+strata verify: capturing the 7-token window (1031 MiB of VRAM free)
+strata verify: captured the 7-token window (upload no error, sync no error)
+strata verify: capturing the 7-token window (1099 MiB of VRAM free)
+strata verify: captured the 7-token window (upload no error, sync no error)
+strata verify: capturing the 7-token window (1997 MiB of VRAM free)
+strata verify: captured the 7-token window (upload no error, sync no error)
+strata verify: capturing the 7-token window (1037 MiB of VRAM free)
+strata verify: captured the 7-token window (upload no error, sync no error)
+strata batch: slot 4 takes 148 tokens (copied in 1.8 ms)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 257 ms (575.5 tok/s), 1 generated in 40 ms (25.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 768 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 165 (no drafts, drafter level) slot 4 at 148 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 4175 ms (start 1): slot 0: 227 windows, 497 tokens (119.0 tok/s), drafts 272 of 430 (63.3%); slot 4: 227 windows, 509 tokens (121.9 tok/s), drafts 282 of 432 (65.3%); drafter catch-ups from batch windows 12 + 0 + 0 + 0 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 148 tokens not parked here: slot 4 parks them with its reply
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata verify: captured the batch window over slots 4
+strata batch: overlapped read: captured 4 group layouts in 9.8 ms
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch (pipelined, 4 groups of 4): 14 group-steps, 14 rows in 4553 ms = 3.1 rows/s (admissions included)
+strata batch: overlapped read of 142 tokens in 144 ms (drain 0.0 ms); the slots decoded 2 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.029 ms avg over 2 windows, ple hit n/a
+strata batch: slot 0 takes 149 tokens (copied in 11.6 ms)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 175 ms (849.1 tok/s), 1 generated in 27 ms (37.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 149 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 138 tokens in 159 ms (drain 9.3 ms); the slots decoded 12 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 12 windows, ple hit n/a
+strata batch: slot 4 takes 145 tokens (copied in 2.3 ms)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 176 ms (825.9 tok/s), 1 generated in 28 ms (35.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 162 (no drafts, drafter level) slot 4 at 145 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 3900 ms (start 2): slot 0: 205 windows, 498 tokens (127.7 tok/s), drafts 293 of 441 (66.4%); slot 4: 208 windows, 511 tokens (131.0 tok/s), drafts 303 of 445 (68.1%); drafter catch-ups from batch windows 25 + 2 + 0 + 0 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: skip parking (145 tokens, below the 1024 minimum; parked=0)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 183 ms (809.5 tok/s), 2 generated in 26 ms (77.0 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 90.69% of 1224 block reads hit VRAM, 0.5 MiB read from RAM
+strata batch: slot 0 takes 150 tokens (copied in 9.9 ms)
+strata serve: prompt 150 tokens = 149 reused + 1 read in 0 ms (2049.5 tok/s), 1 generated in 12 ms (80.8 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 91.48% of 1338 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 150 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 144 tokens in 167 ms (drain 7.7 ms); the slots decoded 12 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.024 ms avg over 12 windows, ple hit n/a
+strata batch: slot 4 takes 151 tokens (copied in 1.9 ms)
+strata serve: prompt 151 tokens = 0 reused + 151 read in 201 ms (749.7 tok/s), 1 generated in 28 ms (35.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.50% of 786 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 151 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 138 tokens in 190 ms (drain 7.8 ms); the slots decoded 27 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 27 windows, ple hit n/a
+strata batch: slot 8 takes 145 tokens (copied in 2.9 ms)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 205 ms (707.9 tok/s), 1 generated in 28 ms (36.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 175 (no drafts, drafter level) slot 4 at 165 (no drafts, drafter level) slot 8 at 145 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 3980 ms (start 3): slot 0: 200 windows, 484 tokens (121.6 tok/s), drafts 286 of 428 (66.8%); slot 4: 200 windows, 454 tokens (114.1 tok/s), drafts 254 of 404 (62.9%); slot 8: 200 windows, 468 tokens (117.6 tok/s), drafts 268 of 434 (61.8%); drafter catch-ups from batch windows 50 + 16 + 0 + 0 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 145 tokens not parked here: slot 8 parks them with its reply
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata verify: captured the batch window over slots 8
+strata batch: overlapped read: captured 4 group layouts in 12.8 ms
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 190 ms (drain 7.9 ms); the slots decoded 27 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 27 windows, ple hit n/a
+strata batch: slot 0 takes 147 tokens (copied in 13.3 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 233 ms (630.6 tok/s), 1 generated in 27 ms (37.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 147 (with drafts, drafter level) slot 4 at 632 (no drafts, drafter level) slot 8 at 627 (no drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 234 ms (start 4): slot 0: 12 windows, 28 tokens (119.5 tok/s), drafts 16 of 23 (69.6%); slot 4: 11 windows, 30 tokens (128.0 tok/s), drafts 19 of 23 (82.6%); slot 8: 11 windows, 28 tokens (119.5 tok/s), drafts 17 of 27 (63.0%); drafter catch-ups from batch windows 50 + 29 + 14 + 0 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 147 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 163 ms (drain 4.3 ms); the slots decoded 13 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.019 ms avg over 13 windows, ple hit n/a
+strata batch: slot 4 takes 147 tokens (copied in 1.8 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 174 ms (843.8 tok/s), 1 generated in 27 ms (37.0 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 147 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 186 ms (drain 9.1 ms); the slots decoded 27 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 27 windows, ple hit n/a
+strata batch: slot 8 takes 147 tokens (copied in 1.8 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 203 ms (725.1 tok/s), 1 generated in 27 ms (36.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 200 (no drafts, drafter level) slot 4 at 161 (no drafts, drafter level) slot 8 at 147 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 4278 ms (start 5): slot 0: 179 windows, 458 tokens (107.1 tok/s), drafts 281 of 431 (65.2%); slot 4: 216 windows, 455 tokens (106.4 tok/s), drafts 239 of 421 (56.8%); slot 8: 214 windows, 511 tokens (119.5 tok/s), drafts 298 of 470 (63.4%); drafter catch-ups from batch windows 75 + 43 + 15 + 0 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: skip parking (147 tokens, below the 1024 minimum; parked=0)
+strata batch: slot 4 gave back 616 tokens of this conversation (all it holds, and 1 checkpoint of its own) in 8.8 ms
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 617 tokens = 616 reused + 1 read in 10 ms (105.1 tok/s), 42 generated in 238 ms (176.7 tok/s), drafts accepted 26 of 38, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 98.54% of 34161 block reads hit VRAM, 2.0 MiB read from RAM
+strata serve: suffix drafts: 1 windows, 3 of 3 drafts accepted
+strata serve: conversation cache: skip parking (659 tokens, below the 1024 minimum; parked=0)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 182 ms (815.0 tok/s), 2 generated in 34 ms (59.4 tok/s), drafts accepted 0 of 3, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 90.69% of 1224 block reads hit VRAM, 0.5 MiB read from RAM
+strata batch: slot 0 takes 150 tokens (copied in 10.5 ms)
+strata serve: prompt 150 tokens = 149 reused + 1 read in 0 ms (2034.6 tok/s), 1 generated in 12 ms (82.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 91.48% of 1338 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 150 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 168 ms (drain 6.7 ms); the slots decoded 12 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 12 windows, ple hit n/a
+strata batch: slot 4 takes 147 tokens (copied in 1.8 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 200 ms (734.2 tok/s), 1 generated in 28 ms (35.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 147 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 141 tokens in 192 ms (drain 7.7 ms); the slots decoded 27 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 27 windows, ple hit n/a
+strata batch: slot 8 takes 148 tokens (copied in 2.9 ms)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 207 ms (716.6 tok/s), 1 generated in 27 ms (37.0 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 768 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 175 (no drafts, drafter level) slot 4 at 161 (no drafts, drafter level) slot 8 at 148 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 0 ms (start 6): ; drafter catch-ups from batch windows 100 + 57 + 15 + 0 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 148 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 138 tokens in 213 ms (drain 9.7 ms); the slots decoded 42 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 42 windows, ple hit n/a
+strata batch: slot 12 takes 145 tokens (copied in 3.0 ms)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 230 ms (631.1 tok/s), 1 generated in 27 ms (36.4 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 189 (no drafts, drafter level) slot 4 at 175 (no drafts, drafter level) slot 8 at 162 (no drafts, drafter level) slot 12 at 145 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 4888 ms (start 7): slot 0: 198 windows, 447 tokens (91.5 tok/s), drafts 249 of 382 (65.2%); slot 4: 197 windows, 483 tokens (98.8 tok/s), drafts 288 of 421 (68.4%); slot 8: 197 windows, 436 tokens (89.2 tok/s), drafts 239 of 383 (62.4%); slot 12: 197 windows, 456 tokens (93.3 tok/s), drafts 259 of 432 (60.0%); drafter catch-ups from batch windows 114 + 71 + 29 + 0 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 145 tokens not parked here: slot 12 parks them with its reply
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata verify: captured the batch window over slots 12
+strata batch: overlapped read: captured 4 group layouts in 12.1 ms
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 213 ms (drain 7.5 ms); the slots decoded 41 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 41 windows, ple hit n/a
+strata batch: slot 4 takes 147 tokens (copied in 2.4 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 254 ms (577.7 tok/s), 1 generated in 27 ms (36.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 649 (no drafts, drafter level) slot 4 at 147 (with drafts, drafter level) slot 8 at 612 (no drafts, drafter level) slot 12 at 615 (no drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 149 ms (start 8): slot 0: 6 windows, 10 tokens (67.3 tok/s), drafts 5 of 6 (83.3%); slot 4: 6 windows, 16 tokens (107.7 tok/s), drafts 10 of 13 (76.9%); slot 8: 6 windows, 14 tokens (94.2 tok/s), drafts 8 of 9 (88.9%); slot 12: 6 windows, 14 tokens (94.2 tok/s), drafts 8 of 12 (66.7%); drafter catch-ups from batch windows 127 + 71 + 43 + 14 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 147 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 141 tokens in 216 ms (drain 8.4 ms); the slots decoded 42 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.019 ms avg over 42 windows, ple hit n/a
+strata batch: slot 0 takes 148 tokens (copied in 13.2 ms)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 231 ms (639.5 tok/s), 1 generated in 27 ms (36.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 768 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 148 (with drafts, drafter level) slot 4 at 177 (no drafts, drafter level) slot 8 at 640 (no drafts, drafter level) slot 12 at 643 (no drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 123 ms (start 9): slot 0: 5 windows, 14 tokens (113.4 tok/s), drafts 9 of 13 (69.2%); slot 4: 5 windows, 11 tokens (89.1 tok/s), drafts 6 of 7 (85.7%); slot 8: 5 windows, 9 tokens (72.9 tok/s), drafts 4 of 7 (57.1%); slot 12: 4 windows, 13 tokens (105.3 tok/s), drafts 9 of 9 (100.0%); drafter catch-ups from batch windows 127 + 85 + 57 + 28 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 148 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 138 tokens in 207 ms (drain 5.8 ms); the slots decoded 38 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.020 ms avg over 38 windows, ple hit n/a
+strata batch: slot 12 takes 145 tokens (copied in 1.8 ms)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 220 ms (660.0 tok/s), 1 generated in 27 ms (36.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 176 (no drafts, drafter level) slot 4 at 202 (no drafts, drafter level) slot 12 at 145 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 0 ms (start 10): ; drafter catch-ups from batch windows 141 + 99 + 67 + 28 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 145 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 142 tokens in 218 ms (drain 8.7 ms); the slots decoded 43 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 43 windows, ple hit n/a
+strata batch: slot 8 takes 149 tokens (copied in 1.9 ms)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 234 ms (635.7 tok/s), 1 generated in 27 ms (36.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 190 (no drafts, drafter level) slot 4 at 216 (no drafts, drafter level) slot 8 at 149 (with drafts, drafter level) slot 12 at 160 (no drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 4980 ms (start 11): slot 0: 202 windows, 469 tokens (94.2 tok/s), drafts 269 of 450 (59.8%); slot 4: 172 windows, 442 tokens (88.8 tok/s), drafts 270 of 407 (66.3%); slot 8: 205 windows, 471 tokens (94.6 tok/s), drafts 266 of 426 (62.4%); slot 12: 203 windows, 496 tokens (99.6 tok/s), drafts 294 of 447 (65.8%); drafter catch-ups from batch windows 155 + 113 + 67 + 43 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: skip parking (149 tokens, below the 1024 minimum; parked=0)
+strata batch: slot 8 gave back 620 tokens of this conversation (all it holds, and 1 checkpoint of its own) in 9.1 ms
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 621 tokens = 620 reused + 1 read in 10 ms (102.1 tok/s), 40 generated in 302 ms (132.5 tok/s), drafts accepted 23 of 38, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 98.63% of 36222 block reads hit VRAM, 2.0 MiB read from RAM
+strata serve: conversation cache: skip parking (661 tokens, below the 1024 minimum; parked=0)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: slot 0 takes 148 tokens (copied in 2.4 ms)
+strata serve: prompt 148 tokens = 0 reused + 148 read in 156 ms (947.1 tok/s), 1 generated in 30 ms (33.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.55% of 768 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 148 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 142 tokens in 170 ms (drain 2.6 ms); the slots decoded 12 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 12 windows, ple hit n/a
+strata batch: slot 4 takes 149 tokens (copied in 3.0 ms)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 180 ms (827.3 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 161 (no drafts, drafter level) slot 4 at 149 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 0 ms (start 12): ; drafter catch-ups from batch windows 168 + 113 + 67 + 43 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 149 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 137 tokens in 194 ms (drain 7.3 ms); the slots decoded 27 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 27 windows, ple hit n/a
+strata batch: slot 8 takes 144 tokens (copied in 3.0 ms)
+strata serve: prompt 144 tokens = 0 reused + 144 read in 209 ms (689.0 tok/s), 1 generated in 28 ms (35.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.54% of 747 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 174 (no drafts, drafter level) slot 4 at 163 (no drafts, drafter level) slot 8 at 144 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 0 ms (start 13): ; drafter catch-ups from batch windows 181 + 127 + 67 + 43 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 144 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 212 ms (drain 8.0 ms); the slots decoded 41 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 41 windows, ple hit n/a
+strata batch: slot 12 takes 147 tokens (copied in 1.8 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 227 ms (646.4 tok/s), 1 generated in 28 ms (35.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 188 (no drafts, drafter level) slot 4 at 176 (no drafts, drafter level) slot 8 at 158 (no drafts, drafter level) slot 12 at 147 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 0 ms (start 14): ; drafter catch-ups from batch windows 195 + 140 + 81 + 43 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 147 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 138 tokens in 217 ms (drain 12.7 ms); the slots decoded 44 rows meanwhile, D_ref 0.0 rows/s, lost n/a of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 44 windows, ple hit n/a
+strata batch: slot 1 takes 145 tokens (copied in 1.1 ms)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 237 ms (611.8 tok/s), 1 generated in 28 ms (36.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata verify: captured the batch window over slots 0,1
+strata serve: conversation cache: 145 tokens not parked here: slot 1 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 138 tokens in 220 ms (drain 11.6 ms); the slots decoded 41 rows meanwhile, D_ref 327.7 rows/s, lost 106 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.020 ms avg over 41 windows, ple hit n/a
+strata batch: slot 0 takes 145 tokens (copied in 2.4 ms)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 254 ms (571.0 tok/s), 1 generated in 28 ms (35.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 145 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 142 tokens in 211 ms (drain 13.1 ms); the slots decoded 48 rows meanwhile, D_ref 327.7 rows/s, lost 78 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.027 ms avg over 36 windows, ple hit n/a
+strata batch: slot 4 takes 149 tokens (copied in 2.9 ms)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 232 ms (643.2 tok/s), 1 generated in 28 ms (36.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 149 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 139 tokens in 210 ms (drain 11.1 ms); the slots decoded 48 rows meanwhile, D_ref 327.7 rows/s, lost 74 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.028 ms avg over 36 windows, ple hit n/a
+strata batch: slot 8 takes 146 tokens (copied in 3.0 ms)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 228 ms (639.7 tok/s), 1 generated in 27 ms (36.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 146 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 143 tokens in 207 ms (drain 10.9 ms); the slots decoded 46 rows meanwhile, D_ref 327.7 rows/s, lost 77 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.027 ms avg over 35 windows, ple hit n/a
+strata batch: slot 12 takes 150 tokens (copied in 1.9 ms)
+strata serve: prompt 150 tokens = 0 reused + 150 read in 225 ms (666.4 tok/s), 1 generated in 27 ms (36.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 780 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 150 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 139 tokens in 212 ms (drain 12.5 ms); the slots decoded 43 rows meanwhile, D_ref 327.7 rows/s, lost 94 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 43 windows, ple hit n/a
+strata batch: slot 1 takes 146 tokens (copied in 1.1 ms)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 232 ms (628.7 tok/s), 1 generated in 27 ms (36.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch (pipelined, 4 groups of 4): 4515 group-steps, 5474 rows in 50256 ms = 108.9 rows/s (admissions included)
+strata serve: conversation cache: skip parking (146 tokens, below the 1024 minimum; parked=0)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 181 ms (810.0 tok/s), 2 generated in 33 ms (60.2 tok/s), drafts accepted 0 of 3, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 92.53% of 1566 block reads hit VRAM, 0.5 MiB read from RAM
+strata batch: slot 0 takes 149 tokens (copied in 10.6 ms)
+strata serve: prompt 149 tokens = 148 reused + 1 read in 0 ms (2017.6 tok/s), 1 generated in 12 ms (82.6 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 93.04% of 1680 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 149 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 170 ms (drain 3.2 ms); the slots decoded 12 rows meanwhile, D_ref 327.7 rows/s, lost 136 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 12 windows, ple hit n/a
+strata batch: slot 4 takes 147 tokens (copied in 2.4 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 199 ms (738.0 tok/s), 1 generated in 28 ms (35.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 161 (no drafts, drafter level) slot 4 at 147 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 20 ms (start 15): slot 0: 1 windows, 1 tokens (49.8 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 2 tokens (99.6 tok/s), drafts 1 of 1 (100.0%); drafter catch-ups from batch windows 1189 + 1135 + 1089 + 1065 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 147 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 139 tokens in 192 ms (drain 6.3 ms); the slots decoded 27 rows meanwhile, D_ref 327.7 rows/s, lost 116 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 27 windows, ple hit n/a
+strata batch: slot 8 takes 146 tokens (copied in 3.0 ms)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 206 ms (709.1 tok/s), 1 generated in 28 ms (35.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 175 (no drafts, drafter level) slot 4 at 163 (no drafts, drafter level) slot 8 at 146 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 0 ms (start 16): ; drafter catch-ups from batch windows 1202 + 1149 + 1089 + 1065 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 146 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 217 ms (drain 10.7 ms); the slots decoded 43 rows meanwhile, D_ref 327.7 rows/s, lost 97 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 43 windows, ple hit n/a
+strata batch: slot 12 takes 147 tokens (copied in 1.8 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 235 ms (624.6 tok/s), 1 generated in 28 ms (35.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 147 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 144 tokens in 216 ms (drain 12.6 ms); the slots decoded 43 rows meanwhile, D_ref 327.7 rows/s, lost 97 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 43 windows, ple hit n/a
+strata batch: slot 1 takes 151 tokens (copied in 1.2 ms)
+strata serve: prompt 151 tokens = 0 reused + 151 read in 236 ms (640.8 tok/s), 1 generated in 28 ms (35.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.50% of 786 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 151 tokens not parked here: slot 1 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 138 tokens in 218 ms (drain 12.0 ms); the slots decoded 51 rows meanwhile, D_ref 327.7 rows/s, lost 75 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.025 ms avg over 41 windows, ple hit n/a
+strata batch: slot 5 takes 145 tokens (copied in 1.1 ms)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 237 ms (610.6 tok/s), 1 generated in 28 ms (36.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata verify: captured the batch window over slots 4,5
+strata serve: conversation cache: 145 tokens not parked here: slot 5 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 146 tokens in 222 ms (drain 11.8 ms); the slots decoded 49 rows meanwhile, D_ref 345.9 rows/s, lost 92 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.030 ms avg over 39 windows, ple hit n/a
+strata batch: slot 0 takes 153 tokens (copied in 14.1 ms)
+strata serve: prompt 153 tokens = 0 reused + 153 read in 256 ms (598.2 tok/s), 1 generated in 28 ms (35.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.28% of 795 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 153 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 142 tokens in 226 ms (drain 14.9 ms); the slots decoded 50 rows meanwhile, D_ref 345.9 rows/s, lost 96 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.030 ms avg over 40 windows, ple hit n/a
+strata batch: slot 4 takes 149 tokens (copied in 1.8 ms)
+strata serve: prompt 149 tokens = 0 reused + 149 read in 248 ms (601.1 tok/s), 1 generated in 27 ms (36.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.27% of 774 block reads hit VRAM, 0.5 MiB read from RAM
+strata serve: conversation cache: 149 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 138 tokens in 221 ms (drain 10.7 ms); the slots decoded 60 rows meanwhile, D_ref 345.9 rows/s, lost 59 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.033 ms avg over 36 windows, ple hit n/a
+strata batch: slot 8 takes 145 tokens (copied in 2.9 ms)
+strata serve: prompt 145 tokens = 0 reused + 145 read in 240 ms (605.4 tok/s), 1 generated in 28 ms (35.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.26% of 753 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 145 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 139 tokens in 221 ms (drain 10.7 ms); the slots decoded 60 rows meanwhile, D_ref 345.9 rows/s, lost 59 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.036 ms avg over 37 windows, ple hit n/a
+strata batch: slot 12 takes 146 tokens (copied in 2.4 ms)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 240 ms (609.2 tok/s), 1 generated in 28 ms (35.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 146 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 140 tokens in 218 ms (drain 11.7 ms); the slots decoded 50 rows meanwhile, D_ref 345.9 rows/s, lost 86 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.026 ms avg over 41 windows, ple hit n/a
+strata batch: slot 1 takes 147 tokens (copied in 1.2 ms)
+strata serve: prompt 147 tokens = 0 reused + 147 read in 237 ms (619.0 tok/s), 1 generated in 28 ms (35.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.49% of 765 block reads hit VRAM, 0.4 MiB read from RAM
+strata serve: conversation cache: 147 tokens not parked here: slot 1 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata batch: overlapped read of 139 tokens in 220 ms (drain 14.3 ms); the slots decoded 52 rows meanwhile, D_ref 345.9 rows/s, lost 84 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.027 ms avg over 42 windows, ple hit n/a
+strata batch: slot 5 takes 146 tokens (copied in 1.2 ms)
+strata serve: prompt 146 tokens = 0 reused + 146 read in 242 ms (603.8 tok/s), 1 generated in 27 ms (36.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.38% of 759 block reads hit VRAM, 0.4 MiB read from RAM
+strata batch (pipelined, 4 groups of 4): 4211 group-steps, 6127 rows in 17916 ms = 342.0 rows/s (admissions included)
+strata serve: conversation cache: skip parking (146 tokens, below the 1024 minimum; parked=0)
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 417 ms (2906.2 tok/s), 512 generated in 3759 ms (136.2 tok/s), drafts accepted 287 of 476, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 99.89% of 1166925 block reads hit VRAM, 5.2 MiB read from RAM
+strata serve: suffix drafts: 1 windows, 1 of 5 drafts accepted
+strata serve: conversation cache: parked 1725 tokens in 42.6 ms; parked=1 bytes=264766392 evictions=0 snapshot_bytes=264766392 reused_kv_bytes=0 capture=async capture_ms=42.8 wait_ms=41.4
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 453 ms (2676.1 tok/s), 512 generated in 3575 ms (143.2 tok/s), drafts accepted 289 of 482, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 99.88% of 1115067 block reads hit VRAM, 5.2 MiB read from RAM
+strata serve: conversation cache: parked 1725 tokens in 1.5 ms; parked=2 bytes=529532784 evictions=0 snapshot_bytes=264766392 reused_kv_bytes=0 capture=async capture_ms=42.7 wait_ms=0.0
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 419 ms (2899.2 tok/s), 2 generated in 28 ms (71.5 tok/s), drafts accepted 0 of 1, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 88.84% of 8199 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: slot 0 takes 1217 tokens (copied in 11.6 ms)
+strata serve: prompt 1217 tokens = 1216 reused + 1 read in 49 ms (20.4 tok/s), 1 generated in 12 ms (84.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 89.96% of 9114 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1217 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1207 tokens in 417 ms (drain 11.1 ms); the slots decoded 26 rows meanwhile, D_ref 345.9 rows/s, lost 353 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 26 windows, ple hit n/a
+strata batch: slot 4 takes 1214 tokens (copied in 3.8 ms)
+strata serve: prompt 1214 tokens = 0 reused + 1214 read in 454 ms (2672.0 tok/s), 1 generated in 29 ms (34.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6366 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1243 (no drafts, drafter level) slot 4 at 1214 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 4123 ms (start 17): slot 0: 223 windows, 483 tokens (117.2 tok/s), drafts 261 of 410 (63.7%); slot 4: 223 windows, 484 tokens (117.4 tok/s), drafts 261 of 451 (57.9%); drafter catch-ups from batch windows 2222 + 2155 + 2111 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1214 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1208 tokens in 417 ms (drain 9.3 ms); the slots decoded 26 rows meanwhile, D_ref 345.9 rows/s, lost 351 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.025 ms avg over 26 windows, ple hit n/a
+strata serve: conversation cache: parked 1726 tokens in 1.5 ms; parked=3 bytes=792474992 evictions=0 snapshot_bytes=262942208 reused_kv_bytes=0 capture=slot 0 capture_ms=26.7 wait_ms=0.0
+strata batch: slot 0 takes 1215 tokens (copied in 4.9 ms)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 434 ms (2797.7 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1215 (with drafts, drafter level) slot 4 at 1724 (no drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 36 ms (start 18): slot 0: 2 windows, 4 tokens (111.3 tok/s), drafts 2 of 3 (66.7%); slot 4: 1 windows, 1 tokens (27.8 tok/s), drafts 0 of 0 (0.0%); drafter catch-ups from batch windows 2222 + 2181 + 2111 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1215 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 418 ms (drain 9.7 ms); the slots decoded 26 rows meanwhile, D_ref 345.9 rows/s, lost 353 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.026 ms avg over 26 windows, ple hit n/a
+strata serve: conversation cache: parked 1725 tokens in 1.6 ms; parked=4 bytes=1055416964 evictions=0 snapshot_bytes=262941972 reused_kv_bytes=0 capture=slot 4 capture_ms=27.8 wait_ms=0.0
+strata batch: slot 4 takes 1212 tokens (copied in 6.0 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 437 ms (2775.2 tok/s), 1 generated in 29 ms (34.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1245 (no drafts, drafter level) slot 4 at 1212 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 3996 ms (start 19): slot 0: 211 windows, 481 tokens (120.4 tok/s), drafts 270 of 430 (62.8%); slot 4: 212 windows, 477 tokens (119.4 tok/s), drafts 268 of 435 (61.6%); drafter catch-ups from batch windows 2248 + 2181 + 2111 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1212 tokens not parked here: slot 4 parks them with its reply
+strata batch: slot 4 gave back 1689 tokens of this conversation (all it holds, and 1 checkpoint of its own) in 84.8 ms
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1690 tokens = 1689 reused + 1 read in 86 ms (11.7 tok/s), 34 generated in 260 ms (130.9 tok/s), drafts accepted 19 of 34, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 98.70% of 100152 block reads hit VRAM, 5.2 MiB read from RAM
+strata serve: suffix drafts: 2 windows, 2 of 10 drafts accepted
+strata serve: conversation cache: parked 1723 tokens in 1.4 ms; parked=5 bytes=1320122268 evictions=0 snapshot_bytes=264705304 reused_kv_bytes=0 capture=async capture_ms=42.7 wait_ms=0.0
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 417 ms (2911.0 tok/s), 2 generated in 28 ms (71.2 tok/s), drafts accepted 0 of 1, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 88.86% of 8184 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: parked 1726 tokens in 1.5 ms; parked=6 bytes=1583064268 evictions=0 snapshot_bytes=262942000 reused_kv_bytes=0 capture=slot 0 capture_ms=26.2 wait_ms=0.0
+strata batch: slot 0 takes 1215 tokens (copied in 67.1 ms)
+strata serve: prompt 1215 tokens = 1214 reused + 1 read in 49 ms (20.4 tok/s), 1 generated in 12 ms (81.4 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 89.97% of 9096 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1215 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1209 tokens in 414 ms (drain 5.4 ms); the slots decoded 25 rows meanwhile, D_ref 345.9 rows/s, lost 347 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 25 windows, ple hit n/a
+strata batch: slot 4 takes 1216 tokens (copied in 3.8 ms)
+strata serve: prompt 1216 tokens = 0 reused + 1216 read in 446 ms (2727.2 tok/s), 1 generated in 30 ms (33.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6375 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1240 (no drafts, drafter level) slot 4 at 1216 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 21 ms (start 20): slot 0: 1 windows, 1 tokens (47.5 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (47.5 tok/s), drafts 0 of 1 (0.0%); drafter catch-ups from batch windows 2273 + 2181 + 2111 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1216 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 491 ms (drain 9.4 ms); the slots decoded 60 rows meanwhile, D_ref 345.9 rows/s, lost 327 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 60 windows, ple hit n/a
+strata batch: slot 8 takes 1212 tokens (copied in 3.3 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 507 ms (2388.5 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1271 (no drafts, drafter level) slot 4 at 1247 (no drafts, drafter level) slot 8 at 1212 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 3748 ms (start 21): slot 0: 186 windows, 453 tokens (120.9 tok/s), drafts 270 of 393 (68.7%); slot 4: 186 windows, 426 tokens (113.7 tok/s), drafts 240 of 369 (65.0%); slot 8: 186 windows, 423 tokens (112.9 tok/s), drafts 237 of 392 (60.5%); drafter catch-ups from batch windows 2303 + 2211 + 2111 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1212 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 473 ms (drain 9.6 ms); the slots decoded 57 rows meanwhile, D_ref 345.9 rows/s, lost 318 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 57 windows, ple hit n/a
+strata serve: conversation cache: parked 1724 tokens in 1.6 ms; parked=7 bytes=1845955724 evictions=0 snapshot_bytes=262891456 reused_kv_bytes=0 capture=slot 0 capture_ms=25.8 wait_ms=0.0
+strata batch: slot 0 takes 1212 tokens (copied in 6.2 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 491 ms (2470.4 tok/s), 1 generated in 29 ms (34.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1212 (with drafts, drafter level) slot 4 at 1702 (no drafts, drafter level) slot 8 at 1663 (no drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 256 ms (start 22): slot 0: 13 windows, 29 tokens (113.2 tok/s), drafts 16 of 32 (50.0%); slot 4: 12 windows, 25 tokens (97.6 tok/s), drafts 14 of 21 (66.7%); slot 8: 12 windows, 33 tokens (128.8 tok/s), drafts 21 of 23 (91.3%); drafter catch-ups from batch windows 2303 + 2240 + 2139 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1212 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1208 tokens in 472 ms (drain 3.4 ms); the slots decoded 55 rows meanwhile, D_ref 345.9 rows/s, lost 316 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 55 windows, ple hit n/a
+strata serve: conversation cache: parked 1727 tokens in 1.4 ms; parked=8 bytes=2108897756 evictions=0 snapshot_bytes=262942032 reused_kv_bytes=0 capture=slot 4 capture_ms=26.2 wait_ms=0.0
+strata batch: slot 4 takes 1215 tokens (copied in 4.6 ms)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 485 ms (2505.9 tok/s), 1 generated in 30 ms (33.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1269 (no drafts, drafter level) slot 4 at 1215 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 19 ms (start 23): slot 0: 1 windows, 1 tokens (52.5 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (52.5 tok/s), drafts 0 of 0 (0.0%); drafter catch-ups from batch windows 2331 + 2240 + 2166 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1215 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 475 ms (drain 4.5 ms); the slots decoded 57 rows meanwhile, D_ref 345.9 rows/s, lost 315 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 57 windows, ple hit n/a
+strata serve: conversation cache: parked 1723 tokens in 1.5 ms; parked=9 bytes=2371782840 evictions=0 snapshot_bytes=262885084 reused_kv_bytes=0 capture=slot 8 capture_ms=31.1 wait_ms=0.0
+strata batch: slot 8 takes 1212 tokens (copied in 5.0 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 502 ms (2416.7 tok/s), 1 generated in 29 ms (34.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1298 (no drafts, drafter level) slot 4 at 1245 (no drafts, drafter level) slot 8 at 1212 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 3938 ms (start 24): slot 0: 186 windows, 425 tokens (107.9 tok/s), drafts 239 of 389 (61.4%); slot 4: 195 windows, 481 tokens (122.1 tok/s), drafts 287 of 445 (64.5%); slot 8: 196 windows, 423 tokens (107.4 tok/s), drafts 228 of 399 (57.1%); drafter catch-ups from batch windows 2359 + 2269 + 2166 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1212 tokens not parked here: slot 8 parks them with its reply
+strata batch: slot 8 gave back 1635 tokens of this conversation (all it holds, and 1 checkpoint of its own) in 84.1 ms
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1636 tokens = 1635 reused + 1 read in 85 ms (11.8 tok/s), 88 generated in 491 ms (179.1 tok/s), drafts accepted 58 of 74, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 99.37% of 204372 block reads hit VRAM, 5.2 MiB read from RAM
+strata serve: conversation cache: parked 1723 tokens in 1.6 ms; parked=10 bytes=2636488144 evictions=0 snapshot_bytes=264705304 reused_kv_bytes=0 capture=async capture_ms=42.3 wait_ms=0.0
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 420 ms (2888.9 tok/s), 2 generated in 28 ms (72.7 tok/s), drafts accepted 0 of 1, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 88.86% of 8184 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: parked 1723 tokens in 1.4 ms; parked=11 bytes=2899373216 evictions=0 snapshot_bytes=262885072 reused_kv_bytes=0 capture=slot 0 capture_ms=26.1 wait_ms=0.0
+strata batch: slot 0 takes 1215 tokens (copied in 66.2 ms)
+strata serve: prompt 1215 tokens = 1214 reused + 1 read in 49 ms (20.4 tok/s), 1 generated in 12 ms (84.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 89.97% of 9096 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1215 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1204 tokens in 415 ms (drain 10.6 ms); the slots decoded 26 rows meanwhile, D_ref 345.9 rows/s, lost 351 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 26 windows, ple hit n/a
+strata serve: conversation cache: parked 1726 tokens in 1.5 ms; parked=12 bytes=3162315216 evictions=0 snapshot_bytes=262942000 reused_kv_bytes=0 capture=slot 4 capture_ms=25.8 wait_ms=0.0
+strata batch: slot 4 takes 1211 tokens (copied in 4.8 ms)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 452 ms (2678.2 tok/s), 1 generated in 29 ms (34.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1241 (no drafts, drafter level) slot 4 at 1211 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 19 ms (start 25): slot 0: 1 windows, 1 tokens (53.6 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (53.6 tok/s), drafts 0 of 0 (0.0%); drafter catch-ups from batch windows 2385 + 2269 + 2166 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1211 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1204 tokens in 476 ms (drain 5.7 ms); the slots decoded 57 rows meanwhile, D_ref 345.9 rows/s, lost 317 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 57 windows, ple hit n/a
+strata batch: slot 8 takes 1211 tokens (copied in 3.2 ms)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 503 ms (2405.3 tok/s), 1 generated in 30 ms (33.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1270 (no drafts, drafter level) slot 4 at 1241 (no drafts, drafter level) slot 8 at 1211 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 24 ms (start 26): slot 0: 1 windows, 1 tokens (42.2 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (42.2 tok/s), drafts 0 of 0 (0.0%); slot 8: 1 windows, 1 tokens (42.2 tok/s), drafts 0 of 0 (0.0%); drafter catch-ups from batch windows 2413 + 2298 + 2166 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1211 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1208 tokens in 530 ms (drain 8.5 ms); the slots decoded 87 rows meanwhile, D_ref 345.9 rows/s, lost 287 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 87 windows, ple hit n/a
+strata batch: slot 12 takes 1215 tokens (copied in 3.7 ms)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 547 ms (2220.3 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1300 (no drafts, drafter level) slot 4 at 1271 (no drafts, drafter level) slot 8 at 1241 (no drafts, drafter level) slot 12 at 1215 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 4184 ms (start 27): slot 0: 165 windows, 424 tokens (101.3 tok/s), drafts 259 of 370 (70.0%); slot 4: 165 windows, 403 tokens (96.3 tok/s), drafts 238 of 376 (63.3%); slot 8: 165 windows, 360 tokens (86.0 tok/s), drafts 195 of 341 (57.2%); slot 12: 165 windows, 358 tokens (85.6 tok/s), drafts 193 of 336 (57.4%); drafter catch-ups from batch windows 2442 + 2327 + 2195 + 2087 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1215 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1204 tokens in 532 ms (drain 11.4 ms); the slots decoded 88 rows meanwhile, D_ref 345.9 rows/s, lost 289 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.022 ms avg over 88 windows, ple hit n/a
+strata serve: conversation cache: parked 1724 tokens in 1.6 ms; parked=13 bytes=3425206672 evictions=0 snapshot_bytes=262891456 reused_kv_bytes=0 capture=slot 0 capture_ms=25.9 wait_ms=0.0
+strata batch: slot 0 takes 1211 tokens (copied in 6.0 ms)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 551 ms (2196.8 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1211 (with drafts, drafter level) slot 4 at 1703 (no drafts, drafter level) slot 8 at 1631 (no drafts, drafter level) slot 12 at 1602 (no drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 245 ms (start 28): slot 0: 10 windows, 24 tokens (98.1 tok/s), drafts 14 of 23 (60.9%); slot 4: 9 windows, 19 tokens (77.6 tok/s), drafts 10 of 17 (58.8%); slot 8: 9 windows, 22 tokens (89.9 tok/s), drafts 13 of 18 (72.2%); slot 12: 9 windows, 19 tokens (77.6 tok/s), drafts 10 of 20 (50.0%); drafter catch-ups from batch windows 2442 + 2356 + 2225 + 2116 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1211 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1206 tokens in 533 ms (drain 9.9 ms); the slots decoded 88 rows meanwhile, D_ref 345.9 rows/s, lost 288 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 88 windows, ple hit n/a
+strata serve: conversation cache: parked 1722 tokens in 1.6 ms; parked=14 bytes=3688091720 evictions=0 snapshot_bytes=262885048 reused_kv_bytes=0 capture=slot 4 capture_ms=26.0 wait_ms=0.0
+strata batch: slot 4 takes 1213 tokens (copied in 4.8 ms)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 551 ms (2201.4 tok/s), 1 generated in 29 ms (34.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1264 (no drafts, drafter level) slot 4 at 1213 (with drafts, drafter level) slot 8 at 1682 (no drafts, drafter level) slot 12 at 1651 (no drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 489 ms (start 29): slot 0: 20 windows, 39 tokens (79.7 tok/s), drafts 19 of 30 (63.3%); slot 4: 20 windows, 43 tokens (87.9 tok/s), drafts 23 of 38 (60.5%); slot 8: 19 windows, 40 tokens (81.8 tok/s), drafts 21 of 38 (55.3%); slot 12: 19 windows, 52 tokens (106.3 tok/s), drafts 33 of 44 (75.0%); drafter catch-ups from batch windows 2471 + 2356 + 2254 + 2146 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1213 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1207 tokens in 522 ms (drain 8.8 ms); the slots decoded 82 rows meanwhile, D_ref 345.9 rows/s, lost 294 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.024 ms avg over 82 windows, ple hit n/a
+strata serve: conversation cache: parked 1722 tokens in 1.5 ms; parked=15 bytes=3950976760 evictions=0 snapshot_bytes=262885040 reused_kv_bytes=0 capture=slot 8 capture_ms=26.4 wait_ms=0.0
+strata batch: slot 8 takes 1214 tokens (copied in 4.8 ms)
+strata serve: prompt 1214 tokens = 0 reused + 1214 read in 554 ms (2192.2 tok/s), 1 generated in 29 ms (34.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6366 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1333 (no drafts, drafter level) slot 4 at 1285 (no drafts, drafter level) slot 8 at 1214 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 24 ms (start 30): slot 0: 1 windows, 1 tokens (42.3 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (42.3 tok/s), drafts 0 of 0 (0.0%); slot 8: 1 windows, 1 tokens (42.3 tok/s), drafts 0 of 0 (0.0%); drafter catch-ups from batch windows 2501 + 2385 + 2254 + 2169 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1214 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1209 tokens in 534 ms (drain 9.3 ms); the slots decoded 88 rows meanwhile, D_ref 345.9 rows/s, lost 289 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 88 windows, ple hit n/a
+strata serve: conversation cache: parked 1726 tokens in 1.5 ms; parked=16 bytes=4213918760 evictions=0 snapshot_bytes=262942000 reused_kv_bytes=0 capture=slot 12 capture_ms=25.4 wait_ms=0.0
+strata batch: slot 12 takes 1216 tokens (copied in 4.7 ms)
+strata serve: prompt 1216 tokens = 0 reused + 1216 read in 565 ms (2151.2 tok/s), 1 generated in 30 ms (33.4 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6375 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1363 (no drafts, drafter level) slot 4 at 1316 (no drafts, drafter level) slot 8 at 1244 (no drafts, drafter level) slot 12 at 1216 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 4960 ms (start 31): slot 0: 153 windows, 359 tokens (72.4 tok/s), drafts 209 of 323 (64.7%); slot 4: 178 windows, 408 tokens (82.3 tok/s), drafts 232 of 365 (63.6%); slot 8: 209 windows, 481 tokens (97.0 tok/s), drafts 272 of 448 (60.7%); slot 12: 210 windows, 464 tokens (93.5 tok/s), drafts 255 of 430 (59.3%); drafter catch-ups from batch windows 2530 + 2415 + 2283 + 2169 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1216 tokens not parked here: slot 12 parks them with its reply
+strata batch: slot 12 gave back 1680 tokens of this conversation (all it holds, and 1 checkpoint of its own) in 84.7 ms
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1681 tokens = 1680 reused + 1 read in 85 ms (11.7 tok/s), 47 generated in 281 ms (167.2 tok/s), drafts accepted 31 of 38, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 98.78% of 106359 block reads hit VRAM, 5.2 MiB read from RAM
+strata serve: conversation cache: parked 1729 tokens in 1.4 ms; parked=17 bytes=4478746336 evictions=0 snapshot_bytes=264827576 reused_kv_bytes=0 capture=async capture_ms=42.6 wait_ms=0.0
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 417 ms (2900.7 tok/s), 2 generated in 25 ms (81.2 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 88.84% of 8172 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: parked 1722 tokens in 1.6 ms; parked=18 bytes=4741631376 evictions=0 snapshot_bytes=262885040 reused_kv_bytes=0 capture=slot 0 capture_ms=25.9 wait_ms=0.0
+strata batch: slot 0 takes 1213 tokens (copied in 67.2 ms)
+strata serve: prompt 1213 tokens = 1212 reused + 1 read in 49 ms (20.3 tok/s), 1 generated in 12 ms (84.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 89.96% of 9084 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1213 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1208 tokens in 418 ms (drain 10.7 ms); the slots decoded 26 rows meanwhile, D_ref 345.9 rows/s, lost 354 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 26 windows, ple hit n/a
+strata serve: conversation cache: parked 1724 tokens in 1.5 ms; parked=19 bytes=5004522624 evictions=0 snapshot_bytes=262891248 reused_kv_bytes=0 capture=slot 4 capture_ms=26.0 wait_ms=0.0
+strata batch: slot 4 takes 1215 tokens (copied in 5.4 ms)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 455 ms (2670.3 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1239 (no drafts, drafter level) slot 4 at 1215 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 20 ms (start 32): slot 0: 1 windows, 1 tokens (49.9 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (49.9 tok/s), drafts 0 of 1 (0.0%); drafter catch-ups from batch windows 2556 + 2415 + 2283 + 2169 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1215 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 478 ms (drain 10.3 ms); the slots decoded 58 rows meanwhile, D_ref 345.9 rows/s, lost 321 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 58 windows, ple hit n/a
+strata serve: conversation cache: parked 1725 tokens in 1.5 ms; parked=20 bytes=5267464592 evictions=0 snapshot_bytes=262941968 reused_kv_bytes=0 capture=slot 8 capture_ms=26.3 wait_ms=0.0
+strata batch: slot 8 takes 1212 tokens (copied in 5.3 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 510 ms (2374.4 tok/s), 1 generated in 29 ms (34.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1269 (no drafts, drafter level) slot 4 at 1245 (no drafts, drafter level) slot 8 at 1212 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 24 ms (start 33): slot 0: 1 windows, 1 tokens (41.2 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (41.2 tok/s), drafts 0 of 0 (0.0%); slot 8: 1 windows, 1 tokens (41.2 tok/s), drafts 0 of 1 (0.0%); drafter catch-ups from batch windows 2585 + 2444 + 2283 + 2169 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1212 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 532 ms (drain 9.0 ms); the slots decoded 88 rows meanwhile, D_ref 345.9 rows/s, lost 287 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 88 windows, ple hit n/a
+strata batch: slot 12 takes 1212 tokens (copied in 3.8 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 563 ms (2152.1 tok/s), 1 generated in 29 ms (34.0 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1299 (no drafts, drafter level) slot 4 at 1276 (no drafts, drafter level) slot 8 at 1242 (no drafts, drafter level) slot 12 at 1212 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 29 ms (start 34): slot 0: 1 windows, 1 tokens (34.0 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (34.0 tok/s), drafts 0 of 0 (0.0%); slot 8: 1 windows, 1 tokens (34.0 tok/s), drafts 0 of 0 (0.0%); slot 12: 1 windows, 1 tokens (34.0 tok/s), drafts 0 of 1 (0.0%); drafter catch-ups from batch windows 2614 + 2474 + 2312 + 2169 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1212 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 544 ms (drain 11.3 ms); the slots decoded 94 rows meanwhile, D_ref 345.9 rows/s, lost 283 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 94 windows, ple hit n/a
+strata batch: slot 1 takes 1212 tokens (copied in 2.4 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 563 ms (2154.3 tok/s), 1 generated in 29 ms (34.3 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1212 tokens not parked here: slot 1 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1206 tokens in 554 ms (drain 13.6 ms); the slots decoded 90 rows meanwhile, D_ref 339.4 rows/s, lost 302 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.025 ms avg over 90 windows, ple hit n/a
+strata serve: conversation cache: parked 1722 tokens in 1.6 ms; parked=21 bytes=5530349840 evictions=0 snapshot_bytes=262885248 reused_kv_bytes=0 capture=slot 0 capture_ms=25.9 wait_ms=0.0
+strata batch: slot 0 takes 1213 tokens (copied in 4.9 ms)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 575 ms (2109.9 tok/s), 1 generated in 29 ms (34.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1213 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1208 tokens in 530 ms (drain 15.1 ms); the slots decoded 100 rows meanwhile, D_ref 339.4 rows/s, lost 250 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.029 ms avg over 75 windows, ple hit n/a
+strata serve: conversation cache: parked 1726 tokens in 1.6 ms; parked=22 bytes=5793291844 evictions=0 snapshot_bytes=262942004 reused_kv_bytes=0 capture=slot 4 capture_ms=26.2 wait_ms=0.0
+strata batch: slot 4 takes 1215 tokens (copied in 4.9 ms)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 553 ms (2198.3 tok/s), 1 generated in 29 ms (34.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1215 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1209 tokens in 549 ms (drain 8.1 ms); the slots decoded 105 rows meanwhile, D_ref 339.4 rows/s, lost 247 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.030 ms avg over 79 windows, ple hit n/a
+strata serve: conversation cache: parked 1723 tokens in 1.6 ms; parked=23 bytes=6056176916 evictions=0 snapshot_bytes=262885072 reused_kv_bytes=0 capture=slot 8 capture_ms=26.0 wait_ms=0.0
+strata batch: slot 8 takes 1216 tokens (copied in 4.8 ms)
+strata serve: prompt 1216 tokens = 0 reused + 1216 read in 579 ms (2100.3 tok/s), 1 generated in 30 ms (33.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6375 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1216 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1206 tokens in 530 ms (drain 9.7 ms); the slots decoded 100 rows meanwhile, D_ref 339.4 rows/s, lost 245 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.029 ms avg over 75 windows, ple hit n/a
+strata serve: conversation cache: parked 1723 tokens in 1.5 ms; parked=24 bytes=6319061988 evictions=0 snapshot_bytes=262885072 reused_kv_bytes=0 capture=slot 12 capture_ms=26.1 wait_ms=0.0
+strata batch: slot 12 takes 1213 tokens (copied in 6.0 ms)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 566 ms (2144.9 tok/s), 1 generated in 29 ms (34.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1303 (no drafts, drafter level) slot 4 at 1276 (no drafts, drafter level) slot 8 at 1245 (no drafts, drafter level) slot 12 at 1213 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 31 ms (start 35): slot 0: 1 windows, 1 tokens (32.7 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (32.7 tok/s), drafts 0 of 0 (0.0%); slot 8: 1 windows, 1 tokens (32.7 tok/s), drafts 0 of 0 (0.0%); slot 12: 1 windows, 4 tokens (130.7 tok/s), drafts 3 of 3 (100.0%); drafter catch-ups from batch windows 3126 + 2984 + 2821 + 2679 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1213 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1204 tokens in 542 ms (drain 11.9 ms); the slots decoded 94 rows meanwhile, D_ref 339.4 rows/s, lost 277 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 94 windows, ple hit n/a
+strata serve: conversation cache: parked 1723 tokens in 1.7 ms; parked=25 bytes=6581947076 evictions=0 snapshot_bytes=262885088 reused_kv_bytes=0 capture=slot 1 capture_ms=30.9 wait_ms=0.0
+strata batch: slot 1 takes 1211 tokens (copied in 4.1 ms)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 576 ms (2101.3 tok/s), 1 generated in 30 ms (33.9 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch (pipelined, 4 groups of 4): 5055 group-steps, 5940 rows in 62850 ms = 94.5 rows/s (admissions included)
+strata batch: STRATA_SLOT_PARK: 3 group starts waited for a slot's capture, 44.2 ms in all
+strata serve: conversation cache: parked 1724 tokens in 1.7 ms; parked=26 bytes=6844838324 evictions=0 snapshot_bytes=262891248 reused_kv_bytes=0 capture=slot 0 capture_ms=26.1 wait_ms=0.0
+strata serve: conversation cache: 1211 tokens not parked here: slot 1 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata serve: STRATA_SOLO_PIPELINE: request pipelined=1 (pipelined)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 435 ms (2786.1 tok/s), 2 generated in 26 ms (77.5 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 91.62% of 10917 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: slot 0 takes 1214 tokens (copied in 65.7 ms)
+strata serve: prompt 1214 tokens = 1213 reused + 1 read in 49 ms (20.4 tok/s), 1 generated in 12 ms (84.1 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 92.26% of 11829 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1214 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 417 ms (drain 10.4 ms); the slots decoded 26 rows meanwhile, D_ref 339.4 rows/s, lost 351 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.023 ms avg over 26 windows, ple hit n/a
+strata serve: conversation cache: parked 1726 tokens in 1.6 ms; parked=27 bytes=7107780324 evictions=0 snapshot_bytes=262942000 reused_kv_bytes=0 capture=slot 4 capture_ms=25.7 wait_ms=0.0
+strata batch: slot 4 takes 1212 tokens (copied in 5.4 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 454 ms (2671.5 tok/s), 1 generated in 29 ms (34.7 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1240 (no drafts, drafter level) slot 4 at 1212 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 20 ms (start 36): slot 0: 1 windows, 1 tokens (49.3 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (49.3 tok/s), drafts 0 of 1 (0.0%); drafter catch-ups from batch windows 3572 + 3433 + 3302 + 3186 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1212 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1206 tokens in 477 ms (drain 11.8 ms); the slots decoded 58 rows meanwhile, D_ref 339.4 rows/s, lost 318 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 58 windows, ple hit n/a
+strata serve: conversation cache: parked 1727 tokens in 1.5 ms; parked=28 bytes=7370722356 evictions=0 snapshot_bytes=262942032 reused_kv_bytes=0 capture=slot 8 capture_ms=26.0 wait_ms=0.0
+strata batch: slot 8 takes 1213 tokens (copied in 5.5 ms)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 510 ms (2376.6 tok/s), 1 generated in 29 ms (34.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1270 (no drafts, drafter level) slot 4 at 1242 (no drafts, drafter level) slot 8 at 1213 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 24 ms (start 37): slot 0: 1 windows, 1 tokens (41.1 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (41.1 tok/s), drafts 0 of 0 (0.0%); slot 8: 1 windows, 1 tokens (41.1 tok/s), drafts 0 of 1 (0.0%); drafter catch-ups from batch windows 3601 + 3462 + 3302 + 3186 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1213 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 538 ms (drain 9.1 ms); the slots decoded 90 rows meanwhile, D_ref 339.4 rows/s, lost 282 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 90 windows, ple hit n/a
+strata serve: conversation cache: parked 1724 tokens in 1.4 ms; parked=29 bytes=7633613604 evictions=0 snapshot_bytes=262891248 reused_kv_bytes=0 capture=slot 12 capture_ms=25.8 wait_ms=0.0
+strata batch: slot 12 takes 1212 tokens (copied in 5.9 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 569 ms (2128.6 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch: STRATA_SPEC_LANES: lanes start: slot 0 at 1301 (no drafts, drafter level) slot 4 at 1273 (no drafts, drafter level) slot 8 at 1244 (no drafts, drafter level) slot 12 at 1212 (with drafts, drafter level)
+strata batch: STRATA_SPEC_LANES: lanes ran 31 ms (start 38): slot 0: 1 windows, 1 tokens (32.6 tok/s), drafts 0 of 0 (0.0%); slot 4: 1 windows, 1 tokens (32.6 tok/s), drafts 0 of 0 (0.0%); slot 8: 1 windows, 1 tokens (32.6 tok/s), drafts 0 of 0 (0.0%); slot 12: 1 windows, 1 tokens (32.6 tok/s), drafts 0 of 3 (0.0%); drafter catch-ups from batch windows 3631 + 3492 + 3332 + 3186 (0 + 0 + 0 + 0 found a hole)
+strata serve: conversation cache: 1212 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1207 tokens in 545 ms (drain 11.9 ms); the slots decoded 94 rows meanwhile, D_ref 339.4 rows/s, lost 280 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.021 ms avg over 94 windows, ple hit n/a
+strata serve: conversation cache: parked 1722 tokens in 1.6 ms; parked=30 bytes=7896498644 evictions=0 snapshot_bytes=262885040 reused_kv_bytes=0 capture=slot 1 capture_ms=26.0 wait_ms=0.0
+strata batch: slot 1 takes 1214 tokens (copied in 4.0 ms)
+strata serve: prompt 1214 tokens = 0 reused + 1214 read in 579 ms (2097.8 tok/s), 1 generated in 29 ms (34.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6366 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1214 tokens not parked here: slot 1 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1204 tokens in 547 ms (drain 12.9 ms); the slots decoded 110 rows meanwhile, D_ref 339.4 rows/s, lost 236 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.026 ms avg over 88 windows, ple hit n/a
+strata batch: slot 5 takes 1211 tokens (copied in 2.4 ms)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 582 ms (2080.3 tok/s), 1 generated in 29 ms (34.1 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1211 tokens not parked here: slot 5 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1206 tokens in 558 ms (drain 15.2 ms); the slots decoded 107 rows meanwhile, D_ref 352.7 rows/s, lost 270 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.031 ms avg over 85 windows, ple hit n/a
+strata serve: conversation cache: parked 1723 tokens in 1.6 ms; parked=31 bytes=8159383924 evictions=0 snapshot_bytes=262885280 reused_kv_bytes=0 capture=slot 0 capture_ms=26.1 wait_ms=0.0
+strata batch: slot 0 takes 1213 tokens (copied in 4.8 ms)
+strata serve: prompt 1213 tokens = 0 reused + 1213 read in 581 ms (2088.9 tok/s), 1 generated in 29 ms (34.4 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.66% of 6360 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1213 tokens not parked here: slot 0 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1205 tokens in 558 ms (drain 14.7 ms); the slots decoded 106 rows meanwhile, D_ref 352.7 rows/s, lost 272 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.032 ms avg over 85 windows, ple hit n/a
+strata serve: conversation cache: parked 1723 tokens in 1.8 ms; parked=32 bytes=8422268996 evictions=0 snapshot_bytes=262885072 reused_kv_bytes=0 capture=slot 4 capture_ms=25.8 wait_ms=0.0
+strata batch: slot 4 takes 1212 tokens (copied in 6.2 ms)
+strata serve: prompt 1212 tokens = 0 reused + 1212 read in 580 ms (2088.3 tok/s), 1 generated in 29 ms (34.5 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6354 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1212 tokens not parked here: slot 4 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1208 tokens in 547 ms (drain 9.4 ms); the slots decoded 123 rows meanwhile, D_ref 352.7 rows/s, lost 208 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.037 ms avg over 74 windows, ple hit n/a
+strata serve: conversation cache: parked 1724 tokens in 1.5 ms; parked=33 bytes=8685160244 evictions=0 snapshot_bytes=262891248 reused_kv_bytes=0 capture=slot 8 capture_ms=25.8 wait_ms=0.0
+strata batch: slot 8 takes 1215 tokens (copied in 4.8 ms)
+strata serve: prompt 1215 tokens = 0 reused + 1215 read in 579 ms (2099.8 tok/s), 1 generated in 29 ms (34.4 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6372 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1215 tokens not parked here: slot 8 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1211 tokens in 544 ms (drain 15.3 ms); the slots decoded 122 rows meanwhile, D_ref 352.7 rows/s, lost 213 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.036 ms avg over 73 windows, ple hit n/a
+strata serve: conversation cache: parked 1723 tokens in 1.4 ms; parked=34 bytes=8948045316 evictions=0 snapshot_bytes=262885072 reused_kv_bytes=0 capture=slot 12 capture_ms=25.9 wait_ms=0.0
+strata batch: slot 12 takes 1218 tokens (copied in 4.5 ms)
+strata serve: prompt 1218 tokens = 0 reused + 1218 read in 589 ms (2067.3 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.67% of 6387 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1218 tokens not parked here: slot 12 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1209 tokens in 553 ms (drain 14.4 ms); the slots decoded 111 rows meanwhile, D_ref 352.7 rows/s, lost 252 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.027 ms avg over 89 windows, ple hit n/a
+strata serve: conversation cache: parked 1725 tokens in 1.6 ms; parked=35 bytes=9210987284 evictions=0 snapshot_bytes=262941968 reused_kv_bytes=0 capture=slot 1 capture_ms=32.6 wait_ms=0.0
+strata batch: slot 1 takes 1216 tokens (copied in 3.9 ms)
+strata serve: prompt 1216 tokens = 0 reused + 1216 read in 595 ms (2044.3 tok/s), 1 generated in 29 ms (35.0 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6375 block reads hit VRAM, 3.7 MiB read from RAM
+strata serve: conversation cache: 1216 tokens not parked here: slot 1 parks them with its reply
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 6 layer prefixes, single existing staging pool
+strata KV prefetch: 0 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata KV prefetch: 3 layer prefixes, single existing staging pool
+strata batch: overlapped read of 1204 tokens in 546 ms (drain 11.6 ms); the slots decoded 109 rows meanwhile, D_ref 352.7 rows/s, lost 249 ms of decode; 0 group starts padded up, 0 waited; stage-1 PLE gather 0.026 ms avg over 87 windows, ple hit n/a
+strata serve: conversation cache: parked 1722 tokens in 1.4 ms; parked=36 bytes=9473872324 evictions=0 snapshot_bytes=262885040 reused_kv_bytes=0 capture=slot 5 capture_ms=33.3 wait_ms=0.0
+strata batch: slot 5 takes 1211 tokens (copied in 15.9 ms)
+strata serve: prompt 1211 tokens = 0 reused + 1211 read in 579 ms (2092.4 tok/s), 1 generated in 30 ms (33.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: resident RAM: 0.00 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file
+strata serve: expert tiers: GPU 0 hits this request; since the start RAM 0 blobs, files 0 blobs 59529.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 0.0 MB from storage (0 major faults) for 0.0 MB of expert reads
+strata serve: KV streaming: 85.69% of 6351 block reads hit VRAM, 3.7 MiB read from RAM
+strata batch (pipelined, 4 groups of 4): 4342 group-steps, 6121 rows in 20928 ms = 292.5 rows/s (admissions included)
+strata batch: STRATA_SLOT_PARK: 6 group starts waited for a slot's capture, 97.5 ms in all
