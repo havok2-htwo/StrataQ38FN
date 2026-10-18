@@ -1,0 +1,224 @@
+[06:00:35] === window A start (steps: 1 5 2 3 4; deadline 09:20, hard stop 09:30, restore timer 09:40)
+  v0.1.45 has every env var / flag used (48)
+  upstream tools take every option used
+  deadline 2026-10-18 09:20:00 (199 min from now; every run ends by it, production loaded again ~09:23), hard stop (backstop) 09:30:00, restore timer 09:40:00
+[06:00:37] wa-restore.timer armed for 2026-10-18 09:40:00
+[06:00:37] stopping strata.service
+[06:01:18] step 1: expected ~10 min, cap 30 min
+[06:01:18] step 1: HC_Q8 boot gate (STRATA_HC_Q8=1; stock+trim, hcq8+trim, hcq8 without trim; batch_test 16 slots greedy)
+[06:04:15] s1 stock-trim rc 0: 0.63 GiB 0.63 GiB 0.63 GiB 0.63 GiB | 16 of 16 slots = solo | cache slots CUDA0 6144 CUDA1 6656 CUDA2 6144 CUDA3 5632 
+[06:06:38] s1 hcq8-trim rc 0: 0.16 GiB 0.18 GiB 0.16 GiB 0.15 GiB | 16 of 16 slots = solo | cache slots CUDA0 6144 CUDA1 6656 CUDA2 6144 CUDA3 5632 
+[06:09:21] s1 hcq8-notrim rc 0: 0.63 GiB 0.63 GiB 0.63 GiB 0.63 GiB | 16 of 16 slots = solo | cache slots CUDA0 5240 CUDA1 5691 CUDA2 5557 CUDA3 4835 
+== stock-trim
+  hc_q8 GiB per card (engine line, card = the last 'CUDAn loads the dense weights' before it): CUDA0 0.63, CUDA1 0.63, CUDA2 0.63, CUDA3 0.63
+  VRAM free with everything loaded (engine, MiB): CUDA0 1507, CUDA1 1601, CUDA2 1707, CUDA3 1805
+  lowest memory.free during the run (nvidia-smi, MiB): CUDA0 1458, CUDA1 1550, CUDA2 1658, CUDA3 1754
+  expert cache slots: CUDA0 6144, CUDA1 6656, CUDA2 6144, CUDA3 5632 | profiled pairs held (CUDA1-3): CUDA1 6656 of 6656, CUDA2 6144 of 6144, CUDA3 5632 of 5632
+  16/16 slots identical to their solo run; batch: 16 slots, 2048 tokens; admissions 5.4s; then 3.3s -> aggregate 236.3 tok/s overall, 630.7 tok/s from the first batch token
+== hcq8-trim
+  hc_q8 GiB per card (engine line, card = the last 'CUDAn loads the dense weights' before it): CUDA0 0.16, CUDA1 0.18, CUDA2 0.16, CUDA3 0.15
+  VRAM free with everything loaded (engine, MiB): CUDA0 1325, CUDA1 1403, CUDA2 2319, CUDA3 1639
+  lowest memory.free during the run (nvidia-smi, MiB): CUDA0 1263, CUDA1 1352, CUDA2 2270, CUDA3 1588
+  expert cache slots: CUDA0 6144, CUDA1 6656, CUDA2 6144, CUDA3 5632 | profiled pairs held (CUDA1-3): CUDA1 6656 of 6656, CUDA2 6144 of 6144, CUDA3 5632 of 5632
+  16/16 slots identical to their solo run; batch: 16 slots, 2048 tokens; admissions 5.4s; then 3.3s -> aggregate 236.4 tok/s overall, 631.1 tok/s from the first batch token
+== hcq8-notrim
+  hc_q8 GiB per card (engine line, card = the last 'CUDAn loads the dense weights' before it): CUDA0 0.63, CUDA1 0.63, CUDA2 0.63, CUDA3 0.63
+  VRAM free with everything loaded (engine, MiB): CUDA0 411, CUDA1 507, CUDA2 507, CUDA3 285
+  lowest memory.free during the run (nvidia-smi, MiB): CUDA0 348, CUDA1 448, CUDA2 450, CUDA3 228
+  expert cache slots: CUDA0 5240, CUDA1 5691, CUDA2 5557, CUDA3 4835 | profiled pairs held (CUDA1-3): CUDA1 5691 of 6656, CUDA2 5557 of 6144, CUDA3 4835 of 5632
+  16/16 slots identical to their solo run; batch: 16 slots, 2048 tokens; admissions 5.7s; then 5.3s -> aggregate 186.2 tok/s overall, 388.7 tok/s from the first batch token
+tokens stock-trim vs hcq8-trim: identity gate (same cache on every card, full complement): solo 16/16, batch 16/16 identical
+tokens hcq8-trim vs hcq8-notrim: NOT COMPARABLE: cache differs (hcq8-trim {0: 6144, 1: 6656, 2: 6144, 3: 5632} vs hcq8-notrim {0: 5240, 1: 5691, 2: 5557, 3: 4835}); informational: solo 6/16, batch 6/16 identical
+HARD GATE (hc_q8 GiB drops on every card under trim): PASS | CUDA0 0.63 -> 0.16, CUDA1 0.63 -> 0.18, CUDA2 0.63 -> 0.16, CUDA3 0.63 -> 0.15
+no-trim check (hcq8 without trim = stock with trim, all layers): same
+production configs setting STRATA_HC_Q8: 0
+hc_q8 lines in the production engine log: 0
+[06:09:21] step 5: expected ~20 min, cap 40 min
+[06:09:21] step 5: ours (production FE, text only) vs best stock 0.1.45 (16 slots + merged switches + PIPED_CONCURRENT)
+[06:10:56] wa-s5-ours ready after 90 s
+[06:12:32] wa-s5-ours-short done (rc 0) | 1 users 131.6 tok/s TTFT p50 0.19 | 2 users 222.7 tok/s TTFT p50 0.23 | 4 users 325.8 tok/s TTFT p50 0.41 | 8 users 399.7 tok/s TTFT p50 0.32 | 16 users 524.6 tok/s TTFT p50 0.37
+[06:13:31] wa-s5-ours-long done (rc 0) | 4 users 274.7 tok/s TTFT p50 0.99 | 16 users 410.0 tok/s TTFT p50 0.77
+[06:15:00] wa-s5-ours-mt done (rc 0): wall 89s, output 13984 tok = 157.7 tok/s, prompt tokens sent 747858, follow-up TTFT p50 2.51 s
+[06:16:59] wa-s5-ours-ag done (rc 0): wall 119.4 s, sessions took 114 s, 98 s, 8535 output tokens, 71.5 tok/s aggregate, 1760481 prompt tokens (1396
+[06:17:28] wa-s5-ours engine: --batch: 16 slot sessions | 1 start(s) |  MMQ_GROUP_SORT sorts 48 of 48 layers;
+[06:19:04] wa-s5-stock-best ready after 91 s
+[06:20:53] wa-s5-stock-best-short done (rc 0) | 1 users 115.5 tok/s TTFT p50 0.26 | 2 users 154.4 tok/s TTFT p50 0.26 | 4 users 266.5 tok/s TTFT p50 0.53 | 8 users 374.1 tok/s TTFT p50 1.07 | 16 users 468.0 tok/s TTFT p50 1.36
+[06:22:04] wa-s5-stock-best-long done (rc 0) | 4 users 218.0 tok/s TTFT p50 1.36 | 16 users 337.4 tok/s TTFT p50 3.48
+[06:23:58] wa-s5-stock-best-mt done (rc 0): wall 114s, output 13563 tok = 119.1 tok/s, prompt tokens sent 747785, follow-up TTFT p50 2.42 s
+[06:26:54] wa-s5-stock-best-ag done (rc 0): wall 176.0 s, sessions took 176 s, 149 s, 5926 output tokens, 33.7 tok/s aggregate, 1757350 prompt tokens (121
+[06:27:23] wa-s5-stock-best engine: --batch: 16 slot sessions | 1 start(s) | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+== short
+ours          1 users agg   131.6  TTFT p50   0.19 p95   0.19 max   0.19
+ours          2 users agg   222.7  TTFT p50   0.23 p95   0.55 max   0.61
+ours          4 users agg   325.8  TTFT p50   0.41 p95   0.91 max   1.01
+ours          8 users agg   399.7  TTFT p50   0.32 p95   2.03 max   2.27
+ours         16 users agg   524.6  TTFT p50   0.37 p95   4.26 max   4.78
+stock-best    1 users agg   115.5  TTFT p50   0.26 p95   0.26 max   0.26
+stock-best    2 users agg   154.4  TTFT p50   0.26 p95   0.57 max   0.63
+stock-best    4 users agg   266.5  TTFT p50   0.53 p95   1.05 max   1.17
+stock-best    8 users agg   374.1  TTFT p50   1.07 p95   2.15 max   2.40
+stock-best   16 users agg   468.0  TTFT p50   1.36 p95   4.39 max   4.94
+== long
+ours          4 users agg   274.7  TTFT p50   0.99 p95   2.07 max   2.28
+ours         16 users agg   410.0  TTFT p50   0.77 p95   9.17 max  10.22
+stock-best    4 users agg   218.0  TTFT p50   1.36 p95   2.56 max   2.80
+stock-best   16 users agg   337.4  TTFT p50   3.48 p95  10.23 max  11.31
+== multiturn
+ours: wall 89s, output 13984 tok = 157.7 tok/s, prompt tokens sent 747858, follow-up TTFT p50 2.51 s
+stock-best: wall 114s, output 13563 tok = 119.1 tok/s, prompt tokens sent 747785, follow-up TTFT p50 2.42 s
+== agentic
+ours:
+role   req err  prompt  cached  TTFT p50    p95    max  dec p50
+main    20   0   51932   42956      2.42   8.18   8.18     66.2
+sub     36   0   19903   14894      2.07   9.44  12.71     45.4
+chat     5   0    1062     252      1.70   3.57   3.57     56.6
+wall 119.4 s, sessions took 114 s, 98 s, 8535 output tokens, 71.5 tok/s aggregate, 1760481 prompt tokens (1396617 cached as reported)
+stock-best:
+role   req err  prompt  cached  TTFT p50    p95    max  dec p50
+main    20   0   51878   34230      4.54  11.13  11.13     56.1
+sub     36   0   19896   14826      1.52   7.33   7.82     15.8
+chat     4   0     878       0      1.54   4.18   4.18     14.1
+wall 176.0 s, sessions took 176 s, 149 s, 5926 output tokens, 33.7 tok/s aggregate, 1757350 prompt tokens (1218351 cached as reported)
+[06:27:23] step 2: expected ~37 min, cap 60 min
+[06:27:23] step 2: STRATA_SLOT_CKPT_MOVE, upstream batch_groups_cache_test.py (ours first: B16 B16P U; stock: U B16P)
+[06:29:25] s2-ours-moveon-B16 rc 1 FAIL 122 s | requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3384, 3383)] | slot gave back lines: 6  conversation cache restores: 0
+[06:31:26] s2-ours-moveoff-B16 rc 1 FAIL 121 s | requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3384, 3383)] | slot gave back lines: 6  conversation cache restores: 0
+[06:33:27] s2-ours-moveon-B16P rc 1 FAIL 121 s | requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3384, 3383)] | slot gave back lines: 6  conversation cache restores: 0
+[06:35:28] s2-ours-moveoff-B16P rc 1 FAIL 121 s | requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3384, 3383)] | slot gave back lines: 6  conversation cache restores: 0
+[06:36:21] s2-ours-moveon-U rc 1 FAIL 53 s | requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3382, 3381)] | slot gave back lines: 6  conversation cache restores: 0
+[06:37:13] s2-ours-moveoff-U rc 1 FAIL 52 s | requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3382, 3381)] | slot gave back lines: 6  conversation cache restores: 0
+[06:38:06] s2-stock-nomove-U rc 0 PASS 53 s | requests (prompt tokens, reused): [(3141, 0), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+[06:38:59] s2-stock-move-U rc 0 PASS 53 s | requests (prompt tokens, reused): [(3141, 0), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+[06:39:51] s2-stock-movepool-U rc 1 FAIL 52 s | requests (prompt tokens, reused): [(3141, 0), (3142, 3141), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+[06:41:52] s2-stock-nomove-B16P rc 0 PASS 121 s | requests (prompt tokens, reused): [(3141, 0), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+[06:43:53] s2-stock-move-B16P rc 1 FAIL 121 s | requests (prompt tokens, reused): [(3141, 0), (3142, 3141), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+[06:45:54] s2-stock-movepool-B16P rc 1 FAIL 121 s | requests (prompt tokens, reused): [(3141, 0), (3142, 3141), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+s2-ours-moveoff-B16          FAIL      requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3384, 3383)] | slot gave back lines: 6  conversation cache restores: 0
+s2-ours-moveoff-B16P         FAIL      requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3384, 3383)] | slot gave back lines: 6  conversation cache restores: 0
+s2-ours-moveoff-U            FAIL      requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3382, 3381)] | slot gave back lines: 6  conversation cache restores: 0
+s2-ours-moveon-B16           FAIL      requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3384, 3383)] | slot gave back lines: 6  conversation cache restores: 0
+s2-ours-moveon-B16P          FAIL      requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3384, 3383)] | slot gave back lines: 6  conversation cache restores: 0
+s2-ours-moveon-U             FAIL      requests (prompt tokens, reused): [(3141, 0), (3146, 3145), (3142, 0), (3184, 3183), (3245, 3220), (3250, 3249), (3246, 3183), (3349, 3324), (3354, 3353), (3350, 3325), (3382, 3381)] | slot gave back lines: 6  conversation cache restores: 0
+s2-stock-move-B16P           FAIL      requests (prompt tokens, reused): [(3141, 0), (3142, 3141), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+s2-stock-move-U              PASS      requests (prompt tokens, reused): [(3141, 0), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+s2-stock-movepool-B16P       FAIL      requests (prompt tokens, reused): [(3141, 0), (3142, 3141), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+s2-stock-movepool-U          FAIL      requests (prompt tokens, reused): [(3141, 0), (3142, 3141), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+s2-stock-nomove-B16P         PASS      requests (prompt tokens, reused): [(3141, 0), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+s2-stock-nomove-U            PASS      requests (prompt tokens, reused): [(3141, 0), (3142, 0), (3245, 3220), (3246, 3245), (3246, 3221), (3349, 3324), (3350, 3349), (3350, 3325), (3375, 3374)] | slot gave back lines: 5  conversation cache restores: 0
+tokens s2-ours-moveon-B16 vs s2-ours-moveoff-B16: per round identical [True, True, True]
+tokens s2-ours-moveon-B16P vs s2-ours-moveoff-B16P: per round identical [True, True, True]
+tokens s2-ours-moveon-U vs s2-ours-moveoff-U: per round identical [True, True, True]
+tokens s2-stock-move-B16P vs s2-stock-nomove-B16P: per round identical [True, True, True]
+tokens s2-stock-move-U vs s2-stock-nomove-U: per round identical [True, True, True]
+tokens s2-stock-movepool-B16P vs s2-stock-nomove-B16P: per round identical [True, True, True]
+tokens s2-stock-movepool-U vs s2-stock-nomove-U: per round identical [True, True, True]
+s2-stock-move-B16P: inert switches: strata: STRATA_MMQ_DIRECT=1 is ignored: this build has no pointer-table MMQ (CUDA with STRATA_MMQ_TAB only) | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+s2-stock-move-U: inert switches: strata: STRATA_MMQ_DIRECT=1 is ignored: this build has no pointer-table MMQ (CUDA with STRATA_MMQ_TAB only) | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+s2-stock-movepool-B16P: inert switches: strata: STRATA_MMQ_DIRECT=1 is ignored: this build has no pointer-table MMQ (CUDA with STRATA_MMQ_TAB only) | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+s2-stock-movepool-U: inert switches: strata: STRATA_MMQ_DIRECT=1 is ignored: this build has no pointer-table MMQ (CUDA with STRATA_MMQ_TAB only) | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+s2-stock-nomove-B16P: inert switches: strata: STRATA_MMQ_DIRECT=1 is ignored: this build has no pointer-table MMQ (CUDA with STRATA_MMQ_TAB only) | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+s2-stock-nomove-U: inert switches: strata: STRATA_MMQ_DIRECT=1 is ignored: this build has no pointer-table MMQ (CUDA with STRATA_MMQ_TAB only) | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+[06:45:54] step 3: expected ~25 min, cap 60 min
+[06:45:54] step 3: stock 8 slots / 16 slots / 16 slots + merged switches without MOVE (1 round(s))
+[06:46:59] wa-s3-p8-r1 ready after 60 s
+[06:48:37] wa-s3-p8-r1-short done (rc 0) | 1 users 112.5 tok/s TTFT p50 0.34 | 8 users 317.7 tok/s TTFT p50 1.84 | 16 users 315.8 tok/s TTFT p50 13.02
+[06:49:47] wa-s3-p8-r1-long done (rc 0) | 16 users 240.1 tok/s TTFT p50 17.95
+[06:52:12] wa-s3-p8-r1-mt done (rc 0): wall 144s, output 13822 tok = 95.9 tok/s, prompt tokens sent 747878, follow-up TTFT p50 13.88 s
+[06:52:29] wa-s3-p8-r1 engine: --batch: 8 slot sessions | 1 start(s)
+[06:54:04] wa-s3-p16-r1 ready after 90 s
+[06:55:33] wa-s3-p16-r1-short done (rc 0) | 1 users 112.6 tok/s TTFT p50 0.34 | 8 users 317.8 tok/s TTFT p50 1.61 | 16 users 377.8 tok/s TTFT p50 1.87
+[06:56:35] wa-s3-p16-r1-long done (rc 0) | 16 users 276.4 tok/s TTFT p50 3.92
+[06:58:54] wa-s3-p16-r1-mt done (rc 0): wall 139s, output 13853 tok = 99.3 tok/s, prompt tokens sent 747883, follow-up TTFT p50 3.03 s
+[06:59:20] wa-s3-p16-r1 engine: --batch: 16 slot sessions | 1 start(s)
+[07:00:55] wa-s3-p16sw-r1 ready after 90 s
+[07:02:12] wa-s3-p16sw-r1-short done (rc 0) | 1 users 115.2 tok/s TTFT p50 0.26 | 8 users 371.1 tok/s TTFT p50 1.17 | 16 users 467.8 tok/s TTFT p50 1.01
+[07:03:03] wa-s3-p16sw-r1-long done (rc 0) | 16 users 335.8 tok/s TTFT p50 3.48
+[07:04:56] wa-s3-p16sw-r1-mt done (rc 0): wall 113s, output 13755 tok = 121.8 tok/s, prompt tokens sent 747853, follow-up TTFT p50 2.3 s
+[07:05:22] wa-s3-p16sw-r1 engine: --batch: 16 slot sessions | 1 start(s) | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+short p8 vs p16: wa-s3-p8-r1-short vs wa-s3-p16-r1-short: 50 common uids - identical 50, different 0 
+short p16 vs p16sw: wa-s3-p16-r1-short vs wa-s3-p16sw-r1-short: 50 common uids - identical 50, different 0 
+long p8 vs p16: wa-s3-p8-r1-long vs wa-s3-p16-r1-long: 32 common uids - identical 31, different 1   uid 1000002: tokens 512 vs 512 (max 512), sha 1564f153c4f5 vs 0cd71ea074d7 
+long p16 vs p16sw: wa-s3-p16-r1-long vs wa-s3-p16sw-r1-long: 32 common uids - identical 32, different 0 
+multiturn wa-s3-p8-r1-mt vs wa-s3-p16-r1-mt: 37/48 replies identical; first differing (uid, turn): [(1, 3), (3, 3), (4, 3), (10, 2), (10, 3)]
+multiturn wa-s3-p16-r1-mt vs wa-s3-p16sw-r1-mt: 35/48 replies identical; first differing (uid, turn): [(1, 3), (3, 3), (4, 3), (5, 3), (8, 2)]
+p16sw switches the engine did not apply (setup.py release build: STRATA_MMQ_TAB=OFF): | STRATA_MMQ_DIRECT=1 is ignored; MMQ_GROUP_SORT sorts 48 of 48 layers;
+[07:05:22] step 4: expected ~82 min, cap 100 min
+[07:05:22] step 4: #2326 stock 16 slots, PIPED_CONCURRENT unset / =1 / PIPED_READ_PIECE=16384, 3 interleaved rounds of cold32k,two_joiners,followup
+[07:06:57] wa-s4-unset-r1 ready after 90 s
+[07:08:56] wa-s4-unset-r1 piped bench rc 0: 3 scenario lines
+[07:09:19] wa-s4-unset-r1 engine: --batch: 16 slot sessions | 1 start(s)
+[07:10:55] wa-s4-piece-r1 ready after 91 s
+[07:12:57] wa-s4-piece-r1 piped bench rc 0: 3 scenario lines
+[07:13:21] wa-s4-piece-r1 engine: --batch: 16 slot sessions | 1 start(s)
+[07:14:56] wa-s4-conc-r1 ready after 90 s
+[07:16:54] wa-s4-conc-r1 piped bench rc 0: 3 scenario lines
+[07:17:17] wa-s4-conc-r1 engine: --batch: 16 slot sessions | 1 start(s)
+[07:18:53] wa-s4-piece-r2 ready after 90 s
+[07:20:50] wa-s4-piece-r2 piped bench rc 0: 3 scenario lines
+[07:21:13] wa-s4-piece-r2 engine: --batch: 16 slot sessions | 1 start(s)
+[07:22:49] wa-s4-conc-r2 ready after 90 s
+[07:24:42] wa-s4-conc-r2 piped bench rc 0: 3 scenario lines
+[07:25:06] wa-s4-conc-r2 engine: --batch: 16 slot sessions | 1 start(s)
+[07:26:41] wa-s4-unset-r2 ready after 90 s
+[07:28:35] wa-s4-unset-r2 piped bench rc 0: 3 scenario lines
+[07:28:59] wa-s4-unset-r2 engine: --batch: 16 slot sessions | 1 start(s)
+[07:30:34] wa-s4-conc-r3 ready after 90 s
+[07:32:27] wa-s4-conc-r3 piped bench rc 0: 3 scenario lines
+[07:32:51] wa-s4-conc-r3 engine: --batch: 16 slot sessions | 1 start(s)
+[07:34:26] wa-s4-unset-r3 ready after 90 s
+[07:36:20] wa-s4-unset-r3 piped bench rc 0: 3 scenario lines
+[07:36:43] wa-s4-unset-r3 engine: --batch: 16 slot sessions | 1 start(s)
+[07:38:19] wa-s4-piece-r3 ready after 91 s
+[07:40:16] wa-s4-piece-r3 piped bench rc 0: 3 scenario lines
+[07:40:40] wa-s4-piece-r3 engine: --batch: 16 slot sessions | 1 start(s)
+[07:42:15] wa-s4-unset-mtag ready after 90 s
+[07:44:36] wa-s4-unset-mtag-mt done (rc 0): wall 141s, output 13689 tok = 97.3 tok/s, prompt tokens sent 747862, follow-up TTFT p50 3.27 s
+[07:48:02] wa-s4-unset-mtag-agentic done (rc 0): wall 206.0 s, sessions took 206 s, 185 s, 5577 output tokens, 27.1 tok/s aggregate, 1756795 prompt tokens (125
+[07:48:29] wa-s4-unset-mtag engine: --batch: 16 slot sessions | 1 start(s)
+[07:50:05] wa-s4-conc-mtag ready after 91 s
+[07:52:24] wa-s4-conc-mtag-mt done (rc 0): wall 140s, output 13736 tok = 98.4 tok/s, prompt tokens sent 747833, follow-up TTFT p50 2.99 s
+[07:55:52] wa-s4-conc-mtag-agentic done (rc 0): wall 207.4 s, sessions took 206 s, 187 s, 5580 output tokens, 26.9 tok/s aggregate, 1756798 prompt tokens (125
+[07:56:19] wa-s4-conc-mtag engine: --batch: 16 slot sessions | 1 start(s)
+[07:57:54] wa-s4-piece-mtag ready after 90 s
+[08:00:18] wa-s4-piece-mtag-mt done (rc 0): wall 144s, output 13849 tok = 96.5 tok/s, prompt tokens sent 747871, follow-up TTFT p50 3.32 s
+[08:04:54] wa-s4-piece-mtag-agentic done (rc 0): wall 276.2 s, sessions took 241 s, 256 s, 8041 output tokens, 29.1 tok/s aggregate, 1765942 prompt tokens (135
+[08:05:21] wa-s4-piece-mtag engine: --batch: 16 slot sessions | 1 start(s)
+[08:06:56] wa-s4-conc-rep ready after 90 s
+[08:08:50] wa-s4-conc-rep1 ok
+[08:10:44] wa-s4-conc-rep2 ok
+[08:12:39] wa-s4-conc-rep3 ok
+[08:14:33] wa-s4-conc-rep4 ok
+[08:16:27] wa-s4-conc-rep5 ok
+[08:18:20] wa-s4-conc-rep6 ok
+[08:20:14] wa-s4-conc-rep7 ok
+[08:22:07] wa-s4-conc-rep8 ok
+[08:22:34] wa-s4-conc-rep engine: --batch: 16 slot sessions | 1 start(s)
+[08:22:34] s4 CONCURRENT=1 repeats: 8 ok, 0 hang(s), 0 error(s), 0 server restart(s); stall/no-progress lines: 0, engine starts: 1
+run                    cold32k stop cold32k TTFT  2j stop        2j TTFT fup TTFT 45K TTFT          agg tok/s
+wa-s4-conc-r1                 8.357      [8.159]   25.868 [16.6, 19.765]   11.654   11.356     [167.7, 113.8]
+wa-s4-conc-r2                 8.325      [8.115]   25.768 [16.526, 19.62]   11.686   11.399     [181.5, 117.5]
+wa-s4-conc-r3                 8.384      [8.185]   25.964 [16.676, 19.842]   11.654   11.364     [162.7, 106.3]
+wa-s4-piece-r1                4.509     [10.767]    9.254 [38.341, 15.403]    4.606   13.457     [186.7, 118.2]
+wa-s4-piece-r2                4.486     [10.719]    9.156 [38.021, 15.239]    4.554   13.342     [182.6, 111.0]
+wa-s4-piece-r3                4.539     [10.829]    9.276 [38.451, 15.486]    4.604   13.458     [180.7, 119.9]
+wa-s4-unset-r1                8.401      [8.204]   26.018 [16.714, 19.9]   11.724   11.413     [182.3, 121.8]
+wa-s4-unset-r2                8.396      [8.185]   25.916 [16.666, 19.811]   11.671   11.368     [182.9, 122.3]
+wa-s4-unset-r3                8.362      [8.156]   25.951 [16.683, 19.824]   11.665   11.375     [182.2, 122.7]
+wa-s4-conc-rep.status             -            -        -              -        -        -       [None, None]
+wa-s4-conc-rep1               8.356      [8.154]   26.007 [16.731, 19.896]   11.733   11.437     [177.6, 121.7]
+wa-s4-conc-rep2                8.22      [8.026]   26.093 [16.788, 19.973]   11.668   11.406     [181.7, 116.7]
+wa-s4-conc-rep3               8.228      [8.041]   26.093 [16.793, 19.964]   11.641   11.391     [187.2, 113.9]
+wa-s4-conc-rep4               8.227      [8.042]   26.023 [16.749, 19.897]   11.607    11.37     [183.0, 121.6]
+wa-s4-conc-rep5                8.21      [8.009]   26.061 [16.774, 19.934]   11.602   11.366     [174.5, 121.5]
+wa-s4-conc-rep6               8.221      [8.026]   26.025 [16.746, 19.894]   11.587   11.357     [182.1, 113.9]
+wa-s4-conc-rep7               8.165      [7.962]   25.816 [16.595, 19.691]   11.479   11.251     [179.7, 122.4]
+wa-s4-conc-rep8               8.229      [8.034]   26.042 [16.762, 19.918]   11.578   11.355     [182.3, 117.7]
+determinism unset vs piece (6 sequential prompts, nothing decoding beside them: the plain path only, not a concurrent read): 6/6 identical
+determinism unset vs conc (6 sequential prompts, nothing decoding beside them: the plain path only, not a concurrent read): 6/6 identical
+informational (STRATA_IQ_MT_MIN=1 in all arms; under PIECE/CONCURRENT the slots compute the experts a read borrows on the CPU, so a difference is expected, not a failure):
+multiturn wa-s4-unset-mtag-mt vs wa-s4-piece-mtag-mt: 38/48 replies identical; first differing (uid, turn): [(1, 3), (3, 3), (4, 3), (5, 2), (5, 3)]
+multiturn wa-s4-unset-mtag-mt vs wa-s4-conc-mtag-mt: 32/48 replies identical; first differing (uid, turn): [(3, 3), (5, 2), (5, 3), (8, 3), (9, 2)]
+read-on-a-thread lines: 0 (results/wa/s4-reads.txt)
+[08:22:34] === window A done after 141 min: step1=8min step5=18min step2=18min step3=19min step4=77min
+[08:22:35] production started again (strata.service)
+[08:24:15] production loaded again
