@@ -31,7 +31,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed (production) - 2026-10-18
 - SSD tier: **1,000 GB/day** write budget (was 300; the day's 300 GB were used up by 16:00 and further evictions were
   dropped) and a **500 GB disk cap** (`STRATA_CONV_TIER_CAP_GB`, engine default 600), set through the new monitor
-  tab; Strata restarted 16:2x, tier warm (279 conversations kept). Worst case 365 TB/year against ~3,600 TBW of the
+  tab; Strata restarted at 16:30, tier warm (279 conversations kept). Worst case 365 TB/year against ~3,600 TBW of the
   RAID members, about ten years.
 
 ### Changed (dashboard, "Strata Monitor")
