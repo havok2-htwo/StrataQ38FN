@@ -14,7 +14,8 @@ GPUs: NVML through ctypes - Strata's serve/telemetry.py gpu_reader when a Strata
 else a small reader of its own; every card is read on its own, an error on one card does not hide the others.
 
 Read-only towards Strata: the only request it sends is GET /metrics (never one that runs the model).  The API key stays
-on this machine; the page only gets numbers.  Keeps running totals and peaks across engine restarts in a state file.
+on this machine; the page only gets numbers.  Everyone sees everything; changes (power/price, new period, GPU power,
+fans, the Strata settings and restart - strata_admin.py) need the admin login (the G3 admin password, g3control.py).  Keeps running totals and peaks across engine restarts in a state file.
 
 usage: python dashboard.py [--port 8082] [--host 0.0.0.0] [--source URL[,KEYFILE]]... [--strata PATH]
                            [--log ENGINE_LOG | --engine-config CONFIG.json] [--state FILE] [--settings FILE]
@@ -38,6 +39,7 @@ from pathlib import Path
 import psutil
 
 import g3control
+import strata_admin
 
 IS_WIN = os.name == "nt"
 HERE = Path(__file__).resolve().parent
@@ -1153,7 +1155,7 @@ class Collector(threading.Thread):
 
 
 # ------------------------------------------------------------------------------------------------ HTTP
-def make_handler(col, ctl=None):
+def make_handler(col, ctl=None, adm=None):
     page = HERE / "index.html"
 
     class H(BaseHTTPRequestHandler):
@@ -1209,6 +1211,14 @@ def make_handler(col, ctl=None):
                     out = ctl.save_power(tok, data)
                 elif path == "/api/control/fan":
                     out = ctl.save_fan(tok, data)
+                elif path == "/api/control/strata/config" and adm:
+                    ctl._need(tok)
+                    out = {"saved": adm.save(data)}
+                    if data.get("restart"):
+                        out["restart"] = adm.restart()
+                elif path == "/api/control/strata/restart" and adm:
+                    ctl._need(tok)
+                    out = adm.restart()
                 else:
                     return self._send(404, b"not found", "text/plain")
             except PermissionError as e:
@@ -1217,6 +1227,8 @@ def make_handler(col, ctl=None):
                 return self._send(502, json.dumps({"error": str(e)}).encode(), "application/json")
             except (ValueError, TypeError) as e:
                 return self._send(400, json.dumps({"error": str(e)}).encode(), "application/json")
+            except OSError as e:
+                return self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
             self._send(200, json.dumps(out).encode(), "application/json")
 
         def do_GET(self):
@@ -1229,6 +1241,10 @@ def make_handler(col, ctl=None):
                 self._send(200, json.dumps(col.history(HISTORY)).encode(), "application/json")
             elif path == "/api/control" and ctl:
                 self._send(200, json.dumps(ctl.view(self._ctl_token())).encode(), "application/json")
+            elif path == "/api/strata" and adm:
+                # read by everyone; the engine log's tail only with the login
+                admin = bool(ctl and ctl.session(self._ctl_token()))
+                self._send(200, json.dumps(adm.view(logged_in=admin)).encode(), "application/json")
             elif path == "/api/stream":
                 # Server-Sent Events: one snapshot per second (+ the newest history point)
                 self.send_response(200)
@@ -1248,7 +1264,8 @@ def make_handler(col, ctl=None):
                 self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
-            # the only writes: the power/price settings and starting a new counting period (the old one is archived)
+            # the writes: the power/price settings, a new counting period (the old one is archived) and /api/control/*
+            # (G3 power/fans, Strata settings/restart) - all of them only with the admin login when there is one (ctl)
             path = self.path.split("?")[0]
             try:
                 n = int(self.headers.get("Content-Length") or 0)
@@ -1259,6 +1276,11 @@ def make_handler(col, ctl=None):
             body = self.rfile.read(n) if n else b"{}"
             if path.startswith("/api/control/") and ctl:
                 return self._control(path, body)
+            if ctl and path in ("/api/settings", "/api/reset"):
+                if not self._same_origin():
+                    return self._send(403, b'{"error": "nur von der Monitor-Seite selbst"}', "application/json")
+                if not ctl.session(self._ctl_token()):
+                    return self._send(401, '{"error": "nur nach Anmeldung"}'.encode(), "application/json")
             try:
                 if path == "/api/settings":
                     data = json.loads(body or b"{}")
@@ -1300,6 +1322,8 @@ def main():
     ap.add_argument("--settings", help=f"power/price settings file (default {SETTINGS_FILE})")
     ap.add_argument("--g3", default="http://127.0.0.1:8000", help="G3 (Genesis3) whose admin API sets the GPU power "
                     "limits and fan curves (settings menu; writes need the G3 admin password); 'off' = no menu")
+    ap.add_argument("--strata-unit", default=strata_admin.UNIT, help="systemd user unit of the Strata server that "
+                    "the settings menu restarts (Linux; the settings are written to --engine-config)")
     ap.add_argument("--g3-dir", default="/home/administrator/G3_VLLM", help="G3 folder (its logs/ settings are read "
                     "without a login)")
     a = ap.parse_args()
@@ -1316,7 +1340,10 @@ def main():
     col = Collector(sources=sources, strata_path=a.strata, log_path=a.log, engine_config=a.engine_config,
                     discover=not a.no_discover)
     col.start()
-    srv = ThreadingHTTPServer((a.host, a.port), make_handler(col, None if a.g3 == "off" else g3control.G3Control(a.g3, a.g3_dir)))
+    ctl = None if a.g3 == "off" else g3control.G3Control(a.g3, a.g3_dir)
+    # the Strata settings need the login, so only with the G3 login and a run config to write to
+    adm = strata_admin.StrataAdmin(a.engine_config, a.strata_unit) if ctl and a.engine_config and not IS_WIN else None
+    srv = ThreadingHTTPServer((a.host, a.port), make_handler(col, ctl, adm))
     srv.daemon_threads = True
     print(f"Strata dashboard on http://{a.host}:{a.port}/  (state: {STATE_FILE}, settings: {SETTINGS_FILE}, "
           f"GPUs: {len(col.gpus.cards) if col.gpus else 0} via {col.gpus.backend if col.gpus else col.gpu_error}, "

@@ -426,6 +426,17 @@ footer p { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 11
 .fan-gpu .why { color: var(--crit); font-size: 12px; margin-top: 4px; }
 @media (max-width: 640px) { .fan-gpu .fm { grid-template-columns: 1fr; } .menu .settings form { grid-template-columns: 1fr; } .menu .frow label { width: calc(50% - 6px); } }
 
+.menu .mauth { padding: 0 16px 10px; }
+.menu .tabs { overflow-x: auto; }
+.menu .tabs button { white-space: nowrap; }
+.menu h3.mh3 { font-size: 14px; margin: 16px 0 6px; }
+.menu #ccForm .frow label { width: 150px; }
+.menu .run { font-size: 11px; color: var(--muted); }
+.menu .run.pend { color: var(--warn); font-weight: 600; }
+.menu .logbox { max-height: 340px; overflow: auto; background: var(--surface); border: 1px solid var(--ring); border-radius: 8px;
+  padding: 8px 10px; margin: 6px 0 0; font-size: 11px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
+.btn.admin-on { border-color: var(--good); }
+.menu .btn:disabled { opacity: .45; cursor: not-allowed; }
 .menu .tab.api h3 { font-size: 14px; margin: 18px 0 6px; }
 .menu .tab.api h3:first-child { margin-top: 4px; }
 .menu .akv { grid-template-columns: minmax(0, 220px) minmax(0, 1fr); font-size: 13px; }
@@ -446,6 +457,7 @@ footer p { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 11
     <span class="badge" id="state"><span class="dot" style="background:var(--muted)"></span><span>verbinde …</span></span>
     <span class="clock" id="clock"></span>
     <button class="btn" id="apiBtn" type="button" aria-haspopup="dialog" aria-controls="menu">ⓘ API</button>
+    <button class="btn" id="authBtn" type="button" aria-haspopup="dialog" aria-controls="menu" hidden>🔒 Anmelden</button>
     <button class="btn" id="menuBtn" type="button" aria-haspopup="dialog" aria-controls="menu">⚙ Einstellungen</button>
     <button class="btn" id="themeBtn" type="button" aria-label="Hell/Dunkel">Hell/Dunkel</button>
   </div>
@@ -773,8 +785,11 @@ footer p { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 11
 <div class="scrim" id="scrim" hidden></div>
 <aside class="menu" id="menu" role="dialog" aria-modal="true" aria-labelledby="menuTitle" hidden>
   <div class="mhd"><h2 id="menuTitle">Einstellungen</h2><button class="btn" type="button" id="menuClose" aria-label="Schließen">✕</button></div>
+  <div class="mauth"><div class="auth" data-auth></div></div>
   <div class="tabs" role="tablist">
     <button role="tab" type="button" data-tab="t-strom" aria-selected="true">Strom &amp; Kosten</button>
+    <button role="tab" type="button" data-tab="t-srv" aria-selected="false">Strata-Server</button>
+    <button role="tab" type="button" data-tab="t-cache" aria-selected="false">Cache &amp; SSD</button>
     <button role="tab" type="button" data-tab="t-power" aria-selected="false">GPU-Leistung</button>
     <button role="tab" type="button" data-tab="t-fan" aria-selected="false">Lüfter</button>
     <button role="tab" type="button" data-tab="t-api" aria-selected="false">API &amp; Nutzung</button>
@@ -794,8 +809,33 @@ footer p { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 11
           <span class="rz"><button class="btn danger" type="button" id="resetBtn">Neue Zählung beginnen …</button></span></div>
       </form>
     </section>
+    <section class="tab" id="t-srv" hidden>
+      <div class="mstat" id="srvStat">–</div>
+      <dl class="kv akv" id="srvRows"></dl>
+      <div class="actions"><button class="btn danger" type="button" id="srvRestart" data-need>Strata neu starten …</button><span class="msg" id="srvMsg"></span></div>
+      <p class="mhint">Ein Neustart lädt das Modell neu (einige Minuten nicht erreichbar). Laufende Anfragen brechen ab, der RAM-Cache der Konversationen ist danach leer; die SSD-Stufe bleibt erhalten und wird weiter genutzt.
+        Config, Binary und Modell wechseln geht hier bewusst nicht (das bleibt ein Deploy).</p>
+      <h3 class="mh3">Engine-Log (Ende)</h3>
+      <pre class="logbox" id="srvLog">nur nach Anmeldung</pre>
+      <div class="actions"><button class="btn" type="button" id="srvLogBtn" data-need>aktualisieren</button></div>
+    </section>
+    <section class="tab" id="t-cache" hidden>
+      <div class="mstat" id="ccStat">–</div>
+      <form id="ccForm">
+        <h3 class="mh3">RAM: Konversations-Cache</h3>
+        <div class="frow" id="ccRam"></div>
+        <p class="mhint">Geparkte Konversationen im RAM (schnellste Stufe). „RAM frei halten“ = so viel bleibt fürs System frei; wird es knapp, wandern die ältesten auf die SSD.</p>
+        <h3 class="mh3">SSD-Stufe</h3>
+        <div class="frow" id="ccSsd"></div>
+        <p class="mhint"><b>Schreiben GB/Tag</b> = so viel darf pro Kalendertag auf die SSD geschrieben werden, danach wird verworfen statt ausgelagert (schont die TBW).
+          <b>Belegt max</b> = so viel liegt höchstens auf der SSD; ist es voll, werden die am längsten nicht genutzten Konversationen überschrieben.</p>
+        <p class="mhint" id="ccDisk"></p>
+        <div class="actions"><button class="btn primary" type="submit" data-need>Speichern</button>
+          <button class="btn danger" type="button" id="ccSaveRestart" data-need>Speichern &amp; Strata neu starten …</button><span class="msg" id="ccMsg"></span></div>
+        <p class="mhint">Die Werte stehen in der Produktions-Config und gelten ab dem nächsten Start von Strata; „läuft“ zeigt, womit Strata gerade läuft.</p>
+      </form>
+    </section>
     <section class="tab" id="t-power" hidden>
-      <div class="auth" data-auth></div>
       <div class="mstat" id="pwStat">–</div>
       <form id="pwForm">
         <div class="frow"><label class="chk"><input type="checkbox" name="night_enabled"> Nachtmodus an</label>
@@ -806,7 +846,6 @@ footer p { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 11
       </form>
     </section>
     <section class="tab" id="t-fan" hidden>
-      <div class="auth" data-auth></div>
       <div class="mstat" id="fanStat">–</div>
       <form id="fanForm">
         <div class="frow"><label>Mindestdrehzahl %<input type="number" name="min_percent" min="30" max="100" step="1" required></label>
@@ -1104,7 +1143,9 @@ function render(s) {
     : 'Tokens: noch kein Parkvorgang im Log';
   const ct = cc.tier;
   $('tierRows').innerHTML = `<div class="grp" id="tierTxt">SSD-Stufe (Konversationen)${ct ? '' : ' <span class="na">aus</span>'}</div>` + (ct ? [
-      ['Konversationen', fmt(ct.files)], ['auf Disk', bytes(ct.disk_bytes)], ['geschrieben', fmt(ct.spills)],
+      ['Konversationen', fmt(ct.files)],
+      ['auf Disk', bytes(ct.disk_bytes) + (strata && strata.running && strata.running.tier_cap_gb ? ' / ' + bytes(strata.running.tier_cap_gb * 1e9) : '')],
+      ['geschrieben', fmt(ct.spills)],
       ...(ct.pending ? [['wartend', fmt(ct.pending)]] : []),
       ['Budget heute', `${bytes(ct.written_today)} / ${bytes(ct.budget)}`], ['Budget frei', bytes(ct.budget_left)],
       ['Restores', fmt(ct.restores)], ['Fehlschläge', fmt(ct.misses)], ['Budget-Drops', fmt(ct.drops_budget)]
@@ -1345,15 +1386,14 @@ function renderMeter(s) {
 function fillSettings(cfg) { const f = $('setForm'); for (const [k, v] of Object.entries(cfg)) if (f.elements[k]) f.elements[k].value = v; }
 $('setForm').onsubmit = async ev => { ev.preventDefault(); const f = ev.target, body = {};
   for (const el of f.elements) if (el.name) body[el.name] = parseFloat(String(el.value).replace(',', '.'));
-  try { const r = await fetch('api/settings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-    const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
+  try { const j = await api('api/settings', body);
     fillSettings(j.settings); $('setMsg').textContent = 'gespeichert ' + new Date().toLocaleTimeString('de-DE'); }
-  catch (e) { $('setMsg').textContent = 'Fehler: ' + e.message; } };
+  catch (e) { $('setMsg').textContent = 'Fehler: ' + e.message; if (e.status === 401) loadCtl(); } };
 $('resetBtn').onclick = async () => {
   if (!confirm('Neue Zählung beginnen?\n\nAlle Summen (Tokens, Zeiten, Energie, Kosten, Spitzen, SSD) starten bei null. Der bisherige Stand wird als state.<Datum>.json im Dashboard-Ordner archiviert.')) return;
-  try { const r = await fetch('api/reset', {method: 'POST'}); const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
+  try { const j = await api('api/reset', {});
     $('setMsg').textContent = 'neu begonnen · archiviert als ' + j.archived; }
-  catch (e) { $('setMsg').textContent = 'Fehler: ' + e.message; } };
+  catch (e) { $('setMsg').textContent = 'Fehler: ' + e.message; if (e.status === 401) loadCtl(); } };
 
 
 // ---- Einstellungen: Seitenleiste (Strom & Kosten · GPU-Leistung · Lüfter)
@@ -1424,20 +1464,23 @@ async function api(path, body) {
 async function loadCtl() {
   try { ctl = await api('api/control'); }
   catch (e) { ctl = {error: e.status === 404 ? 'Dieser Monitor-Server hat kein G3-Einstellungsmenü (dashboard.py zu alt oder --g3 off).' : e.message, logged_in: false}; }
-  renderAuth(); renderPower(); renderFan(); }
+  renderAuth(); renderPower(); renderFan(); loadStrata(); }
 let authShown = null;
 function renderAuth() {
   const on = !!(ctl && ctl.logged_in);
   if (authShown !== on) { authShown = on;      // rebuild the login box only when the state changes (keeps what is typed)
     for (const el of document.querySelectorAll('[data-auth]')) el.innerHTML = on
-      ? `<span>✓ angemeldet bei G3 (${esc(ctl.g3_url)}) – Änderungen werden über G3 angewendet</span><span style="flex:1"></span><button class="btn" type="button" data-logout>Abmelden</button>`
-      : `<span>Ändern nur mit dem <b>G3-Admin-Passwort</b>. Anzeige geht ohne.</span><span style="flex:1"></span>
+      ? `<span>✓ als Admin angemeldet (Passwort von G3, ${esc(ctl.g3_url)}) – alle Einstellungen änderbar</span><span style="flex:1"></span><button class="btn" type="button" data-logout>Abmelden</button>`
+      : `<span>Ansehen kann jeder. Ändern nur mit dem <b>G3-Admin-Passwort</b>.</span><span style="flex:1"></span>
          <input type="password" autocomplete="current-password" placeholder="G3-Admin-Passwort" data-pw><button class="btn primary" type="button" data-login>Anmelden</button><span class="msg" data-amsg></span>`;
     for (const el of document.querySelectorAll('[data-login]')) el.onclick = () => doLogin(el.parentElement);
     for (const el of document.querySelectorAll('[data-pw]')) el.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); doLogin(el.parentElement); } };
     for (const el of document.querySelectorAll('[data-logout]')) el.onclick = async () => { try { await api('api/control/logout', {}); } catch (e) {} loadCtl(); }; }
-  // without a login the settings are shown but locked - never the login box itself
-  for (const el of document.querySelectorAll('#pwForm input, #fanForm input, #fanForm select, #fanForm [data-act], [data-need]')) el.disabled = !on; }
+  const ab = $('authBtn'); ab.hidden = !ctl || (!!ctl.error && !on); ab.textContent = on ? '✓ Admin' : '🔒 Anmelden'; ab.classList.toggle('admin-on', on);
+  // without a login the settings are shown but locked - never the login box itself (no G3 menu: power/price stay open)
+  const gate = !!ctl && !(ctl.error && ctl.error.startsWith('Dieser Monitor-Server'));
+  for (const el of document.querySelectorAll('#setForm input, #setForm button, #pwForm input, #fanForm input, #fanForm select, #fanForm [data-act], #ccForm input, [data-need]'))
+    el.disabled = gate && !on; }
 async function doLogin(box) {
   const pw = box.querySelector('[data-pw]').value, msg = box.querySelector('[data-amsg]');
   msg.textContent = 'melde an …';
@@ -1463,7 +1506,9 @@ function renderPower() {
   renderAuth(); }
 function pwNow() { const gs = (lastSnap && lastSnap.gpus) || [];
   gs.forEach((g, i) => { const el = $('pwNow' + i); if (el) el.innerHTML = (g.power_limit != null ? fmt(g.power_limit) + ' W' : '–') + (g.power != null ? ` <span class="mhint">(zieht ${fmt(g.power)} W)</span>` : ''); }); }
-function menuTick() { if (!$('menu').hidden && menuTab === 't-api') renderApi(); if ($('menu').hidden || !ctl) return; const n = ((lastSnap && lastSnap.gpus) || []).length;
+function menuTick() { if (!$('menu').hidden && menuTab === 't-api') renderApi();
+  const st = !$('menu').hidden && (menuTab === 't-srv' || menuTab === 't-cache');
+  if (Date.now() - strataAt > (st ? 15000 : 300000)) loadStrata(); else if (st && menuTab === 't-srv') renderSrv(); if ($('menu').hidden || !ctl) return; const n = ((lastSnap && lastSnap.gpus) || []).length;
   if (!$('pwForm').dataset.dirty && $('pwRows').children.length < n) renderPower(); else pwNow();
   if (!$('fanForm').dataset.dirty && fanDraft && fanDraft.gpus.length < n) renderFan(); }
 $('pwForm').oninput = () => { $('pwForm').dataset.dirty = '1'; };
@@ -1539,6 +1584,69 @@ $('fanForm').onsubmit = async ev => { ev.preventDefault();
     delete $('fanForm').dataset.dirty; await loadCtl(); }
   catch (e) { $('fanMsg').textContent = 'Fehler: ' + e.message; if (e.status === 401) loadCtl(); } };
 
+// ---- Strata-Server · Cache & SSD (dashboard/strata_admin.py: GET api/strata for everyone, changes after the login)
+let strata = null, strataAt = 0;
+const CC_RAM = ['cc_gib', 'cc_slots', 'cc_min_free_gib', 'cc_min_tokens'];
+const CC_SSD = ['tier_write_gb_day', 'tier_cap_gb', 'tier_min_tokens', 'tier_ttl_h', 'tier_min_free_gb'];
+const base = p => String(p || '').split('/').pop();
+async function loadStrata() {
+  strataAt = Date.now();
+  try { strata = await api('api/strata'); }
+  catch (e) { strata = {error: e.status === 404 ? 'Dieser Monitor kann Strata nicht einstellen (dashboard.py ohne --engine-config, --g3 off oder Windows).' : e.message}; }
+  renderSrv(); renderCache(); }
+function restartQuestion() { const b = lastSnap && lastSnap.batch;
+  return confirm('Strata jetzt neu starten?\n\n' + (b && b.busy ? `${b.busy} Anfrage(n) laufen gerade und brechen ab.\n` : 'Gerade läuft keine Anfrage.\n')
+    + 'Das Modell lädt einige Minuten neu; der RAM-Cache der Konversationen ist danach leer, die SSD-Stufe bleibt.'); }
+function renderSrv() {
+  const st = strata || {}, sv = st.service || {}, b = lastSnap && lastSnap.batch;
+  $('srvStat').innerHTML = st.error && !st.service ? `<span class="err">${esc(st.error)}</span>`
+    : `Dienst <b>${esc(sv.unit || 'strata.service')}</b>: ` + (sv.active === 'active' ? '<b>läuft</b>' : `<span class="err">${esc(sv.active || '?')}${sv.sub ? ' (' + esc(sv.sub) + ')' : ''}</span>`)
+      + (sv.since ? ` · seit ${new Date(sv.since * 1000).toLocaleString('de-DE')}` : '') + (st.error ? ` · <span class="err">${esc(st.error)}</span>` : '');
+  $('srvRows').innerHTML = !st.service ? '' : [
+    ['Config', `<code>${esc(base(st.config))}</code> → <code>${esc(base(st.config_real))}</code>`],
+    ['Engine', `<code>${esc(base(st.exe))}</code>`],
+    ['Prozesse', `Server ${sv.pid ?? '–'} · Engine ${st.engine_pid ?? '–'}`],
+    ['Anfragen jetzt', b ? `${fmt(b.busy)} / ${fmt(b.slots)} Slots` : '–'],
+    ['Neustarts durch systemd', fmt(sv.restarts)],
+    ...(st.last_restart ? [['Neustart von hier', new Date(st.last_restart * 1000).toLocaleString('de-DE')]] : [])
+  ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+  const lg = $('srvLog'), end = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 8;
+  lg.textContent = st.log != null ? st.log : 'nur nach Anmeldung';
+  if (end) lg.scrollTop = lg.scrollHeight; }
+function ccField(k) { const d = strata.fields[k], v = strata.saved[k], r = strata.running ? strata.running[k] : null;
+  return `<label>${esc(d.label)}<input type="number" name="${k}" min="${d.min}" max="${d.max}" step="any" value="${v ?? ''}">`
+    + `<span class="run${strata.running && r !== v ? ' pend' : ''}">läuft: ${r == null ? '–' : fmt(r, r % 1 ? 1 : 0)}</span></label>`; }
+function renderCache() {
+  const st = strata || {}, f = $('ccForm');
+  if (!st.fields || !st.saved) { $('ccStat').innerHTML = `<span class="err">${esc(st.error || 'keine Daten')}</span>`; return; }
+  const pend = st.running ? Object.keys(st.saved).filter(k => st.running[k] !== st.saved[k]) : [];
+  $('ccStat').innerHTML = (st.running ? (pend.length ? `<span class="err">${pend.length} gespeicherte Änderung(en) wirken erst nach dem Neustart</span>` : 'Gespeichert = läuft')
+    : 'Strata läuft gerade nicht – die Werte gelten beim nächsten Start') + ` · <code>${esc(base(st.config_real))}</code>`;
+  if (!f.dataset.dirty) { $('ccRam').innerHTML = CC_RAM.map(ccField).join(''); $('ccSsd').innerHTML = CC_SSD.map(ccField).join(''); }
+  const dk = st.disk, day = st.saved.tier_write_gb_day;
+  $('ccDisk').innerHTML = dk && !dk.error ? `<code>${esc(dk.dir)}</code>: Stufe ${bytes(dk.tier_bytes)} · frei ${bytes(dk.free)} von ${bytes(dk.total)}`
+      + (day ? ` · volles Tagesbudget = ${fmt(day * 365 / 1000, 0)} TB/Jahr geschrieben` : '') : dk ? `<span class="err">${esc(dk.error)}</span>` : '';
+  renderAuth(); }
+async function ccSave(restart) {
+  const f = $('ccForm'), body = {};
+  for (const el of f.querySelectorAll('input[name]')) { if (el.value === '') continue;
+    const v = Number(String(el.value).replace(',', '.')); if (strata.saved[el.name] !== v) body[el.name] = v; }
+  if (!Object.keys(body).length && !restart) { $('ccMsg').textContent = 'nichts geändert'; return; }
+  if (restart && !restartQuestion()) return;
+  body.restart = !!restart; $('ccMsg').textContent = 'speichere …';
+  try { await api('api/control/strata/config', body); delete f.dataset.dirty;
+    $('ccMsg').textContent = (restart ? 'gespeichert · Strata startet neu ' : 'gespeichert – wirkt nach dem nächsten Neustart ') + new Date().toLocaleTimeString('de-DE');
+    await loadStrata(); }
+  catch (e) { $('ccMsg').textContent = 'Fehler: ' + e.message; if (e.status === 401) loadCtl(); } }
+$('ccForm').oninput = () => { $('ccForm').dataset.dirty = '1'; };
+$('ccForm').onsubmit = ev => { ev.preventDefault(); ccSave(false); };
+$('ccSaveRestart').onclick = () => ccSave(true);
+$('srvRestart').onclick = async () => { if (!restartQuestion()) return; $('srvMsg').textContent = 'starte neu …';
+  try { await api('api/control/strata/restart', {}); $('srvMsg').textContent = 'Neustart ausgelöst ' + new Date().toLocaleTimeString('de-DE'); await loadStrata(); }
+  catch (e) { $('srvMsg').textContent = 'Fehler: ' + e.message; if (e.status === 401) loadCtl(); } };
+$('srvLogBtn').onclick = loadStrata;
+$('authBtn').onclick = () => { menuOpen(); const pw = document.querySelector('[data-pw]'); if (pw) pw.focus({preventScroll: true}); };
+
 // ---- data
 function safeRender(d) {
   try { render(d); $('jsErr').style.display = 'none'; }
@@ -1560,6 +1668,7 @@ if (window.ResizeObserver) { let lw = 0; new ResizeObserver(en => { const w = Ma
 { const rs = $('reqScroll'), upd = () => rs.classList.toggle('end', rs.scrollLeft + rs.clientWidth >= rs.scrollWidth - 4);
   rs.addEventListener('scroll', upd, {passive: true}); window.addEventListener('resize', upd); setTimeout(upd, 0); }
 boot();
+loadCtl();
 </script>
 </body>
 </html>
