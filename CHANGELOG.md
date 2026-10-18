@@ -4,6 +4,36 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (dashboard: admin login, Strata settings) - 2026-10-18
+- **Everyone sees everything, every change needs the admin login.** One login box for all tabs of ⚙ Einstellungen
+  plus a header button (🔒 Anmelden / ✓ Admin); the password is G3's admin password (`dashboard/g3control.py`, no
+  second password store). Without the login every field and button is locked and the server answers 401. Power
+  price/consumption and "Neue Zählung" (`/api/settings`, `/api/reset`) were open before and now need the login too
+  (same-origin + JSON check as the G3 writes).
+- **Strata-Server** tab: `strata.service` status (since when, server and engine PID, systemd restarts), the config
+  (`production.json` → its target) and engine binary, requests running now, **restart** with a confirmation (says
+  how many requests break off; the RAM conversation cache is empty afterwards, the SSD tier is kept), and the tail of
+  the engine log (login only).
+- **Cache & SSD** tab: conversation cache in RAM (`--conversation-cache-mib` as GiB, `-slots`, `-min-free-mib` as
+  GiB, `-min-tokens`) and the SSD tier (`STRATA_CONV_TIER_WRITE_GB_DAY` write budget per day, `_CAP_GB` the most it
+  keeps on disk - full means the least recently used conversations are overwritten, `_MIN_TOKENS`, `_TTL_H` shown as
+  "Aufbewahrungszeit" = time since the last use, `_MIN_FREE_GB`). Each field shows the value the running engine was
+  started with (read from `/proc` cmdline + environ), so saved-but-pending changes are marked; "Speichern" writes the
+  production config (the file the symlink points at, same JSON format, only the changed keys), "Speichern & Strata
+  neu starten" applies it. Ranges are checked in the page and the server; the disk cap must fit next to what the disk
+  keeps free. Disk line: tier size, free space, TB/year at a full day budget. Config, binary and model cannot be
+  switched here on purpose (that stays a deploy).
+- Main panel, SSD tier: "auf Disk" shows used / cap.
+- New module `dashboard/strata_admin.py`; `dashboard.py` gets `GET /api/strata` (everyone; log only with the login),
+  `POST /api/control/strata/config` and `/api/control/strata/restart` (login) and the option `--strata-unit`
+  (default `strata.service`). Active on Linux with `--engine-config` and the G3 login.
+
+### Changed (production) - 2026-10-18
+- SSD tier: **1,000 GB/day** write budget (was 300; the day's 300 GB were used up by 16:00 and further evictions were
+  dropped) and a **500 GB disk cap** (`STRATA_CONV_TIER_CAP_GB`, engine default 600), set through the new monitor
+  tab; Strata restarted 16:2x, tier warm (279 conversations kept). Worst case 365 TB/year against ~3,600 TBW of the
+  RAID members, about ten years.
+
 ### Changed (dashboard, "Strata Monitor")
 - New layout: a status band (phase, throughput now, batch slots, GPUs, wall power, cost) and panels by question
   (Was läuft gerade? · Wie schnell? · Was kostet es? · Ist die Hardware ok? · Speicher & Caches · Verlauf ·

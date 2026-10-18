@@ -75,7 +75,9 @@ The engine and the models are **not** included. The repository holds everything 
   approx. tokens), 10-minute charts, recent requests. It also runs without a Strata server (`Start-Dashboard.bat`,
   Linux: `linux/start-dashboard.sh`, port 8082). Its **⚙ Einstellungen** menu holds the power price, the GPU power
   limits per GPU for day and night and the fan curves (written through G3's admin API with the G3 admin password;
-  fans: more cooling only, never below G3's default curve), and **ⓘ API** explains the endpoints, context window,
+  fans: more cooling only, never below G3's default curve), on Linux also the **Strata server** (status, restart,
+  engine log) and **Cache & SSD** (RAM conversation cache, SSD tier write budget per day, disk cap, retention time).
+  Everyone can look; every change needs the admin login (the G3 admin password). **ⓘ API** explains the endpoints, context window,
   thinking levels (none/low/medium/high) and how to send images
 - benchmark and A/B tools with their measurement data and analysis reports
 - the engine patch series and its design documents (`linux/patches/`, `linux/upstream/`)
