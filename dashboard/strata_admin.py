@@ -32,7 +32,7 @@ FIELDS = {
     "tier_write_gb_day": ("env", "STRATA_CONV_TIER_WRITE_GB_DAY", 1, (0, 5000), 200, "SSD schreiben GB/Tag"),
     "tier_cap_gb":      ("env", "STRATA_CONV_TIER_CAP_GB", 1, (10, 5000), 600, "SSD belegt max GB"),
     "tier_min_tokens":  ("env", "STRATA_CONV_TIER_MIN_TOKENS", 1, (1024, 262144), 16384, "SSD ab Tokens"),
-    "tier_ttl_h":       ("env", "STRATA_CONV_TIER_TTL_H", 1, (1, 8760), 168, "SSD Lebensdauer h"),
+    "tier_ttl_h":       ("env", "STRATA_CONV_TIER_TTL_H", 1, (1, 8760), 168, "SSD Aufbewahrungszeit h"),
     "tier_min_free_gb": ("env", "STRATA_CONV_TIER_MIN_FREE_GB", 1, (8, 2000), 64, "SSD frei halten GiB"),
 }
 
