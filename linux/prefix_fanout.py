@@ -41,7 +41,7 @@ def one(url, d, q, max_tok, uid):
             "stream_options": {"include_usage": True}}
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    t0 = time.time(); tf = None; usage = None; err = None; n = 0
+    t0 = time.time(); tf = None; usage = None; err = None; n = 0; txt = []
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
             for raw in r:
@@ -53,7 +53,7 @@ def one(url, d, q, max_tok, uid):
                 for ch in c.get("choices") or []:
                     dd = ch.get("delta") or {}
                     if dd.get("content") or dd.get("reasoning_content"):
-                        tf = tf or time.time(); n += 1
+                        tf = tf or time.time(); n += 1; txt.append((dd.get("reasoning_content") or "") + (dd.get("content") or ""))
     except Exception as e:  # noqa: BLE001
         err = repr(e)[:200]
     t1 = time.time()
@@ -61,7 +61,7 @@ def one(url, d, q, max_tok, uid):
     gen = u.get("completion_tokens", n)
     return {"uid": uid, "t0": t0, "tf": tf, "t1": t1, "ttft": (tf - t0) if tf else None, "gen": gen,
             "prompt": u.get("prompt_tokens"), "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens"),
-            "dec": (gen - 1) / (t1 - tf) if tf and t1 > tf and gen > 1 else None, "err": err}
+            "dec": (gen - 1) / (t1 - tf) if tf and t1 > tf and gen > 1 else None, "err": err, "text": "".join(txt)}
 
 
 def poll(url, stop, rows):

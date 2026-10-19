@@ -49,21 +49,30 @@ trap 'trap "" PIPE; log "aborted by signal"; exit 1' INT TERM HUP
 log "window start: stopping strata.service"; STOPPED=1; systemctl --user stop strata.service
 gpus_free || { log "GPUs not free"; exit 1; }
 
+arm() { local A=$1 SD=$2 EX=$3
 systemctl --user reset-failed strata-bench.scope 2>/dev/null
-( cd "$SRV" && env $SRVENV systemd-run --user --scope --unit=strata-bench -p MemoryMax=224G -p MemorySwapMax=0 \
-    $PY "$SRV/serve/server.py" --engine strata --config "$OUT/config.json" --port $SP --host 127.0.0.1 \
-    > "$OUT/server.out" 2>&1 < /dev/null & )
+( cd "$SD" && env $SRVENV $EX systemd-run --user --scope --unit=strata-bench -p MemoryMax=224G -p MemorySwapMax=0 \
+    $PY "$SD/serve/server.py" --engine strata --config "$OUT/config.json" --port $SP --host 127.0.0.1 \
+    > "$OUT/server-$A.out" 2>&1 < /dev/null & )
 t0=$(date +%s)
 until curl -s -m 3 $SURL/health | grep -q '"loaded": *true'; do
-  [ $(( $(date +%s) - t0 )) -gt 10 ] && ! systemctl --user is-active -q strata-bench.scope && { log "server died during start"; tail -5 "$OUT/server.out" | tee -a "$OUT/window.log"; exit 1; }
-  [ $(( $(date +%s) - t0 )) -gt 600 ] && { log "start timeout"; exit 1; }; sleep 5; done
-log "test server ready after $(( $(date +%s) - t0 )) s"
+  [ $(( $(date +%s) - t0 )) -gt 10 ] && ! systemctl --user is-active -q strata-bench.scope && { log "$A: server died during start"; return 1; }
+  [ $(( $(date +%s) - t0 )) -gt 600 ] && { log "$A: start timeout"; return 1; }; sleep 5; done
+log "$A: test server ready after $(( $(date +%s) - t0 )) s ($SD $EX)"
 for run in "warm 20000 w20" "cold 20000 c20" "warm 60000 w60"; do
   set -- $run
-  bgw timeout 600 $PY -I prefix_fanout.py --url $SURL --n 16 --doc-tok $2 --mode $1 --tag "$3-$(date +%s)" --label $3 \
-      --out "$OUT/$3.json" > "$OUT/$3.txt" 2>&1
-  log "$3: $(grep '^==>' "$OUT/$3.txt" | cut -c1-400)"
+  bgw timeout 600 $PY -I prefix_fanout.py --url $SURL --n 16 --doc-tok $2 --mode $1 --tag "$3" --label $A-$3 \
+      --out "$OUT/$A-$3.json" > "$OUT/$A-$3.txt" 2>&1
+  log "$A-$3: $(grep '^==>' "$OUT/$A-$3.txt" | cut -c1-330)"
 done
+stop_bench; rm -rf "$TIER"; mkdir -p "$TIER"; }
+arm base "$SRV" ""
+arm pin "$R/Strata-ll9-autopin" "STRATA_AUTO_PIN=4096"
+for r in w20 c20 w60; do python3 -c "
+import json,sys
+a,b=(json.load(open(f'$OUT/{x}-$r.json'))['rows'] for x in ('base','pin'))
+ta={x['uid']:x['text'] for x in a}; tb={x['uid']:x['text'] for x in b}
+same=sum(ta[k]==tb.get(k) for k in ta); print(f'$r: replies identical {same}/{len(ta)}')" | while read l; do log "$l"; done; done
 grep -a "prompt .* tokens = .* reused" "$OUT/engine.log" | tail -60 > "$OUT/engine-reuse.txt"
 log "engine reuse lines: $(wc -l < "$OUT/engine-reuse.txt") (results/fanout/engine-reuse.txt)"
 back
