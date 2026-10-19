@@ -6,8 +6,9 @@ set -euo pipefail
 R=/media/raid0/StrataQ38FN; URL=http://127.0.0.1:8090
 case "${1:-}" in
   "") TARGET=T16-1441j-fair-g4-prod262r-vision-cpu.json ;;
+  --8k) TARGET=T16-1441j-fair-g8-prod262r-vision-cpu.json ;;
   --rollback) TARGET=T16-1441j-fair-prod262r-vision-cpu.json ;;
-  *) echo "usage: $0 [--rollback]"; exit 2 ;;
+  *) echo "usage: $0 [--8k|--rollback]"; exit 2 ;;
 esac
 echo "production.json: $(readlink $R/linux/configs/production.json) -> $TARGET"
 ln -sfn "$TARGET" $R/linux/configs/production.json
