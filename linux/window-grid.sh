@@ -274,24 +274,18 @@ T0=$(date +%s)                                  # (WINDOW_S: production's outage
 for i in $(seq 60); do curl -s -m 2 $URL/health >/dev/null || break; sleep 2; done
 free_gpus || abort "GPUs not free"
 
-# ---- 1. agent mix + 16 users: PROD G4 G4 PROD (16K vs 4K checkpoint grid) -------------------------------------------
-step mix_PROD_1 450 1500 mix_arm SP-PROD 1
-step mix_G4_1 450 1500 mix_arm MX-G4 1
-step mix_G4_2 450 1500 mix_arm MX-G4 2
-step mix_PROD_2 450 1500 mix_arm SP-PROD 2
-judge mix_G4 mix_PROD_1,mix_G4_1 "$PY" -I "$FT" --mode mix --dir $OUT --arms-list SP-PROD,MX-G4 --reps 2 --gain 1.10
-judge mix_sum_G4 mix_PROD_1,mix_G4_1,mix_G4_2,mix_PROD_2 "$PY" -I "$FT" --mode absum --tag grd --reps 2 --arms-list SP-PROD,MX-G4 --since-line "$SWEEP0"
-for f in "$OUT"/mix-*-agentic.txt "$OUT"/mix-*-mt.txt; do log "    [cache] $(basename $f): $(tail -1 $f | cut -c1-200)"; done
-python3 - "$OUT" <<'PYX' | while read l; do log "    [cache] $l"; done
-import json, sys, glob
-for f in ("multiturn.jsonl", "agentic.jsonl"):
-    for line in open(f"{sys.argv[1]}/{f}"):
-        r = json.loads(line); p = c = 0
-        for k, v in r.items():
-            if isinstance(v, dict) and "prompt" in v and "cached" in v: p += v["prompt"] or 0; c += v["cached"] or 0
-        if p: print(f"{r.get('label')}: prompt {p}, cached {c} = {100*c/p:.1f} %")
-PYX
-[ -f "$OUT/mix_sum_G4.txt" ] && sed 's/^/    /' "$OUT/mix_sum_G4.txt" | tee -a "$OUT/window.log" >/dev/null
+# ---- 1. short: bench_agentic only, PROD then G4 (one server start each) ----------------------------------------------
+ag_arm() { local n=$1 cfg rc=0 ml=ag-$1 u=http://127.0.0.1:$TPORT
+    cfg=$(runcfg "$n" "$ml") || return 1
+    up "gr-$ml" "$cfg" || return 1
+    timeout -s INT 900 "$PY" -I "$L/bench_agentic.py" --url "$u" --temperature 0 --label "$ml" --out "$OUT/agentic.jsonl" \
+        > "$OUT/$ml.txt" 2>&1 || rc=1
+    echo "==> $ml: $(tail -1 "$OUT/$ml.txt" | cut -c1-200)"; grep -E "^(main|sub|chat) " "$OUT/$ml.txt" | sed 's/^/==> '$ml' /'
+    echo "==> rss $ml: peak $(rss_peak) INFO"
+    sleep 2; systemctl --user stop strata-bench.scope; return $rc; }
+export -f ag_arm
+step ag_PROD 300 900 ag_arm SP-PROD
+step ag_G4 300 900 ag_arm MX-G4
 
 # ---- 3. production back, unchanged ------------------------------------------------------------------------------------
 bench_down end
