@@ -1,0 +1,100 @@
+From f8fcc2762e01d10a9c73e4e055be7df2826ff92a Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 17:44:22 +0100
+Subject: [PATCH] serve: ConvCacheLog counts the borrow engine's restore lines
+ ("restored N of M tokens", "borrowed N of a parked M-token conversation")
+
+With STRATA_PARK_BORROW=1 (ll10-borrow) the engine names the donor in its restore line and writes a borrow as its
+own line; the EVENT pattern matched neither, so production's /metrics showed restores 0 beside 515 restore and 118
+borrow lines (2026-11-06). Both now count as restores, a borrow also in the new "borrows" counter; the old formats
+parse as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py                 | 12 ++++++++---
+ serve/test_conv_cache_borrow.py | 36 +++++++++++++++++++++++++++++++++
+ 2 files changed, 45 insertions(+), 3 deletions(-)
+ create mode 100644 serve/test_conv_cache_borrow.py
+
+diff --git a/serve/server.py b/serve/server.py
+index 974663ad..217c36ab 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -748,8 +748,12 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
+ class ConvCacheLog:
+     """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
+     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
+-    which is the log): read on from where it was last read, from the start of the engine's current run."""
+-    EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
++    which is the log): read on from where it was last read, from the start of the engine's current run.  With
++    STRATA_PARK_BORROW=1 (ll10-borrow) a restore line names the donor ("restored N of M tokens") and a borrow is its own
++    line ("borrowed N of a parked M-token conversation ...; parked=P bytes=B"): both count as restores, a borrow also
++    as one of "borrows"."""
++    EVENT = re.compile(r"conversation cache: (parked|skipped|restored|borrowed) (\d+)"
++                       r"(?: of (?:a parked )?\d+(?:-token conversation)?)?(?: tokens)?.*?parked=(\d+) bytes=(\d+)"
+                        r"(?: evictions=(\d+))?")
+     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+     # STRATA_CONV_TIER_DIR (the disk tier): "conversation tier: <event>; files=F parts=P disk_bytes=D written_today=W
+@@ -764,7 +768,7 @@ class ConvCacheLog:
+         self.reset()
+ 
+     def reset(self):
+-        self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
++        self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "borrows": 0, "last_event": None,
+                       "last_tokens": None, "last_at": None}
+ 
+     def poll(self, path, start) -> dict:
+@@ -811,6 +815,8 @@ class ConvCacheLog:
+                     st["evictions"] = int(m.group(5))
+                 if m.group(1) != "skipped":
+                     st["parks" if m.group(1) == "parked" else "restores"] += 1
++                    if m.group(1) == "borrowed":
++                        st["borrows"] += 1
+                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
+                 continue
+             m = self.DROPPED.search(line)
+diff --git a/serve/test_conv_cache_borrow.py b/serve/test_conv_cache_borrow.py
+new file mode 100644
+index 00000000..1df1f9a2
+--- /dev/null
++++ b/serve/test_conv_cache_borrow.py
+@@ -0,0 +1,36 @@
++"""ll10-borrow: with STRATA_PARK_BORROW=1 the engine writes "restored N of M tokens" and "borrowed N of a parked M-token
++conversation" lines; ConvCacheLog counted neither (production's /metrics showed restores 0 beside 515 restore lines)."""
++import os
++import tempfile
++import unittest
++
++
++class ConvCacheBorrowLines(unittest.TestCase):
++    def test_borrow_and_donor_restore_lines_count_as_restores(self):
++        from serve.server import ConvCacheLog
++        lines = [
++            "strata serve: conversation cache: parked 131444 tokens in 1.3 ms; parked=1 bytes=3576173496 evictions=0 x=1",
++            "strata serve: conversation cache: restored 131444 tokens (live) in 173.7 ms; parked=0 bytes=2006374744",
++            "strata serve: conversation cache: restored 137289 of 137289 tokens (live) in 203.1 ms; parked=12 bytes=83",
++            "strata serve: conversation cache: restored 22357 of 24415 tokens (checkpoint) in 196.8 ms; parked=12 "
++            "bytes=94 (borrow failed (copy), taken)",
++            "strata serve: conversation cache: borrowed 8192 of a parked 31259-token conversation (checkpoint) in 113.1 "
++            "ms; parked=152 bytes=102793092240 checkpoints=1",
++            "strata serve: conversation cache: skip parking (702 tokens, below the 1024 minimum; parked=9)",
++            "strata serve: conversation cache: evicted 10 parked conversations to admit this snapshot (1220 MiB plus "
++            "16384 MiB floor)",
++        ]
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "engine.log")
++            with open(path, "w") as f:
++                f.write("\n".join(lines) + "\n")
++            st = ConvCacheLog().poll(path, 0)
++        self.assertEqual(st["parks"], 1)
++        self.assertEqual(st["restores"], 4)
++        self.assertEqual(st["borrows"], 1)
++        self.assertEqual((st["parked"], st["bytes"]), (152, 102793092240))
++        self.assertEqual((st["last_event"], st["last_tokens"]), ("borrowed", 8192))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

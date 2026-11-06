@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Production: engine strata-g3-ll10-borrow (Strata-ll10-borrow @324b1d80, sha256 20d43c775ab99baa; patches/v0.1.44.1-ll10-borrow)
 # with STRATA_PARK_BORROW=1 only (STRATA_SERVE_STOP_BOUND=0, no CONV_MMAP / GATE_EVICT; MALLOC_MMAP_THRESHOLD_ 4 MiB stays),
-# server Strata-143-prod checked out at Strata-srv-1106 @10015835 (patches/v0.1.44.1-srv-1106). Deployed 2026-11-06 on the
+# server Strata-143-prod checked out at Strata-srv-1106 @f8fcc276 (10015835 + ConvCacheLog borrow lines) (patches/v0.1.44.1-srv-1106). Deployed 2026-11-06 on the
 # owner's go-ahead without a GPU test (window-borrow.sh follows at night).
 # --rollback: engine strata-g3-1441j-reads2 (T16-1441j-fair-g8-mmap4m-...) and server 90f73293, i.e. the state of 276dfe4.
 set -euo pipefail
 R=/media/raid0/StrataQ38FN; URL=http://127.0.0.1:8090
 case "${1:-}" in
-  "") TARGET=T16-ll10-borrow-g8-mmap4m-prod262r-vision-cpu.json; SERVER=100158350751e6ae257a9a7f90a926d6de979370 ;;
+  "") TARGET=T16-ll10-borrow-g8-mmap4m-prod262r-vision-cpu.json; SERVER=f8fcc2762e01d10a9c73e4e055be7df2826ff92a ;;
   --rollback) TARGET=T16-1441j-fair-g8-mmap4m-prod262r-vision-cpu.json; SERVER=90f73293 ;;
   *) echo "usage: $0 [--rollback]"; exit 2 ;;
 esac
