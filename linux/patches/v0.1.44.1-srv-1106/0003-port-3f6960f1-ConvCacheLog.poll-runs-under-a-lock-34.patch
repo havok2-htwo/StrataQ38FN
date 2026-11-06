@@ -1,0 +1,115 @@
+From 8452e7384f3e5ad7996631e6d332db0c3601abb5 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:10:38 +0100
+Subject: [PATCH 3/8] port 3f6960f1: ConvCacheLog.poll runs under a lock
+ (#3443)
+
+Polls come from several request and monitor threads; a second poll moved `pos` between the first one's size check
+and its read, so park lines were counted twice or a read length went negative (ValueError). Upstream's test
+(in test_serve_robustness.py, which this fork deleted) comes along as serve/test_conv_cache_poll.py; it fails on
+90f73293 and passes here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py               |  8 ++++-
+ serve/test_conv_cache_poll.py | 62 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+), 1 deletion(-)
+ create mode 100644 serve/test_conv_cache_poll.py
+
+diff --git a/serve/server.py b/serve/server.py
+index a8f67cb4..8292fb77 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -760,6 +760,7 @@ class ConvCacheLog:
+ 
+     def __init__(self):
+         self.key, self.pos = None, 0
++        self.lock = threading.Lock()                    # polls come from several request / monitor threads at once
+         self.reset()
+ 
+     def reset(self):
+@@ -767,7 +768,12 @@ class ConvCacheLog:
+                       "last_tokens": None, "last_at": None}
+ 
+     def poll(self, path, start) -> dict:
+-        """The state after the log's new lines; `start` is where the engine's current run began in it."""
++        """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
++        time: a second one moved `pos` between the size check and the seek and raised ValueError (negative seek)."""
++        with self.lock:
++            return self._poll(path, start)
++
++    def _poll(self, path, start) -> dict:
+         if not path or start is None:
+             return dict(self.state)
+         if self.key != (path, start):                   # another start of the engine: its cache starts empty
+diff --git a/serve/test_conv_cache_poll.py b/serve/test_conv_cache_poll.py
+new file mode 100644
+index 00000000..adc92ac4
+--- /dev/null
++++ b/serve/test_conv_cache_poll.py
+@@ -0,0 +1,62 @@
++"""#3443 (upstream 3f6960f1): ConvCacheLog.poll runs under a lock.  Upstream has this in serve/test_serve_robustness.py,
++which this fork does not carry."""
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from unittest import mock
++
++
++class ConvCachePoll(unittest.TestCase):
++    """ConvCacheLog.poll ran outside any lock: a second poll that moved `pos` between the first one's size check and
++    its read left a negative read length (ValueError).  Found by HWSTALL while triaging #3443."""
++    PARK = ("strata serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=104857600 evictions=0 "
++            "snapshot_bytes=104857600 reused_kv_bytes=0\n")
++
++    def test_a_poll_that_overlaps_another_one_does_not_raise(self):
++        import os
++        from serve.server import ConvCacheLog
++        with tempfile.TemporaryDirectory() as d:
++            log = Path(d) / "strata.log"
++            log.write_text(self.PARK, encoding="utf-8")
++            c = ConvCacheLog()
++            c.poll(str(log), 0)
++            with open(log, "a", encoding="utf-8") as f:
++                f.write(self.PARK)
++            first_sized, first_may_go = threading.Event(), threading.Event()
++            real_size = os.path.getsize
++            calls = []
++
++            def slow_first(path):
++                size = real_size(path)
++                if not calls and path == str(log):
++                    calls.append(1)
++                    first_sized.set()
++                    first_may_go.wait(2.0)             # the first poll has its size; a second poll runs meanwhile
++                return size
++            errors = []
++
++            def first():
++                try:
++                    c.poll(str(log), 0)
++                except BaseException as e:             # noqa: BLE001
++                    errors.append(e)
++            with mock.patch("serve.server.os.path.getsize", slow_first):
++                t = threading.Thread(target=first, daemon=True)
++                t.start()
++                self.assertTrue(first_sized.wait(5))
++                with open(log, "a", encoding="utf-8") as f:
++                    f.write(self.PARK * 2)
++                second = threading.Thread(target=lambda: c.poll(str(log), 0), daemon=True)
++                second.start()
++                second.join(0.5)                       # (with the lock it waits for the first one)
++                first_may_go.set()
++                t.join(5)
++                second.join(5)
++            self.assertEqual(errors, [])
++            self.assertEqual(c.poll(str(log), 0)["parks"], 4, "every parked line counted once")
++
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

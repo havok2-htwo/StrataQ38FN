@@ -1,0 +1,222 @@
+From 2d26a35731da910aa49c39497e3633a15410472d Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:11:02 +0100
+Subject: [PATCH 4/8] port fc27296d + b145a4a2: no O(n^2) tool-body rescans or
+ partial-tag checks while streaming
+
+fc27296d: inside a wrapped call the closing-tag search only looks at newly appended text (plus an overlap for a
+tag split across feeds) until a candidate appears; then the original full walk runs for that call. Recovery
+always uses the full walk. b145a4a2: _hold finds a held partial tag with str.find on the tag's first character
+instead of testing every prefix of every tag. Both are exact (upstream's tests compare against the original walk
+after every feed). Clean cherry-picks; tests test_parser_call_scan.py and test_parser_hold.py come along.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/frontend.py              | 32 +++++++++++++++---
+ serve/test_parser_call_scan.py | 61 ++++++++++++++++++++++++++++++++++
+ serve/test_parser_hold.py      | 60 +++++++++++++++++++++++++++++++++
+ 3 files changed, 149 insertions(+), 4 deletions(-)
+ create mode 100644 serve/test_parser_call_scan.py
+ create mode 100644 serve/test_parser_hold.py
+
+diff --git a/serve/frontend.py b/serve/frontend.py
+index c36a44da..69ba9971 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -1039,6 +1039,7 @@ class OutputParser:
+         return out
+ 
+     def _reset_scan(self):
++        self._call_end_checked = 0   # closing-tag search progress for the current wrapped call
+         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
+         self.ss = "name"             # name -> between -> str|raw -> ... -> done
+         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
+@@ -1046,6 +1047,20 @@ class OutputParser:
+         self.sval_started = False
+         self.sdeclared = {}
+ 
++    def _wrapped_call_end(self) -> int:
++        # Without a closing tag the structural walk cannot finish. Search only
++        # newly appended text plus enough overlap for a tag split across feeds.
++        # A literal closing tag inside a value needs structural disambiguation:
++        # once any candidate appears, keep the original full walk for this call.
++        # Recovery can rewrite the buffer, so it always uses the full walk.
++        if not self.recover and self._call_end_checked >= 0:
++            start = max(0, self._call_end_checked - len(CALL_END) + 1)
++            if self.buf.find(CALL_END, start) < 0:
++                self._call_end_checked = len(self.buf)
++                return -1
++            self._call_end_checked = -1
++        return call_end(self.buf)
++
+     def _scan(self) -> list[Event]:
+         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
+         out = []
+@@ -1152,10 +1167,19 @@ class OutputParser:
+     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
+         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
+         best = 0
++        size = len(text)
+         for tag in tags:
+-            for n in range(1, len(tag)):
+-                if text.endswith(tag[:n]):
+-                    best = max(best, n)
++            if len(tag) <= 1:
++                continue
++            # Only a suffix beginning with the tag's first character can match.
++            # Ordinary token deltas contain no '<': one C-level search replaces
++            # checking every possible prefix. Earliest candidate is the longest.
++            start = text.find(tag[0], max(0, size - len(tag) + 1))
++            while start >= 0 and size - start > best:
++                if tag.startswith(text[start:]):
++                    best = size - start
++                    break
++                start = text.find(tag[0], start + 1)
+         return best
+ 
+     def feed(self, delta: str) -> list[Event]:
+@@ -1351,7 +1375,7 @@ class OutputParser:
+                         elif after and not CALL_END.startswith(after):
+                             drop = 0
+                 else:
+-                    i = call_end(self.buf)
++                    i = self._wrapped_call_end()
+                     if i >= 0:
+                         drop = len(CALL_END)
+                     if self.recover:                # a batch in one wrapper: the next call follows this one's
+diff --git a/serve/test_parser_call_scan.py b/serve/test_parser_call_scan.py
+new file mode 100644
+index 00000000..a4484514
+--- /dev/null
++++ b/serve/test_parser_call_scan.py
+@@ -0,0 +1,61 @@
++"""Wrapped-call precheck parity against the original structural walk."""
++import itertools
++import random
++import unittest
++from unittest.mock import patch
++
++from serve import frontend
++
++
++class ReferenceParser(frontend.OutputParser):
++    def _wrapped_call_end(self):
++        return frontend.call_end(self.buf)
++
++
++def events_without_ids(events):
++    return [(e.kind, e.text, (e.call.name, e.call.arguments) if e.call else None) for e in events]
++
++
++class CallScanTests(unittest.TestCase):
++    def test_chunk_boundaries_literal_tags_multiple_calls_and_recovery(self):
++        def call(value):
++            return "<tool_call><function=write><parameter=text>" + value + "</parameter></function></tool_call>"
++        bodies = [call("ordinary"), call("literal </tool_call> text </function> here"),
++                  call("literal </parameter> prose"), call("a") + call("b"),
++                  call("unfinished")[:-5], call("incomplete </tool_call> prose")[:-30],
++                  "<tool_call><function=write></function></tool_call>",
++                  "<function=write><parameter=text>bare</parameter></function>",
++                  "<tool_call><function=write><parameter=text>a</parameter></function>"
++                  "<parameter=write><parameter=text>b</parameter></function></tool_call>"]
++        tools = [{"name": "write", "parameters": {"properties": {"text": {"type": "string"}}}}]
++        rng = random.Random(1030)
++        for text, stream, recover in itertools.product(bodies, (False, True), (False, True)):
++            # Every fixed chunk width, plus random partitions; compare after EACH feed.
++            for width in range(1, 16):
++                a = frontend.OutputParser(thinking=False, tools=tools, stream_tools=stream, recover=recover)
++                b = ReferenceParser(thinking=False, tools=tools, stream_tools=stream, recover=recover)
++                pos = 0
++                while pos < len(text):
++                    end = pos + (rng.randint(1, 20) if width == 15 else width)
++                    delta = text[pos:end]
++                    self.assertEqual(events_without_ids(a.feed(delta)), events_without_ids(b.feed(delta)))
++                    pos = end
++                self.assertEqual(events_without_ids(a.finish()), events_without_ids(b.finish()))
++
++    def test_no_structural_rescans_until_closer_and_reset_for_next_call(self):
++        parser = frontend.OutputParser(thinking=False)
++        with patch.object(frontend, "call_end", wraps=frontend.call_end) as walk:
++            for _ in range(2):
++                parser.feed("<tool_call><function=write><parameter=text>")
++                before = walk.call_count
++                for _ in range(100):
++                    parser.feed("abcdefgh")
++                self.assertEqual(walk.call_count, before)
++                for char in "</parameter></function></tool_call>":
++                    parser.feed(char)
++                self.assertEqual(walk.call_count, before + 1)
++                self.assertEqual(parser._call_end_checked, 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/serve/test_parser_hold.py b/serve/test_parser_hold.py
+new file mode 100644
+index 00000000..519f8192
+--- /dev/null
++++ b/serve/test_parser_hold.py
+@@ -0,0 +1,60 @@
++"""Partial-tag parity, including overlapping prefixes and arbitrary chunk boundaries."""
++import itertools
++import random
++import unittest
++
++from serve.frontend import OutputParser
++
++
++def reference_hold(text, tags):
++    return max((n for tag in tags for n in range(1, len(tag)) if text.endswith(tag[:n])), default=0)
++
++
++class ReferenceParser(OutputParser):
++    def _hold(self, text, tags):
++        return reference_hold(text, tags)
++
++
++class HoldTests(unittest.TestCase):
++    def test_overlapping_and_empty_tags(self):
++        parser = OutputParser()
++        tags = ("", "a", "aaa", "abab", "baab", "<tool_call>", "</think>")
++        for size in range(8):
++            for chars in itertools.product("ab<", repeat=size):
++                text = "".join(chars)
++                self.assertEqual(parser._hold(text, tags), reference_hold(text, tags), text)
++
++    def test_every_real_tag_split(self):
++        tags = ("<tool_call>", "</think>", "</parameter>")
++        parser = OutputParser()
++        for tag in tags:
++            for n in range(len(tag) + 1):
++                for prefix in ("", "prose\n", "<", "<<<", "🙂日本語"):
++                    text = prefix + tag[:n]
++                    self.assertEqual(parser._hold(text, tags), reference_hold(text, tags), text)
++
++    def test_streamed_events_match_reference(self):
++        texts = ["Reasoning.\n</think>\nAnswer café 🙂\n",
++                 "Quoted `</think>` text and <tool_call> prose.",
++                 "\n```xml\n<tool_call>\n```\nAnswer\n<tool_",
++                 "<tool_call><function=lookup><parameter=q>abc</parameter></function></tool_call>\nDone",
++                 "<tool_call><function=lookup><parameter=q>abc</parameter></function></tool_call></think>Done"]
++        rng = random.Random(1028)
++        for text, thinking, recover, stream_tools in itertools.product(texts, (False, True), (False, True), (False, True)):
++            for _ in range(5):
++                args = dict(thinking=thinking, tools=[{"name": "lookup"}], recover=recover, stream_tools=stream_tools)
++                actual, expected = OutputParser(**args), ReferenceParser(**args)
++                def normalized(events):
++                    # Tool call IDs are deliberately random; compare their semantic contents.
++                    return [(e.kind, e.text, (e.call.name, e.call.arguments) if e.call else None) for e in events]
++                pos = 0
++                while pos < len(text):
++                    end = pos + rng.randint(1, 9)
++                    delta = text[pos:end]
++                    self.assertEqual(normalized(actual.feed(delta)), normalized(expected.feed(delta)))
++                    pos = end
++                self.assertEqual(normalized(actual.finish()), normalized(expected.finish()))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

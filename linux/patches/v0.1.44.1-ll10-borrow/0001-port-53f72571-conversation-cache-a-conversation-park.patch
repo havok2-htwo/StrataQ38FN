@@ -1,0 +1,198 @@
+From 107d02d037abc959a28212a7ea26f91408488291 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:14:23 +0100
+Subject: [PATCH 1/7] port 53f72571: conversation cache: a conversation parked
+ again keeps at most an eighth of each K/V buffer in reserve (was up to 16 MiB
+ per buffer, 0.4-0.5 GB per conversation)
+
+Upstream 53f72571 by BlueKingMuch, applied unchanged (conversation_buffer.hpp
+segment_capacity() takes what the buffer held before the append and bounds the
+reserve to max(64 KiB, held/8), still at most 16 MiB; allocation_peak() passes
+the same; two conversation_cache_test cases; DETAILS.md).
+
+Checked on our side before porting: nothing outside ConversationBuffer depends
+on the reserve's size.  The SSD tier (conversation_tier.cpp) sizes its write
+budget from image.bytes(), which only gets smaller; conversation_file.cpp writes
+size() bytes and reads into a fresh buffer (resize from empty: exact payload,
+no reserve); the STRATA_SLOT_PARK / STRATA_PARK_ASYNC captures go through
+StagedCopy in staging-sized blocks, independent of segment sizes; the capture
+admission (conversation_snapshot.cpp) asks allocation_peak(), which now
+predicts the smaller reserve (both new tests check bytes() <= peak).
+
+Comments adjusted: conversation_cache.hpp evict_oldest() and the physical-RAM
+gate in generate.cpp said every segment is 16 MiB and above glibc's mmap
+threshold, so an eviction is back with the kernel at once.  That held only for
+the full segments; with this change the append reserve is smaller still.
+Upstream #3115: held/8 makes appended segments of a few MiB or less, below the
+mmap threshold (production sets MALLOC_MMAP_THRESHOLD_=4 MiB), so they come
+from malloc arenas and an evicted entry need not return them to the kernel;
+the RAM gate then reads less MemAvailable back than the cache freed.  Not
+addressed here; the allocation side is a separate change (E2).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/DETAILS.md                             |  6 ++--
+ include/strata/core/conversation_buffer.hpp | 16 ++++++---
+ include/strata/core/conversation_cache.hpp  |  8 +++--
+ src/core/conversation_cache_test.cpp        | 36 +++++++++++++++++++++
+ src/program/generate.cpp                    | 10 +++---
+ 5 files changed, 61 insertions(+), 15 deletions(-)
+
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 6169917b..1e8a9562 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -1018,11 +1018,11 @@ Snapshots contain running state, checkpoints, used K/V pages, and draft-layer K/
+ They add host RAM, not another model or VRAM allocation. The byte budget also counts
+ an incoming snapshot during a switch. After a restore, unchanged K/V pages can be
+ retained for the next parking operation; growth appends storage without copying
+-the existing pages. Rewinds refresh the affected pages, and running state and
++the existing pages, with room for the next turns of at most an eighth of each
++buffer (and at most 16 MiB), which the budget counts like the rest of the snapshot.
++Rewinds refresh the affected pages, and running state and
+ checkpoints are captured again. Retained active K/V counts against the same byte
+ budget and is discarded before evicting parked entries under memory pressure.
+-If reserving space for growth would evict another conversation, parking uses a
+-full capture instead.
+ Oldest parked entries are evicted first.
+ Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
+ `--conversation-cache-min-tokens N` (default 0 = park every conversation) parks only conversations of at least N
+diff --git a/include/strata/core/conversation_buffer.hpp b/include/strata/core/conversation_buffer.hpp
+index 88a010b4..d8a45177 100644
+--- a/include/strata/core/conversation_buffer.hpp
++++ b/include/strata/core/conversation_buffer.hpp
+@@ -54,7 +54,7 @@ public:
+         const size_t full = extra / segment_bytes, tail = extra % segment_bytes;
+         if (!add(total, full * segment_bytes)) return SIZE_MAX;
+         if (tail && !add(total, segment_capacity(tail, full ? segment_bytes :
+-                segments_.empty() ? 0 : segments_.back().capacity(), size_ != 0))) return SIZE_MAX;
++                segments_.empty() ? 0 : segments_.back().capacity(), size_ != 0, size_))) return SIZE_MAX;
+         size_t count = segments_.size();
+         if (!add(count, full + (tail != 0))) return SIZE_MAX;
+         if (count > segments_.capacity() &&
+@@ -63,7 +63,8 @@ public:
+     }
+     void resize(size_t n, uint8_t value = 0) {
+         if (n > size_) {
+-            const bool growing = size_ != 0;
++            const size_t held = size_;
++            const bool growing = held != 0;
+             const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
+             const size_t extend = std::min(n - size_, spare);
+             const size_t extra = n - size_ - extend;
+@@ -76,7 +77,7 @@ public:
+                 const size_t count = std::min(segment_bytes, n - size_);
+                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
+                 Segment segment;
+-                segment.reserve(segment_capacity(count, previous, growing));
++                segment.reserve(segment_capacity(count, previous, growing, held));
+                 segment.resize(count, value);
+                 segments_.push_back(std::move(segment));
+                 size_ += count;
+@@ -126,9 +127,14 @@ private:
+     // A fresh capture allocates exactly its payload. Later appends reserve
+     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
+     // extend the final allocation instead of adding one transfer per turn.
+-    static size_t segment_capacity(size_t count, size_t previous, bool growing) {
++    // The reserve is also bounded by an eighth of what the buffer held before
++    // the append (at least 64 KiB): a parked conversation carries it in every
++    // K/V buffer, and at up to 16 MiB each it came to 0.4-0.5 GB of a ~1 GB
++    // conversation (Qwen3.8-Flash-Next), counted against the cache's budget.
++    static size_t segment_capacity(size_t count, size_t previous, bool growing, size_t held) {
+         if (!growing) return count;
+-        return std::max(count, std::min(segment_bytes, std::max<size_t>(65536, std::min(previous, segment_bytes/2)*2)));
++        const size_t geometric = std::min(segment_bytes, std::max<size_t>(65536, std::min(previous, segment_bytes/2)*2));
++        return std::max(count, std::min(geometric, std::max<size_t>(65536, held / 8)));
+     }
+     static bool add(size_t& n, size_t extra) {
+         if (extra > SIZE_MAX - n) return false;
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 5a012c4e..0cd9791f 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -362,9 +362,11 @@ public:
+ 
+     // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
+     // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
+-    // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
+-    // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
+-    // to the kernel at once - the next admission check reads it back from /proc/meminfo.
++    // gate in generate.cpp).  A ConversationBuffer is a list of segments of up to 16 MiB and each segment is
++    // its own allocation; the full 16 MiB ones are above glibc's mmap threshold and go back to the kernel at
++    // once - the next admission check reads it back from /proc/meminfo.  A buffer's last segment is smaller
++    // (a capture's tail; since 53f72571 an append reserves at most an eighth of what the buffer held, at least
++    // 64 KiB), and a segment below the threshold comes from a malloc arena, which need not return it (#3115).
+     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
+     // `spill` (make_room's evictions: the cache made room for another image): an eviction sink may keep the image
+     // (STRATA_CONV_TIER_DIR, conversation_tier.hpp).  The physical-RAM gate and a save's reclaim evict to get the memory
+diff --git a/src/core/conversation_cache_test.cpp b/src/core/conversation_cache_test.cpp
+index faf1b03b..8dd8ee79 100644
+--- a/src/core/conversation_cache_test.cpp
++++ b/src/core/conversation_cache_test.cpp
+@@ -58,6 +58,42 @@ int main() {
+         bytes.visit(0,bytes.size(),[&](const uint8_t*,size_t,size_t){++segments;return true;});
+         check(segments <= 4,"thousands of small turns do not create thousands of restore transfers");
+     }
++    {
++        // a parked conversation's K/V buffer (16 MiB, as captured) grows by one turn: the reserve for later turns is
++        // an eighth of the buffer at most, not another 16 MiB segment
++        ConversationBuffer bytes;
++        bytes.resize(ConversationBuffer::segment_bytes, 3);
++        const size_t captured = bytes.bytes();
++        check(captured - bytes.size() < 1024, "a fresh capture reserves nothing");
++        const size_t turn = 1 << 20;
++        const size_t peak = bytes.allocation_peak(bytes.size() + turn);
++        bytes.resize(bytes.size() + turn, 4);
++        check(bytes.bytes() <= peak, "a turn's growth stays within the predicted allocation peak");
++        check(bytes.bytes() - captured <= turn + ConversationBuffer::segment_bytes / 8 + 1024,
++              "the reserve for later turns is at most an eighth of the buffer");
++        const size_t reserved = bytes.bytes();
++        bytes.resize(bytes.size() + turn / 2, 5);
++        check(bytes.bytes() == reserved, "the next small turn fills the reserve instead of allocating");
++        size_t segments = 0;
++        bytes.visit(0, bytes.size(), [&](const uint8_t*, size_t, size_t) { ++segments; return true; });
++        check(segments == 2, "the reserve extends the turn's segment");
++    }
++    {
++        // many turns of 1 MiB onto a 16 MiB buffer: the reserve grows with the buffer, so the segments do not
++        // multiply one per turn, and the reserve never exceeds an eighth of the buffer
++        ConversationBuffer bytes;
++        bytes.resize(ConversationBuffer::segment_bytes, 1);
++        for (int k = 0; k < 256; ++k) {
++            const size_t before = bytes.size();
++            const size_t peak = bytes.allocation_peak(before + (1 << 20));
++            bytes.resize(before + (1 << 20), 2);
++            check(bytes.bytes() <= peak, "each turn stays within the predicted allocation peak");
++            check(bytes.bytes() - bytes.size() <= before / 8 + 4096, "the reserve stays within an eighth");
++        }
++        size_t segments = 0;
++        bytes.visit(0, bytes.size(), [&](const uint8_t*, size_t, size_t) { ++segments; return true; });
++        check(segments <= 64, "256 turns of 1 MiB take far fewer than 256 segments");
++    }
+     {
+         ConversationKv layer;
+         layer.k.resize(400);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 545ad340..db2fa601 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -9930,10 +9930,12 @@ int main(int argc, char** argv) {
+                 // though every parked conversation could give its RAM back - and refusing here throws
+                 // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
+                 // Evict the least recently active parked conversations until it fits, or until none are
+-                // left.  Each ConversationBuffer is a list of 16 MiB segments, each segment its own
+-                // allocation, so an evicted entry is back with the kernel before the next check reads
+-                // /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
+-                // below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
++                // left.  Each ConversationBuffer is a list of segments of up to 16 MiB, each segment its own
++                // allocation, so an evicted entry's full segments are back with the kernel before the next
++                // check reads /proc/meminfo; no waiting is needed.  Segments below glibc's mmap threshold (a
++                // buffer's tail, and the append reserve, at most an eighth of the buffer since 53f72571) come
++                // from malloc arenas and need not come back (#3115; ConversationCache::evict_oldest).
++                // slots() bounds the loop, and the two lines below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
+                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
+                 size_t evicted = 0;
+                 std::optional<strata::core::HostMemoryReading> mem;
+-- 
+2.43.0
+

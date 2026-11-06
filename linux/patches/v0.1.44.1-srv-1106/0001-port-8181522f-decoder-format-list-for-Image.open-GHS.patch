@@ -1,0 +1,135 @@
+From 610e66bc379898ff85eff35285a5831dfc6f5bc7 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:08:56 +0100
+Subject: [PATCH 1/8] port 8181522f: decoder format list for Image.open
+ (GHSA-78g4-xqwv-q3g8)
+
+Hand port of the formats= part only: a local PICTURE_FORMATS tuple in serve/server.py (this fork has no
+serve/ds_pictures.py) passed to Image.open at the EXIF probe and in Vision.normalize, so a JPEG 2000 or any
+other decoder outside JPEG/PNG/GIF/BMP/WebP/TIFF/AVIF is never reached. The Pillow 13.0.0 upgrade, the
+requirements.txt bump and the packaging locks are NOT ported (the venv stays on Pillow 12.3.0; the list closes
+the hole on any Pillow version). Upstream's DecoderAllowlist tests come along, the spy test counting two
+Image.open calls instead of three (no DeepSeek picture reader here).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py                | 10 ++++--
+ serve/test_exif_orientation.py | 61 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 05272f29..34f1ba7d 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -2710,6 +2710,12 @@ class StrataEngine:
+                 self.progress_ms, self.reused = 0, 0
+ 
+ 
++#: The picture formats Pillow is allowed to open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF; a phone's MPO file is opened by
++#: the JPEG entry).  Pillow picks the decoder from the file's first bytes, never from its name or the client's
++#: Content-Type, so without this list a crafted JPEG 2000 (GHSA-78g4-xqwv-q3g8: OpenJPEG heap overflow in Pillow
++#: 11.1.0 to 12.3.0) or any other rarely used decoder was reachable from a picture request (upstream 8181522f, #4220;
++#: the Pillow 13 upgrade itself is not part of this port - the list closes the hole on any Pillow version).
++PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP", "TIFF", "AVIF")
+ IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
+ 
+ 
+@@ -2908,7 +2914,7 @@ class Vision:
+         try:
+             import io
+             from PIL import Image
+-            with Image.open(io.BytesIO(data)) as im:
++            with Image.open(io.BytesIO(data), formats=PICTURE_FORMATS) as im:
+                 return im.getexif().get(0x0112, 1) not in (None, 0, 1)
+         except Exception:  # noqa: BLE001 - any failure leaves the image as it was sent
+             return False
+@@ -2928,7 +2934,7 @@ class Vision:
+             raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
+                              "GIF work without it") from None
+         try:
+-            im = Image.open(io.BytesIO(data))
++            im = Image.open(io.BytesIO(data), formats=PICTURE_FORMATS)
+             im.load()
+             from PIL import ImageOps
+             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
+diff --git a/serve/test_exif_orientation.py b/serve/test_exif_orientation.py
+index 5eafa0ae..e356ab6d 100644
+--- a/serve/test_exif_orientation.py
++++ b/serve/test_exif_orientation.py
+@@ -1,6 +1,7 @@
+ """#1229: a phone JPEG stored turned (EXIF Orientation 6 or 8) is turned upright before the vision encoder reads it."""
+ import io
+ import unittest
++from unittest import mock
+ 
+ from serve.server import Vision
+ 
+@@ -43,5 +44,65 @@ class ExifOrientation(unittest.TestCase):
+         self.assertEqual(Vision.normalize(data), data)
+ 
+ 
++@unittest.skipIf(Image is None, "Pillow is not installed")
++class DecoderAllowlist(unittest.TestCase):
++    """GHSA-78g4-xqwv-q3g8 (#4220): a crafted JPEG 2000 reached OpenJPEG's heap overflow through Image.open().load(), because
++    Pillow picks the decoder by the file's first bytes.  Only the formats the picture reader documents are opened."""
++
++    @staticmethod
++    def sample(fmt, **kw) -> bytes:
++        out = io.BytesIO()
++        Image.new("RGB", (16, 8), (10, 120, 200)).save(out, format=fmt, **kw)
++        return out.getvalue()
++
++    def test_a_jpeg_2000_picture_is_refused_before_any_decoder_runs(self):
++        try:
++            data = self.sample("JPEG2000")
++        except (KeyError, OSError, ValueError):
++            self.skipTest("this Pillow cannot write JPEG 2000")
++        with mock.patch.object(Image.Image, "load", side_effect=AssertionError("the JPEG 2000 decoder ran")):
++            with self.assertRaises(ValueError) as caught:
++                Vision.normalize(data)
++        self.assertIn("could not be read", str(caught.exception))
++
++    def test_other_formats_outside_the_list_are_refused_too(self):
++        for fmt in ("PPM", "ICO", "TGA"):
++            with self.subTest(fmt):
++                with self.assertRaises(ValueError):
++                    Vision.normalize(self.sample(fmt))
++
++    def test_the_documented_formats_still_become_a_png(self):
++        for fmt, kw in (("WEBP", {}), ("TIFF", {}), ("GIF", {}), ("PNG", {})):
++            with self.subTest(fmt):
++                data = self.sample(fmt, **kw)
++                out = Vision.normalize(data)
++                self.assertEqual(Image.open(io.BytesIO(out)).size, (16, 8))
++
++    def test_a_phone_mpo_file_is_still_read_and_turned(self):
++        a, b = Image.new("RGB", (40, 20), (200, 30, 30)), Image.new("RGB", (40, 20), (30, 200, 30))
++        exif = Image.Exif()
++        exif[0x0112] = 6
++        out = io.BytesIO()
++        a.save(out, format="MPO", save_all=True, append_images=[b], exif=exif)
++        self.assertEqual(Image.open(io.BytesIO(out.getvalue())).format, "MPO")
++        self.assertEqual(Image.open(io.BytesIO(Vision.normalize(out.getvalue()))).size, (20, 40))
++
++    def test_the_exif_probe_and_the_decoder_pass_the_list(self):
++        seen = []
++        real = Image.open
++
++        def spy(*a, **kw):
++            seen.append(kw.get("formats"))
++            return real(*a, **kw)
++
++        data = self.sample("WEBP")
++        with mock.patch.object(Image, "open", spy):
++            Vision.normalize(data)
++            Vision._exif_rotated(jpeg((8, 8), 6))
++        self.assertEqual(len(seen), 2)              # this fork has no DeepSeek picture reader (serve/ds_pictures.py)
++        self.assertTrue(all(f and "JPEG2000" not in f and "JPEG" in f for f in seen), seen)
++
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

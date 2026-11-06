@@ -1,0 +1,539 @@
+From 09aedda61ec1a25f7915606c8cd60e5f39a16bc7 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 11:02:41 +0100
+Subject: [PATCH 6/7] conversation cache: a request that starts with a shallow
+ checkpoint of a parked conversation borrows it, the image goes back to its
+ place (opt-in STRATA_PARK_BORROW=1, #1164)
+
+A sibling subagent sharing only the main agent's system prompt and tool list (the 8192-token root) took the main
+agent's parked 132k image: take() moved it into the session, the subagent's request rewrote every cell past 8192,
+and the main agent's next turn read its history again (production log rel 2001/2603/4060: a ping-pong between two
+agent families, each restoring "8192 tokens (checkpoint)").
+
+With STRATA_PARK_BORROW=1 such a match borrows instead (conversation_borrow_rule): not the live end, shallower than
+the entry's deepest checkpoint (upstream c9e571e0), less than half of the entry (2 * match < its length: a turn that
+re-renders a few dozen tokens before the end still takes, so no stale copy stays behind each main-agent turn), and
+no pinned shared prefix at or below the match (upstream 2b296987).  Everything else is taken as before.
+
+Unlike upstream (gated on stages.empty(), restore_prefix), the image is still take()n - the outgoing park counts it
+as held and cannot evict or supersede it - and restored whole on the validated path (layer split, draftless slot
+images, the K/V growth), then the borrower copies only the checkpoints at or below its resume point, stage parts
+index-aligned (conversation_borrow_checkpoints), skips retain() and drops the retained K/V, and put_back() returns
+the image to its LRU place (park_serial): an entry parked meanwhile that supersedes it drops it, the slot count and
+budget evict oldest first, which may be the donor itself.  The SSD tier (its load consumes the file) and a read that
+gave way (STRATA_READ_YIELD) never borrow.
+
+Logs "conversation cache: borrowed N of a parked M-token conversation (checkpoint) in X ms; parked=.. bytes=..
+checkpoints=.."; with the switch on the "restored" line also names the donor's length ("restored N of M tokens").
+Off: nothing changes (put() records park_serial, which nothing else reads).
+
+conversation_cache_test: the rule (incl. the production 8192 / 132245 of 132362 cases), put_back's LRU place,
+accounting, slot count, budget, supersede and pinned-only cases, and the checkpoint copy with and without a layer
+split (4850 checks).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/conversation_cache.hpp | 124 +++++++++++++-
+ src/core/conversation_cache_test.cpp       | 188 +++++++++++++++++++++
+ src/program/generate.cpp                   | 104 +++++++++---
+ 3 files changed, 390 insertions(+), 26 deletions(-)
+
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 9dd36655..7714460e 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -10,6 +10,7 @@
+ #include <cstdint>
+ #include <deque>
+ #include <functional>
++#include <new>
+ #include <optional>
+ #include <utility>
+ #include <vector>
+@@ -205,6 +206,10 @@ struct SavedConversation {
+     /// layer, whose K/V below it then stays as it was - as after a slot's give-back: drafts may differ, tokens never.
+     /// A run-time mark only, not in a session file.
+     bool draftless = false;
++    /// The order ConversationCache::put parked it in (its LRU position; 0: never parked).  A borrowed image
++    /// (STRATA_PARK_BORROW) goes back to the place this names, not to the young end (ConversationCache::put_back).
++    /// A run-time mark only, not in a session file, and not part of the image's identity (conversation_image_same).
++    uint64_t park_serial = 0;
+ 
+     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
+     bool pinned() const {
+@@ -258,6 +263,60 @@ inline bool conversation_image_same(const SavedConversation& a, const SavedConve
+     return true;
+ }
+ 
++// STRATA_PARK_BORROW (#1164 upstream, c9e571e0 + 2b296987): whether a request whose longest reuse is checkpoint
++// match `tokens` (not the live end: `live`) inside the parked conversation `e` borrows the image instead of taking
++// it.  take() moves the whole conversation into the session, and the request then rewrites every cell past the
++// checkpoint, so the conversation the image held reads its history again on its next turn - a sibling subagent
++// sharing only the system prompt and tool list (the 8192-token root) cost the main agent's 132k image that way.
++// Borrowed is: not the live end (that is the conversation going on); shallower than the entry's deepest checkpoint
++// (a match there is the same conversation re-rendering its last reply, whose tail is stale - upstream's rule);
++// less than half of the entry (2 * tokens < its live length: the main agent re-rendering a few dozen tokens before
++// its end still takes - upstream's rule alone would keep a stale ~3.6 GB copy behind every such turn); and no
++// pinned shared prefix (pin=N) at or below the match (a borrow copies those checkpoints, so the pin would be held
++// twice; taken, one conversation holds it as pin=N expects - upstream 2b296987).  Everything else: take(), as before.
++inline bool conversation_borrow_rule(const SavedConversation& e, int64_t tokens, bool live) {
++    if (tokens <= 0 || live) return false;
++    if (2 * (uint64_t) tokens >= (uint64_t) e.live.ids.size()) return false;
++    size_t deepest = 0;
++    for (const auto& c : e.checkpoints) {
++        if (c.pinned && (int64_t) c.ids.size() <= tokens) return false;
++        deepest = std::max(deepest, c.ids.size());
++    }
++    return (size_t) tokens < deepest;
++}
++
++// STRATA_PARK_BORROW: the checkpoints a borrower gets of the donor image `e`, copied (the donor keeps its own): the
++// ones `keep` accepts (the caller's: at or below the resume point and on the prompt's path).  With a layer split
++// each comes with its stage parts, the same index of every stage image's chain (a restored image holds them
++// index-aligned, as conversation_checkpoints_merge expects of a whole image), and they are merged into the
++// checkpoint layout the session runs with.  False (and `out` empty): the stage chains do not line up, or a copy
++// failed for memory - the caller then has no checkpoint (it reads from 0 or from the live end, as after a merge
++// that failed on the take path).
++template<class Keep>
++bool conversation_borrow_checkpoints(const SavedConversation& e, Keep&& keep, std::vector<ConversationCheckpoint>& out) {
++    out.clear();
++    try {
++        if (e.stage_images.empty()) {
++            for (const auto& c : e.checkpoints)
++                if (keep(c)) out.push_back(c);
++            return true;
++        }
++        for (const auto& si : e.stage_images)
++            if (si.checkpoints.size() != e.checkpoints.size()) return false;
++        ConversationCheckpointSplit cs;
++        cs.parts.resize(e.stage_images.size());
++        for (size_t j = 0; j < e.checkpoints.size(); ++j) {
++            if (!keep(e.checkpoints[j])) continue;
++            cs.stage0.push_back(e.checkpoints[j]);
++            for (size_t k = 0; k < e.stage_images.size(); ++k) cs.parts[k].push_back(e.stage_images[k].checkpoints[j]);
++        }
++        return conversation_checkpoints_merge(std::move(cs), out);
++    } catch (const std::bad_alloc&) {
++        out.clear();
++        return false;
++    }
++}
++
+ template<class Token>
+ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
+                             const std::vector<ConversationImageKey>& images) {
+@@ -350,6 +409,67 @@ public:
+         return out;
+     }
+ 
++    // STRATA_PARK_BORROW: whether match `m` (best()'s, nothing changed since) borrows entry m.index instead of taking
++    // it (conversation_borrow_rule).  The caller still take()s it - the outgoing park then counts it as `held` and
++    // cannot evict or supersede it, as today - restores it whole, copies what it needs and put_back()s it.
++    bool borrows(const Match& m) const {
++        return m.index < entries_.size() && conversation_borrow_rule(entries_[m.index], m.tokens, m.live);
++    }
++    // A borrowed image, back where it was in the LRU order (its park_serial: entries are in park order).  Nothing
++    // is allocated.  What would have happened to it had it stayed parked happens now: an entry parked after it that
++    // supersedes it (drop_superseded, the outgoing park while it was out: the same conversation went on elsewhere)
++    // drops it, and the slot count and budget hold as for put(), the oldest entry going first - which may be this
++    // one (a donor older than every other entry).  The retained K/V goes (the caller's restore described this
++    // image, not the session).  True: it is parked again; false: it was superseded, evicted or did not fit (it is
++    // freed, or the eviction sink has it).
++    bool put_back(SavedConversation&& image) {
++        const size_t n = image.bytes();
++        reuse_ = {};
++        if (!enabled() || n > budget_) return false;
++        const uint64_t serial = image.park_serial != 0 ? image.park_serial : next_serial_++;
++        image.park_serial = serial;
++        {
++            // drop_superseded's own rules, run against this image alone
++            std::deque<SavedConversation> rest = std::exchange(entries_, {});
++            const size_t rest_bytes = std::exchange(bytes_, n);
++            entries_.push_back(std::move(image));
++            bool superseded = false;
++            for (const SavedConversation& y : rest)
++                if (y.park_serial > serial && drop_superseded(y.live.ids, y.live.imgs, y.checkpoints, y.cvec) > 0) {
++                    superseded = true;
++                    break;
++                }
++            if (!superseded) image = std::move(entries_.front());
++            entries_ = std::move(rest);
++            bytes_ = rest_bytes;
++            if (superseded) return false;
++        }
++        auto at = std::upper_bound(entries_.begin(), entries_.end(), serial,
++                                   [](uint64_t s, const SavedConversation& e) { return s < e.park_serial; });
++        entries_.insert(at, std::move(image));
++        bytes_ += n;
++        auto here = [&] {
++            return std::any_of(entries_.begin(), entries_.end(),
++                               [&](const SavedConversation& e) { return e.park_serial == serial; });
++        };
++        while (entries_.size() > slots_ || bytes_ > budget_) {
++            if (!evict_oldest(true)) {
++                // only pinned ones are left beside it: it goes (before it came back, everything else fit)
++                for (size_t i = 0; i < entries_.size(); ++i)
++                    if (entries_[i].park_serial == serial) {
++                        bytes_ -= entries_[i].bytes();
++                        entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
++                        break;
++                    }
++                return false;
++            }
++            if (!here()) return false;
++        }
++        ++put_back_;
++        return true;
++    }
++    size_t put_backs() const { return put_back_; }   // the images put_back() parked again
++
+     // Reserve before allocating a snapshot. held is an incoming image removed
+     // with take() but still alive during the exchange; count it against RAM too.
+     bool make_room(size_t incoming, size_t held = 0) {
+@@ -506,13 +626,15 @@ public:
+         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
+         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
+         if (!make_room(n, held)) return false;
++        image.park_serial = next_serial_++;
+         entries_.push_back(std::move(image));
+         bytes_ += n;
+         return true;
+     }
+ 
+ private:
+-    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
++    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, put_back_ = 0;
++    uint64_t next_serial_ = 1;   // park_serial of the next put()
+     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+     bool supersede_prefix_ = false;   // drop_superseded by tokens (set_supersede_prefix)
+     EvictSink evict_sink_;            // set_evict_sink
+diff --git a/src/core/conversation_cache_test.cpp b/src/core/conversation_cache_test.cpp
+index f0bb8001..b4ac0bde 100644
+--- a/src/core/conversation_cache_test.cpp
++++ b/src/core/conversation_cache_test.cpp
+@@ -613,5 +613,193 @@ int main() {
+         check(conversation_checkpoints_stage_copy(chain, 2, 0, true).size() == 1,
+               "a reused checkpoint stays in a slot image's chain");
+     }
++    {
++        // STRATA_PARK_BORROW: the decision rule (conversation_borrow_rule / ConversationCache::borrows)
++        auto cp = [](std::vector<int32_t> ids, bool pinned = false) {
++            ConversationCheckpoint c; c.ids = std::move(ids); c.pinned = pinned; return c;
++        };
++        auto seq = [](int32_t from, int32_t to) { std::vector<int32_t> v; for (int32_t i = from; i < to; ++i) v.push_back(i); return v; };
++        SavedConversation e;
++        e.live.ids = seq(0, 20);
++        e.checkpoints = {cp(seq(0, 4)), cp(seq(0, 9)), cp(seq(0, 10)), cp(seq(0, 12))};
++        check(conversation_borrow_rule(e, 4, false), "a shallow root, far from the end, is borrowed");
++        check(conversation_borrow_rule(e, 9, false), "2 * 9 < 20 and below the deepest checkpoint: borrowed");
++        check(!conversation_borrow_rule(e, 10, false), "half the conversation (2 * 10 == 20) is taken");
++        check(!conversation_borrow_rule(e, 12, false), "the deepest checkpoint (a re-render) is taken");
++        check(!conversation_borrow_rule(e, 4, true), "the live end is the conversation going on: taken");
++        check(!conversation_borrow_rule(e, 0, false), "no match, nothing to borrow");
++        SavedConversation shallow = e;   // only the matched checkpoint: nothing deeper to keep for anyone
++        shallow.checkpoints = {cp(seq(0, 4))};
++        check(!conversation_borrow_rule(shallow, 4, false), "a match on the only checkpoint is taken");
++        SavedConversation pin_low = e;
++        pin_low.checkpoints[0].pinned = true;
++        check(!conversation_borrow_rule(pin_low, 9, false), "a pin=N prefix at or below the match: taken (2b296987)");
++        check(!conversation_borrow_rule(pin_low, 4, false), "a match on the pinned prefix itself: taken");
++        SavedConversation pin_high = e;
++        pin_high.checkpoints[3].pinned = true;
++        check(conversation_borrow_rule(pin_high, 9, false), "a pin deeper than the match is not copied: borrowed");
++        // the production case (log rel 2001 / 254744): a sibling on the 8192 root borrows the main agent's 132362
++        // tokens; the main agent's own next turn at its message-boundary checkpoint 132245 takes it
++        SavedConversation big;
++        big.live.ids = seq(0, 132362);
++        big.checkpoints = {cp(seq(0, 8192)), cp(seq(0, 122880)), cp(seq(0, 132245)), cp(seq(0, 132302))};
++        check(conversation_borrow_rule(big, 8192, false), "a subagent on the shared 8192 root borrows");
++        check(!conversation_borrow_rule(big, 132245, false), "the main agent's next turn takes its image");
++        // through the cache: best() then borrows() on the same entry
++        ConversationCache cache(1 << 26, 4);
++        SavedConversation a = image({});
++        a.live.ids = seq(0, 20);
++        a.checkpoints = {cp(seq(0, 4)), cp(seq(0, 12))};
++        check(cache.put(std::move(a)), "park A");
++        std::vector<int32_t> sib = seq(0, 4); sib.push_back(99); sib.push_back(98);
++        const auto ms = cache.best(sib, {}, true);
++        check(ms.tokens == 4 && !ms.live && cache.borrows(ms), "a sibling on A's root borrows through the cache");
++        std::vector<int32_t> cont = seq(0, 21);
++        const auto mc = cache.best(cont, {}, true);
++        check(mc.live && !cache.borrows(mc), "A going on is taken through the cache");
++        ConversationCache::Match stale = ms;
++        stale.index = 7;
++        check(!cache.borrows(stale), "a match on an entry that is not there is never borrowed");
++    }
++    {
++        // STRATA_PARK_BORROW: put_back's bookkeeping - LRU place, accounting, slot count, budget, supersede
++        auto cp = [](std::vector<int32_t> ids, bool pinned = false) {
++            ConversationCheckpoint c; c.ids = std::move(ids); c.pinned = pinned; return c;
++        };
++        auto conv = [&](int32_t tag) {   // a 6-token conversation with a 2-token root of its own
++            SavedConversation s = image({tag, tag, 1, 2, 3, 4});
++            s.checkpoints = {cp({tag, tag})};
++            return s;
++        };
++        auto holds = [](const ConversationCache& c, int32_t tag) {
++            return c.best(std::vector<int32_t>{tag, tag, 1, 2, 3, 4, 5}, {}, true).live;
++        };
++        {   // the LRU place: A B C parked, B borrowed, D parks while B is out, B back between A and C
++            ConversationCache cache(1 << 26, 8);
++            check(cache.put(conv(10)) && cache.put(conv(20)) && cache.put(conv(30)), "park A B C");
++            const size_t before = cache.bytes();
++            const auto m = cache.best(std::vector<int32_t>{20, 20, 7}, {}, true);
++            SavedConversation b = cache.take(m.index);
++            check(b.park_serial != 0 && cache.size() == 2, "B is taken with its park order");
++            const uint64_t b_serial = b.park_serial;
++            const size_t b_bytes = b.bytes();
++            cache.retain(std::vector<ConversationKv>(1), 3);
++            check(cache.retained_bytes() > 0, "retained K/V from the restore");
++            check(cache.put(conv(40)), "the outgoing D parks while B is out");
++            const size_t d_bytes = conv(40).bytes();
++            check(cache.put_back(std::move(b)) && cache.put_backs() == 1, "B goes back");
++            check(cache.size() == 4 && cache.bytes() == before + d_bytes && cache.retained_bytes() == 0,
++                  "accounted again, and the retained K/V is gone");
++            check(b_bytes > 0 && cache.superseded() == 0 && cache.evictions() == 0, "nothing dropped or evicted");
++            const auto again = cache.best(std::vector<int32_t>{20, 20, 7}, {}, true);
++            check(again.tokens == 2, "B's root matches again");
++            check(cache.take(again.index).park_serial == b_serial, "B keeps its park order");
++            check(cache.put_back(cache.take(cache.best(std::vector<int32_t>{30, 30, 7}, {}, true).index)),
++                  "C borrowed and back as well");
++            check(cache.put_back(conv(20)), "an image that was never parked (no serial) goes to the young end");
++            // eviction order now: A, C, D, B
++            check(cache.evict_oldest() && !holds(cache, 10), "A, the oldest, goes first");
++            check(cache.evict_oldest() && !holds(cache, 30) && holds(cache, 40), "then C, which kept its place");
++            check(cache.evict_oldest() && !holds(cache, 40) && holds(cache, 20), "then D, then B");
++        }
++        {   // a full cache: B back evicts the oldest other entry; a donor older than all others is the one to go
++            ConversationCache cache(1 << 26, 3);
++            check(cache.put(conv(10)) && cache.put(conv(20)) && cache.put(conv(30)), "park A B C in 3 slots");
++            SavedConversation b = cache.take(cache.best(std::vector<int32_t>{20, 20, 7}, {}, true).index);
++            check(cache.put(conv(40)) && cache.size() == 3 && cache.evictions() == 0, "D takes B's slot");
++            check(cache.put_back(std::move(b)) && cache.size() == 3 && cache.evictions() == 1, "B back, one evicted");
++            check(!holds(cache, 10) && holds(cache, 20) && holds(cache, 30) && holds(cache, 40), "A, the oldest, went");
++            SavedConversation oldest = cache.take(cache.best(std::vector<int32_t>{20, 20, 7}, {}, true).index);
++            check(cache.put(conv(50)), "E parks while B is out again");
++            check(!cache.put_back(std::move(oldest)) && cache.size() == 3 && cache.evictions() == 2,
++                  "B, older than C D E, is the one the slot count evicts");
++            check(!holds(cache, 20) && holds(cache, 30) && holds(cache, 40) && holds(cache, 50), "C D E stay");
++            check(cache.put_backs() == 1, "only the put-back that stayed is counted");
++        }
++        {   // the budget: B back makes room the same way (oldest first)
++            const size_t one = conv(10).bytes();
++            ConversationCache cache(3 * one, 8);
++            check(cache.put(conv(10)) && cache.put(conv(20)) && cache.put(conv(30)), "park A B C in 3 images' room");
++            SavedConversation b = cache.take(cache.best(std::vector<int32_t>{20, 20, 7}, {}, true).index);
++            check(cache.put(conv(40)) && cache.evictions() == 0, "D fits in B's room");
++            check(cache.put_back(std::move(b)) && cache.evictions() == 1 && cache.bytes() <= 3 * one,
++                  "B back within the budget, A evicted");
++            check(!holds(cache, 10) && holds(cache, 20), "A went, B stayed");
++        }
++        {   // what parked while it was out supersedes it: the same conversation went on elsewhere
++            ConversationCache cache(1 << 26, 8);
++            cache.set_supersede_prefix(true);
++            check(cache.put(conv(10)) && cache.put(conv(20)), "park A B");
++            SavedConversation a = cache.take(cache.best(std::vector<int32_t>{10, 10, 7}, {}, true).index);
++            SavedConversation on = image({10, 10, 1, 2, 3, 4, 5, 6});   // A's conversation, two tokens on
++            on.checkpoints = {cp({10, 10})};
++            check(cache.put(std::move(on)) && cache.superseded() == 0, "A going on parks while A is out");
++            check(!cache.put_back(std::move(a)) && cache.superseded() == 1 && cache.size() == 2,
++                  "A is not parked again: superseded, as if it had stayed");
++            check(cache.put_backs() == 0 && holds(cache, 20), "B untouched");
++            // an older entry that A does not continue does not supersede it
++            SavedConversation b = cache.take(cache.best(std::vector<int32_t>{20, 20, 7}, {}, true).index);
++            check(cache.put_back(std::move(b)) && cache.superseded() == 1, "B back: nothing parked after it holds it");
++        }
++        {   // a donor holding a pin deeper than the borrow, beside pinned entries only: it cannot stay
++            ConversationCache cache(1 << 26, 2);
++            SavedConversation x = conv(10);
++            x.checkpoints.push_back(cp({10, 10, 1, 2}, true));
++            check(cache.put(std::move(x)), "park X with a pinned prefix");
++            SavedConversation xb = cache.take(cache.best(std::vector<int32_t>{10, 10, 7}, {}, true).index);
++            SavedConversation p2 = conv(20); p2.checkpoints[0].pinned = true;
++            SavedConversation p3 = conv(30); p3.checkpoints[0].pinned = true;
++            check(cache.put(std::move(p2)) && cache.put(std::move(p3)), "two pinned entries fill both slots");
++            check(!cache.put_back(std::move(xb)) && cache.size() == 2 && cache.evictions() == 0,
++                  "only pinned ones beside it: X goes, nothing evicted");
++            check(holds(cache, 20) && holds(cache, 30) && !holds(cache, 10), "the pinned entries stay");
++        }
++        {   // a disabled cache parks nothing back
++            ConversationCache off(0, 4);
++            check(!off.put_back(conv(10)) && off.size() == 0, "disabled: not parked");
++        }
++    }
++    {
++        // STRATA_PARK_BORROW: the borrower's checkpoints, copied (conversation_borrow_checkpoints)
++        auto cp = [](std::vector<int32_t> ids, uint8_t mark) {
++            ConversationCheckpoint c; c.ids = std::move(ids); c.gdn.resize(16, mark); return c;
++        };
++        SavedConversation d = image({1, 2, 3, 4, 5, 6, 7, 8, 9});
++        d.checkpoints = {cp({1, 2}, 1), cp({1, 2, 3, 4}, 2), cp({1, 2, 3, 4, 5, 6}, 3)};
++        auto upto4 = [](const ConversationCheckpoint& c) { return c.ids.size() <= 4; };
++        std::vector<ConversationCheckpoint> out{cp({9}, 9)};
++        check(conversation_borrow_checkpoints(d, upto4, out) && out.size() == 2 && out[0].ids.size() == 2 &&
++              out[1].ids.size() == 4 && out[1].gdn[0] == 2 && out[0].stage_parts.empty(),
++              "one GPU: the checkpoints up to the resume point, in order, nothing else");
++        check(d.checkpoints.size() == 3 && d.checkpoints[1].gdn.size() == 16, "the donor keeps all of its own");
++        // a layer split: each stage image's chain index-aligned with the first's; the copies carry their parts
++        SavedConversation s = d;
++        for (uint8_t k = 0; k < 2; ++k) {
++            SavedConversation si;
++            si.checkpoints = {cp({1, 2}, (uint8_t) (10 * (k + 1) + 1)), cp({1, 2, 3, 4}, (uint8_t) (10 * (k + 1) + 2)),
++                              cp({1, 2, 3, 4, 5, 6}, (uint8_t) (10 * (k + 1) + 3))};
++            s.stage_images.push_back(std::move(si));
++        }
++        check(conversation_borrow_checkpoints(s, upto4, out) && out.size() == 2, "a layer split: two copied");
++        bool parts = true;
++        for (size_t j = 0; j < out.size(); ++j) {
++            parts = parts && out[j].stage_parts.size() == 2 && out[j].gdn[0] == (uint8_t) (j + 1);
++            for (size_t k = 0; k < 2 && parts; ++k)
++                parts = out[j].stage_parts[k].gdn[0] == (uint8_t) (10 * (k + 1) + j + 1) &&
++                        out[j].stage_parts[k].ids == out[j].ids;
++        }
++        check(parts, "each copy carries its own stage parts, index-aligned");
++        check(s.stage_images[0].checkpoints.size() == 3 && s.stage_images[1].checkpoints[2].gdn[0] == 23,
++              "the donor's stage chains are untouched");
++        SavedConversation bad = s;
++        bad.stage_images[1].checkpoints.pop_back();
++        out = {cp({9}, 9)};
++        check(!conversation_borrow_checkpoints(bad, upto4, out) && out.empty(), "stage chains that do not line up: none");
++        SavedConversation swapped = s;
++        std::swap(swapped.stage_images[0].checkpoints[0], swapped.stage_images[0].checkpoints[1]);
++        check(!conversation_borrow_checkpoints(swapped, upto4, out) && out.empty(), "parts of other checkpoints: none");
++        check(conversation_borrow_checkpoints(d, [](const ConversationCheckpoint&) { return false; }, out) && out.empty(),
++              "nothing on the path: none, and that is no failure");
++    }
+     std::printf("conversation_cache_test: %d checks passed\n", checks);
+ }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index cd0fe394..b64d0720 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -454,6 +454,19 @@ bool gate_evict_env() {
+     }();
+     return on;
+ }
++// STRATA_PARK_BORROW=1 (default off; upstream #1164, c9e571e0 + 2b296987): a request whose longest reuse is a
++// shallow checkpoint inside a parked conversation (a sibling subagent sharing the main agent's system prompt and
++// tool list, the 8192-token root) borrows the image instead of taking it (conversation_borrow_rule): it is taken and
++// restored whole as before, the borrower copies the checkpoints up to its resume point, and the image goes back to
++// its LRU place (ConversationCache::put_back) for its own conversation's next turn.  Not from the SSD tier (its
++// load consumes the file) nor for a read that gave way (STRATA_READ_YIELD: no parked source).  Off: taken, as before
++bool park_borrow_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_PARK_BORROW");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ bool slot_park_verify_env() {
+     static const bool on = [] {
+         const char* v = std::getenv("STRATA_SLOT_PARK_VERIFY");
+@@ -15320,7 +15333,14 @@ int main(int argc, char** argv) {
+                     }
+                 }
+             }
+-            if (!from_tier && yield_pin < 0 && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
++            // STRATA_PARK_BORROW: decided before take() (the rule reads the entry); taken either way, so the outgoing
++            // park below counts it as held and can neither evict nor supersede it, and restored whole - only what
++            // happens after the restore differs (the borrow branch there)
++            bool borrow = false;
++            if (!from_tier && yield_pin < 0 && parked.tokens > std::max(resume, slot_tokens)) {
++                borrow = park_borrow_env() && conversations.borrows(parked);
++                incoming.emplace(conversations.take(parked.index));
++            }
+             if (incoming) slot_source = -1;
+             // Reject the entire image before parking/overwriting the outgoing
+             // state. Invalid entries can safely fall back to its existing prefix.
+@@ -15561,30 +15581,64 @@ int main(int argc, char** argv) {
+                                  mtp.kv_state().kv_mode, "ram",
+                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
+                 }
+-                live = std::move(incoming->live.ids);
+-                live_imgs = std::move(incoming->live.imgs);
+-                if (stages.empty()) {
+-                    checks = std::move(incoming->checkpoints);
+-                } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
+-                    strata::core::ConversationCheckpointSplit cs;
+-                    cs.stage0 = std::move(incoming->checkpoints);
+-                    for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
+-                    if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+-                }
+-                cvec_cached = incoming->cvec;
+-                resume = parked.tokens;
+-                from_live = parked.live;
+-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+-                    std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
+-                    for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
+-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+-                }
+-                incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+-                lent_slot = -1;   // (the main session holds the parked conversation now)
+-                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu%s\n",
+-                             (long long) resume, from_live ? "live" : "checkpoint",
+-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+-                             conversations.size(), conversations.bytes(), from_tier ? " from=disk" : "");
++                const int64_t donor_tokens = (int64_t) incoming->live.ids.size();
++                if (borrow) {
++                    // STRATA_PARK_BORROW: the session holds the donor's whole image now, as after a take (the same
++                    // restore, K/V growth and draft handling - a batch slot's draftless image too), and this request
++                    // rewrites every cell past parked.tokens: it needs the donor's checkpoints up to there and nothing
++                    // else (off_path below keeps the same ones), copied with their stage parts - the donor keeps
++                    // everything for its own next turn.  No retain(): those K/V pages are the donor's and go back with
++                    // it; the outgoing session's retained K/V goes, as retain() replaces it on the take path
++                    live = incoming->live.ids;
++                    live_imgs = incoming->live.imgs;
++                    if (!strata::core::conversation_borrow_checkpoints(*incoming, [&](const ConvCheckpoint& c) {
++                            return (int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs);
++                        }, checks))
++                        checks.clear();   // (the mount below then finds none: read from 0, as after a failed merge)
++                    cvec_cached = incoming->cvec;
++                    resume = parked.tokens;
++                    from_live = false;
++                    conversations.take_reuse();
++                    const size_t copied = checks.size();
++                    const bool back = conversations.put_back(std::move(*incoming));
++                    incoming.reset();
++                    lent_slot = -1;   // (the main session holds a copy of the parked conversation's start now)
++                    std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld of a parked %lld-token "
++                                         "conversation (checkpoint) in %.1f ms; parked=%zu bytes=%zu checkpoints=%zu%s\n",
++                                 (long long) resume, (long long) donor_tokens,
++                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
++                                 conversations.size(), conversations.bytes(), copied,
++                                 back ? "" : " (not parked again: superseded, or evicted for room)");
++                } else {
++                    live = std::move(incoming->live.ids);
++                    live_imgs = std::move(incoming->live.imgs);
++                    if (stages.empty()) {
++                        checks = std::move(incoming->checkpoints);
++                    } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
++                        strata::core::ConversationCheckpointSplit cs;
++                        cs.stage0 = std::move(incoming->checkpoints);
++                        for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
++                        if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
++                    }
++                    cvec_cached = incoming->cvec;
++                    resume = parked.tokens;
++                    from_live = parked.live;
++                    if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
++                        std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
++                        for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
++                        conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
++                    }
++                    incoming.reset(); // Running-state/checkpoint copies are no longer needed.
++                    lent_slot = -1;   // (the main session holds the parked conversation now)
++                    // STRATA_PARK_BORROW on: the donor's length too, so a take tells its cost without byte arithmetic
++                    char donor[48] = "";
++                    if (park_borrow_env())
++                        std::snprintf(donor, sizeof donor, " of %lld", (long long) donor_tokens);
++                    std::fprintf(stderr, "strata serve: conversation cache: restored %lld%s tokens (%s) in %.1f ms; parked=%zu bytes=%zu%s\n",
++                                 (long long) resume, donor, from_live ? "live" : "checkpoint",
++                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
++                                 conversations.size(), conversations.bytes(), from_tier ? " from=disk" : "");
++                }
+             }
+             if (want_cvec != cvec_cached) {
+                 live_ok = false;
+-- 
+2.43.0
+

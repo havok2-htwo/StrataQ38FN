@@ -1,0 +1,102 @@
+From 324b1d808f4bc0efb4085cf99cbe2cf35c208e02 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 11:12:53 +0100
+Subject: [PATCH 7/7] fixup E4-borrow: a failed checkpoint copy takes the image
+ instead of borrowing it
+
+The borrow branch copied the donor's checkpoints after choosing to borrow; when
+conversation_borrow_checkpoints returned false (bad_alloc on the ~120 MB copies,
+or stage chains that do not line up) checks was cleared but resume = parked.tokens
+and from_live = false stayed, so the mount found no checkpoint and the serve loop
+returned 1 ('ERR restoring a conversation checkpoint failed'): the engine exited
+and the RAM conversation cache with it.  The copy now runs before the branch; a
+failure sets borrow = false and the image is taken exactly as with the switch off
+(moves only), logged as '(borrow failed (copy), taken)' on the restored line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/conversation_cache.hpp |  4 +--
+ src/program/generate.cpp                   | 29 ++++++++++++++++------
+ 2 files changed, 23 insertions(+), 10 deletions(-)
+
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 7714460e..88fbafe5 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -290,8 +290,8 @@ inline bool conversation_borrow_rule(const SavedConversation& e, int64_t tokens,
+ // each comes with its stage parts, the same index of every stage image's chain (a restored image holds them
+ // index-aligned, as conversation_checkpoints_merge expects of a whole image), and they are merged into the
+ // checkpoint layout the session runs with.  False (and `out` empty): the stage chains do not line up, or a copy
+-// failed for memory - the caller then has no checkpoint (it reads from 0 or from the live end, as after a merge
+-// that failed on the take path).
++// failed for memory - the caller then has no checkpoint and must not borrow: it takes the image instead (the take
++// moves the checkpoints and allocates nothing), so the copy runs before the borrow/take branch is chosen.
+ template<class Keep>
+ bool conversation_borrow_checkpoints(const SavedConversation& e, Keep&& keep, std::vector<ConversationCheckpoint>& out) {
+     out.clear();
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index b64d0720..bbfb2e18 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -458,8 +458,9 @@ bool gate_evict_env() {
+ // shallow checkpoint inside a parked conversation (a sibling subagent sharing the main agent's system prompt and
+ // tool list, the 8192-token root) borrows the image instead of taking it (conversation_borrow_rule): it is taken and
+ // restored whole as before, the borrower copies the checkpoints up to its resume point, and the image goes back to
+-// its LRU place (ConversationCache::put_back) for its own conversation's next turn.  Not from the SSD tier (its
+-// load consumes the file) nor for a read that gave way (STRATA_READ_YIELD: no parked source).  Off: taken, as before
++// its LRU place (ConversationCache::put_back) for its own conversation's next turn; a failed checkpoint copy takes
++// it, as off.  Not from the SSD tier (its load consumes the file) nor for a read that gave way (STRATA_READ_YIELD:
++// no parked source).  Off: taken, as before
+ bool park_borrow_env() {
+     static const bool on = [] {
+         const char* v = std::getenv("STRATA_PARK_BORROW");
+@@ -15582,6 +15583,20 @@ int main(int argc, char** argv) {
+                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
+                 }
+                 const int64_t donor_tokens = (int64_t) incoming->live.ids.size();
++                // STRATA_PARK_BORROW: the checkpoint copy is tried before the branch is chosen.  It allocates (about
++                // 120 MB a checkpoint, a bad_alloc is reachable) and fails when the stage chains do not line up; a
++                // borrow without its checkpoint would find none at the mount below and end the serve loop ("ERR
++                // restoring a conversation checkpoint failed", the whole RAM cache with it).  A failed copy takes the
++                // image instead, as with the switch off - the take moves, it allocates nothing
++                std::vector<ConvCheckpoint> lent_checks;
++                bool borrow_failed = false;
++                if (borrow && !strata::core::conversation_borrow_checkpoints(*incoming, [&](const ConvCheckpoint& c) {
++                        return (int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs);
++                    }, lent_checks)) {
++                    lent_checks.clear();
++                    borrow = false;
++                    borrow_failed = true;
++                }
+                 if (borrow) {
+                     // STRATA_PARK_BORROW: the session holds the donor's whole image now, as after a take (the same
+                     // restore, K/V growth and draft handling - a batch slot's draftless image too), and this request
+@@ -15591,10 +15606,7 @@ int main(int argc, char** argv) {
+                     // it; the outgoing session's retained K/V goes, as retain() replaces it on the take path
+                     live = incoming->live.ids;
+                     live_imgs = incoming->live.imgs;
+-                    if (!strata::core::conversation_borrow_checkpoints(*incoming, [&](const ConvCheckpoint& c) {
+-                            return (int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs);
+-                        }, checks))
+-                        checks.clear();   // (the mount below then finds none: read from 0, as after a failed merge)
++                    checks = std::move(lent_checks);   // (copied above, before the branch)
+                     cvec_cached = incoming->cvec;
+                     resume = parked.tokens;
+                     from_live = false;
+@@ -15634,10 +15646,11 @@ int main(int argc, char** argv) {
+                     char donor[48] = "";
+                     if (park_borrow_env())
+                         std::snprintf(donor, sizeof donor, " of %lld", (long long) donor_tokens);
+-                    std::fprintf(stderr, "strata serve: conversation cache: restored %lld%s tokens (%s) in %.1f ms; parked=%zu bytes=%zu%s\n",
++                    std::fprintf(stderr, "strata serve: conversation cache: restored %lld%s tokens (%s) in %.1f ms; parked=%zu bytes=%zu%s%s\n",
+                                  (long long) resume, donor, from_live ? "live" : "checkpoint",
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+-                                 conversations.size(), conversations.bytes(), from_tier ? " from=disk" : "");
++                                 conversations.size(), conversations.bytes(), from_tier ? " from=disk" : "",
++                                 borrow_failed ? " (borrow failed (copy), taken)" : "");
+                 }
+             }
+             if (want_cvec != cvec_cached) {
+-- 
+2.43.0
+

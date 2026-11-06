@@ -1,0 +1,32 @@
+From 630b760697d90b8eaaf5ef2c29cb3d38293990a1 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:41:02 +0100
+Subject: [PATCH 4/7] fixup E2-mmap: sycl snapshot test reads the spare row
+ into ConversationBytes
+
+The SYCL copy of conversation_snapshot_test.cpp compared a std::vector<uint8_t> with
+ConversationCheckpoint::dead, which is now ConversationBytes; std::vector has no operator== across
+allocator types, so the SYCL build with tests on (sycl/CMakeLists.txt) stopped compiling. Same change
+as in the root test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/src/core/conversation_snapshot_test.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sycl/src/core/conversation_snapshot_test.cpp b/sycl/src/core/conversation_snapshot_test.cpp
+index c7e70951..34393616 100644
+--- a/sycl/src/core/conversation_snapshot_test.cpp
++++ b/sycl/src/core/conversation_snapshot_test.cpp
+@@ -302,7 +302,7 @@ void full_session(int fmt, int mode, int experts) {
+     }
+     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after stage images");
+     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
+-    std::vector<uint8_t> spare(sizes.dead);
++    ConversationBytes spare(sizes.dead);
+     cuda_check(DPCT_CHECK_ERROR(
+         dpct::get_in_order_queue()
+             .memcpy(spare.data(), main.state.idx_pooled, sizes.dead)
+-- 
+2.43.0
+

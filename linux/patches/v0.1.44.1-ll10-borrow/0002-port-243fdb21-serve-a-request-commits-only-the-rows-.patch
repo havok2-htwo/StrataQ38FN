@@ -1,0 +1,180 @@
+From f81292e132022a4b038e1f7b5f7582af30e4cbab Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:17:52 +0100
+Subject: [PATCH 2/7] port 243fdb21: serve: a request commits only the rows it
+ can emit, so the parked snapshot matches what the client got (#4677)
+
+Upstream 243fdb21 (patch and policy test by hanchengme): serve_stop_bound()
+caps a verify window's accepted rows at the rows the request can still emit
+(max_new - produced_n) and ends at the first EOS, before the commit, so a
+request's last window no longer parks a snapshot with tokens the client never
+received (conversation_prefix() refused it and the older checkpoint was used).
+include/strata/core/serve_stop_bound.hpp and tests/core/serve_stop_bound_test.cpp
+are upstream's unchanged; the test is registered beside conv_cache_test.
+
+Changes against upstream:
+- No #if defined(STRATA_USE_HIP) gates: it applies on CUDA too.  Upstream
+  measured it only on HIP (4 x R9700); nothing in it is backend-specific.
+- The pipelined loop (STRATA_SOLO_PIPELINE, which STRATA_SPEC_LANES folds in)
+  caps `a` before V1(A)'s commit as upstream, and that capped `a` is what the
+  front stages B never ran on commit (VF(st, A).pl_commit_async(a + 1)) and
+  what a launched B's undo replays (undo_keep = a + 1).  A cut window has
+  a < A.T - 1, so it is never "on" and the A.T commit for the accepted-whole
+  case is not reached.  Every stage holds the same rows.
+- The spec lanes' own verdict (spec_lanes::verdict, the lane_verdict commit)
+  already commits only the rows it emits (vd.commit); unchanged.
+- Both sites cap only while produced_n < max_new: with nothing left to emit
+  serve_stop_bound() returns 0 and a would be -1 (x = outp[-1]); that case
+  commits as before.
+- The env switch is kept as upstream: on by default, STRATA_SERVE_STOP_BOUND=0
+  turns it off (the A/B against production's behaviour).
+
+Not measured on CUDA yet.  Verified only: the engine builds; the policy test
+(2,736 cases) and the CPU conversation tests pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                           |  6 +++++
+ include/strata/core/serve_stop_bound.hpp | 15 ++++++++++++
+ src/program/generate.cpp                 | 26 ++++++++++++++++++++
+ tests/core/serve_stop_bound_test.cpp     | 31 ++++++++++++++++++++++++
+ 4 files changed, 78 insertions(+)
+ create mode 100644 include/strata/core/serve_stop_bound.hpp
+ create mode 100644 tests/core/serve_stop_bound_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 544962bd..a8809069 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1328,6 +1328,12 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
+   target_include_directories(conv_cache_test PRIVATE include)
+   add_test(NAME conv_cache_test COMMAND conv_cache_test)
++  # #4677 (upstream 243fdb21): the accepted rows a request commits are bounded to what it can emit (header-only, CPU;
++  # 2,736 cases against the old output loop)
++  add_executable(serve_stop_bound_test tests/core/serve_stop_bound_test.cpp)
++  target_include_directories(serve_stop_bound_test PRIVATE include)
++  target_compile_features(serve_stop_bound_test PRIVATE cxx_std_17)
++  add_test(NAME serve_stop_bound_test COMMAND serve_stop_bound_test)
+   # which path computes the draft layer's prompt K/V, and STRATA_SPLIT_MTP_BATCH's parsing (header-only, CPU)
+   add_executable(draft_kv_plan_test src/program/draft_kv_plan_test.cpp)
+   target_include_directories(draft_kv_plan_test PRIVATE include)
+diff --git a/include/strata/core/serve_stop_bound.hpp b/include/strata/core/serve_stop_bound.hpp
+new file mode 100644
+index 00000000..f270b319
+--- /dev/null
++++ b/include/strata/core/serve_stop_bound.hpp
+@@ -0,0 +1,15 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++
++namespace strata::core {
++// A committed input row must correspond to an output the caller can expose.
++// The last exposed output remains the next unconsumed token, as in the scalar loop.
++template<class Token, class IsEos>
++int serve_stop_bound(int accepted, int64_t remaining, const Token* outputs, IsEos is_eos) {
++    const int count = static_cast<int>(std::min<int64_t>(accepted, std::max<int64_t>(0, remaining)));
++    for (int i = 0; i < count; ++i)
++        if (is_eos(outputs[i])) return i + 1;
++    return count;
++}
++}
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index db2fa601..afc5bee9 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -23,6 +23,7 @@
+ #include "strata/core/remote_expert_opt.hpp"
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/conversation_snapshot.hpp"
++#include "strata/core/serve_stop_bound.hpp"
+ #include "strata/core/conversation_file.hpp"
+ #include "strata/core/conversation_tier.hpp"
+ #include "strata/core/session_save_reclaim.hpp"
+@@ -17050,6 +17051,17 @@ int main(int argc, char** argv) {
+             }
+             bool first_window = true;
+             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
++            // #4677 (upstream 243fdb21): a verify window commits only the rows whose outputs this request can still
++            // emit (max_new, the first EOS), so the parked snapshot is a prefix of the next prompt.  On by default as
++            // upstream (measured there on HIP, 4 x R9700: 0 of 16 continuations fell back to the older checkpoint
++            // against 4 of 16 without it); here on CUDA too, in the serial loop and in the pipelined one that
++            // STRATA_SOLO_PIPELINE / STRATA_SPEC_LANES run (its front-stage commits and the undo replay take the same
++            // capped count).  STRATA_SERVE_STOP_BOUND=0 turns it off (the A/B).  The spec lanes' own verdict
++            // (spec_lanes::verdict) already commits only the rows it emits.
++            static const bool stop_bound = [] {
++                const char* v = std::getenv("STRATA_SERVE_STOP_BOUND");
++                return v == nullptr || std::strcmp(v, "0") != 0;
++            }();
+             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
+             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
+             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
+@@ -17656,6 +17668,14 @@ int main(int argc, char** argv) {
+                     chain_kind = 0;
+                     int a = 0;
+                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
++                    // #4677: the rows this request can emit only.  The capped `a` is also what the front stages commit
++                    // below (B never ran there) and what a launched B's undo replays (undo_keep), and a cut window is
++                    // never "on" (a < A.T - 1), so every stage holds the same rows.  (produced_n < max_new: a window
++                    // with nothing left to emit commits as before - serve_stop_bound would give 0 rows.)
++                    if (stop_bound && produced_n < max_new)
++                        a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
++                            return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
++                        }) - 1;
+                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
+                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
+                     draft_offered += A.T - 1;
+@@ -17941,6 +17961,12 @@ int main(int argc, char** argv) {
+                 }
+                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
+                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
++                // #4677: a merged window contains prompt rows: every one must still be committed.  Otherwise do not
++                // cache accepted rows whose outputs this request cannot emit (as in the pipelined loop above).
++                if (stop_bound && !merged && produced_n < max_new)
++                    a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
++                        return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
++                    }) - 1;
+                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
+                 if (!from_sfx && !first_window)
+diff --git a/tests/core/serve_stop_bound_test.cpp b/tests/core/serve_stop_bound_test.cpp
+new file mode 100644
+index 00000000..5bf85346
+--- /dev/null
++++ b/tests/core/serve_stop_bound_test.cpp
+@@ -0,0 +1,31 @@
++// (asserts stay on in a Release build: the test is its own check)
++#undef NDEBUG
++#include "strata/core/serve_stop_bound.hpp"
++#include <cassert>
++#include <iostream>
++#include <vector>
++
++int main() {
++    int cases = 0;
++    // Independent reference: the existing emission loop, including its budget and EOS rules.
++    for (int accepted = 1; accepted <= 16; ++accepted)
++        for (int remaining = 1; remaining <= 18; ++remaining)
++            for (int eos = -1; eos < accepted; ++eos) {
++                std::vector<int> outputs(accepted);
++                for (int i = 0; i < accepted; ++i) outputs[i] = i == eos ? -1 : 100 + i;
++                std::vector<int> reference;
++                for (int i = 0; i < accepted && static_cast<int>(reference.size()) < remaining; ++i) {
++                    reference.push_back(outputs[i]);
++                    if (outputs[i] == -1) break;
++                }
++                const int kept = strata::core::serve_stop_bound(accepted, remaining, outputs.data(),
++                                                               [](int t) { return t == -1; });
++                assert(kept > 0 && kept <= accepted && kept <= remaining);
++                assert(std::vector<int>(outputs.begin(), outputs.begin() + kept) == reference);
++                // Unlike the old full-window commit, no unexposed input suffix enters the cached history.
++                assert(kept == static_cast<int>(reference.size()));
++                ++cases;
++            }
++    assert(strata::core::serve_stop_bound(4, 0, static_cast<const int*>(nullptr), [](int) { return false; }) == 0);
++    std::cout << "SUMMARY stop_bound cases=" << cases << " passed\n";
++}
+-- 
+2.43.0
+

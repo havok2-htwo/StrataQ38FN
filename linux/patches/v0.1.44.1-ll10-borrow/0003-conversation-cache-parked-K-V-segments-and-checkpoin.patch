@@ -1,0 +1,648 @@
+From 823ed5e6ffd627f81d07b2f7527f06678744fcd2 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:34:01 +0100
+Subject: [PATCH 3/7] conversation cache: parked K/V segments and checkpoint
+ state can be mapped one by one, so an eviction returns its RAM to the kernel
+ (opt-in STRATA_CONV_MMAP=1, #3115)
+
+Parked conversations (ConversationBuffer segments, ConversationCheckpoint gdn / ple / tails / dead / block_pos)
+come from malloc.  glibc serves a request from a free arena chunk before it consults the mmap threshold, raises a
+dynamic threshold above 16 MiB after the first mmapped free, and shrinks a thread arena only at its top heap's top.
+So what an eviction frees stays resident in the arenas; the physical-RAM gate's next MemAvailable / cgroup reading
+does not move, and the gate can evict the whole cache and still refuse.  Production host: 1,946 arena heaps with
+108 GiB RSS; an evict-all of 22 GiB left "available" unchanged; 15 GB of new snapshots admitted with no RSS growth.
+
+STRATA_CONV_MMAP=1 (read once, at the first allocation): include/strata/core/conversation_alloc.hpp's
+ConversationAllocator maps every allocation of at least 64 KiB on its own (page-rounded anonymous mmap) and
+munmaps it on free; smaller ones and the switch unset go through operator new exactly as std::allocator does.
+- ConversationBuffer::Segment uses it with no value-initialization: resize() still passes its fill value, except for
+  a fresh mapping filled with 0, which is zero already (no second pass over the pages).  A mapped segment's capacity
+  is its whole pages, so bytes() counts what is resident and the last page's spare bytes serve the next append.
+- ConversationCheckpoint's running-state vectors are ConversationBytes (std::vector<uint8_t> with the allocator,
+  value-initializing as before).  Copy / move (O(1), stateless allocator) / operator== are std::vector's.
+- Plain pageable memory either way; nothing calls cudaHostRegister on it.
+- The two comments that said an eviction is back with the kernel (generate.cpp's RAM gate,
+  ConversationCache::evict_oldest) now describe the arena retention and the switch; serve logs a line when it is on.
+- conversation_alloc_test (CPU only, with and without the switch): container semantics (zeroing over stale bytes,
+  fill values, growth, copy / move / ==) and RssAnon falling back to its baseline after parking ~2.2 GiB from four
+  threads and evicting it (without the switch, 427 MiB stayed resident in the same run).
+
+Without the variable the engine allocates as before (the checkpoint vectors' type changed; their behaviour did not).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                              |   6 +
+ include/strata/core/conversation_alloc.hpp  | 160 ++++++++++++++++
+ include/strata/core/conversation_buffer.hpp |  17 +-
+ include/strata/core/conversation_cache.hpp  |  18 +-
+ src/core/conversation_alloc_test.cpp        | 191 ++++++++++++++++++++
+ src/core/conversation_copy.hpp              |   6 +-
+ src/core/conversation_file.cpp              |   4 +-
+ src/core/conversation_file_test.cpp         |   4 +-
+ src/core/conversation_snapshot_test.cpp     |   2 +-
+ src/core/conversation_tier_test.cpp         |   4 +-
+ src/core/conversation_validation_test.cpp   |   2 +-
+ src/program/generate.cpp                    |  17 +-
+ 12 files changed, 405 insertions(+), 26 deletions(-)
+ create mode 100644 include/strata/core/conversation_alloc.hpp
+ create mode 100644 src/core/conversation_alloc_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a8809069..8264b494 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -138,6 +138,12 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
+   target_include_directories(conversation_tier_test PRIVATE include)
+   target_link_libraries(conversation_tier_test PRIVATE Threads::Threads)
+   add_test(NAME conversation_tier_test COMMAND conversation_tier_test)
++  # STRATA_CONV_MMAP (conversation_alloc.hpp): with the switch (the test sets it) and without
++  add_executable(conversation_alloc_test src/core/conversation_alloc_test.cpp)
++  target_include_directories(conversation_alloc_test PRIVATE include)
++  target_link_libraries(conversation_alloc_test PRIVATE Threads::Threads)
++  add_test(NAME conversation_alloc_test COMMAND conversation_alloc_test)
++  add_test(NAME conversation_alloc_test_off COMMAND conversation_alloc_test --off)
+ endif()
+ 
+ if(STRATA_HIP_GFX906)
+diff --git a/include/strata/core/conversation_alloc.hpp b/include/strata/core/conversation_alloc.hpp
+new file mode 100644
+index 00000000..65b1a869
+--- /dev/null
++++ b/include/strata/core/conversation_alloc.hpp
+@@ -0,0 +1,160 @@
++// include/strata/core/conversation_alloc.hpp - where parked conversation state gets its host memory.
++//
++// A parked conversation is its K/V (ConversationBuffer segments, conversation_buffer.hpp) and its checkpoints'
++// running state (ConversationCheckpoint::gdn / ple / tails / dead / block_pos, conversation_cache.hpp): pageable host
++// memory, tens of MiB to GiB per conversation, freed when the cache evicts it.  By default it comes from malloc
++// (operator new), as it always has.  glibc's malloc does not give such memory back to the kernel reliably (#3115):
++//
++//   * a request is served from a free chunk of an arena whenever one is large enough - the mmap threshold is only
++//     consulted when no free chunk can serve it - so once an arena holds freed snapshots, even the full 16 MiB
++//     segments and the ~30 MB checkpoint vectors are carved from it, not mmapped;
++//   * with glibc's default (dynamic) threshold, freeing an mmapped 16 MiB chunk raises the threshold above 16 MiB,
++//     so from then on the segments go to the arenas anyway;
++//   * a thread arena (the park threads' captures land in theirs) shrinks only at its topmost heap's top, and only by
++//     what lies above the trim threshold; free chunks in the middle of a heap stay resident until malloc_trim.
++//
++// So an eviction frees the bytes into the arena, the process's RSS stays where it was, and the physical-RAM gate
++// (generate.cpp, sample_host_memory: MemAvailable and the cgroup) sees nothing come back.  Measured on the
++// production host: 1,946 arena heaps holding 108 GiB RSS, an evict-everything that freed 22 GiB of parked
++// conversations and left "available" where it was, and 15 GB of new snapshots admitted with zero RSS growth.
++//
++// STRATA_CONV_MMAP=1: every such allocation of at least 64 KiB is its own anonymous mapping (mmap, rounded up to whole
++// pages) and is munmap'ed when it is freed, so an evicted conversation's memory is back with the kernel when
++// evict_oldest() returns, whatever glibc's thresholds and arenas do.  Below 64 KiB (a short capture's scale buffers,
++// a checkpoint's dead rows and block positions) stays with malloc: those are few bytes beside the rest, and a mapping
++// each would only cost syscalls and map count.  Reproducer (variant f, an mmap per segment / gdn vector): the
++// arenas' RSS after an evict-all went from 6.2 GiB to 0.2 GiB and no park was refused (was 57 of 400).
++//
++// The switch is read once, at the first allocation, and never changes in the process: deallocate() decides by the
++// size alone whether the block was mapped, which is the same size allocate() was given (the allocator contract).
++// Unset or anything but 1: operator new / operator delete, exactly std::allocator's behaviour.  The memory is
++// ordinary pageable memory either way; cudaMemcpy to and from it goes through the driver's staging as before, and
++// nothing registers it with cudaHostRegister (a pinned range must not be unmapped under the driver).
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <new>
++#include <type_traits>
++#include <utility>
++#include <vector>
++
++#if defined(__unix__) || defined(__APPLE__)
++#include <sys/mman.h>
++#include <unistd.h>
++#define STRATA_CONV_MMAP_SUPPORTED 1
++#else
++#define STRATA_CONV_MMAP_SUPPORTED 0
++#endif
++
++namespace strata::core {
++
++namespace conversation_alloc_detail {
++struct Mode {
++    bool mmap = false;
++    size_t min = 0;    ///< the smallest allocation that is mapped (bytes)
++    size_t page = 4096;
++};
++inline Mode read_mode() {
++    Mode m;
++#if STRATA_CONV_MMAP_SUPPORTED
++    const char* e = std::getenv("STRATA_CONV_MMAP");
++    m.mmap = e != nullptr && std::strcmp(e, "1") == 0;
++    const long page = sysconf(_SC_PAGESIZE);
++    if (page > 0 && (page & (page - 1)) == 0) m.page = (size_t) page;
++    m.min = std::max<size_t>(65536, m.page);
++#endif
++    return m;
++}
++inline const Mode& mode() {
++    static const Mode m = read_mode();
++    return m;
++}
++inline size_t page_round(size_t bytes, size_t page) {
++    return bytes > std::numeric_limits<size_t>::max() - (page - 1) ? 0 : (bytes + page - 1) & ~(page - 1);
++}
++}  // namespace conversation_alloc_detail
++
++/// STRATA_CONV_MMAP=1 in this process (read once).
++inline bool conversation_mmap_enabled() { return conversation_alloc_detail::mode().mmap; }
++
++/// True when an allocation of `bytes` is its own mapping: the switch is on and it is at least the minimum.  Such a
++/// block is zero when allocate() returns it (fresh anonymous pages), so a caller that filled it with zeros would
++/// write every page twice (ConversationBuffer::resize skips that).
++inline bool conversation_mmap_block(size_t bytes) {
++    const auto& m = conversation_alloc_detail::mode();
++    return m.mmap && bytes >= m.min;
++}
++
++/// The capacity worth reserving for `bytes`: with the switch on and a mapped block, `bytes` rounded up to whole pages
++/// (the mapping holds them anyway, so the container may as well use them and the cache counts what is resident);
++/// otherwise `bytes` unchanged.  0 for a count that does not round (the caller's overflow checks refuse it).
++inline size_t conversation_alloc_capacity(size_t bytes) {
++    if (!conversation_mmap_block(bytes)) return bytes;
++    return conversation_alloc_detail::page_round(bytes, conversation_alloc_detail::mode().page);
++}
++
++/// The allocator of parked conversation state.  Stateless: every instance allocates the same way, so containers move
++/// in O(1) and compare equal.  ValueInit = false: construct(p) with no argument leaves the element alone (a container
++/// that resizes without a fill value does not write the new elements); ConversationBuffer uses it for its segments and
++/// passes the fill value explicitly unless the block is a fresh mapping.  ValueInit = true: std::allocator's
++/// value-initialization (resize(n) zeroes), for the checkpoint vectors, whose callers rely on it as before.
++template<class T, bool ValueInit = true>
++struct ConversationAllocator {
++    using value_type = T;
++    using size_type = std::size_t;
++    using difference_type = std::ptrdiff_t;
++    using propagate_on_container_move_assignment = std::true_type;
++    using is_always_equal = std::true_type;
++    template<class U> struct rebind { using other = ConversationAllocator<U, ValueInit>; };
++
++    ConversationAllocator() noexcept = default;
++    template<class U> ConversationAllocator(const ConversationAllocator<U, ValueInit>&) noexcept {}
++
++    T* allocate(size_t n) {
++        if (n > std::numeric_limits<size_t>::max() / sizeof(T)) throw std::bad_array_new_length();
++        const size_t bytes = n * sizeof(T);
++#if STRATA_CONV_MMAP_SUPPORTED
++        if (conversation_mmap_block(bytes)) {
++            const size_t len = conversation_alloc_detail::page_round(bytes, conversation_alloc_detail::mode().page);
++            if (len == 0) throw std::bad_alloc();
++            void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++            if (p == MAP_FAILED) throw std::bad_alloc();
++            return static_cast<T*>(p);
++        }
++#endif
++        return std::allocator<T>().allocate(n);
++    }
++    void deallocate(T* p, size_t n) noexcept {
++        if (p == nullptr) return;
++#if STRATA_CONV_MMAP_SUPPORTED
++        const size_t bytes = n * sizeof(T);
++        if (conversation_mmap_block(bytes)) {
++            ::munmap(static_cast<void*>(p), conversation_alloc_detail::page_round(bytes, conversation_alloc_detail::mode().page));
++            return;
++        }
++#endif
++        std::allocator<T>().deallocate(p, n);
++    }
++
++    template<class U> void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
++        if constexpr (ValueInit) ::new ((void*) p) U();
++        else ::new ((void*) p) U;
++    }
++    template<class U, class... A> void construct(U* p, A&&... a) {
++        ::new ((void*) p) U(std::forward<A>(a)...);
++    }
++
++    template<class U> bool operator==(const ConversationAllocator<U, ValueInit>&) const noexcept { return true; }
++    template<class U> bool operator!=(const ConversationAllocator<U, ValueInit>&) const noexcept { return false; }
++};
++
++/// A checkpoint's running-state bytes (ConversationCheckpoint::gdn and the rest): a std::vector with the allocator
++/// above.  Same interface and semantics as std::vector<uint8_t>; only where the memory comes from differs.
++using ConversationBytes = std::vector<uint8_t, ConversationAllocator<uint8_t>>;
++
++}  // namespace strata::core
+diff --git a/include/strata/core/conversation_buffer.hpp b/include/strata/core/conversation_buffer.hpp
+index d8a45177..bd302bc5 100644
+--- a/include/strata/core/conversation_buffer.hpp
++++ b/include/strata/core/conversation_buffer.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "strata/core/conversation_alloc.hpp"
+ #include "strata/core/progress.hpp"
+ 
+ #include <algorithm>
+@@ -78,7 +79,10 @@ public:
+                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
+                 Segment segment;
+                 segment.reserve(segment_capacity(count, previous, growing, held));
+-                segment.resize(count, value);
++                // STRATA_CONV_MMAP: a fresh mapping is zero already (conversation_alloc.hpp); filling it with zeros
++                // would touch every page once before the capture writes it again
++                if (value == 0 && conversation_mmap_block(segment.capacity())) segment.resize(count);
++                else segment.resize(count, value);
+                 segments_.push_back(std::move(segment));
+                 size_ += count;
+                 progress_beat();   // #2049: zero-filling 16 MiB of fresh pages is slow when the host is paging
+@@ -123,7 +127,10 @@ public:
+     }
+ 
+ private:
+-    using Segment = std::vector<uint8_t>;
++    // STRATA_CONV_MMAP=1: each segment of at least 64 KiB is its own mapping and goes back to the kernel when it is
++    // freed (conversation_alloc.hpp, #3115).  Without it: operator new, as before.  ValueInit off: resize() always
++    // passes its fill value, except for a fresh mapping, which is zero already.
++    using Segment = std::vector<uint8_t, ConversationAllocator<uint8_t, false>>;
+     // A fresh capture allocates exactly its payload. Later appends reserve
+     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
+     // extend the final allocation instead of adding one transfer per turn.
+@@ -131,10 +138,12 @@ private:
+     // the append (at least 64 KiB): a parked conversation carries it in every
+     // K/V buffer, and at up to 16 MiB each it came to 0.4-0.5 GB of a ~1 GB
+     // conversation (Qwen3.8-Flash-Next), counted against the cache's budget.
++    // STRATA_CONV_MMAP: a mapped segment's capacity is its whole pages (conversation_alloc_capacity), so the spare
++    // bytes of its last page serve the next append and bytes() counts what is resident; without it, unchanged.
+     static size_t segment_capacity(size_t count, size_t previous, bool growing, size_t held) {
+-        if (!growing) return count;
++        if (!growing) return conversation_alloc_capacity(count);
+         const size_t geometric = std::min(segment_bytes, std::max<size_t>(65536, std::min(previous, segment_bytes/2)*2));
+-        return std::max(count, std::min(geometric, std::max<size_t>(65536, held / 8)));
++        return conversation_alloc_capacity(std::max(count, std::min(geometric, std::max<size_t>(65536, held / 8))));
+     }
+     static bool add(size_t& n, size_t extra) {
+         if (extra > SIZE_MAX - n) return false;
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 0cd9791f..17ad08a1 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -24,7 +24,9 @@ struct ConversationImageKey {
+ struct ConversationCheckpoint {
+     std::vector<int32_t> ids;
+     std::vector<ConversationImageKey> imgs;
+-    std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
++    // the running state: ConversationBytes is std::vector<uint8_t> with the parked state's allocator (STRATA_CONV_MMAP,
++    // conversation_alloc.hpp); the gdn recurrence alone is ~30 MB a stage
++    ConversationBytes gdn, ple, tails, dead, block_pos;
+     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
+     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
+@@ -362,11 +364,15 @@ public:
+ 
+     // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
+     // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
+-    // gate in generate.cpp).  A ConversationBuffer is a list of segments of up to 16 MiB and each segment is
+-    // its own allocation; the full 16 MiB ones are above glibc's mmap threshold and go back to the kernel at
+-    // once - the next admission check reads it back from /proc/meminfo.  A buffer's last segment is smaller
+-    // (a capture's tail; since 53f72571 an append reserves at most an eighth of what the buffer held, at least
+-    // 64 KiB), and a segment below the threshold comes from a malloc arena, which need not return it (#3115).
++    // gate in generate.cpp).  A ConversationBuffer is a list of segments of up to 16 MiB, each its own
++    // allocation, and a checkpoint's running state is a few vectors of up to ~30 MB.  Freeing them does NOT
++    // by itself give the memory back to the kernel (#3115, conversation_alloc.hpp): glibc serves any request
++    // from a free arena chunk before it looks at its mmap threshold, so once the arenas hold freed snapshots
++    // the 16 MiB segments are carved from them too (with the default dynamic threshold they are anyway, after
++    // the first free), and a thread arena keeps the freed chunks resident.  The RSS - and the MemAvailable /
++    // cgroup reading the physical-RAM gate takes next - then stays where it was.  With STRATA_CONV_MMAP=1
++    // every such allocation of at least 64 KiB is its own mapping, munmap'ed here, and the memory is back with
++    // the kernel when this returns; the small rest (under 64 KiB a buffer) stays with malloc.
+     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
+     // `spill` (make_room's evictions: the cache made room for another image): an eviction sink may keep the image
+     // (STRATA_CONV_TIER_DIR, conversation_tier.hpp).  The physical-RAM gate and a save's reclaim evict to get the memory
+diff --git a/src/core/conversation_alloc_test.cpp b/src/core/conversation_alloc_test.cpp
+new file mode 100644
+index 00000000..0721af30
+--- /dev/null
++++ b/src/core/conversation_alloc_test.cpp
+@@ -0,0 +1,191 @@
++// CPU only (no device, no CUDA): the parked conversation state's allocator (conversation_alloc.hpp, STRATA_CONV_MMAP).
++//
++//   conversation_alloc_test        STRATA_CONV_MMAP=1 (set here before the first allocation): every block of 64 KiB
++//                                  or more is a mapping of its own, and what the cache frees leaves the process's RSS
++//                                  at once - also when a thread of its own allocated it (glibc would give it a thread
++//                                  arena) and when the heap already held freed snapshots
++//   conversation_alloc_test --off  the switch unset: the same container semantics through operator new; the RSS is
++//                                  printed, not checked (glibc decides)
++//
++// Both check what the switch must not change: resize's fill value and zeroing (also of bytes a shrink left behind
++// within the capacity), growth, copy / move / operator==, a checkpoint's vectors.
++#include "strata/core/conversation_cache.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include <unistd.h>
++
++using namespace strata::core;
++
++static int checks_run = 0;
++static void check(bool ok, const char* label) {
++    ++checks_run;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
++}
++
++// Resident anonymous memory of this process (RssAnon, /proc/self/status), bytes.
++static size_t rss_anon() {
++    FILE* f = std::fopen("/proc/self/status", "r");
++    if (!f) return 0;
++    char line[256];
++    size_t kb = 0;
++    while (std::fgets(line, sizeof line, f))
++        if (std::strncmp(line, "RssAnon:", 8) == 0) { kb = std::strtoull(line + 8, nullptr, 10); break; }
++    std::fclose(f);
++    return kb * 1024;
++}
++
++static bool all(const ConversationBuffer& b, uint8_t v) {
++    return b.visit(0, b.size(), [&](const uint8_t* p, size_t n, size_t) {
++        for (size_t i = 0; i < n; ++i) if (p[i] != v) return false;
++        return true;
++    });
++}
++static void fill(ConversationBuffer& b, size_t from, uint8_t salt) {
++    b.visit(from, b.size() - from, [&](uint8_t* p, size_t n, size_t at) {
++        for (size_t i = 0; i < n; ++i) p[i] = (uint8_t) (salt + (at + i) * 131);
++        return true;
++    });
++}
++
++// A parked conversation of `layers` K/V buffers of `kv` bytes each (written as a capture would) and one checkpoint
++// with a `gdn`-byte recurrence.
++static SavedConversation conversation(size_t layers, size_t kv, size_t gdn, int salt) {
++    SavedConversation c;
++    c.live.ids = {salt, 1, 2, 3};
++    c.live.gdn.resize(gdn);
++    for (size_t i = 0; i < gdn; i += 4096) c.live.gdn[i] = (uint8_t) salt;
++    c.kv.resize(layers);
++    for (auto& l : c.kv) {
++        l.k.resize(kv); fill(l.k, 0, (uint8_t) salt);
++        l.v.resize(kv); fill(l.v, 0, (uint8_t) (salt + 1));
++        l.k_scale.resize(kv / 32); fill(l.k_scale, 0, 3);
++    }
++    return c;
++}
++
++static void semantics() {
++    const bool on = conversation_mmap_enabled();
++    // a fresh buffer: zero, whatever the source of its pages
++    ConversationBuffer a;
++    a.resize(40u << 20);                      // two full segments and an 8 MiB tail
++    check(a.size() == (40u << 20) && all(a, 0), "a fresh buffer reads zero");
++    fill(a, 0, 9);
++    ConversationBuffer b = a;
++    check(b == a, "a copy equals its source");
++    // a shrink leaves stale bytes in the last segment's capacity: growing back must zero them again
++    a.resize((32u << 20) + 100);
++    a.resize(40u << 20);
++    bool tail_zero = a.visit((32u << 20) + 100, (8u << 20) - 100, [](const uint8_t* p, size_t n, size_t) {
++        for (size_t i = 0; i < n; ++i) if (p[i]) return false;
++        return true;
++    });
++    check(tail_zero, "growing over stale bytes zeroes them");
++    check(!(a == b), "the zeroed range differs from the copy");
++    // an explicit fill value, on a fresh mapping and on an extension
++    ConversationBuffer c;
++    c.resize(3u << 20, 0x5a);
++    check(all(c, 0x5a), "a fill value reaches a fresh segment");
++    c.resize((3u << 20) + 5000, 0x5a);
++    check(c.size() == (3u << 20) + 5000 && all(c, 0x5a), "a fill value reaches an extension");
++    // a growing buffer (the chat-turn appends): the reserve is whole pages when mapped
++    ConversationBuffer d;
++    d.resize(100000);
++    fill(d, 0, 1);
++    for (int t = 0; t < 200; ++t) d.resize(d.size() + 7777);
++    check(d.size() == 100000 + 200 * 7777, "appends grow the size");
++    bool appended_zero = d.visit(100000, d.size() - 100000, [](const uint8_t* p, size_t n, size_t) {
++        for (size_t i = 0; i < n; ++i) if (p[i]) return false;
++        return true;
++    });
++    check(appended_zero, "appended bytes are zero");
++    if (on) check(conversation_alloc_capacity(100000) % (size_t) sysconf(_SC_PAGESIZE) == 0 &&
++                  conversation_alloc_capacity(100000) >= 100000 && conversation_alloc_capacity(1000) == 1000,
++                  "a mapped segment's capacity is whole pages");
++    else check(conversation_alloc_capacity(100000) == 100000, "without the switch the capacity is the request");
++    check(d.allocation_peak(d.size() + (20u << 20)) >= d.bytes() + (19u << 20), "the peak estimate covers a growth");
++    // move: O(1), the source is empty
++    ConversationBuffer e = std::move(b);
++    check(b.empty() && e.size() == (40u << 20), "a move takes the segments");
++    ConversationBuffer f{1, 2, 3};
++    uint8_t g[3] = {};
++    check(f.read(g, 0, 3) && g[0] == 1 && g[2] == 3, "the initializer-list buffer");
++
++    // the checkpoint vectors: std::vector semantics, resize(n) zeroes
++    ConversationBytes v;
++    v.resize(1u << 20);
++    bool zero = true;
++    for (uint8_t x : v) zero = zero && x == 0;
++    check(zero, "a checkpoint vector resizes to zero");
++    std::memset(v.data(), 0xee, v.size());
++    v.resize(1000);
++    v.resize(1u << 20);
++    zero = true;
++    for (size_t i = 1000; i < v.size(); ++i) zero = zero && v[i] == 0;
++    check(zero && v[999] == 0xee, "regrowing a checkpoint vector zeroes, keeps the head");
++    ConversationBytes w = v;
++    check(w == v && w.data() != v.data(), "a checkpoint vector copies");
++    for (int i = 0; i < 100000; ++i) w.push_back((uint8_t) i);
++    check(w.size() == (1u << 20) + 100000 && w[(1u << 20) + 99999] == (uint8_t) 99999, "push_back grows");
++    const uint8_t* before = w.data();
++    ConversationBytes x = std::move(w);
++    check(x.data() == before && w.empty(), "a checkpoint vector moves without copying");
++    ConversationCheckpoint ck;
++    ck.gdn.assign(300000, 7); ck.ple = {1, 2}; ck.tails.assign(70000, 9);
++    ConversationCheckpoint ck2 = ck;
++    check(ck2.gdn == ck.gdn && ck2.ple == ck.ple && ck2.tails == ck.tails, "a checkpoint copies");
++    check(ck.bytes() >= 300000 + 70000 + 2, "a checkpoint counts its vectors");
++}
++
++// The cache's own path: park, evict, see the RSS fall.  `strict`: the switch is on, so it must.
++static void rss_returns(bool strict) {
++    const size_t layers = 13, kv = (20u << 20) + 12345, gdn = 30u << 20;   // ~550 MiB a conversation
++    ConversationCache cache(8ull << 30, 64, 1);
++    const size_t base = rss_anon();
++    // captured on threads of their own, as the park threads do (glibc: one arena each)
++    std::vector<SavedConversation> made(4);
++    std::vector<std::thread> threads;
++    for (size_t i = 0; i < made.size(); ++i)
++        threads.emplace_back([&, i] { made[i] = conversation(layers, kv, gdn, (int) i + 10); });
++    for (auto& t : threads) t.join();
++    for (auto& c : made) check(cache.put(std::move(c)), "a conversation parks");
++    made.clear();
++    const size_t parked = cache.bytes(), full = rss_anon();
++    std::printf("  parked %zu MiB in %zu entries: RssAnon %zu -> %zu MiB\n", parked >> 20, cache.size(), base >> 20,
++                full >> 20);
++    if (strict) check(full >= base + parked * 9 / 10, "the parked bytes are resident");
++    while (cache.evict_oldest()) {}
++    const size_t after = rss_anon();
++    std::printf("  evicted all: RssAnon %zu MiB (%s)\n", after >> 20, strict ? "checked" : "glibc's choice, not checked");
++    if (strict) check(after < base + (16u << 20), "an eviction gives the RAM back at once");
++    // a second round reuses nothing: the heap held freed snapshots before (the case where glibc carves new
++    // segments from its free chunks), and the mapping still returns
++    for (int round = 0; round < 2; ++round) {
++        SavedConversation c = conversation(layers, kv, gdn, 40 + round);
++        check(cache.put(std::move(c)), "a second conversation parks");
++        cache.evict_oldest();
++    }
++    const size_t again = rss_anon();
++    std::printf("  park + evict twice more: RssAnon %zu MiB\n", again >> 20);
++    if (strict) check(again < base + (16u << 20), "the RAM comes back on every round");
++}
++
++int main(int argc, char** argv) {
++    const bool off = argc > 1 && std::string(argv[1]) == "--off";
++    if (off) unsetenv("STRATA_CONV_MMAP");
++    else setenv("STRATA_CONV_MMAP", "1", 1);      // before the first allocation: the mode is read once
++    check(conversation_mmap_enabled() == !off, "the switch is read once from the environment");
++    check(!conversation_mmap_block(65535) && conversation_mmap_block(65536) == !off, "the 64 KiB minimum");
++    setenv("STRATA_CONV_MMAP", off ? "1" : "0", 1);
++    check(conversation_mmap_enabled() == !off, "a later change of the environment changes nothing");
++    semantics();
++    rss_returns(!off);
++    std::printf("conversation_alloc_test%s: %d checks passed\n", off ? " --off" : "", checks_run);
++    return 0;
++}
+diff --git a/src/core/conversation_copy.hpp b/src/core/conversation_copy.hpp
+index 2ee43c60..c93ce5c2 100644
+--- a/src/core/conversation_copy.hpp
++++ b/src/core/conversation_copy.hpp
+@@ -65,9 +65,9 @@ inline long test_slow_copy_us() {
+     return v;
+ }
+ 
+-template<class T>
+-inline std::vector<T> copy_beating(const std::vector<T>& src) {
+-    std::vector<T> out;
++template<class T, class A>
++inline std::vector<T, A> copy_beating(const std::vector<T, A>& src) {
++    std::vector<T, A> out;
+     out.reserve(src.size());
+     const size_t step = std::max<size_t>(1, ((size_t) 1 << 20) / sizeof(T));
+     for (size_t at = 0; at < src.size(); at += step) {
+diff --git a/src/core/conversation_file.cpp b/src/core/conversation_file.cpp
+index 24291be5..a33a38a8 100644
+--- a/src/core/conversation_file.cpp
++++ b/src/core/conversation_file.cpp
+@@ -643,7 +643,7 @@ struct Out {
+     }
+     void u64(uint64_t v) { raw(&v, 8); }
+     void i64(int64_t v) { raw(&v, 8); }
+-    template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
++    template<class T, class A> void vec(const std::vector<T, A>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
+     void buffer(const ConversationBuffer& b) {
+         u64(b.size());
+         b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { raw(p, c); return ok; });
+@@ -735,7 +735,7 @@ struct In {
+         if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
+         return true;
+     }
+-    template<class T> bool vec(std::vector<T>& v, uint64_t limit = UINT64_MAX) {
++    template<class T, class A> bool vec(std::vector<T, A>& v, uint64_t limit = UINT64_MAX) {
+         uint64_t n = 0;
+         if (!count(n, sizeof(T), limit)) return false;
+         v.resize((size_t) n);
+diff --git a/src/core/conversation_file_test.cpp b/src/core/conversation_file_test.cpp
+index fd85f2ca..4809cc1f 100644
+--- a/src/core/conversation_file_test.cpp
++++ b/src/core/conversation_file_test.cpp
+@@ -51,8 +51,8 @@ ConversationBuffer pattern(size_t n, uint8_t seed) {
+     return b;
+ }
+ 
+-std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
+-    std::vector<uint8_t> v(n);
++ConversationBytes bytes_of(size_t n, uint8_t seed) {
++    ConversationBytes v(n);
+     for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 7u + seed);
+     return v;
+ }
+diff --git a/src/core/conversation_snapshot_test.cpp b/src/core/conversation_snapshot_test.cpp
+index 1e2541d6..ef60cfde 100644
+--- a/src/core/conversation_snapshot_test.cpp
++++ b/src/core/conversation_snapshot_test.cpp
+@@ -300,7 +300,7 @@ void full_session(int fmt, int mode, int experts) {
+     }
+     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after stage images");
+     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
+-    std::vector<uint8_t> spare(sizes.dead);
++    ConversationBytes spare(sizes.dead);
+     cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
+     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
+     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
+diff --git a/src/core/conversation_tier_test.cpp b/src/core/conversation_tier_test.cpp
+index 5ddff6d2..5f736d69 100644
+--- a/src/core/conversation_tier_test.cpp
++++ b/src/core/conversation_tier_test.cpp
+@@ -42,8 +42,8 @@ ConversationBuffer pattern(size_t n, uint8_t seed) {
+     });
+     return b;
+ }
+-std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
+-    std::vector<uint8_t> v(n);
++ConversationBytes bytes_of(size_t n, uint8_t seed) {
++    ConversationBytes v(n);
+     for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 7u + seed);
+     return v;
+ }
+diff --git a/src/core/conversation_validation_test.cpp b/src/core/conversation_validation_test.cpp
+index c670ef13..e8bb8e27 100644
+--- a/src/core/conversation_validation_test.cpp
++++ b/src/core/conversation_validation_test.cpp
+@@ -89,7 +89,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
+     check(conversation_state_sizes(g, z, error), "checked canonical/pruned/zero-QSA sizing");
+     Pools first(g, format), last(g, format), draft(g, format);
+     std::array<QsaState, 2> layers{first.st, last.st};
+-    std::vector<uint8_t> gdn(z.gdn, 0xa5), history(ple ? z.ple : 0, 0xa5);
++    ConversationBytes gdn(z.gdn, 0xa5), history(ple ? z.ple : 0, 0xa5);
+     SessionState ss;
+     ss.max_cells = 96; ss.gdn_state = (float*) gdn.data();
+     // the whole-model carve, as session_init leaves a one-GPU session
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index afc5bee9..3903c018 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -9782,6 +9782,10 @@ int main(int argc, char** argv) {
+             AsyncPark& a; ParkThreads& t;
+             ~ParkStop() { a.cancel.store(true); t.wait(); }
+         } park_stop{apark, park_threads};
++        if (strata::core::conversation_mmap_enabled())
++            std::fprintf(stderr, "strata serve: STRATA_CONV_MMAP: parked K/V segments and checkpoint state of 64 KiB "
++                                 "or more are mapped one by one and unmapped when freed (an eviction returns its RAM "
++                                 "to the kernel at once)\n");
+         const bool park_threads_on = park_threads_env() || park_async_env();
+         bool park_async_on = park_async_env() && conversations.enabled();
+         if (park_async_on) {
+@@ -9931,11 +9935,14 @@ int main(int argc, char** argv) {
+                 // though every parked conversation could give its RAM back - and refusing here throws
+                 // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
+                 // Evict the least recently active parked conversations until it fits, or until none are
+-                // left.  Each ConversationBuffer is a list of segments of up to 16 MiB, each segment its own
+-                // allocation, so an evicted entry's full segments are back with the kernel before the next
+-                // check reads /proc/meminfo; no waiting is needed.  Segments below glibc's mmap threshold (a
+-                // buffer's tail, and the append reserve, at most an eighth of the buffer since 53f72571) come
+-                // from malloc arenas and need not come back (#3115; ConversationCache::evict_oldest).
++                // left.  Whether an eviction raises the next reading depends on the allocator (#3115,
++                // conversation_alloc.hpp; ConversationCache::evict_oldest): by default the segments and
++                // checkpoint vectors come from malloc, and glibc keeps what an eviction frees in its arenas
++                // (any size: a free arena chunk is used before the mmap threshold is looked at), so the RSS and
++                // the reading stay where they were and the loop can empty the cache and still refuse - measured
++                // on the production host.  With STRATA_CONV_MMAP=1 each allocation of at least 64 KiB is its own
++                // mapping, unmapped on eviction, so an evicted entry is back with the kernel before the next
++                // check reads /proc/meminfo; no waiting is needed.
+                 // slots() bounds the loop, and the two lines below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
+                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
+                 size_t evicted = 0;
+-- 
+2.43.0
+

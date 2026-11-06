@@ -1,0 +1,175 @@
+From 100158350751e6ae257a9a7f90a926d6de979370 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:28:42 +0100
+Subject: [PATCH 8/8] fixup! port c08fd2ec: the write limit is on a write that
+ makes no progress, not on the whole write
+
+socket.sendall's timeout bounds the whole call (Python 3.5+: "the maximum total duration to send all data"), so with
+STRATA_STREAM_WRITE_TIMEOUT_S set on the connection one large SSE event (a Responses response.completed, a released
+tool argument, a long held-back text) to a client that is slow but still reading failed after 60 s as a disconnect -
+the opposite of what c08fd2ec says ("a write that makes no progress for this long"). The SSE stream now writes through
+ProgressWriter: send() in a loop, the limit restarting with every piece that goes out; a client that reads nothing
+still times out after the limit. Idle streams (a long prefill, heartbeats only) were never affected: the timeout only
+applies while a write is blocked.
+
+Tests (serve/test_stream_write_timeout.py): a 100 KB write to a ~50 KB/s reader with a 0.3 s limit arrives whole (it
+fails with sendall), a reader that reads nothing still times out, and a 1.5 s silent prompt read under a 0.3 s limit
+ends with the full answer, [DONE] and usage.prompt_tokens_details.cached_tokens.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py                    | 30 ++++++++++++
+ serve/test_stream_write_timeout.py | 76 ++++++++++++++++++++++++++++++
+ 2 files changed, 106 insertions(+)
+
+diff --git a/serve/server.py b/serve/server.py
+index 2cc0136d..974663ad 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -5751,6 +5751,35 @@ class BadBody(Exception):
+         self.status = status
+ 
+ 
++class ProgressWriter:
++    """The SSE stream's wfile under STREAM_WRITE_TIMEOUT_S (#4271).  socket.sendall's timeout bounds the WHOLE write
++    (Python 3.5+), so one large event (a Responses `response.completed`, a released tool argument, a long held-back
++    text) to a client that is slow but still reading failed as a timeout after STREAM_WRITE_TIMEOUT_S.  send() in a
++    loop restarts the limit with every piece that goes out: only a write that makes no progress for that long fails
++    (TimeoutError, an OSError: the stream loops treat it as a disconnect)."""
++
++    closed = False
++
++    def __init__(self, sock):
++        self._sock = sock
++
++    def write(self, data) -> int:
++        view = memoryview(data).cast("B")
++        sent = 0
++        while sent < len(view):
++            sent += self._sock.send(view[sent:])     # waits at most the socket's timeout for room, sends a part
++        return sent
++
++    def writable(self) -> bool:
++        return True
++
++    def flush(self) -> None:
++        pass
++
++    def close(self) -> None:
++        self.closed = True
++
++
+ def make_handler(svc: Service):
+     class Handler(BaseHTTPRequestHandler):
+         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+@@ -6531,6 +6560,7 @@ def make_handler(svc: Service):
+             if STREAM_WRITE_TIMEOUT_S > 0:
+                 try:
+                     self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)     # (#4271) a stuck write ends as OSError: disconnected
++                    self.wfile = ProgressWriter(self.connection)          # ... a slow one that still reads does not
+                 except OSError:
+                     pass
+ 
+diff --git a/serve/test_stream_write_timeout.py b/serve/test_stream_write_timeout.py
+index 70e2454c..21a3a27f 100644
+--- a/serve/test_stream_write_timeout.py
++++ b/serve/test_stream_write_timeout.py
+@@ -1,8 +1,10 @@
+ """#4271 (upstream c08fd2ec): a streaming client that stops reading, without closing its connection, must not hold the
+ engine's turn for ever: the write that makes no progress ends the request as a disconnect and the next request is
+ served.  (Upstream has this in serve/test_serve_robustness.py, which this fork does not carry.)"""
++import http.client
+ import json
+ import socket
++import threading
+ import time
+ import unittest
+ from pathlib import Path
+@@ -43,10 +45,84 @@ class StalledClient(unittest.TestCase):
+             httpd.shutdown()
+             httpd.server_close()
+ 
++    def test_a_silent_prompt_read_is_not_a_stuck_write(self):
++        """A long prefill sends nothing for longer than the limit: the limit is on a write that makes no progress, an
++        idle stream is never cut (Genesis: 25 s and more without output before the first token)."""
++        class SlowStart(MockEngine):
++            def generate(self, *a, **k):
++                time.sleep(1.5)                          # the prompt being read: no token, no write
++                yield from super().generate(*a, **k)
++        tok = ByteTokenizer()
++        svc = Service(SlowStart(tok, "</think>\n\nEs ist 08:01."), tok,
++                      ChatTemplate(Path(server.__file__).parent / "chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            with mock.patch.object(server, "STREAM_WRITE_TIMEOUT_S", 0.3):
++                c = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=30)
++                c.request("POST", "/v1/chat/completions", json.dumps(
++                    {"messages": [{"role": "user", "content": "Wie spät ist es?"}], "stream": True,
++                     "stream_options": {"include_usage": True}}), {"Content-Type": "application/json"})
++                raw = c.getresponse().read().decode()
++            text = "".join(json.loads(b[6:])["choices"][0]["delta"].get("content") or ""
++                           for b in raw.split("\n\n") if b.startswith("data: {") and json.loads(b[6:])["choices"])
++            self.assertEqual(text, "Es ist 08:01.")
++            self.assertTrue(raw.rstrip().endswith("data: [DONE]"), raw[-200:])
++            self.assertIn('"cached_tokens"', raw)
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
+     @unittest.skipIf("STRATA_STREAM_WRITE_TIMEOUT_S" in __import__("os").environ, "the environment sets the limit")
+     def test_the_default_is_60_seconds(self):
+         self.assertEqual(server.STREAM_WRITE_TIMEOUT_S, 60.0)
+ 
+ 
++class ProgressWriterLimit(unittest.TestCase):
++    """socket.sendall's timeout bounds the whole write, so a large event to a slow client that keeps reading ended as a
++    timeout; ProgressWriter (the SSE stream's wfile under the limit) fails only when no piece goes out for that long."""
++
++    def pair(self):
++        a, b = socket.socketpair()
++        a.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
++        b.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
++        a.settimeout(0.3)
++        self.addCleanup(a.close)
++        self.addCleanup(b.close)
++        return a, b
++
++    def test_a_slow_client_that_keeps_reading_gets_a_large_event_whole(self):
++        a, b = self.pair()
++        got, stop = bytearray(), threading.Event()
++
++        def read():
++            while not stop.is_set():
++                try:
++                    piece = b.recv(1024)
++                except OSError:
++                    return
++                if not piece:
++                    return
++                got.extend(piece)
++                time.sleep(0.02)                         # about 50 KB/s: alive, but slower than the write
++        t = threading.Thread(target=read, daemon=True)
++        t.start()
++        data = bytes(range(256)) * 400                   # 100 KB in one write: about 2 s, far over the 0.3 s limit
++        t0 = time.monotonic()
++        self.assertEqual(server.ProgressWriter(a).write(data), len(data))
++        self.assertGreater(time.monotonic() - t0, 0.3)
++        end = time.monotonic() + 5
++        while len(got) < len(data) and time.monotonic() < end:
++            time.sleep(0.01)
++        stop.set()
++        self.assertEqual(bytes(got), data)
++
++    def test_a_client_that_reads_nothing_still_times_out(self):
++        a, _b = self.pair()
++        t0 = time.monotonic()
++        with self.assertRaises(OSError):                 # TimeoutError: the stream loops' disconnect
++            server.ProgressWriter(a).write(b"x" * (4 << 20))
++        self.assertLess(time.monotonic() - t0, 5)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

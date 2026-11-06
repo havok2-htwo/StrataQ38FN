@@ -1,0 +1,108 @@
+From 6ceb432efbd227b270d1b3fc7b4fb52243abf2f1 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:10:04 +0100
+Subject: [PATCH 2/8] port c08fd2ec: a streaming client that stops reading no
+ longer holds the engine's turn
+
+STREAM_WRITE_TIMEOUT_S (STRATA_STREAM_WRITE_TIMEOUT_S, default 60, 0 = off) is set on the connection right after
+the SSE headers, so a write that makes no progress for that long raises OSError, which every stream loop already
+turns into a disconnect (cancel set, engine stopped, turn/slot given back). Connections are HTTP/1.0 and closed
+after the response, so no idle keep-alive connection is affected; the client watcher only recv()s after select()
+says readable. server.py only; upstream's test lives in test_serve_robustness.py, which this fork deleted, so it
+comes along as serve/test_stream_write_timeout.py.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py                    |  9 ++++++
+ serve/test_stream_write_timeout.py | 52 ++++++++++++++++++++++++++++++
+ 2 files changed, 61 insertions(+)
+ create mode 100644 serve/test_stream_write_timeout.py
+
+diff --git a/serve/server.py b/serve/server.py
+index 34f1ba7d..a8f67cb4 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -222,6 +222,10 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
+ # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
+ # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
+ ENGINE_SILENCE_S = 300.0
++# #4271: a streaming client that stops reading (a hung process, a network that dropped) leaves the thread that writes to
++# it blocked once the socket buffers are full - and that thread holds the engine's turn.  A write that makes no progress
++# for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit, as before.
++STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "60") or 0)
+ # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
+ # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
+ SESSION_WAIT_MAX_S = 3600
+@@ -6518,6 +6522,11 @@ def make_handler(svc: Service):
+             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
+             self._cors()
+             self.end_headers()
++            if STREAM_WRITE_TIMEOUT_S > 0:
++                try:
++                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)     # (#4271) a stuck write ends as OSError: disconnected
++                except OSError:
++                    pass
+ 
+         def _capture(self, items, api):
+             """Retain bounded input/output for the monitor without changing the API response (the items as they
+diff --git a/serve/test_stream_write_timeout.py b/serve/test_stream_write_timeout.py
+new file mode 100644
+index 00000000..70e2454c
+--- /dev/null
++++ b/serve/test_stream_write_timeout.py
+@@ -0,0 +1,52 @@
++"""#4271 (upstream c08fd2ec): a streaming client that stops reading, without closing its connection, must not hold the
++engine's turn for ever: the write that makes no progress ends the request as a disconnect and the next request is
++served.  (Upstream has this in serve/test_serve_robustness.py, which this fork does not carry.)"""
++import json
++import socket
++import time
++import unittest
++from pathlib import Path
++from unittest import mock
++
++import serve.server as server
++from serve.frontend import ChatTemplate
++from serve.server import ByteTokenizer, MockEngine, Service, serve
++
++
++class StalledClient(unittest.TestCase):
++    def test_a_client_that_stops_reading_gives_the_turn_back(self):
++        tok = ByteTokenizer()
++        engine = MockEngine(tok, " ".join(str(i) for i in range(80000)), max_context=2_000_000)   # (not one repeated token)
++        svc = Service(engine, tok, ChatTemplate(Path(server.__file__).parent / "chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        port = httpd.server_address[1]
++        stuck = socket.socket()
++        try:
++            with mock.patch.object(server, "STREAM_WRITE_TIMEOUT_S", 0.5):
++                stuck.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
++                stuck.connect(("127.0.0.1", port))
++                body = json.dumps({"messages": [{"role": "user", "content": "go"}], "stream": True,
++                                   "max_tokens": 400000, "reasoning_effort": "none"}).encode()
++                stuck.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
++                              b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
++                # ... and it never reads.  Wait until the server is writing into a full buffer, then until it lets go.
++                end = time.monotonic() + 3
++                while time.monotonic() < end and not svc.fifo.locked():
++                    time.sleep(0.01)
++                self.assertTrue(svc.fifo.locked(), "the stuck client's request holds the engine's turn")
++                end = time.monotonic() + 20
++                while time.monotonic() < end and svc.fifo.locked():
++                    time.sleep(0.05)
++                self.assertFalse(svc.fifo.locked(), "the turn is still held by a client that does not read")
++        finally:
++            stuck.close()
++            httpd.shutdown()
++            httpd.server_close()
++
++    @unittest.skipIf("STRATA_STREAM_WRITE_TIMEOUT_S" in __import__("os").environ, "the environment sets the limit")
++    def test_the_default_is_60_seconds(self):
++        self.assertEqual(server.STREAM_WRITE_TIMEOUT_S, 60.0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

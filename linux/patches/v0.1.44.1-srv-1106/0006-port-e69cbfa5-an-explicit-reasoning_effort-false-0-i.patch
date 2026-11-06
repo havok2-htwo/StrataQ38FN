@@ -1,0 +1,47 @@
+From 7d5b1c2c85f6f9b05f96a8c9e7a9f4a0a2029d49 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:12:07 +0100
+Subject: [PATCH 6/8] port e69cbfa5: an explicit reasoning_effort false/0 is
+ not replaced by the default
+
+Service.with_shared (called first in _openai, i.e. every /v1/chat/completions request) filled in the shared/config
+thinking level whenever req["reasoning_effort"] was falsy, so an explicit False or 0 became the default. Now only a
+missing or empty value is filled. The condition differs only for False/0/empty containers; a request that carries
+chat_template_kwargs.enable_thinking or chat_template_kwargs.reasoning_effort (every known Genesis shape) or a
+non-empty reasoning_effort string skips this branch on both versions, so what those requests get is unchanged.
+Upstream's test line comes along in test_effort_paths.py.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py            | 2 +-
+ serve/test_effort_paths.py | 1 +
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 8292fb77..2cc0136d 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -4137,7 +4137,7 @@ class Service:
+         if effort:
+             if api == "openai":
+                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+-                if not req.get("reasoning_effort") and not req.get("reasoning") and \
++                if req.get("reasoning_effort") in (None, "") and not req.get("reasoning") and \
+                         "enable_thinking" not in ctk and "reasoning_effort" not in ctk:
+                     req["reasoning_effort"] = effort
+             elif not req.get("thinking") and not req.get("output_config"):
+diff --git a/serve/test_effort_paths.py b/serve/test_effort_paths.py
+index dbc1ae6f..15525f6b 100644
+--- a/serve/test_effort_paths.py
++++ b/serve/test_effort_paths.py
+@@ -130,6 +130,7 @@ class EffortPaths(unittest.TestCase):
+                                                      "thinking": {"type": "enabled", "budget_tokens": 20000}}), "xhigh")
+         self.assertEqual(self.level("/v1/responses", {"input": "hello", "reasoning": {"effort": "high"}}), "xhigh")
+         self.assertEqual(self.level("/v1/chat/completions", {"messages": MSG, "reasoning_effort": "none"}), "none")
++        self.assertEqual(self.level("/v1/chat/completions", {"messages": MSG, "reasoning_effort": False}), "none")
+ 
+     def test_the_chat_settings_shared_with_apps_beat_the_config(self):
+         self.svc.config_effort = "low"
+-- 
+2.43.0
+
