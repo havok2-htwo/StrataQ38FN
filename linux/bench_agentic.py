@@ -20,7 +20,7 @@ makes two arms comparable.  With --scale the token sizes shrink for a quick smok
   python3 bench_agentic.py --url http://127.0.0.1:8090 --label strata-agentic
   python3 bench_agentic.py --url http://127.0.0.1:8096 --model qwen3.8-flash-next --vllm --label vllm-agentic
 """
-import argparse, concurrent.futures as cf, datetime, json, random, statistics, threading, time, urllib.request
+import argparse, concurrent.futures as cf, datetime, hashlib, json, random, statistics, threading, time, urllib.request
 
 WORDS = ("def class return import self value index buffer cache request handler config parser token error retry "
          "timeout async await thread lock queue worker batch slot kernel tensor stream offset length header payload "
@@ -78,18 +78,19 @@ class Client:
             err = f"{type(e).__name__}: {e}"
         t_end = time.perf_counter()
         gen = usage.get("completion_tokens", len(parts))
+        reply = "".join(parts)
         row = {"role": role, "who": who, "at": round(t_send - self.t0, 2), "ttft": (t_first or t_end) - t_send,
                "e2e": t_end - t_send, "gen": gen, "prompt": usage.get("prompt_tokens", 0),
                "cached": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0,
                "dec": (gen - 1) / (t_end - t_first) if t_first and gen > 1 and t_end > t_first else 0.0,
-               "err": err}
+               "err": err, "sha": hashlib.sha256(reply.encode("utf-8")).hexdigest()[:16]}   # (reply identity across arms)
         with self.lock:
             self.rows.append(row)
         if a.verbose:
             print(f"[{row['at']:7.1f}s] {role:4s} {who:10s} prompt {row['prompt']:6d} cached {row['cached']:6d} "
                   f"ttft {row['ttft']:6.2f}s gen {gen:4d} {row['dec']:6.1f} tok/s{'  ERR ' + err if err else ''}",
                   flush=True)
-        return "".join(parts) or "(no answer)"
+        return reply or "(no answer)"
 
 
 def sizes(a, n):

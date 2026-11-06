@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GPU window "borrow" (~95 min of production outage, cap WINDOW_S, default 6600 s): the ll10-borrow engine patch set
+# GPU window "borrow" (~110 min of production outage planned, cap WINDOW_S, default 7800 s = 130 min): the ll10-borrow engine patch set
 # (Strata-ll10-borrow/build/strata, a copy pinned by sha256 at prep) against production as it runs, arm by arm, on the
 # Genesis ping-pong that loses production's cache (main agent ~136k + check call + a ~29.5k sub-agent sharing the 13k
 # tool head; repro_park_ram.py pingpong) and on the RAM-gate interleave case (repro_park_ram.py interleave).
@@ -10,19 +10,34 @@
 #   N1  new binary, STRATA_SERVE_STOP_BOUND as its default (on: a request commits only the rows it can emit)
 #   N2  N1 + STRATA_PARK_BORROW=1
 #   N3  N2 + STRATA_CONV_MMAP=1 STRATA_GATE_EVICT=1 MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=1048576
-# N1..N3 run the server from Strata-143-prod too, or from --server-tree DIR (e.g. Strata-srv-1106; P and N0 always run
+#   N4  N2 + STRATA_READS=$READS_N (stage 2 background reads, TESTLOG #88, with its starvation fix: ll7-reads2 063af1fd =
+#       ll10-borrow 23588120) + server STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN (#88's agent-mix READS arm,
+#       where it failed; w1/w2's long reads are >= 105K, its shorts and streams < 4096: there 4096 = #88's 8192).  Needs
+#       --server-tree with STRATA_SERVER_READS (Strata-srv-1106 >= 22f4781f).  FAIR (STRATA_READ_YIELD=1 + the drop-in's
+#       STRATA_YIELD_SHORT) stays on as in N2 (#88 measured READS without it); STRATA_READS_SOLO stays 0
+# N1..N4 run the server from Strata-143-prod too, or from --server-tree DIR (e.g. Strata-srv-1106; P and N0 always run
 # Strata-143-prod, so with --server-tree N1 vs N0 is the stop bound + the server; S0 separates the two).  Per arm, one fresh server start (empty tier dir, its own engine log), in this order:
 #   1 repro_park_ram.py pingpong @136000, 2 cycles (A2, A3: reuse target >= 95 %; SUB/SUB2 reuse; borrowed / restored /
-#     superseded lines; park capture_ms / wait_ms), --pressure $PP_PRESSURE                                    ~5 min
+#     superseded lines; park capture_ms / wait_ms), --pressure $PP_PRESSURE                                  ~3-5 min
 #   2 repro_park_ram.py interleave @136000 (16 fillers, B in A's slot, A2), --pressure $IL_PRESSURE (cgroup: the test
-#     scope's MemoryMax at usage + 18102 MiB, production's RAM situation of 2026-11-06)                        ~4 min
+#     scope's MemoryMax at usage + 18102 MiB, production's RAM situation of 2026-11-06)                      ~3-4 min
 #   3 bench_multiturn.py 16 users x 3 turns greedy (--doc $MT_DOC): reply sha per (uid, turn) = the identity check over
-#     the parked/restored path                                                                                 ~4 min
+#     the parked/restored path (wall 86-96 s in #88)                                                         ~2 min
 #   4 bench_concurrency.py 1/8/16 users short (2 rounds, 128-512 tokens, greedy): throughput + reply sha per uid
-#     (compare_replies.py vs P = the identity check over the batch path)                                         ~3 min
+#     (compare_replies.py vs P = the identity check over the batch path; 5 + ~15 + 22 s in #88/#89)             ~1.5 min
 #   + engine start ~2 min; the engine log's conversation-cache lines (counts, capture_ms/wait_ms) and the scope's peak RSS
-# Per arm ~18 min, 5 arms ~90 min + production stop/start ~5 min.  A step (= one arm) that no longer fits the window is
-# skipped (logged); ARMS="P N0 N2" runs a subset (P is needed for the identity verdicts).
+# Then the reads step for each arm of READS_ARMS (default "N2 N4", those in ARMS), after all arms, back to back: one
+# more fresh server start (empty tier dir, engine-rd-<arm>.log) with
+#   R1 fair_tools.py --mode scen --scenario win --rep $WIN_REP (TESTLOG #88's w1: a cold ~125K read beside 2 decoding
+#      streams, 4 shorts at +3/6/9/12 s; w2: a cold ~105K read, a burst of 16 shorts at +4 s; one rep: 59 s in #88)
+#   R2 bench_agentic.py greedy (the agent mix where READS failed in #88: wall 116.8 -> 142-148 s)  ~6 min incl. the start
+# The summary judges N4 vs N2 as #88 did (win_vs_fair --gain 1.0 --long-tol 0.05 + the agent mix): every w1 short's
+# TTFT (max) and the time to all 16 w2 first tokens <= 1.00 x N2's, the long reads' totals <= 1.05 x, bench_agentic's
+# and bench_multiturn's wall <= 1.05 x, every reply identical (win, bench_agentic per request, bench_multiturn), N4's
+# reads went to the background -> PASS / FAIL.  When the two reads steps no longer fit, the last one (N4) runs alone.
+# Per arm ~11-12 min by those parts (ARM_EST 15 min is the skip threshold), the reads step ~6 min (READS_EST 7): 6 arms
+# + 2 reads steps ~80 min, by the thresholds ~104 min, + production stop/start ~4 min (cap WINDOW_S 130 min).  A step
+# that no longer fits the window is skipped (logged); ARMS="P N0 N2" runs a subset (P is needed for the identity verdicts).
 # Isolation: test servers only on 127.0.0.1:8091 in strata-bench.scope (MemoryMax 224G as production's unit), tier dirs
 # under /media/raid0/strata-kvspill-bench/borrow/<run> (never production's), results in results/borrow (an existing one
 # moves to results/borrow.prev-<time>), production.json / the unit / its drop-in are only read.  Production is stopped
@@ -35,7 +50,7 @@
 # after production is back.
 #   DRY=1 ./window-borrow.sh [--server-tree DIR]   # prep checks + configs + the plan; production untouched
 #   ./window-borrow.sh [--server-tree DIR]         # the window (needs the user's GPU-window approval)
-#   ARMS="P N0 N1 N2 N3" WINDOW_S=6600 PP_PRESSURE=none IL_PRESSURE=cgroup ./window-borrow.sh
+#   ARMS="P N0 N1 N2 N3 N4" READS_ARMS="N2 N4" WINDOW_S=7800 PP_PRESSURE=none IL_PRESSURE=cgroup ./window-borrow.sh
 #   verdicts: grep -E 'PASS|FAIL|SKIP' results/borrow/window.log; table: results/borrow/summary.txt
 set -u
 R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs
@@ -56,9 +71,18 @@ while [ $# -gt 0 ]; do
         *) echo "unknown argument $1 (--server-tree DIR, --dry-run)"; exit 2 ;;
     esac
 done
-ARMS=${ARMS:-P N0 N1 N2 N3}
-WINDOW_S=${WINDOW_S:-6600}; RESERVE=480                     # outage cap (stop -> restart), room kept for the restart
-ARM_EST=${ARM_EST:-1080}; ARM_CAP=${ARM_CAP:-2100}          # per arm: expected / hard cap (s)
+ARMS=${ARMS:-P N0 N1 N2 N3 N4}
+WINDOW_S=${WINDOW_S:-7800}; RESERVE=480                     # outage cap (stop -> restart), room kept for the restart
+ARM_EST=${ARM_EST:-900}; ARM_CAP=${ARM_CAP:-2100}           # per arm: expected / hard cap (s)
+READS_ARMS=${READS_ARMS-N2 N4}                              # the arms that also get the reads step (those in ARMS)
+READS_EST=${READS_EST:-420}; READS_CAP=${READS_CAP:-1200}   # the reads step: expected / hard cap (s)
+READS_N=${READS_N:-2}; READS_BG_MIN=${READS_BG_MIN:-4096}   # N4: engine STRATA_READS, server STRATA_READS_BG_MIN
+WIN_REP=${WIN_REP:-1}                                       # fair_tools win --rep (#88's rep 1 prompts)
+FT=$L/fair_tools.py; NEWTREE=$R/Strata-ll10-borrow
+# the starvation fix (#88: a held read waited 4 x (reads) picks; 063af1fd) adds no string to the binary: its source
+# line must be in NEWTREE's HEAD and the binary built after the commit that brought it
+READS_FIX_SRC='rs::next(view, bg_pick, (int64_t) bg_reads.size())'
+
 SIZE=${SIZE:-136000}; CYCLES=${CYCLES:-2}
 PP_PRESSURE=${PP_PRESSURE:-none}; IL_PRESSURE=${IL_PRESSURE:-cgroup}
 PP_FILLERS=${PP_FILLERS:-8}; IL_FILLERS=${IL_FILLERS:-16}
@@ -186,15 +210,32 @@ arm_run() { local a=$1 cfg rc=0 u=http://127.0.0.1:$TPORT elog lab=$TAG-$1
     else echo "==> $lab: the server is gone after interleave FAIL"; rc=1; fi
     echo "$(rss_peak)" > "$OUT/rss-$a.txt"; echo "==> rss $a: peak $(cat "$OUT/rss-$a.txt") GiB (memory.peak) INFO"
     grep -a 'conversation cache' "$elog" > "$OUT/$a-cache-lines.txt" 2>/dev/null
-    echo "==> $a engine: $(grep -ac 'conversation cache: restored' "$elog" 2>/dev/null) restored, $(grep -a 'conversation cache' "$elog" 2>/dev/null | grep -c borrow) borrow, $(grep -ac superseded "$elog" 2>/dev/null) superseded, $(grep -ac 'skip parking' "$elog" 2>/dev/null) skip-parking, $(grep -ac 'physical RAM admission' "$elog" 2>/dev/null) RAM refusals INFO"
+    echo "==> $a engine: $(grep -ac 'conversation cache: restored' "$elog" 2>/dev/null) restored, $(grep -a 'conversation cache' "$elog" 2>/dev/null | grep -c borrow) borrow, $(grep -ac superseded "$elog" 2>/dev/null) superseded, $(grep -ac 'skip parking' "$elog" 2>/dev/null) skip-parking, $(grep -ac 'physical RAM admission' "$elog" 2>/dev/null) RAM refusals, $(grep -ac 'the prompt read goes to the background at' "$elog" 2>/dev/null) background reads INFO"
     sleep 2; systemctl --user stop strata-bench.scope; return $rc; }
-export -f tup runcfg srv up rss_peak arm_run
-export PY L CF OUT TIER TPORT TAG RP SIZE CYCLES PP_PRESSURE IL_PRESSURE PP_FILLERS IL_FILLERS MT_DOC MEMMAX
+# reads_run <ARM>: the stage 2 reads step - one more server start (fresh tier dir, engine-rd-<ARM>.log): fair_tools win
+# (w1, w2: rep $WIN_REP -> win-<ARM>.json), then bench_agentic greedy (-> agentic.jsonl, label $TAG-<ARM>-agentic)
+reads_run() { local a=$1 cfg rc=0 u=http://127.0.0.1:$TPORT elog lab=$TAG-$1
+    cfg=$(runcfg "$a" "rd-$a") || return 1; elog=$OUT/engine-rd-$a.log
+    up "$lab-rdup" "$cfg" || return 1
+    timeout -s INT 900 "$PY" -I "$FT" --mode scen --config "$cfg" --url "$u" --scenario win --rep "$WIN_REP" \
+        --label "$lab-win" --out "$OUT/win-$a.json" > "$OUT/$a-win.txt" 2>&1 || rc=1
+    grep -a '^round ' "$OUT/$a-win.txt" | cut -c1-400 | sed "s/^/==> $lab win /; s/\$/ INFO/"
+    grep -aE '^==>' "$OUT/$a-win.txt" || echo "==> $lab win: no verdict (see $OUT/$a-win.txt) FAIL"
+    if tup; then
+        timeout -s INT 900 "$PY" -I "$L/bench_agentic.py" --url "$u" --temperature 0 --label "$lab-agentic" \
+            --out "$OUT/agentic.jsonl" > "$OUT/$a-agentic.txt" 2>&1 || rc=1
+        echo "==> $lab agentic: $(tail -1 "$OUT/$a-agentic.txt" | cut -c1-200) INFO"
+    else echo "==> $lab: the server is gone after the win scenario FAIL"; rc=1; fi
+    echo "$(rss_peak)" > "$OUT/rss-rd-$a.txt"; echo "==> rss rd-$a: peak $(cat "$OUT/rss-rd-$a.txt") GiB (memory.peak) INFO"
+    echo "==> rd-$a engine: $(grep -ac 'the prompt read goes to the background at' "$elog" 2>/dev/null) background reads, $(grep -ac "background read of slot .*'s request is ready" "$elog" 2>/dev/null) ready, $(grep -ac 'gives way at' "$elog" 2>/dev/null) give-ways, $(grep -ac 'engine started' "$elog" 2>/dev/null) engine starts INFO"
+    sleep 2; systemctl --user stop strata-bench.scope; return $rc; }
+export -f tup runcfg srv up rss_peak arm_run reads_run
+export PY L CF OUT TIER TPORT TAG RP SIZE CYCLES PP_PRESSURE IL_PRESSURE PP_FILLERS IL_FILLERS MT_DOC MEMMAX FT WIN_REP
 cfg_exe() { python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['exe'])" "$1"; }
 
 # ---- summary (no GPU; after production is back) -----------------------------------------------------------------------
-summary() { "$PY" -I - "$OUT" "$L/results/sweep.jsonl" "$L/results/sweep.requests.jsonl" "$L/compare_replies.py" "$TAG" $ARMS <<'PYEOF'
-import json, re, statistics, subprocess, sys
+summary() { READS_N=$READS_N READS_BG_MIN=$READS_BG_MIN "$PY" -I - "$OUT" "$L/results/sweep.jsonl" "$L/results/sweep.requests.jsonl" "$L/compare_replies.py" "$TAG" $ARMS <<'PYEOF'
+import argparse, contextlib, io, json, os, re, statistics, subprocess, sys
 from pathlib import Path
 out, sweep, sreq, cmp, tag, arms = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
 def jl(p):
@@ -202,6 +243,23 @@ def jl(p):
         return [json.loads(x) for x in open(p) if x.strip()]
     except OSError:
         return []
+sys.path.insert(0, str(Path(cmp).parent))      # (linux/: fair_tools for the reads step's win facts and engine lines)
+try:
+    import fair_tools as FTM
+except Exception as e:  # noqa: BLE001 - the main table does not need it
+    FTM = None
+    print(f"(fair_tools.py not importable: {e!r}; the reads columns stay empty)")
+def win_of(a):
+    try:
+        return FTM.win_facts(json.load(open(out / f"win-{a}.json"))) if FTM else None
+    except (OSError, ValueError):
+        return None
+ag = {}
+for r in jl(out / "agentic.jsonl"):
+    lab = r.get("label", "")
+    if lab.startswith(tag + "-") and lab.endswith("-agentic"):
+        ag[lab[len(tag) + 1:-len("-agentic")]] = r
+mtrow = {r.get("label"): r for r in jl(out / "multiturn.jsonl")}
 scen = {}
 for r in jl(out / "repro.jsonl"):
     if r.get("kind") == "scenario":
@@ -264,7 +322,8 @@ def f(x, d=0):
 print(f"# window borrow {tag}: per arm (one server start each); reuse % = reused / prompt; ident = vs P (greedy)")
 hdr = (f"{'arm':4s} {'A2%':>6s} {'A3%':>6s} {'SUB':>13s} {'SUB2':>13s} {'IL A2%':>6s} {'IL ttft':>7s} {'borrow':>6s} "
        f"{'restor':>6s} {'supers':>6s} {'refuse':>6s} {'parks':>5s} {'cap p50':>7s} {'cap max':>7s} {'wait max':>8s} "
-       f"{'tps@1':>6s} {'tps@8':>6s} {'tps@16':>6s} {'ttft16':>6s} {'id conc':>7s} {'id mt':>7s} {'id A':>4s} {'RSS GiB':>7s} pp   server")
+       f"{'tps@1':>6s} {'tps@8':>6s} {'tps@16':>6s} {'ttft16':>6s} {'id conc':>7s} {'id mt':>7s} {'id A':>4s} {'RSS GiB':>7s} "
+       f"{'w1 max':>6s} {'w2 all':>6s} {'ag wall':>7s} pp   server")
 print(hdr); print("-" * len(hdr))
 for a in arms:
     pp, il = scen.get((f"{tag}-{a}", "pingpong")), scen.get((f"{tag}-{a}", "interleave"))
@@ -279,6 +338,7 @@ for a in arms:
         rss = open(out / f"rss-{a}.txt").read().strip()
     except OSError:
         rss = "-"
+    wf = win_of(a) or {}
     print(f"{a:4s} {pct(tr.get('A2')):>6s} {pct(tr.get('A3')):>6s} {s('SUB'):>13s} {s('SUB2'):>13s} "
           f"{pct((il or {}).get('a2_reuse')):>6s} {f((il or {}).get('a2_ttft_s'), 2):>7s} {e.get('borrow', '-'):>6} "
           f"{e.get('restored', '-'):>6} {e.get('supers', '-'):>6} {e.get('refuse', '-'):>6} {e.get('parks', '-'):>5} "
@@ -286,6 +346,8 @@ for a in arms:
           f"{f((sw.get(1) or {}).get('agg_out_tps'), 1):>6s} {f((sw.get(8) or {}).get('agg_out_tps'), 1):>6s} "
           f"{f((sw.get(16) or {}).get('agg_out_tps'), 1):>6s} {f((sw.get(16) or {}).get('ttft_p50'), 2):>6s} "
           f"{ident_conc(a):>7s} {ident_mt(a):>7s} {ident_a(a):>4s} {rss:>7s} "
+          f"{f((wf.get('w1') or {}).get('s_max'), 2):>6s} {f((wf.get('w2') or {}).get('all_first'), 2):>6s} "
+          f"{f((ag.get(a) or {}).get('wall_s'), 1):>7s} "
           f"{'PASS' if pp and pp.get('hit') else 'FAIL' if pp else '-':4s} {server(a)}")
 if "N0" in arms and "P" in arms:
     ok = ident_conc("N0") == "same" and (lambda m: m != "-" and m.split("/")[0] == m.split("/")[1])(ident_mt("N0"))
@@ -295,7 +357,136 @@ for a in arms:
     if a not in ("P", "N0"):
         print(f"==> identity {a} vs P (expected exact): conc {ident_conc(a)}, multiturn {ident_mt(a)}, A replies {ident_a(a)} INFO")
 print("(pp = pingpong PASS: A2 and A3 >= 95 % reused and above the grid point below the branch; SUB = reused/prompt; IL = interleave; cap = park capture_ms; "
-      "id A: '=' per scenario when A's greedy reply equals P's)")
+      "id A: '=' per scenario when A's greedy reply equals P's; w1 max = every w1 short's TTFT, w2 all = time to all 16 "
+      "w2 first tokens, ag wall = bench_agentic's wall (s): the reads step, arms of READS_ARMS only)")
+
+# ---- stage 2 (background reads): N4 vs N2, TESTLOG #88's rule ---------------------------------------------------------
+RB, RN = "N2", "N4"
+RA = [a for a in arms if (out / f"win-{a}.json").exists() or a in ag]
+def bgstat(name):
+    try:
+        lines = open(out / name, errors="replace").read().splitlines()
+    except OSError:
+        return None
+    if FTM is None:
+        return None
+    bg = sum(bool(FTM.BG_RE.search(ln)) for ln in lines)
+    rdy = sum(bool(FTM.RDY_RE.search(ln)) for ln in lines)
+    errd = sum("background read of slot" in ln and " ends at " in ln and ": err" in ln for ln in lines)
+    unp = sum("holds no read of this prompt that gave way" in ln for ln in lines)
+    return {"bg": bg, "ready": rdy, "err": errd, "unpinned": unp, "give": sum("gives way at" in ln for ln in lines)}
+def bgs(name):
+    b = bgstat(name)
+    return "-" if b is None else f"{b['bg']}/{b['ready']}"
+def ag_keyed(r):            # per request: (who, its k-th call) -> reply sha (None: an error or no sha in the row)
+    d = {}
+    for row in sorted((r or {}).get("rows") or [], key=lambda z: z.get("at", 0)):
+        d.setdefault(row.get("who"), []).append(None if row.get("err") else row.get("sha"))
+    return {(w, i): x for w, v in d.items() for i, x in enumerate(v)}
+def same_ag(x, y):          # main and sub-agent requests all; the chat user's: those both runs made (timing decides how many)
+    a, b = ag_keyed(x), ag_keyed(y)
+    keys = {k for k in set(a) | set(b) if not str(k[0]).startswith("chat")} | (set(a) & set(b))
+    return sum(1 for k in keys if a.get(k) is not None and a.get(k) == b.get(k)), len(keys)
+def same_win(x, y):
+    keys = sorted(k for k in set(x) | set(y) if not k.startswith("_") and not k.endswith("-meta"))
+    ok = sum(1 for k in keys if isinstance(x.get(k), dict) and isinstance(y.get(k), dict) and not x[k].get("error")
+             and not y[k].get("error") and x[k].get("text") == y[k].get("text"))
+    return ok, len(keys)
+def same_mt(a, b):
+    x, y = mt.get(f"{tag}-{a}-mt"), mt.get(f"{tag}-{b}-mt")
+    if not x or not y:
+        return None
+    k = set(x) | set(y)
+    return sum(x.get(i) is not None and x.get(i) == y.get(i) for i in k), len(k)
+def g2(d, *ks):
+    for k in ks:
+        d = (d or {}).get(k)
+    return d
+if RA:
+    print()
+    print(f"# stage 2 reads step (one more server start per arm: fair_tools win --rep, then bench_agentic greedy); mt = the "
+          f"arm's own bench_multiturn run; bg rd = background reads handed / ready (reads step, arm run)")
+    h2 = (f"{'arm':4s} {'w1 p50':>6s} {'w1 max':>6s} {'w1 long':>7s} {'w2 all':>6s} {'w2 p50':>6s} {'w2 p95':>6s} "
+          f"{'w2 long':>7s} {'ag wall':>7s} {'main':>5s} {'sub':>5s} {'chat':>5s} {'ag p95':>6s} {'ag tok':>6s} "
+          f"{'mt wall':>7s} {'mt fol':>6s} {'bg rd':>7s} {'bg arm':>7s} {'RSS':>6s}")
+    print(h2); print("-" * len(h2))
+    for a in RA:
+        w = win_of(a) or {}
+        w1, w2, g, m = w.get("w1") or {}, w.get("w2") or {}, ag.get(a) or {}, mtrow.get(f"{tag}-{a}-mt") or {}
+        try:
+            rr = open(out / f"rss-rd-{a}.txt").read().strip()
+        except OSError:
+            rr = "-"
+        print(f"{a:4s} {f(w1.get('s_p50'), 2):>6s} {f(w1.get('s_max'), 2):>6s} {f(w1.get('long_total'), 2):>7s} "
+              f"{f(w2.get('all_first'), 2):>6s} {f(w2.get('s_p50'), 2):>6s} {f(w2.get('s_p95'), 2):>6s} "
+              f"{f(w2.get('long_total'), 2):>7s} {f(g.get('wall_s'), 1):>7s} {f(g2(g, 'main', 'ttft_p50'), 2):>5s} "
+              f"{f(g2(g, 'sub', 'ttft_p50'), 2):>5s} {f(g2(g, 'chat', 'ttft_p50'), 2):>5s} {f(g2(g, 'main', 'ttft_p95'), 2):>6s} "
+              f"{str(g.get('out_tok', '-')):>6s} {f(m.get('wall_s'), 1):>7s} {f(m.get('follow_ttft_p50'), 2):>6s} "
+              f"{bgs(f'engine-rd-{a}.log'):>7s} {bgs(f'engine-{a}.log'):>7s} {rr:>6s}")
+    print("(#88 for reference, rep 1-2 medians, production of then: w1 short TTFT max PROD 20.20 / FAIR 1.19 / READS "
+          "0.88 s, w2 all 16 first 17.08 / 4.87 / 17.03 s; bench_agentic wall PROD 116.8-116.9 / READS 142.1-148.3 s)")
+    wb, wn = win_of(RB), win_of(RN)
+    gb, gn = ag.get(RB), ag.get(RN)
+    mb, mn = mtrow.get(f"{tag}-{RB}-mt"), mtrow.get(f"{tag}-{RN}-mt")
+    what = (f"{RN} (N2 + STRATA_READS={os.environ.get('READS_N', '?')}, server STRATA_SERVER_READS=1 "
+            f"STRATA_READS_BG_MIN={os.environ.get('READS_BG_MIN', '?')}, the starvation fix 063af1fd)")
+    if FTM and wb and wn:          # #88's own tool on the same files (median of one run = the run)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                FTM.mode_win(argparse.Namespace(arms=[f"{RB}={out}/win-{RB}.json", f"{RN}={out}/win-{RN}.json"],
+                                                gain=1.0, long_tol=0.05))
+                FTM.mode_readstat(argparse.Namespace(
+                    arms=[f"{RB}={out}/engine-rd-{RB}.log", f"{RN}={out}/engine-rd-{RN}.log",
+                          f"{RN}arm={out}/engine-{RN}.log"], want_bg=f"{RN},{RN}arm", want_none=RB,
+                    want_clean=f"{RB},{RN},{RN}arm", max_starts=1))
+            except Exception as e:  # noqa: BLE001
+                print(f"==> fair_tools win / readstat failed: {e!r} FAIL")
+        for ln in buf.getvalue().splitlines():
+            print(f"    [fair_tools] {ln.strip()[:400]}")
+    if not (wb and wn and gb and gn):
+        print(f"==> stage 2 {RN} vs {RB}: not measured (reads step ran for {', '.join(RA) or 'none'}; want both win "
+              f"files and both bench_agentic runs) INFO")
+    else:
+        res = []
+        def judge(name, ok, line):
+            res.append((name, ok))
+            print(f"==> stage 2 {RN} vs {RB} {line} {'PASS' if ok else 'FAIL'}")
+        b1, n1, b2, n2 = wb.get("w1") or {}, wn.get("w1") or {}, wb.get("w2") or {}, wn.get("w2") or {}
+        ok = None not in (b1.get("s_max"), n1.get("s_max")) and n1["s_max"] <= b1["s_max"] and n1.get("s_miss") == 0
+        judge("w1", ok, f"w1 (a cold ~125K read beside 2 streams, 4 shorts): every short's TTFT (max) {f(b1.get('s_max'), 2)} "
+              f"-> {f(n1.get('s_max'), 2)} s, p50 {f(b1.get('s_p50'), 2)} -> {f(n1.get('s_p50'), 2)} s (want <= 1.00 x, "
+              f"#88's rule; shorts without a token {n1.get('s_miss')})")
+        ok = None not in (b2.get("all_first"), n2.get("all_first")) and n2["all_first"] <= b2["all_first"] and n2.get("s_miss") == 0
+        judge("w2", ok, f"w2 (a cold ~105K read, 16 shorts at once): all 16 first tokens after {f(b2.get('all_first'), 2)} -> "
+              f"{f(n2.get('all_first'), 2)} s, p50 {f(b2.get('s_p50'), 2)} -> {f(n2.get('s_p50'), 2)} s (want <= 1.00 x)")
+        ok = all(None not in (x.get("long_total"), y.get("long_total")) and y["long_total"] <= 1.05 * x["long_total"]
+                 for x, y in ((b1, n1), (b2, n2)))
+        judge("long", ok, f"long reads: w1 total {f(b1.get('long_total'), 2)} -> {f(n1.get('long_total'), 2)} s, w2 "
+              f"{f(b2.get('long_total'), 2)} -> {f(n2.get('long_total'), 2)} s (want <= 1.05 x)")
+        aw = (gb.get("wall_s"), gn.get("wall_s"))
+        mw = ((mb or {}).get("wall_s"), (mn or {}).get("wall_s"))
+        rel = lambda p: f"{100 * (p[1] / p[0] - 1):+.1f} %" if None not in p and p[0] else "-"
+        ok = None not in aw and aw[1] <= 1.05 * aw[0] and None not in mw and mw[1] <= 1.05 * mw[0]
+        errs = sum(int(g2(gn, r, "err") or 0) for r in ("main", "sub", "chat"))
+        judge("mix", ok and errs == 0, f"agent mix: bench_agentic wall {f(aw[0], 1)} -> {f(aw[1], 1)} s ({rel(aw)}), main TTFT "
+              f"p50 {f(g2(gb, 'main', 'ttft_p50'), 2)} -> {f(g2(gn, 'main', 'ttft_p50'), 2)} s, {gb.get('out_tok')} -> "
+              f"{gn.get('out_tok')} output tokens, {errs} request errors; bench_multiturn wall {f(mw[0], 1)} -> "
+              f"{f(mw[1], 1)} s ({rel(mw)}), follow-up TTFT p50 {f((mb or {}).get('follow_ttft_p50'), 2)} -> "
+              f"{f((mn or {}).get('follow_ttft_p50'), 2)} s (want both walls <= +5 %, no errors)")
+        sw, sa, sm = same_win(json.load(open(out / f"win-{RB}.json")), json.load(open(out / f"win-{RN}.json"))), \
+            same_ag(gb, gn), same_mt(RB, RN)
+        ok = sw[0] == sw[1] > 0 and sa[0] == sa[1] > 0 and sm is not None and sm[0] == sm[1] > 0
+        judge("replies", ok, f"replies (greedy): win {sw[0]}/{sw[1]}, bench_agentic {sa[0]}/{sa[1]} (per request), "
+              f"bench_multiturn {'-' if sm is None else f'{sm[0]}/{sm[1]}'} identical")
+        st_rd, st_arm = bgstat(f"engine-rd-{RN}.log"), bgstat(f"engine-{RN}.log")
+        ok = bool(st_rd) and st_rd["bg"] > 0 and st_rd["ready"] == st_rd["bg"] and st_rd["err"] == 0 and st_rd["unpinned"] == 0
+        judge("bg", ok, f"background reads: reads step {st_rd and st_rd['bg']} handed / {st_rd and st_rd['ready']} ready / "
+              f"{st_rd and st_rd['err']} dropped with err / {st_rd and st_rd['unpinned']} unpinned (want > 0, all ready, "
+              f"none err / unpinned); arm run {st_arm and st_arm['bg']} / {st_arm and st_arm['ready']}; {RB}: "
+              f"{(bgstat(f'engine-rd-{RB}.log') or {}).get('bg')} (want 0)")
+        bad = [n for n, ok in res if not ok]
+        print(f"==> stage 2 {what} vs {RB}: {'PASS (all ' + str(len(res)) + ')' if not bad else 'FAIL (' + ', '.join(bad) + ')'}")
 PYEOF
 }
 
@@ -314,25 +505,44 @@ for s in "$SRV" "$NSRV"; do
 done
 [ "$(git -C "$SRV" rev-parse --short=8 HEAD)" = 90f73293 ] || { echo "$SRV is not at 90f73293 (production's server)"; exit 1; }
 git -C "$NSRV" merge-base --is-ancestor 90f73293 HEAD 2>/dev/null || { echo "$NSRV does not contain 90f73293"; exit 1; }
-for f in "$RP" "$L/bench_multiturn.py" "$L/bench_concurrency.py" "$L/compare_replies.py"; do
+for f in "$RP" "$L/bench_multiturn.py" "$L/bench_concurrency.py" "$L/compare_replies.py" "$FT" "$L/bench_agentic.py"; do
+    [ -e "$f" ] || { echo "missing $f"; exit 1; }
     "$PY" -I "$f" --help > /dev/null || { echo "$f does not load"; exit 1; }; done
+grep -q '"sha": hashlib' "$L/bench_agentic.py" || { echo "$L/bench_agentic.py writes no reply sha (the agent mix's identity)"; exit 1; }
 PPCHK=$("$PY" -I "$RP" --dry-run --exact --scenarios pingpong,interleave --sizes "$SIZE" --cycles "$CYCLES" 2>&1) \
     || { echo "$PPCHK"; echo "repro_park_ram.py --dry-run --exact failed"; exit 1; }
 # the switches the arms set must exist in the binary (an unknown STRATA_* is silently ignored: the arm would be N0/N1)
-declare -A NEED=([N0]=STRATA_SERVE_STOP_BOUND [S0]=STRATA_SERVE_STOP_BOUND [N1]=STRATA_SERVE_STOP_BOUND [N2]=STRATA_PARK_BORROW [N3]="STRATA_CONV_MMAP STRATA_GATE_EVICT")
+declare -A NEED=([N0]=STRATA_SERVE_STOP_BOUND [S0]=STRATA_SERVE_STOP_BOUND [N1]=STRATA_SERVE_STOP_BOUND [N2]=STRATA_PARK_BORROW [N3]="STRATA_CONV_MMAP STRATA_GATE_EVICT" [N4]=STRATA_READS)
 MISSING=; KEEP_ARMS=
 for a in $ARMS; do
-    case $a in P|N0|S0|N1|N2|N3) ;; *) echo "unknown arm $a (P N0 S0 N1 N2 N3)"; exit 1 ;; esac
+    case $a in P|N0|S0|N1|N2|N3|N4) ;; *) echo "unknown arm $a (P N0 S0 N1 N2 N3 N4)"; exit 1 ;; esac
     [ "$a" = S0 ] && [ "$NSRV" = "$(readlink -f "$SRV")" ] && { echo "arm S0 needs --server-tree DIR other than $SRV (else it is N0)"; exit 1; }
     miss=; for s in ${NEED[$a]:-}; do grep -qa "$s" "$NEWSRC" || miss="$miss $s"; done
-    [ "$a" = N3 ] && ! grep -qa STRATA_PARK_BORROW "$NEWSRC" && miss="$miss STRATA_PARK_BORROW"
+    case $a in N3|N4) grep -qa STRATA_PARK_BORROW "$NEWSRC" || miss="$miss STRATA_PARK_BORROW" ;; esac
+    if [ "$a" = N4 ]; then   # the server half, the starvation fix in the binary, nothing of it in the baseline already
+        grep -q 'STRATA_SERVER_READS' "$NSRV/serve/server.py" || miss="$miss STRATA_SERVER_READS(server $NSRV: --server-tree)"
+        fixt=$(git -C "$NEWTREE" log -1 --format=%ct -S"$READS_FIX_SRC" HEAD -- src/program/generate.cpp 2>/dev/null)
+        if [ -z "$fixt" ] || ! git -C "$NEWTREE" grep -qF "$READS_FIX_SRC" HEAD -- src/program/generate.cpp; then
+            miss="$miss reads-fix-063af1fd(not in $NEWTREE HEAD)"
+        elif [ "$(stat -c %Y "$NEWSRC")" -lt "$fixt" ]; then miss="$miss reads-fix-063af1fd(binary older than the fix commit)"; fi
+        python3 -c "import json,sys; sys.exit(any(k.startswith('STRATA_READS') for k in json.load(open(sys.argv[1]))['env']))" "$BASESRC" \
+            || miss="$miss STRATA_READS*(already in the baseline config: N2 would not be without it)"
+        case " $(systemctl --user show strata.service -p Environment --value) " in *" STRATA_SERVER_READS="*|*" STRATA_READS_"*)
+            miss="$miss STRATA_SERVER_READS(already in production's server env: N2 would get it too)" ;; esac
+    fi
     if [ -n "$miss" ]; then MISSING="$MISSING $a:${miss# }"; [ "$ALLOW_MISSING" = 1 ] && continue; fi
     KEEP_ARMS="$KEEP_ARMS $a"
 done
 if [ -n "$MISSING" ]; then
-    [ "$ALLOW_MISSING" = 1 ] || { echo "$NEWSRC lacks switches:$MISSING (rebuild, or ALLOW_MISSING=1 drops those arms)"; exit 1; }
-    echo "dropping arms (switch missing in the binary):$MISSING"; fi
+    [ "$ALLOW_MISSING" = 1 ] || { echo "$NEWSRC (or the N server) lacks what the arms need:$MISSING (rebuild / --server-tree, or ALLOW_MISSING=1 drops those arms)"; exit 1; }
+    echo "dropping arms (switch missing in the binary or the server):$MISSING"; fi
 ARMS=${KEEP_ARMS# }; [ -n "$ARMS" ] || { echo "no arm left"; exit 1; }
+RARMS=; for a in $ARMS; do case " $READS_ARMS " in *" $a "*) RARMS="$RARMS $a" ;; esac; done; RARMS=${RARMS# }
+TOKCHK=
+if [ -n "$RARMS" ]; then   # the win scenario's prompts measured with the tokenizer (CPU only, low priority)
+    TOKCHK=$(nice -n 19 taskset -c 0-47 "$PY" -I "$FT" --mode tokcheck --config "$BASESRC" --short 2048 --reps-list "$WIN_REP" 2>&1) \
+        || { echo "$TOKCHK"; echo "fair_tools.py tokcheck failed: the reads step's scenarios do not fit"; exit 1; }
+fi
 curl -s -m 2 "http://127.0.0.1:$TPORT/health" > /dev/null && { echo "port $TPORT already serves something: the test servers need it"; exit 1; }
 systemctl --user is-active -q strata-bench.scope && { echo "strata-bench.scope is active: another bench is running"; exit 1; }
 systemctl --user is-active -q "$RUNIT.timer" && { echo "$RUNIT.timer is active: another window of this kind?"; exit 1; }
@@ -355,10 +565,12 @@ NEW_SHA=$(sha256sum "$NEWSRC" | cut -c1-16); NEW=$BIN/strata-ll10-borrow-$NEW_SH
 cp "$NEWSRC" "$NEW" && chmod +x "$NEW" || { echo "cannot copy $NEWSRC"; exit 1; }
 [ "$(sha256sum "$NEW" | cut -c1-16)" = "$NEW_SHA" ] || { echo "$NEWSRC changed while it was copied (a build running?)"; exit 1; }
 echo "$PPCHK" | sed 's/^/    [dry-run --exact] /' >> "$OUT/window.log"
-log "window prep ($TAG): arms $ARMS; production $(basename "$PRODSRC") sha256 $PRODCFG_SHA, exe $(basename "$PEXE") sha256 $PROD_SHA, server $SRV @$(git -C "$SRV" rev-parse --short HEAD); new $NEWSRC sha256 $NEW_SHA ($(git -C "$R/Strata-ll10-borrow" rev-parse --short HEAD 2>/dev/null) $(git -C "$R/Strata-ll10-borrow" log -1 --format=%s 2>/dev/null | cut -c1-70)) -> $NEW; N server $NSRV @$(git -C "$NSRV" rev-parse --short HEAD); server env: $SRVENV; pingpong @$SIZE x$CYCLES pressure $PP_PRESSURE fillers $PP_FILLERS, interleave pressure $IL_PRESSURE fillers $IL_FILLERS; baseline (P, and the arms' config) $(basename "$BASESRC"), exe $(basename "$BEXE")"
+[ -n "$TOKCHK" ] && echo "$TOKCHK" | sed 's/^/    [tokcheck] /' >> "$OUT/window.log"
+log "window prep ($TAG): arms $ARMS; reads step for '${RARMS:-none}' (fair_tools win --rep $WIN_REP + bench_agentic; N4: STRATA_READS=$READS_N, server STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN; $NEWTREE $(git -C "$NEWTREE" status --porcelain -- src include CMakeLists.txt 2>/dev/null | grep -q . && echo 'has UNCOMMITTED source changes' || echo 'sources clean')); production $(basename "$PRODSRC") sha256 $PRODCFG_SHA, exe $(basename "$PEXE") sha256 $PROD_SHA, server $SRV @$(git -C "$SRV" rev-parse --short HEAD); new $NEWSRC sha256 $NEW_SHA ($(git -C "$R/Strata-ll10-borrow" rev-parse --short HEAD 2>/dev/null) $(git -C "$R/Strata-ll10-borrow" log -1 --format=%s 2>/dev/null | cut -c1-70)) -> $NEW; N server $NSRV @$(git -C "$NSRV" rev-parse --short HEAD); server env: $SRVENV; pingpong @$SIZE x$CYCLES pressure $PP_PRESSURE fillers $PP_FILLERS, interleave pressure $IL_PRESSURE fillers $IL_FILLERS; baseline (P, and the arms' config) $(basename "$BASESRC"), exe $(basename "$BEXE")"
 
 # configs, all from the baseline config (production's unless BASE_CONFIG): exe, then the arm's env changes (K=V sets, -K drops); the sidecar <name>.srv:
-# the server checkout + production's server env
+# the server checkout + production's server env (+ SRVX[name]: the arm's own server env)
+declare -A SRVX=([N4]="STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN")
 mkcfg() {   # $1 name, $2 exe, $3 server dir, then changes ...
     local name=$1 exe=$2 sdir=$3; shift 3
     python3 - "$BASESRC" "$CF/$name.json" "$exe" "$@" <<'PYEOF' || exit 1
@@ -372,7 +584,7 @@ for kv in sys.argv[4:]:
         k, v = kv.split("=", 1); e[k] = v
 json.dump(c, open(dst, "w"), indent=1)
 PYEOF
-    echo "SERVER_DIR=$sdir $SRVENV" > "$CF/$name.srv"; }
+    echo "SERVER_DIR=$sdir $SRVENV${SRVX[$name]:+ ${SRVX[$name]}}" > "$CF/$name.srv"; }
 OFF=(-STRATA_PARK_BORROW -STRATA_CONV_MMAP -STRATA_GATE_EVICT)
 mkcfg P  "$BEXE" "$SRV"
 mkcfg N0 "$NEW"  "$SRV"  "${OFF[@]}" STRATA_SERVE_STOP_BOUND=0     # P's server: N0 vs P = the binary only
@@ -381,25 +593,32 @@ mkcfg N1 "$NEW"  "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND
 mkcfg N2 "$NEW"  "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1
 mkcfg N3 "$NEW"  "$NSRV" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_CONV_MMAP=1 STRATA_GATE_EVICT=1 \
     MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=1048576
-for a in P N0 S0 N1 N2 N3; do
-    log "    [cfg] $a: exe $(basename "$(cfg_exe "$CF/$a.json")"), server $(sed 's/ .*//' "$CF/$a.srv"), env vs production: $(python3 -c "
+mkcfg N4 "$NEW"  "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_READS="$READS_N"   # N2 + stage 2
+for a in P N0 S0 N1 N2 N3 N4; do
+    log "    [cfg] $a: exe $(basename "$(cfg_exe "$CF/$a.json")"), server $(sed 's/ .*//' "$CF/$a.srv")${SRVX[$a]:+ + server env ${SRVX[$a]}}, env vs production: $(python3 -c "
 import json,sys; p=json.load(open(sys.argv[1]))['env']; c=json.load(open(sys.argv[2]))['env']
 d=[f'{k}={c[k]}' for k in c if p.get(k)!=c[k]]+[f'-{k}' for k in p if k not in c]; print(' '.join(d) or 'none')" "$BASESRC" "$CF/$a.json")"
 done
-NEED_S=$(( $(echo $ARMS | wc -w) * ARM_EST + 300 ))
+NEED_S=$(( $(echo $ARMS | wc -w) * ARM_EST + $(echo $RARMS | wc -w) * READS_EST + 300 ))
 if [ "$DRY" = 1 ]; then
-    log "dry run: prep and configs ok, production untouched ($CF); expected outage ~$(( NEED_S / 60 )) min for arms '$ARMS' (cap $(( WINDOW_S / 60 )) min)"
+    log "dry run: prep and configs ok, production untouched ($CF); expected outage ~$(( NEED_S / 60 )) min for arms '$ARMS' + reads steps '${RARMS:-none}' (cap $(( WINDOW_S / 60 )) min, steps until $(( (WINDOW_S - RESERVE) / 60 )))"
     for a in $ARMS; do echo "  step arm_$a (expected ~$(( ARM_EST / 60 )) min, cap $(( ARM_CAP / 60 )) min): arm_run $a -> $OUT/arm_$a.txt"
         echo "    server: $(cat "$CF/$a.srv" | cut -c1-160) ... on 127.0.0.1:$TPORT, MemoryMax $MEMMAX"
+        [ -n "${SRVX[$a]:-}" ] && echo "    server env of the arm: ${SRVX[$a]} (engine: $(python3 -c "import json,sys; e=json.load(open(sys.argv[1]))['env']; print(' '.join(f'{k}={e[k]}' for k in sorted(e) if k.startswith(('STRATA_READ', 'STRATA_PARK_BORROW', 'STRATA_SERVE_STOP'))))" "$CF/$a.json"))"
         echo "    + repro_park_ram.py --label $TAG-$a --scenarios pingpong --sizes $SIZE --cycles $CYCLES --fillers $PP_FILLERS --pressure $PP_PRESSURE"
         echo "    + repro_park_ram.py --label $TAG-$a --scenarios interleave --sizes $SIZE --fillers $IL_FILLERS --pressure $IL_PRESSURE"
         echo "    + bench_multiturn.py --users 16 --turns 3 --doc $MT_DOC --temperature 0 --label $TAG-$a-mt"
         echo "    + run_strata_variant.sh (ATTACH) $TAG-$a-short 1,8,16 --rounds 2 --max-tok 512 --max-tok-min 128 --prompt-tok 100 --temperature 0"; done
+    for a in $RARMS; do echo "  step reads_$a (expected ~$(( READS_EST / 60 )) min, cap $(( READS_CAP / 60 )) min): reads_run $a -> $OUT/reads_$a.txt (one more fresh server start, after all arms)"
+        echo "    + fair_tools.py --mode scen --scenario win --rep $WIN_REP --label $TAG-$a-win -> win-$a.json (w1 cold ~125K beside 2 streams + 4 shorts, w2 cold ~105K + 16 shorts)"
+        echo "    + bench_agentic.py --temperature 0 --label $TAG-$a-agentic -> agentic.jsonl"; done
+    [ "$(echo $RARMS | wc -w)" -gt 1 ] && echo "  (the reads steps run back to back; when they no longer all fit, only the last, ${RARMS##* }, runs)"
     echo "  then: production restarted (EXIT trap; $GUNIT.service on a SIGKILL; $RUNIT.timer backstop), summary table -> $OUT/summary.txt"
     grep -E '^(what|A |  )' <<< "$PPCHK" | sed 's/^/  [dry-run --exact] /'
+    [ -n "$TOKCHK" ] && grep -E '^==> tokcheck win' <<< "$TOKCHK" | sed 's/^/  [tokcheck] /'
     exit 0
 fi
-[ "$NEED_S" -le $(( WINDOW_S - RESERVE )) ] || log "note: arms '$ARMS' need ~$(( NEED_S / 60 )) min, the window allows $(( (WINDOW_S - RESERVE) / 60 )): the last ones may be skipped"
+[ "$NEED_S" -le $(( WINDOW_S - RESERVE )) ] || log "note: arms '$ARMS' + reads steps '$RARMS' need ~$(( NEED_S / 60 )) min, the window allows $(( (WINDOW_S - RESERVE) / 60 )): the last ones may be skipped"
 
 # ---- the window -------------------------------------------------------------------------------------------------------
 for _ in $(seq 180); do prod_loaded && break; sleep 5; done
@@ -421,4 +640,11 @@ for _ in $(seq 60); do ss -Hltn 'sport = :8090' | grep -q . || break; sleep 2; d
 free_gpus || on_sig "GPUs not free"
 
 for a in $ARMS; do step "arm_$a" "$ARM_EST" "$ARM_CAP" arm_run "$a"; done
+# the reads steps (stage 2: N2 then N4, back to back); when the pair no longer fits, the last one alone (INFO only)
+RUN_R=$RARMS; nr=$(echo $RUN_R | wc -w)
+if [ "$nr" -gt 1 ] && [ "$(left)" -lt $(( nr * READS_EST )) ]; then
+    for a in $RUN_R; do [ "$a" = "${RUN_R##* }" ] || { log "step reads_$a: SKIP (the $nr reads steps need ~$(( nr * READS_EST )) s, $(left) s left: only reads_${RUN_R##* }, no baseline)"; echo skip > "$OUT/rc_reads_$a"; }; done
+    RUN_R=${RUN_R##* }
+fi
+for a in $RUN_R; do step "reads_$a" "$READS_EST" "$READS_CAP" reads_run "$a"; done
 exit 0                                           # -> EXIT trap: production back, then the summary
