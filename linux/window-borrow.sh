@@ -41,7 +41,10 @@ set -u
 R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs
 URL=http://127.0.0.1:8090; TPORT=8091; PY=$R/Strata/.venv/bin/python
 NEWSRC=$R/Strata-ll10-borrow/build/strata                  # being built in parallel: pinned by a copy at prep
-SRV=$R/Strata-143-prod                                      # production's server checkout (P, and N by default)
+SRV=${BASE_SRV:-$R/Strata-143-prod}                         # P's and N0's server checkout (default: production's; and N by default)
+# BASE_CONFIG / BASE_SRV: the baseline the arms are built from when production already runs the new build (2026-11-06:
+# BASE_CONFIG=configs/T16-1441j-fair-g8-mmap4m-prod262r-vision-cpu.json BASE_SRV=$R/Strata-143-base @90f73293); the
+# safety checks (which engine runs now, what is restored) always read production.json
 NSRV=$SRV
 DRY=${DRY:-0}
 while [ $# -gt 0 ]; do
@@ -298,8 +301,9 @@ PYEOF
 
 # ---- prep (no GPU; production still serving) --------------------------------------------------------------------------
 PRODSRC=$(readlink -f "$C/production.json")
+BASESRC=$(readlink -f "${BASE_CONFIG:-$C/production.json}")
 for f in "$RP" "$L/bench_multiturn.py" "$L/bench_concurrency.py" "$L/compare_replies.py" "$L/run_strata_variant.sh" \
-         "$SRV/serve/server.py" "$NSRV/serve/server.py" "$PRODSRC" "$NEWSRC"; do [ -e "$f" ] || { echo "missing $f"; exit 1; }; done
+         "$SRV/serve/server.py" "$NSRV/serve/server.py" "$PRODSRC" "$BASESRC" "$NEWSRC"; do [ -e "$f" ] || { echo "missing $f"; exit 1; }; done
 [ -x "$L/run_strata_variant.sh" ] || { echo "$L/run_strata_variant.sh is not executable"; exit 1; }
 [ -x "$NEWSRC" ] || { echo "$NEWSRC is not executable"; exit 1; }
 for s in "$SRV" "$NSRV"; do
@@ -343,6 +347,7 @@ fi
 # production's server env (the drop-in's STRATA_* keys, read now): every test server gets it
 SRVENV=$(systemctl --user show strata.service -p Environment --value | tr ' ' '\n' | grep '^STRATA_' | tr '\n' ' ')
 PROD_SHA=$(sha256sum "$PEXE" | cut -c1-16); PRODCFG_SHA=$(sha256sum "$PRODSRC" | cut -c1-16)
+BEXE=$(cfg_exe "$BASESRC"); [ -x "$BEXE" ] || { echo "the baseline's exe $BEXE missing"; exit 1; }
 if [ "$DRY" = 1 ]; then rm -rf "$OUT"                    # (the dry run's own scratch dir)
 elif [ -e "$OUT" ]; then PREV=$OUT.prev-$(date +%Y%m%d-%H%M%S); mv "$OUT" "$PREV" || { echo "cannot move $OUT aside"; exit 1; }; fi
 mkdir -p "$OUT" "$CF" "$BIN"
@@ -350,13 +355,13 @@ NEW_SHA=$(sha256sum "$NEWSRC" | cut -c1-16); NEW=$BIN/strata-ll10-borrow-$NEW_SH
 cp "$NEWSRC" "$NEW" && chmod +x "$NEW" || { echo "cannot copy $NEWSRC"; exit 1; }
 [ "$(sha256sum "$NEW" | cut -c1-16)" = "$NEW_SHA" ] || { echo "$NEWSRC changed while it was copied (a build running?)"; exit 1; }
 echo "$PPCHK" | sed 's/^/    [dry-run --exact] /' >> "$OUT/window.log"
-log "window prep ($TAG): arms $ARMS; production $(basename "$PRODSRC") sha256 $PRODCFG_SHA, exe $(basename "$PEXE") sha256 $PROD_SHA, server $SRV @$(git -C "$SRV" rev-parse --short HEAD); new $NEWSRC sha256 $NEW_SHA ($(git -C "$R/Strata-ll10-borrow" rev-parse --short HEAD 2>/dev/null) $(git -C "$R/Strata-ll10-borrow" log -1 --format=%s 2>/dev/null | cut -c1-70)) -> $NEW; N server $NSRV @$(git -C "$NSRV" rev-parse --short HEAD); server env: $SRVENV; pingpong @$SIZE x$CYCLES pressure $PP_PRESSURE fillers $PP_FILLERS, interleave pressure $IL_PRESSURE fillers $IL_FILLERS"
+log "window prep ($TAG): arms $ARMS; production $(basename "$PRODSRC") sha256 $PRODCFG_SHA, exe $(basename "$PEXE") sha256 $PROD_SHA, server $SRV @$(git -C "$SRV" rev-parse --short HEAD); new $NEWSRC sha256 $NEW_SHA ($(git -C "$R/Strata-ll10-borrow" rev-parse --short HEAD 2>/dev/null) $(git -C "$R/Strata-ll10-borrow" log -1 --format=%s 2>/dev/null | cut -c1-70)) -> $NEW; N server $NSRV @$(git -C "$NSRV" rev-parse --short HEAD); server env: $SRVENV; pingpong @$SIZE x$CYCLES pressure $PP_PRESSURE fillers $PP_FILLERS, interleave pressure $IL_PRESSURE fillers $IL_FILLERS; baseline (P, and the arms' config) $(basename "$BASESRC"), exe $(basename "$BEXE")"
 
-# configs, all from production's config: exe, then the arm's env changes (K=V sets, -K drops); the sidecar <name>.srv:
+# configs, all from the baseline config (production's unless BASE_CONFIG): exe, then the arm's env changes (K=V sets, -K drops); the sidecar <name>.srv:
 # the server checkout + production's server env
 mkcfg() {   # $1 name, $2 exe, $3 server dir, then changes ...
     local name=$1 exe=$2 sdir=$3; shift 3
-    python3 - "$PRODSRC" "$CF/$name.json" "$exe" "$@" <<'PYEOF' || exit 1
+    python3 - "$BASESRC" "$CF/$name.json" "$exe" "$@" <<'PYEOF' || exit 1
 import json, sys
 src, dst, exe = sys.argv[1:4]
 c = json.load(open(src)); c["exe"] = exe; e = c["env"]
@@ -369,7 +374,7 @@ json.dump(c, open(dst, "w"), indent=1)
 PYEOF
     echo "SERVER_DIR=$sdir $SRVENV" > "$CF/$name.srv"; }
 OFF=(-STRATA_PARK_BORROW -STRATA_CONV_MMAP -STRATA_GATE_EVICT)
-mkcfg P  "$PEXE" "$SRV"
+mkcfg P  "$BEXE" "$SRV"
 mkcfg N0 "$NEW"  "$SRV"  "${OFF[@]}" STRATA_SERVE_STOP_BOUND=0     # P's server: N0 vs P = the binary only
 mkcfg S0 "$NEW"  "$NSRV" "${OFF[@]}" STRATA_SERVE_STOP_BOUND=0     # N0 on the --server-tree server
 mkcfg N1 "$NEW"  "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND
@@ -379,7 +384,7 @@ mkcfg N3 "$NEW"  "$NSRV" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_CO
 for a in P N0 S0 N1 N2 N3; do
     log "    [cfg] $a: exe $(basename "$(cfg_exe "$CF/$a.json")"), server $(sed 's/ .*//' "$CF/$a.srv"), env vs production: $(python3 -c "
 import json,sys; p=json.load(open(sys.argv[1]))['env']; c=json.load(open(sys.argv[2]))['env']
-d=[f'{k}={c[k]}' for k in c if p.get(k)!=c[k]]+[f'-{k}' for k in p if k not in c]; print(' '.join(d) or 'none')" "$PRODSRC" "$CF/$a.json")"
+d=[f'{k}={c[k]}' for k in c if p.get(k)!=c[k]]+[f'-{k}' for k in p if k not in c]; print(' '.join(d) or 'none')" "$BASESRC" "$CF/$a.json")"
 done
 NEED_S=$(( $(echo $ARMS | wc -w) * ARM_EST + 300 ))
 if [ "$DRY" = 1 ]; then
