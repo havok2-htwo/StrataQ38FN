@@ -1,0 +1,176 @@
+From 88b798ac888451904f5b07e0c19dffc8cfe7b355 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 04:24:09 +0100
+Subject: [PATCH] serve: background reads only under load (opt-in
+ STRATA_READS_MIN_BUSY=N, TESTLOG #96)
+
+STRATA_READS_MIN_BUSY=N (default 0: as before) lets a batch admission send
+bg=<park> only while at least N other slots have a request in them (reading,
+decoding, or a background read's park slot: slot_live); a slot only
+reserved, or waiting for its BDONE, does not count.  Below N the read goes on
+the control lines at full speed.  A long request alone that
+STRATA_READS_SOLO sends to the background (bg_solo) is not affected.
+
+TESTLOG #96: with STRATA_READS_BG_MIN=32768 an agent mix's main agent
+(3-5 at once) waited 2.87 -> 4.07 s for its first token.
+
+Tests (serve/test_reads.py, fake engine): the count, below N no bg=,
+at N bg= as before, N=0 as without it, STRATA_READS_SOLO unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py     | 27 ++++++++++++++++----
+ serve/test_reads.py | 61 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 83 insertions(+), 5 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 3bf1ab17..3ff8e840 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -359,9 +359,14 @@ YIELD_RETRY_S = _timeout_env("STRATA_YIELD_RETRY_S", 2.0) or 0.0
+ # path as before), so requests arriving during its read are served meanwhile; once it decodes alone in its slot it goes
+ # back to the solo path as any slot does (_may_go_solo).  Only with at least STRATA_READS_BG_MIN tokens the engine
+ # would read: what a slot holds and the start of the last solo prompt (the main session's) are not counted.
++# STRATA_READS_MIN_BUSY=N (opt-in; default 0: as above) sends an admission to the background only while at least N other
++# slots are busy - a request decoding or reading in them (a background read's park slot too; a slot only reserved, or
++# waiting for its BDONE, is not).  With fewer there is little to serve meanwhile and the read goes on the control lines
++# at full speed (TESTLOG #96: an agent mix's main agent at 3-5 at once).  STRATA_READS_SOLO's requests are not affected.
+ SERVER_READS = os.environ.get("STRATA_SERVER_READS", "") not in ("", "0")
+ READS_BG_MIN = max(1, _int_env("STRATA_READS_BG_MIN", 8192))
+ READS_SOLO = os.environ.get("STRATA_READS_SOLO", "0") not in ("", "0")
++READS_MIN_BUSY = max(0, _int_env("STRATA_READS_MIN_BUSY", 0))
+ READS_RELEASE_S = 600.0     # a left request's background read: its park slot is freed after this long without a BPP
+ STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+ STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+@@ -1880,6 +1885,14 @@ class StrataEngine:
+             return None
+         return min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+ 
++    def _reads_busy_ok(self, own) -> bool:
++        """STRATA_READS_MIN_BUSY (the caller holds slot_cv): may an admission into `own` read in the background now - at
++        least that many other slots have a request in them (reading, decoding, or a background read's park: slot_live);
++        0: always, as without the switch."""
++        if READS_MIN_BUSY <= 0:
++            return True
++        return sum(1 for b, r in enumerate(self.slot_live) if b != own and r is not None) >= READS_MIN_BUSY
++
+     def _bg_wait(self, park: int, cancel, live: dict):
+         """STRATA_SERVER_READS: waits for the background read in `park` (its lines come on the slot's queue), yielding
+         None heartbeats; a cancel sends BSTOP <park> once.  Returns ("ready", h), ("cancel", why) or ("err", why).
+@@ -2137,8 +2150,9 @@ class StrataEngine:
+         # yslot - the slot the next BGEN names as holding it; no_yield - the engine said YIELDNO final
+         park, yslot, no_yield = None, None, False
+         # STRATA_SERVER_READS: bg_park - the slot reserved for this request's background read (bg=); bg_off - not again
+-        # (the engine dropped it: read here); bg_wait - the read is in the background now (a disconnect stops it there)
+-        bg_park, bg_off, bg_wait = None, False, False
++        # (the engine dropped it: read here); bg_wait - the read is in the background now (a disconnect stops it there);
++        # bg_solo - STRATA_READS_SOLO sent it, alone, to a slot to read there (STRATA_READS_MIN_BUSY does not apply)
++        bg_park, bg_off, bg_wait, bg_solo = None, False, False, False
+ 
+         def free_bg_park():
+             nonlocal bg_park
+@@ -2171,8 +2185,10 @@ class StrataEngine:
+                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
+                 with self.slot_cv:
+                     alone = not any(self.slot_busy) and self.waiting == 0
+-                    if (alone and left > 1 and READS_SOLO and not out and not embeddings and self._reads_row() and
+-                            self._solo_new_tokens(prompt) >= READS_BG_MIN and self._reads_park_pick(None) is not None):
++                    bg_solo = bool(alone and left > 1 and READS_SOLO and not out and not embeddings and
++                                   self._reads_row() and self._solo_new_tokens(prompt) >= READS_BG_MIN and
++                                   self._reads_park_pick(None) is not None)
++                    if bg_solo:
+                         alone = False                       # STRATA_SERVER_READS: read in the background (a slot)
+                 if alone and left > 1:
+                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+@@ -2325,7 +2341,8 @@ class StrataEngine:
+                     if (yslot is None and park is None and bg_park is None and not bg_off and not embeddings and
+                             self._reads_row()):
+                         with self.slot_cv:              # STRATA_SERVER_READS: may its batched parts go to the background
+-                            if self._new_tokens(prompt) >= READS_BG_MIN:
++                            # (STRATA_READS_MIN_BUSY: only while enough other slots are busy; not for bg_solo)
++                            if self._new_tokens(prompt) >= READS_BG_MIN and (bg_solo or self._reads_busy_ok(slot)):
+                                 bg_park = self._reads_park_pick(slot)
+                                 if bg_park is not None and bg_park != slot:
+                                     self.slot_busy[bg_park] = True
+diff --git a/serve/test_reads.py b/serve/test_reads.py
+index 70637ee3..b870cf4c 100644
+--- a/serve/test_reads.py
++++ b/serve/test_reads.py
+@@ -48,6 +48,27 @@ class Rules(unittest.TestCase):
+                 e.slot_busy[b] = True
+             self.assertIsNone(e._reads_park_pick(0))
+ 
++    def test_min_busy_counts_the_other_slots_with_a_request(self):
++        # STRATA_READS_MIN_BUSY=N: the background only while N other slots read, decode or hold a background read
++        e = engine(8, {"reads": 2, "reads_row": 4}, gs=4)
++        self.assertEqual(server.READS_MIN_BUSY, 0)                       # opt-in
++        with e.slot_cv:
++            self.assertTrue(e._reads_busy_ok(0))                         # 0: always, as without the switch
++            with mock.patch.object(server, "READS_MIN_BUSY", 2):
++                self.assertFalse(e._reads_busy_ok(0))
++                e.slot_live[0] = {"state": "reading"}                    # its own slot is not another one
++                e.slot_live[5] = {"state": "decoding"}
++                self.assertFalse(e._reads_busy_ok(0))                    # 1 < 2
++                e.slot_busy[2] = e.slot_busy[6] = True                   # only reserved, or waiting for its BDONE
++                self.assertFalse(e._reads_busy_ok(0))
++                e.slot_live[7] = {"state": "background"}                 # a background read in its park slot
++                self.assertTrue(e._reads_busy_ok(0))                     # 2: at N
++                e.slot_live[1] = {"state": "decoding"}
++                self.assertTrue(e._reads_busy_ok(0))                     # 3: above N
++                self.assertTrue(e._reads_busy_ok(5))                     # (from slot 5: 0, 1, 7)
++                e.slot_live[1] = e.slot_live[7] = None
++                self.assertFalse(e._reads_busy_ok(5))                    # (only 0)
++
+     def test_a_finish_goes_first_on_the_control_lines(self):
+         e = engine(4, {"reads": 1, "reads_row": 1})
+         e.ctl = threading.Lock()
+@@ -244,6 +265,46 @@ class ReadsService(ParallelService):
+         self.assertNotIn("BREAD", log)
+         self.assertNotIn("bg=", log)
+ 
++    def _long_beside_one_busy(self, min_busy):
++        """A long admission while one other slot decodes, STRATA_READS_MIN_BUSY=min_busy -> the fake engine's log."""
++        self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
++        with mock.patch.object(server, "READS_MIN_BUSY", min_busy):
++            bg = self._busy_slot()
++            r = self.chat("long " * 600)
++            bg.join(30)
++        self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
++        time.sleep(0.3)
++        self.assertFalse(any(self.engine.slot_busy), self.engine.slot_busy)
++        self.assertEqual(self.engine.bg_parks, set())
++        return self.log.read_text().splitlines()
++
++    def test_min_busy_below_it_the_long_admission_reads_on_the_lines(self):
++        log = self._long_beside_one_busy(2)                              # 1 other slot busy < 2
++        longs = [x.split() for x in log if x.startswith("BGEN ") and int(x.split()[2]) > 2600]
++        self.assertTrue(longs, log)                                      # a batch admission ...
++        self.assertGreaterEqual(int(longs[0][3]), 1, log)                # ... beside the other slot's request ...
++        self.assertFalse(any("bg=" in x or x.startswith("BREAD ") for x in log), log)   # ... without bg=
++
++    def _assert_background(self, log):
++        breads = [x.split() for x in log if x.startswith("BREAD ")]
++        self.assertTrue(breads and int(breads[0][3]) > 2600, log)       # the long one, handed to the background
++        self.assertTrue(any(x.startswith(f"BREADY {breads[0][2]} ") for x in log), log)
++
++    def test_min_busy_at_it_the_long_admission_reads_in_the_background_as_before(self):
++        self._assert_background(self._long_beside_one_busy(1))          # 1 other slot busy >= 1
++
++    def test_min_busy_0_is_as_without_it(self):
++        self._assert_background(self._long_beside_one_busy(0))
++
++    def test_min_busy_leaves_a_long_request_alone_to_reads_solo(self):
++        # STRATA_READS_SOLO sends a long request alone to the background: no other slot is busy, and that is its case
++        self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4"])
++        with mock.patch.object(server, "READS_SOLO", True), mock.patch.object(server, "READS_MIN_BUSY", 4):
++            r = self.chat("long " * 600)
++        self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
++        log = self.log.read_text().splitlines()
++        self.assertTrue(log and log[0].startswith("BREAD "), log)
++
+     def test_a_dropped_background_read_is_read_on_the_lines(self):
+         self.start(8, says_groups=2, more=["--reads", "2", "--reads-row", "4", "--bg-err"])
+         bg = self._busy_slot()
+-- 
+2.43.0
+

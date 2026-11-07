@@ -19,8 +19,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Second window 03:30-04:01 CET (TESTLOG #96, 320 W): with `STRATA_READS_BG_MIN=32768` on top of the new default the
   multi-turn median is unchanged (3.39 → 3.36 s) and shorts beside a 125K read get their first token a third sooner
   (max 1.37 → 0.92 s, the long read itself 28.2 → 26.9 s), but the agent mix's main agent loses 42 % TTFT: the server
-  counts "new tokens" without the engine's parked RAM cache, so cached main turns are sent to the background. Still off;
-  next: the engine reads such a request in the foreground when its real new tokens are below the threshold.
+  counts "new tokens" without the engine's parked RAM cache, so cached main turns are sent to the background.
+- Third window 04:38-05:17 CET (TESTLOG #97): engine patch 0009 `STRATA_READS_FG_BELOW=N` (a background read with fewer
+  real new tokens after its restore is read in the foreground) fixes the main agent (TTFT p50 3.09 → 2.75 s) and keeps
+  the shorts' gain (1.43 → 1.00 s); with 16 users reading ~57K at once the follow-ups are 20 % faster, but the tails get
+  worse (slowest first turn +17 %, agent-mix p95 11.8 → 19.1 s) because background reads run at ~1.3K tok/s. Stage 2
+  stays off. Server patch 0011 adds `STRATA_READS_MIN_BUSY=N` (background reads only with N other busy slots), opt-in.
 
 ### Changed (production) - 2026-11-06
 - 07:44 UTC: `MALLOC_MMAP_THRESHOLD_` 16 MiB → **4 MiB** (TESTLOG #93). Parked conversations were refused at the RAM gate

@@ -1,0 +1,119 @@
+From 3af0006d4352fd93c41e792e479790c942db2d0f Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 04:13:43 +0100
+Subject: [PATCH] batch: a background read with few real new tokens after its
+ restore is read in the foreground (opt-in STRATA_READS_FG_BELOW=N, TESTLOG
+ #96)
+
+The server decides bg=<park> by the tokens its slots do not hold; it does not
+see the engine's parked RAM conversations.  TESTLOG #96 (STRATA_READS=2,
+STRATA_READS_BG_MIN=32768): a ~45K main-agent turn whose state was parked
+went to the background, the engine restored ~42K and read the last ~3.4K at
+background priority (readstat (42244, 45672, 3421)); main TTFT p50 2.87 ->
+4.07 s.
+
+STRATA_READS_FG_BELOW=N (read once; default 0 = off, as before): in
+bg_handoff, where the restore and the resume point are known, a prompt with
+n - resume < N new tokens is not handed over (read_plan::fg_below).  It takes
+the existing decline: "strata batch: bg=<park> not taken, the prompt is read
+here: only K new tokens after the restore (< STRATA_READS_FG_BELOW=N)", no
+BREAD, the prompt is read in the foreground, and the server frees the
+reserved park slot after the admission as for any bg= the engine does not
+take (server.py: "taken back, or not taken: the park slot goes back").
+No protocol change.  Start-up line on stderr; "ignored" without STRATA_READS
+or --batch.  read_plan_test checks the rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/program/read_plan.hpp |  6 ++++++
+ src/program/generate.cpp             | 20 +++++++++++++++++++-
+ tests/program/read_plan_test.cpp     | 11 +++++++++++
+ 3 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/include/strata/program/read_plan.hpp b/include/strata/program/read_plan.hpp
+index baff19bb..eb5dde9f 100644
+--- a/include/strata/program/read_plan.hpp
++++ b/include/strata/program/read_plan.hpp
+@@ -28,6 +28,12 @@ namespace strata::program::read_plan {
+ /// STRATA_READS=N: the engine side's switch (N >= 1; how many reads it holds at once is read_sched::reads_limit).
+ inline bool reads_on(const char* v) { return read_yield::env_count(v) >= 1; }
+ 
++/// STRATA_READS_FG_BELOW=N (opt-in; 0: off): a bg=<park> admission whose prompt has fewer than N new tokens once its
++/// restore is done (n - resume: what a parked conversation, a checkpoint or a slot did not cover) is read in the
++/// foreground - the server counts only what its slots hold, so a turn of a conversation the engine has parked looks
++/// long there and is short here (TESTLOG #96: a 45K main-agent turn, 42K restored, 3.4K read in the background).
++inline bool fg_below(int64_t n, int64_t resume, int64_t below) { return below > 0 && n - resume < below; }
++
+ /// One part of the serial cut loop: [a, b), read batched, and whether the loop checkpoints at b (a turn, root,
+ /// message or pin cut) and as the tail kind (the message cut of STRATA_MSG_CKPT_TAIL).
+ struct Part {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index bb4bbc43..85dfd363 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -266,6 +266,14 @@ int64_t reads_test_pause_env() {
+     static const int64_t k = strata::program::read_yield::env_count(std::getenv("STRATA_READS_TEST_PAUSE_EVERY"));
+     return k;
+ }
++// STRATA_READS_FG_BELOW=N (read once; default 0 = off; TESTLOG #96): a bg=<park> admission (or a STRATA_READS_FORCE_BG
++// one) with fewer than N new tokens after its restore (read_plan::fg_below: n - resume) is read in the foreground, as
++// any bg= the engine does not take ("not taken" line, no BREAD: the server frees the park slot after the admission).
++// The server's count sees what its slots hold, not the engine's parked conversations
++int64_t reads_fg_below_env() {
++    static const int64_t k = strata::program::read_yield::env_count(std::getenv("STRATA_READS_FG_BELOW"));
++    return k;
++}
+ // STRATA_ADMIT_MERGE_FIRST=1 (read once; off by default): a batch admission reads the last prompt tokens of its last
+ // windowed part (up to a window's max_t, the last prompt token included) and its first token in ONE window instead of
+ // the part's last windows and a window of the last token alone.  A row computes what it computes in any window while
+@@ -11530,6 +11538,13 @@ int main(int argc, char** argv) {
+             std::printf("INFO reads=%d reads_row=%d%s\n",
+                         strata::program::read_sched::reads_limit(std::getenv("STRATA_READS"), o.batch, rk), rk,
+                         reads_force_bg_env() ? " force_bg=1" : "");
++            if (reads_fg_below_env() > 0)
++                std::fprintf(stderr, "strata serve: STRATA_READS_FG_BELOW=%lld: a background read (bg=) with fewer new "
++                                     "tokens than that after its restore is read in the foreground\n",
++                             (long long) reads_fg_below_env());
++        } else if (reads_fg_below_env() > 0) {
++            std::fprintf(stderr, "strata serve: STRATA_READS_FG_BELOW=%lld ignored: %s\n", (long long) reads_fg_below_env(),
++                         reads_on() ? "no --batch" : "STRATA_READS is off");
+         }
+         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+         std::fflush(stdout);
+@@ -16976,7 +16991,10 @@ int main(int argc, char** argv) {
+                 namespace rp = strata::program::read_plan;
+                 const int pk = bg_park;
+                 const int limit = strata::program::read_sched::reads_limit(std::getenv("STRATA_READS"), o.batch, yield_k);
+-                if (!piped || stages.empty()) why = "it needs pipelined groups on a layer split";
++                if (rp::fg_below(n, resume, reads_fg_below_env()))   // STRATA_READS_FG_BELOW (the restore is done)
++                    why = "only " + std::to_string(n - resume) + " new tokens after the restore (< STRATA_READS_FG_BELOW=" +
++                          std::to_string(reads_fg_below_env()) + ")";
++                else if (!piped || stages.empty()) why = "it needs pipelined groups on a layer split";
+                 else if (!pipe_overlap_env()) why = "STRATA_PIPE_OVERLAP is off";
+                 else if (admit_slot < 0) why = "not a batch admission";
+                 else if (pk < 0 || pk >= (int) bs.size()) why = "no such slot";
+diff --git a/tests/program/read_plan_test.cpp b/tests/program/read_plan_test.cpp
+index 744dff31..94a87165 100644
+--- a/tests/program/read_plan_test.cpp
++++ b/tests/program/read_plan_test.cpp
+@@ -98,6 +98,17 @@ static std::vector<int64_t> lens(const std::vector<CK>& v) {
+ int main() {
+     CHECK(!rp::reads_on(nullptr) && !rp::reads_on("") && !rp::reads_on("0") && rp::reads_on("1") && rp::reads_on("4"));
+ 
++    // ---- STRATA_READS_FG_BELOW: the new tokens after the restore decide, not the prompt's length; 0 (unset): never
++    {
++        CHECK(!rp::fg_below(45672, 42244, 0));                 // off: as before (TESTLOG #96's main-agent turn)
++        CHECK(rp::fg_below(45672, 42244, 32768));              // 3428 new after the 42K restore: read here
++        CHECK(rp::fg_below(45672, 42244, 3429) && !rp::fg_below(45672, 42244, 3428));   // fewer than N, not N
++        CHECK(!rp::fg_below(125000, 0, 32768));                // a cold 125K read still goes to the background
++        CHECK(!rp::fg_below(90000, 40000, 32768));             // 50K new after a restore too
++        CHECK(!rp::fg_below(45672, 42244, ry::env_count("-5")) && !rp::fg_below(45672, 42244, ry::env_count("x")));
++        CHECK(rp::fg_below(45672, 42244, ry::env_count("32768")));
++    }
++
+     const int64_t C = 512, SR = 64;
+     auto wok = [&](int64_t a, int64_t b) { return b - a <= SR; };
+ 
+-- 
+2.43.0
+

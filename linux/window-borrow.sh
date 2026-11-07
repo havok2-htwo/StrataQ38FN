@@ -10,11 +10,16 @@
 #   N1  new binary, STRATA_SERVE_STOP_BOUND as its default (on: a request commits only the rows it can emit)
 #   N2  N1 + STRATA_PARK_BORROW=1
 #   N3  N2 + STRATA_CONV_MMAP=1 STRATA_GATE_EVICT=1 MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=1048576
-#   N4  N2 + STRATA_READS=$READS_N (stage 2 background reads, TESTLOG #88, with its starvation fix: ll7-reads2 063af1fd =
-#       ll10-borrow 23588120) + server STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN (#88's agent-mix READS arm,
-#       where it failed; w1/w2's long reads are >= 105K, its shorts and streams < 4096: there 4096 = #88's 8192).  Needs
-#       --server-tree with STRATA_SERVER_READS (Strata-srv-1106 >= 22f4781f).  FAIR (STRATA_READ_YIELD=1 + the drop-in's
-#       STRATA_YIELD_SHORT) stays on as in N2 (#88 measured READS without it); STRATA_READS_SOLO stays 0
+#   N4  $READS_BASE (N2; READS_BASE=N3: N3) + STRATA_READS=$READS_N (stage 2 background reads, TESTLOG #88, with its
+#       starvation fix: ll7-reads2 063af1fd = ll10-borrow 23588120) + server STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN
+#       (#88's agent-mix READS arm, where it failed; w1/w2's long reads are >= 105K, its shorts and streams < 4096: there
+#       4096 = #88's 8192).  #96's main agent (a parked ~45K turn sent with bg=, ~3.4K of it read at low priority):
+#       READS_FG_BELOW=N > 0 adds the engine's STRATA_READS_FG_BELOW=N (a background read with fewer than N real new tokens
+#       after its restore is read in the foreground), READS_MIN_BUSY=N > 0 the server's STRATA_READS_MIN_BUSY=N (the
+#       background only while N other slots are busy); 0 (the default) leaves them unset, N4 as before.  Needs --server-tree
+#       with STRATA_SERVER_READS (Strata-srv-1106 >= 22f4781f; + STRATA_READS_MIN_BUSY when READS_MIN_BUSY > 0).  FAIR
+#       (STRATA_READ_YIELD=1 + the drop-in's STRATA_YIELD_SHORT) stays on as in N2 (#88 measured READS without it);
+#       STRATA_READS_SOLO stays 0
 # N1..N4 run the server from Strata-143-prod too, or from --server-tree DIR (e.g. Strata-srv-1106; P and N0 always run
 # Strata-143-prod, so with --server-tree N1 vs N0 is the stop bound + the server; S0 separates the two).  Per arm, one fresh server start (empty tier dir, its own engine log), in this order:
 #   1 repro_park_ram.py pingpong @136000, 2 cycles (A2, A3: reuse target >= 95 %; SUB/SUB2 reuse; borrowed / restored /
@@ -30,14 +35,22 @@
 # more fresh server start (empty tier dir, engine-rd-<arm>.log) with
 #   R1 fair_tools.py --mode scen --scenario win --rep $WIN_REP (TESTLOG #88's w1: a cold ~125K read beside 2 decoding
 #      streams, 4 shorts at +3/6/9/12 s; w2: a cold ~105K read, a burst of 16 shorts at +4 s; one rep: 59 s in #88)
-#   R2 bench_agentic.py greedy (the agent mix where READS failed in #88: wall 116.8 -> 142-148 s)  ~6 min incl. the start
-# The summary judges N4 vs N2 as #88 did (win_vs_fair --gain 1.0 --long-tol 0.05 + the agent mix): every w1 short's
-# TTFT (max) and the time to all 16 w2 first tokens <= 1.00 x N2's, the long reads' totals <= 1.05 x, bench_agentic's
+#   R2 bench_agentic.py greedy (the agent mix where READS failed in #88: wall 116.8 -> 142-148 s)  ~5.5 min incl. the start
+#   R3 "many users, long prompts" (INFO only): bench_multiturn.py 16 users x 2 turns greedy --doc $MT_LONG_DOC (40000 =
+#      56.3-58.0K-token first turns by the model's tokenizer, 28800 = 40.3-41.6K: --doc is ~1.4 tokens per unit): 16 cold
+#      long reads at once, then their follow-ups (~4.1K new each); cut at MT_LONG_CAP (420 s); MT_LONG_DOC=0 skips it  ~4-5 min
+# The summary judges N4 vs $READS_BASE as #88 did (win_vs_fair --gain 1.0 --long-tol 0.05 + the agent mix): every w1 short's
+# TTFT (max) and the time to all 16 w2 first tokens <= 1.00 x the base's, the long reads' totals <= 1.05 x, bench_agentic's
 # and bench_multiturn's wall <= 1.05 x, every reply identical (win, bench_agentic per request, bench_multiturn), N4's
-# reads went to the background -> PASS / FAIL.  When the two reads steps no longer fit, the last one (N4) runs alone.
-# Per arm ~11-12 min by those parts (ARM_EST 15 min is the skip threshold), the reads step ~6 min (READS_EST 7): 6 arms
-# + 2 reads steps ~80 min, by the thresholds ~104 min, + production stop/start ~4 min (cap WINDOW_S 130 min).  A step
-# that no longer fits the window is skipped (logged); ARMS="P N0 N2" runs a subset (P is needed for the identity verdicts).
+# reads went to the background (R1 + R2: the engine log up to R3's start; READS_MIN_BUSY > 0, which holds w1 / w2's
+# long reads in the foreground: the whole reads step, R3 included) -> PASS / FAIL.  R3 (wall, first-turn and
+# follow-up TTFT p50/p95, replies, its background reads) is INFO, not part of PASS.  When the two reads steps no longer
+# fit, the last one (N4) runs alone.
+# Measured 11-07 (8 arm runs, 4 reads steps): an arm 9.2-9.9 min (ARM_EST 12 min is the skip threshold), the reads step
+# 5.2-5.6 min + R3 ~4-5 min (READS_EST 11, 7 without R3).  6 arms + 2 reads steps ~78 min, by the thresholds ~94 min;
+# ARMS="N3 N4" + 2 reads steps ~38 min, by the thresholds ~46 min (R3 at its cap twice: ~45); + production stop/start
+# ~2-4 min (cap WINDOW_S).  A step that no longer fits the window is skipped (logged); ARMS="P N0 N2" runs a subset (P is
+# needed for the identity verdicts).
 # Isolation: test servers only on 127.0.0.1:8091 in strata-bench.scope (MemoryMax 224G as production's unit), tier dirs
 # under /media/raid0/strata-kvspill-bench/borrow/<run> (never production's), results in results/borrow (an existing one
 # moves to results/borrow.prev-<time>), production.json / the unit / its drop-in are only read.  Production is stopped
@@ -53,6 +66,9 @@
 #   ARMS="P N0 N1 N2 N3 N4" READS_ARMS="N2 N4" WINDOW_S=7800 PP_PRESSURE=none IL_PRESSURE=cgroup ./window-borrow.sh
 #   stage 2 on the default (TESTLOG #96): ARMS="N3 N4" READS_ARMS="N3 N4" READS_BASE=N3 READS_BG_MIN=32768 WINDOW_S=3300 \
 #       BASE_SRV=$R/Strata-143-base ./window-borrow.sh --server-tree $R/Strata-srv-1106   (N4 = N3 + reads, judged vs N3)
+#   #96's follow-up (main agent: foreground below 32K real new tokens; the background only with >= 4 other slots busy):
+#       ARMS="N3 N4" READS_ARMS="N3 N4" READS_BASE=N3 READS_BG_MIN=32768 READS_FG_BELOW=32768 READS_MIN_BUSY=4 \
+#       WINDOW_S=3300 BASE_SRV=$R/Strata-143-base ./window-borrow.sh --server-tree $R/Strata-srv-1106
 #   verdicts: grep -E 'PASS|FAIL|SKIP' results/borrow/window.log; table: results/borrow/summary.txt
 set -u
 R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs
@@ -75,11 +91,19 @@ while [ $# -gt 0 ]; do
 done
 ARMS=${ARMS:-P N0 N1 N2 N3 N4}
 WINDOW_S=${WINDOW_S:-7800}; RESERVE=480                     # outage cap (stop -> restart), room kept for the restart
-ARM_EST=${ARM_EST:-900}; ARM_CAP=${ARM_CAP:-2100}           # per arm: expected / hard cap (s)
+ARM_EST=${ARM_EST:-720}; ARM_CAP=${ARM_CAP:-2100}           # per arm: expected / hard cap (s) (11-07: 554-594 s)
 READS_ARMS=${READS_ARMS-N2 N4}                              # the arms that also get the reads step (those in ARMS)
-READS_EST=${READS_EST:-420}; READS_CAP=${READS_CAP:-1200}   # the reads step: expected / hard cap (s)
 READS_N=${READS_N:-2}; READS_BG_MIN=${READS_BG_MIN:-4096}   # N4: engine STRATA_READS, server STRATA_READS_BG_MIN
+READS_FG_BELOW=${READS_FG_BELOW:-0}                         # N4: engine STRATA_READS_FG_BELOW (0: unset)
+READS_MIN_BUSY=${READS_MIN_BUSY:-0}                         # N4: server STRATA_READS_MIN_BUSY (0: unset)
 READS_BASE=${READS_BASE:-N2}                                # N4 = READS_BASE + stage 2 (N2: night of 11-07; N3: the default since)
+MT_LONG_DOC=${MT_LONG_DOC:-40000}                           # the reads step's R3: bench_multiturn --doc (0: no R3)
+MT_LONG_CAP=${MT_LONG_CAP:-420}                             # R3's timeout (s)
+for v in READS_FG_BELOW READS_MIN_BUSY MT_LONG_DOC MT_LONG_CAP; do
+    case ${!v} in ''|*[!0-9]*) echo "$v must be a non-negative integer (is '${!v}')"; exit 2 ;; esac; done
+[ "$MT_LONG_CAP" -gt 0 ] || { echo "MT_LONG_CAP must be > 0 (timeout 0 would not cut R3)"; exit 2; }
+# the reads step: expected (R1 + R2 5.2-5.6 min on 11-07, R3 ~4-5 min) / hard cap (s)
+READS_EST=${READS_EST:-$([ "$MT_LONG_DOC" -gt 0 ] && echo 660 || echo 420)}; READS_CAP=${READS_CAP:-1500}
 WIN_REP=${WIN_REP:-1}                                       # fair_tools win --rep (#88's rep 1 prompts)
 FT=$L/fair_tools.py; NEWTREE=$R/Strata-ll10-borrow
 # the starvation fix (#88: a held read waited 4 x (reads) picks; 063af1fd) adds no string to the binary: its source
@@ -216,8 +240,11 @@ arm_run() { local a=$1 cfg rc=0 u=http://127.0.0.1:$TPORT elog lab=$TAG-$1
     echo "==> $a engine: $(grep -ac 'conversation cache: restored' "$elog" 2>/dev/null) restored, $(grep -a 'conversation cache' "$elog" 2>/dev/null | grep -c borrow) borrow, $(grep -ac superseded "$elog" 2>/dev/null) superseded, $(grep -ac 'skip parking' "$elog" 2>/dev/null) skip-parking, $(grep -ac 'physical RAM admission' "$elog" 2>/dev/null) RAM refusals, $(grep -ac 'the prompt read goes to the background at' "$elog" 2>/dev/null) background reads INFO"
     sleep 2; systemctl --user stop strata-bench.scope; return $rc; }
 # reads_run <ARM>: the stage 2 reads step - one more server start (fresh tier dir, engine-rd-<ARM>.log): fair_tools win
-# (w1, w2: rep $WIN_REP -> win-<ARM>.json), then bench_agentic greedy (-> agentic.jsonl, label $TAG-<ARM>-agentic)
-reads_run() { local a=$1 cfg rc=0 u=http://127.0.0.1:$TPORT elog lab=$TAG-$1
+# (w1, w2: rep $WIN_REP -> win-<ARM>.json), then bench_agentic greedy (-> agentic.jsonl, label $TAG-<ARM>-agentic), then
+# (MT_LONG_DOC > 0) R3: bench_multiturn 16 users x 2 turns greedy --doc $MT_LONG_DOC (-> multiturn-long.jsonl, label
+# $TAG-<ARM>-mtl), cut at MT_LONG_CAP; the engine log's size at R3's start -> rd-<ARM>.mtl-at (the summary's PASS counts
+# of background reads stop there, as in #96; R3's own are counted from there)
+reads_run() { local a=$1 cfg rc=0 r u=http://127.0.0.1:$TPORT elog lab=$TAG-$1
     cfg=$(runcfg "$a" "rd-$a") || return 1; elog=$OUT/engine-rd-$a.log
     up "$lab-rdup" "$cfg" || return 1
     timeout -s INT 900 "$PY" -I "$FT" --mode scen --config "$cfg" --url "$u" --scenario win --rep "$WIN_REP" \
@@ -229,15 +256,28 @@ reads_run() { local a=$1 cfg rc=0 u=http://127.0.0.1:$TPORT elog lab=$TAG-$1
             --out "$OUT/agentic.jsonl" > "$OUT/$a-agentic.txt" 2>&1 || rc=1
         echo "==> $lab agentic: $(tail -1 "$OUT/$a-agentic.txt" | cut -c1-200) INFO"
     else echo "==> $lab: the server is gone after the win scenario FAIL"; rc=1; fi
+    if [ "$MT_LONG_DOC" -gt 0 ]; then   # R3, INFO: many users, long prompts (timeout -k: a cut run ends, it writes no row)
+        if tup; then
+            sleep 2; stat -c %s "$elog" > "$OUT/rd-$a.mtl-at" 2>/dev/null
+            timeout -s INT -k 20 "$MT_LONG_CAP" "$PY" -I "$L/bench_multiturn.py" --url "$u" --users 16 --turns 2 \
+                --doc "$MT_LONG_DOC" --temperature 0 --label "$lab-mtl" --out "$OUT/multiturn-long.jsonl" > "$OUT/$a-mtl.txt" 2>&1
+            r=$?
+            if [ $r -eq 0 ]; then echo "==> $lab multiturn-long: $(tail -1 "$OUT/$a-mtl.txt" | cut -c1-200) INFO"
+            elif [ $r -eq 124 ] || [ $r -eq 137 ]; then rc=1; echo "==> $lab multiturn-long: cut at its cap ($MT_LONG_CAP s), no row INFO"
+            else rc=1; echo "==> $lab multiturn-long: exit $r, no row (see $OUT/$a-mtl.txt) INFO"; fi
+        else echo "==> $lab: the server is gone after bench_agentic FAIL"; rc=1; fi
+    fi
     echo "$(rss_peak)" > "$OUT/rss-rd-$a.txt"; echo "==> rss rd-$a: peak $(cat "$OUT/rss-rd-$a.txt") GiB (memory.peak) INFO"
-    echo "==> rd-$a engine: $(grep -ac 'the prompt read goes to the background at' "$elog" 2>/dev/null) background reads, $(grep -ac "background read of slot .*'s request is ready" "$elog" 2>/dev/null) ready, $(grep -ac 'gives way at' "$elog" 2>/dev/null) give-ways, $(grep -ac 'engine started' "$elog" 2>/dev/null) engine starts INFO"
+    echo "==> rd-$a engine: $(grep -ac 'the prompt read goes to the background at' "$elog" 2>/dev/null) background reads, $(grep -ac "background read of slot .*'s request is ready" "$elog" 2>/dev/null) ready, $(grep -ac 'gives way at' "$elog" 2>/dev/null) give-ways, $(grep -ac 'engine started' "$elog" 2>/dev/null) engine starts, $(grep -ac 'not taken, the prompt is read here: only [0-9]* new tokens after the restore' "$elog" 2>/dev/null) bg= read in the foreground by STRATA_READS_FG_BELOW (its start line: $(grep -aqE 'STRATA_READS_FG_BELOW=[0-9]+: a background read' "$elog" 2>/dev/null && echo yes || echo no)) INFO"
     sleep 2; systemctl --user stop strata-bench.scope; return $rc; }
 export -f tup runcfg srv up rss_peak arm_run reads_run
-export PY L CF OUT TIER TPORT TAG RP SIZE CYCLES PP_PRESSURE IL_PRESSURE PP_FILLERS IL_FILLERS MT_DOC MEMMAX FT WIN_REP
+export PY L CF OUT TIER TPORT TAG RP SIZE CYCLES PP_PRESSURE IL_PRESSURE PP_FILLERS IL_FILLERS MT_DOC MEMMAX FT WIN_REP \
+    MT_LONG_DOC MT_LONG_CAP
 cfg_exe() { python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['exe'])" "$1"; }
 
 # ---- summary (no GPU; after production is back) -----------------------------------------------------------------------
-summary() { READS_N=$READS_N READS_BG_MIN=$READS_BG_MIN READS_BASE=$READS_BASE "$PY" -I - "$OUT" "$L/results/sweep.jsonl" "$L/results/sweep.requests.jsonl" "$L/compare_replies.py" "$TAG" $ARMS <<'PYEOF'
+summary() { READS_N=$READS_N READS_BG_MIN=$READS_BG_MIN READS_BASE=$READS_BASE READS_FG_BELOW=$READS_FG_BELOW \
+    READS_MIN_BUSY=$READS_MIN_BUSY MT_LONG_DOC=$MT_LONG_DOC "$PY" -I - "$OUT" "$L/results/sweep.jsonl" "$L/results/sweep.requests.jsonl" "$L/compare_replies.py" "$TAG" $ARMS <<'PYEOF'
 import argparse, contextlib, io, json, os, re, statistics, subprocess, sys
 from pathlib import Path
 out, sweep, sreq, cmp, tag, arms = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
@@ -263,6 +303,7 @@ for r in jl(out / "agentic.jsonl"):
     if lab.startswith(tag + "-") and lab.endswith("-agentic"):
         ag[lab[len(tag) + 1:-len("-agentic")]] = r
 mtrow = {r.get("label"): r for r in jl(out / "multiturn.jsonl")}
+mlrow = {r.get("label"): r for r in jl(out / "multiturn-long.jsonl")}     # the reads step's R3 ($TAG-<arm>-mtl)
 scen = {}
 for r in jl(out / "repro.jsonl"):
     if r.get("kind") == "scenario":
@@ -365,10 +406,15 @@ print("(pp = pingpong PASS: A2 and A3 >= 95 % reused and above the grid point be
 
 # ---- stage 2 (background reads): N4 vs N2, TESTLOG #88's rule ---------------------------------------------------------
 RB, RN = os.environ.get("READS_BASE", "N2"), "N4"
-RA = [a for a in arms if (out / f"win-{a}.json").exists() or a in ag]
-def bgstat(name):
+RA = [a for a in arms if (out / f"win-{a}.json").exists() or a in ag or f"{tag}-{a}-mtl" in mlrow]
+def mtl_at(a):              # engine-rd-<a>.log's size when R3 started (None: no R3 ran)
     try:
-        lines = open(out / name, errors="replace").read().splitlines()
+        return int(open(out / f"rd-{a}.mtl-at").read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+def bgstat(name, lo=0, hi=None):    # the log's bytes lo..hi (R1 + R2: 0..mtl_at; R3: mtl_at..)
+    try:
+        lines = open(out / name, "rb").read()[lo:hi].decode("utf-8", "replace").splitlines()
     except OSError:
         return None
     if FTM is None:
@@ -378,9 +424,13 @@ def bgstat(name):
     errd = sum("background read of slot" in ln and " ends at " in ln and ": err" in ln for ln in lines)
     unp = sum("holds no read of this prompt that gave way" in ln for ln in lines)
     return {"bg": bg, "ready": rdy, "err": errd, "unpinned": unp, "give": sum("gives way at" in ln for ln in lines)}
-def bgs(name):
-    b = bgstat(name)
+def bgs(name, lo=0, hi=None):
+    b = bgstat(name, lo, hi)
     return "-" if b is None else f"{b['bg']}/{b['ready']}"
+def ml_fo95(r):             # the follow-ups' TTFT p95: turn 2's (R3 has 2 turns; with more, the largest turn's p95)
+    v = [g2(r, f"turn{t}", "ttft_p95") for t in range(2, int((r or {}).get("turns") or 0) + 1)]
+    v = [x for x in v if x is not None]
+    return max(v) if v else None
 def ag_keyed(r):            # per request: (who, its k-th call) -> reply sha (None: an error or no sha in the row)
     d = {}
     for row in sorted((r or {}).get("rows") or [], key=lambda z: z.get("at", 0)):
@@ -407,15 +457,18 @@ def g2(d, *ks):
     return d
 if RA:
     print()
-    print(f"# stage 2 reads step (one more server start per arm: fair_tools win --rep, then bench_agentic greedy); mt = the "
-          f"arm's own bench_multiturn run; bg rd = background reads handed / ready (reads step, arm run)")
+    print(f"# stage 2 reads step (one more server start per arm: fair_tools win --rep, bench_agentic greedy, then R3 "
+          f"bench_multiturn 16 x 2 greedy --doc {os.environ.get('MT_LONG_DOC', '?')}); mt = the arm's own bench_multiturn "
+          f"run; bg rd = background reads handed / ready (reads step R1 + R2, R3 = ml bg, arm run)")
     h2 = (f"{'arm':4s} {'w1 p50':>6s} {'w1 max':>6s} {'w1 long':>7s} {'w2 all':>6s} {'w2 p50':>6s} {'w2 p95':>6s} "
           f"{'w2 long':>7s} {'ag wall':>7s} {'main':>5s} {'sub':>5s} {'chat':>5s} {'ag p95':>6s} {'ag tok':>6s} "
-          f"{'mt wall':>7s} {'mt fol':>6s} {'bg rd':>7s} {'bg arm':>7s} {'RSS':>6s}")
+          f"{'mt wall':>7s} {'mt fol':>6s} {'ml wall':>7s} {'ml1 50':>6s} {'ml1 95':>6s} {'mlf 50':>6s} {'mlf 95':>6s} "
+          f"{'bg rd':>7s} {'ml bg':>7s} {'bg arm':>7s} {'RSS':>6s}")
     print(h2); print("-" * len(h2))
     for a in RA:
         w = win_of(a) or {}
         w1, w2, g, m = w.get("w1") or {}, w.get("w2") or {}, ag.get(a) or {}, mtrow.get(f"{tag}-{a}-mt") or {}
+        x, at = mlrow.get(f"{tag}-{a}-mtl") or {}, mtl_at(a)
         try:
             rr = open(out / f"rss-rd-{a}.txt").read().strip()
         except OSError:
@@ -425,14 +478,50 @@ if RA:
               f"{f(w2.get('long_total'), 2):>7s} {f(g.get('wall_s'), 1):>7s} {f(g2(g, 'main', 'ttft_p50'), 2):>5s} "
               f"{f(g2(g, 'sub', 'ttft_p50'), 2):>5s} {f(g2(g, 'chat', 'ttft_p50'), 2):>5s} {f(g2(g, 'main', 'ttft_p95'), 2):>6s} "
               f"{str(g.get('out_tok', '-')):>6s} {f(m.get('wall_s'), 1):>7s} {f(m.get('follow_ttft_p50'), 2):>6s} "
-              f"{bgs(f'engine-rd-{a}.log'):>7s} {bgs(f'engine-{a}.log'):>7s} {rr:>6s}")
+              f"{f(x.get('wall_s'), 1):>7s} {f(g2(x, 'turn1', 'ttft_p50'), 2):>6s} {f(g2(x, 'turn1', 'ttft_p95'), 2):>6s} "
+              f"{f(x.get('follow_ttft_p50'), 2):>6s} {f(ml_fo95(x), 2):>6s} "
+              f"{bgs(f'engine-rd-{a}.log', 0, at):>7s} {bgs(f'engine-rd-{a}.log', at) if at is not None else '-':>7s} "
+              f"{bgs(f'engine-{a}.log'):>7s} {rr:>6s}")
     print("(#88 for reference, rep 1-2 medians, production of then: w1 short TTFT max PROD 20.20 / FAIR 1.19 / READS "
           "0.88 s, w2 all 16 first 17.08 / 4.87 / 17.03 s; bench_agentic wall PROD 116.8-116.9 / READS 142.1-148.3 s)")
+    print("(ml = R3, many users, long prompts: wall (s), ml1 = first-turn TTFT p50 / p95 (16 cold long reads at once), "
+          "mlf = follow-up TTFT p50 / p95 (turn 2), ml bg = its background reads handed / ready; INFO, not part of PASS)")
     wb, wn = win_of(RB), win_of(RN)
     gb, gn = ag.get(RB), ag.get(RN)
     mb, mn = mtrow.get(f"{tag}-{RB}-mt"), mtrow.get(f"{tag}-{RN}-mt")
-    what = (f"{RN} (N2 + STRATA_READS={os.environ.get('READS_N', '?')}, server STRATA_SERVER_READS=1 "
-            f"STRATA_READS_BG_MIN={os.environ.get('READS_BG_MIN', '?')}, the starvation fix 063af1fd)")
+    fgb, mbz = os.environ.get("READS_FG_BELOW", "0"), os.environ.get("READS_MIN_BUSY", "0")
+    what = (f"{RN} ({RB} + STRATA_READS={os.environ.get('READS_N', '?')}"
+            f"{' STRATA_READS_FG_BELOW=' + fgb if fgb not in ('', '0') else ''}, server STRATA_SERVER_READS=1 "
+            f"STRATA_READS_BG_MIN={os.environ.get('READS_BG_MIN', '?')}"
+            f"{' STRATA_READS_MIN_BUSY=' + mbz if mbz not in ('', '0') else ''}, the starvation fix 063af1fd)")
+    def ml_line():          # R3 (INFO): RN vs RB, many users, long prompts
+        xb, xn = mlrow.get(f"{tag}-{RB}-mtl"), mlrow.get(f"{tag}-{RN}-mtl")
+        if not (xb or xn):
+            if mtl_at(RB) is not None or mtl_at(RN) is not None:
+                print(f"==> stage 2 {RN} vs {RB} many users, long prompts (R3): no bench_multiturn row (cut at its cap or "
+                      f"failed: see {RB}-mtl.txt, {RN}-mtl.txt) INFO")
+            return
+        def p(fn):
+            return f"{f(fn(xb) if xb else None, 2)} -> {f(fn(xn) if xn else None, 2)}"
+        wl = ((xb or {}).get("wall_s"), (xn or {}).get("wall_s"))
+        rel = f"{100 * (wl[1] / wl[0] - 1):+.1f} %" if None not in wl and wl[0] else "-"
+        sm = "-"
+        if xb and xn:
+            x = {(r[0], r[1]): r[3] for r in xb.get("replies") or []}
+            y = {(r[0], r[1]): r[3] for r in xn.get("replies") or []}
+            k = set(x) | set(y)
+            sm = f"{sum(x.get(i) is not None and x.get(i) == y.get(i) for i in k)}/{len(k)}"
+        def bgml(a):
+            at = mtl_at(a)
+            b = bgstat(f"engine-rd-{a}.log", at) if at is not None else None
+            return "-" if not b else f"{b['bg']} handed / {b['ready']} ready / {b['err']} err / {b['unpinned']} unpinned"
+        r0 = xn or xb
+        print(f"==> stage 2 {RN} vs {RB} many users, long prompts (R3: bench_multiturn {r0.get('users')} users x "
+              f"{r0.get('turns')} turns greedy, --doc {os.environ.get('MT_LONG_DOC', '?')} = ~{g2(r0, 'turn1', 'prompt')} "
+              f"tok first turns read cold at once): wall {f(wl[0], 1)} -> {f(wl[1], 1)} s ({rel}); first-turn TTFT p50 "
+              f"{p(lambda r: g2(r, 'turn1', 'ttft_p50'))} s, p95 {p(lambda r: g2(r, 'turn1', 'ttft_p95'))} s; follow-up "
+              f"TTFT p50 {p(lambda r: r.get('follow_ttft_p50'))} s, p95 {p(ml_fo95)} s; replies {sm} identical; background "
+              f"reads {RN}: {bgml(RN)}, {RB}: {bgml(RB)} INFO")
     if FTM and wb and wn:          # #88's own tool on the same files (median of one run = the run)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -450,6 +539,7 @@ if RA:
     if not (wb and wn and gb and gn):
         print(f"==> stage 2 {RN} vs {RB}: not measured (reads step ran for {', '.join(RA) or 'none'}; want both win "
               f"files and both bench_agentic runs) INFO")
+        ml_line()
     else:
         res = []
         def judge(name, ok, line):
@@ -482,12 +572,18 @@ if RA:
         ok = sw[0] == sw[1] > 0 and sa[0] == sa[1] > 0 and sm is not None and sm[0] == sm[1] > 0
         judge("replies", ok, f"replies (greedy): win {sw[0]}/{sw[1]}, bench_agentic {sa[0]}/{sa[1]} (per request), "
               f"bench_multiturn {'-' if sm is None else f'{sm[0]}/{sm[1]}'} identical")
-        st_rd, st_arm = bgstat(f"engine-rd-{RN}.log"), bgstat(f"engine-{RN}.log")
+        # READS_MIN_BUSY > 0 keeps a read in the foreground while fewer other slots are busy (w1's long read beside 2
+        # streams, w2's beside none: R1 / R2 may hand none, by design): then judged over the whole reads step, R3 included
+        whole = mbz not in ("", "0")
+        st_rd, st_arm = bgstat(f"engine-rd-{RN}.log", 0, None if whole else mtl_at(RN)), bgstat(f"engine-{RN}.log")
+        part = (f"R1 + R2 + R3, READS_MIN_BUSY={mbz}; R1 + R2 alone {bgs(f'engine-rd-{RN}.log', 0, mtl_at(RN))}"
+                if whole else "R1 + R2")
         ok = bool(st_rd) and st_rd["bg"] > 0 and st_rd["ready"] == st_rd["bg"] and st_rd["err"] == 0 and st_rd["unpinned"] == 0
-        judge("bg", ok, f"background reads: reads step {st_rd and st_rd['bg']} handed / {st_rd and st_rd['ready']} ready / "
+        judge("bg", ok, f"background reads: reads step ({part}) {st_rd and st_rd['bg']} handed / {st_rd and st_rd['ready']} ready / "
               f"{st_rd and st_rd['err']} dropped with err / {st_rd and st_rd['unpinned']} unpinned (want > 0, all ready, "
               f"none err / unpinned); arm run {st_arm and st_arm['bg']} / {st_arm and st_arm['ready']}; {RB}: "
-              f"{(bgstat(f'engine-rd-{RB}.log') or {}).get('bg')} (want 0)")
+              f"{(bgstat(f'engine-rd-{RB}.log', 0, None if whole else mtl_at(RB)) or {}).get('bg')} (want 0)")
+        ml_line()
         bad = [n for n, ok in res if not ok]
         print(f"==> stage 2 {what} vs {RB}: {'PASS (all ' + str(len(res)) + ')' if not bad else 'FAIL (' + ', '.join(bad) + ')'}")
 PYEOF
@@ -523,7 +619,13 @@ for a in $ARMS; do
     miss=; for s in ${NEED[$a]:-}; do grep -qa "$s" "$NEWSRC" || miss="$miss $s"; done
     case $a in N3|N4) grep -qa STRATA_PARK_BORROW "$NEWSRC" || miss="$miss STRATA_PARK_BORROW" ;; esac
     if [ "$a" = N4 ]; then   # the server half, the starvation fix in the binary, nothing of it in the baseline already
+        [ "$READS_BASE" = N3 ] && for s in ${NEED[N3]}; do grep -qa "$s" "$NEWSRC" || miss="$miss $s(READS_BASE=N3)"; done
         grep -q 'STRATA_SERVER_READS' "$NSRV/serve/server.py" || miss="$miss STRATA_SERVER_READS(server $NSRV: --server-tree)"
+        # #96's follow-up switches, only when set: the engine's in the binary, the server's as a quoted name in server.py
+        [ "$READS_FG_BELOW" -gt 0 ] && ! grep -qa STRATA_READS_FG_BELOW "$NEWSRC" \
+            && miss="$miss STRATA_READS_FG_BELOW(binary $NEWSRC: READS_FG_BELOW=$READS_FG_BELOW)"
+        [ "$READS_MIN_BUSY" -gt 0 ] && ! grep -qE "[\"']STRATA_READS_MIN_BUSY[\"']" "$NSRV/serve/server.py" \
+            && miss="$miss STRATA_READS_MIN_BUSY(server $NSRV: READS_MIN_BUSY=$READS_MIN_BUSY)"
         fixt=$(git -C "$NEWTREE" log -1 --format=%ct -S"$READS_FIX_SRC" HEAD -- src/program/generate.cpp 2>/dev/null)
         if [ -z "$fixt" ] || ! git -C "$NEWTREE" grep -qF "$READS_FIX_SRC" HEAD -- src/program/generate.cpp; then
             miss="$miss reads-fix-063af1fd(not in $NEWTREE HEAD)"
@@ -569,11 +671,15 @@ cp "$NEWSRC" "$NEW" && chmod +x "$NEW" || { echo "cannot copy $NEWSRC"; exit 1; 
 [ "$(sha256sum "$NEW" | cut -c1-16)" = "$NEW_SHA" ] || { echo "$NEWSRC changed while it was copied (a build running?)"; exit 1; }
 echo "$PPCHK" | sed 's/^/    [dry-run --exact] /' >> "$OUT/window.log"
 [ -n "$TOKCHK" ] && echo "$TOKCHK" | sed 's/^/    [tokcheck] /' >> "$OUT/window.log"
-log "window prep ($TAG): arms $ARMS; reads step for '${RARMS:-none}' (fair_tools win --rep $WIN_REP + bench_agentic; N4: STRATA_READS=$READS_N, server STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN; $NEWTREE $(git -C "$NEWTREE" status --porcelain -- src include CMakeLists.txt 2>/dev/null | grep -q . && echo 'has UNCOMMITTED source changes' || echo 'sources clean')); production $(basename "$PRODSRC") sha256 $PRODCFG_SHA, exe $(basename "$PEXE") sha256 $PROD_SHA, server $SRV @$(git -C "$SRV" rev-parse --short HEAD); new $NEWSRC sha256 $NEW_SHA ($(git -C "$R/Strata-ll10-borrow" rev-parse --short HEAD 2>/dev/null) $(git -C "$R/Strata-ll10-borrow" log -1 --format=%s 2>/dev/null | cut -c1-70)) -> $NEW; N server $NSRV @$(git -C "$NSRV" rev-parse --short HEAD); server env: $SRVENV; pingpong @$SIZE x$CYCLES pressure $PP_PRESSURE fillers $PP_FILLERS, interleave pressure $IL_PRESSURE fillers $IL_FILLERS; baseline (P, and the arms' config) $(basename "$BASESRC"), exe $(basename "$BEXE")"
+log "window prep ($TAG): arms $ARMS; reads step for '${RARMS:-none}' (fair_tools win --rep $WIN_REP + bench_agentic$([ "$MT_LONG_DOC" -gt 0 ] && echo " + R3 bench_multiturn 16 x 2 --doc $MT_LONG_DOC cap $MT_LONG_CAP s"); N4: $READS_BASE + STRATA_READS=$READS_N$([ "$READS_FG_BELOW" -gt 0 ] && echo " STRATA_READS_FG_BELOW=$READS_FG_BELOW"), server STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN$([ "$READS_MIN_BUSY" -gt 0 ] && echo " STRATA_READS_MIN_BUSY=$READS_MIN_BUSY"); $NEWTREE $(git -C "$NEWTREE" status --porcelain -- src include CMakeLists.txt 2>/dev/null | grep -q . && echo 'has UNCOMMITTED source changes' || echo 'sources clean')); production $(basename "$PRODSRC") sha256 $PRODCFG_SHA, exe $(basename "$PEXE") sha256 $PROD_SHA, P/N0 server $SRV @$(git -C "$SRV" rev-parse --short HEAD); new $NEWSRC sha256 $NEW_SHA ($(git -C "$R/Strata-ll10-borrow" rev-parse --short HEAD 2>/dev/null) $(git -C "$R/Strata-ll10-borrow" log -1 --format=%s 2>/dev/null | cut -c1-70)) -> $NEW; N server $NSRV @$(git -C "$NSRV" rev-parse --short HEAD); server env: $SRVENV; pingpong @$SIZE x$CYCLES pressure $PP_PRESSURE fillers $PP_FILLERS, interleave pressure $IL_PRESSURE fillers $IL_FILLERS; baseline (P, and the arms' config) $(basename "$BASESRC"), exe $(basename "$BEXE")"
 
 # configs, all from the baseline config (production's unless BASE_CONFIG): exe, then the arm's env changes (K=V sets, -K drops); the sidecar <name>.srv:
 # the server checkout + production's server env (+ SRVX[name]: the arm's own server env)
-declare -A SRVX=([N4]="STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN")
+SRV4="STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=$READS_BG_MIN"     # N4's server env (+ STRATA_READS_MIN_BUSY only when > 0)
+[ "$READS_MIN_BUSY" -gt 0 ] && SRV4="$SRV4 STRATA_READS_MIN_BUSY=$READS_MIN_BUSY"
+declare -A SRVX=([N4]="$SRV4")
+R4=("STRATA_READS=$READS_N")                                        # N4's engine env on top of READS_BASE
+[ "$READS_FG_BELOW" -gt 0 ] && R4+=("STRATA_READS_FG_BELOW=$READS_FG_BELOW")
 mkcfg() {   # $1 name, $2 exe, $3 server dir, then changes ...
     local name=$1 exe=$2 sdir=$3; shift 3
     python3 - "$BASESRC" "$CF/$name.json" "$exe" "$@" <<'PYEOF' || exit 1
@@ -597,9 +703,9 @@ mkcfg N2 "$NEW"  "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW
 mkcfg N3 "$NEW"  "$NSRV" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_CONV_MMAP=1 STRATA_GATE_EVICT=1 \
     MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=1048576
 case $READS_BASE in
-  N2) mkcfg N4 "$NEW" "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_READS="$READS_N" ;;   # N2 + stage 2
+  N2) mkcfg N4 "$NEW" "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 "${R4[@]}" ;;               # N2 + stage 2
   N3) mkcfg N4 "$NEW" "$NSRV" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_CONV_MMAP=1 STRATA_GATE_EVICT=1 \
-          MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=1048576 STRATA_READS="$READS_N" ;;                      # N3 + stage 2
+          MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=1048576 "${R4[@]}" ;;                                    # N3 + stage 2
   *) echo "READS_BASE must be N2 or N3"; exit 1 ;;
 esac
 for a in P N0 S0 N1 N2 N3 N4; do
@@ -619,7 +725,8 @@ if [ "$DRY" = 1 ]; then
         echo "    + run_strata_variant.sh (ATTACH) $TAG-$a-short 1,8,16 --rounds 2 --max-tok 512 --max-tok-min 128 --prompt-tok 100 --temperature 0"; done
     for a in $RARMS; do echo "  step reads_$a (expected ~$(( READS_EST / 60 )) min, cap $(( READS_CAP / 60 )) min): reads_run $a -> $OUT/reads_$a.txt (one more fresh server start, after all arms)"
         echo "    + fair_tools.py --mode scen --scenario win --rep $WIN_REP --label $TAG-$a-win -> win-$a.json (w1 cold ~125K beside 2 streams + 4 shorts, w2 cold ~105K + 16 shorts)"
-        echo "    + bench_agentic.py --temperature 0 --label $TAG-$a-agentic -> agentic.jsonl"; done
+        echo "    + bench_agentic.py --temperature 0 --label $TAG-$a-agentic -> agentic.jsonl"
+        [ "$MT_LONG_DOC" -gt 0 ] && echo "    + R3 (INFO) bench_multiturn.py --users 16 --turns 2 --doc $MT_LONG_DOC --temperature 0 --label $TAG-$a-mtl -> multiturn-long.jsonl (16 cold ~$(( MT_LONG_DOC * 7 / 5000 ))K-token first turns at once, then the follow-ups; timeout $MT_LONG_CAP s)"; done
     [ "$(echo $RARMS | wc -w)" -gt 1 ] && echo "  (the reads steps run back to back; when they no longer all fit, only the last, ${RARMS##* }, runs)"
     echo "  then: production restarted (EXIT trap; $GUNIT.service on a SIGKILL; $RUNIT.timer backstop), summary table -> $OUT/summary.txt"
     grep -E '^(what|A |  )' <<< "$PPCHK" | sed 's/^/  [dry-run --exact] /'

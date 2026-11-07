@@ -522,7 +522,9 @@ series `patches/v0.1.44.1-ll10-borrow/`, on the production engine 28de225d) and 
 without them (TESTLOG #95). Not on: stage-2 background reads (`STRATA_READS`), which cut short-request TTFT beside a long
 read by a third but slowed the 16-user multi-turn median by 62 % at `STRATA_READS_BG_MIN=4096`; at 32768 the multi-turn
 median is unchanged, but the agent mix's main agent is 42 % slower because the server sends turns whose state is parked
-in the engine's RAM cache to the background (TESTLOG #96; the fix belongs in the engine).
+in the engine's RAM cache to the background (TESTLOG #96). With the engine counting real new tokens
+(`STRATA_READS_FG_BELOW`, TESTLOG #97) the medians improve for nearly everyone but the tails get worse, because background
+reads run at ~1.3K tok/s; still off.
 
 Reproduce: `python3 -I linux/repro_park_ram.py --scenarios pingpong --sizes 136000 --cycles 2` (test port 8091 by default,
 `--allow-prod` for production); GPU A/B: `linux/window-borrow.sh` (`DRY=1` first).
