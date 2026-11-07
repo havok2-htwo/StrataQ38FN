@@ -51,6 +51,8 @@
 #   DRY=1 ./window-borrow.sh [--server-tree DIR]   # prep checks + configs + the plan; production untouched
 #   ./window-borrow.sh [--server-tree DIR]         # the window (needs the user's GPU-window approval)
 #   ARMS="P N0 N1 N2 N3 N4" READS_ARMS="N2 N4" WINDOW_S=7800 PP_PRESSURE=none IL_PRESSURE=cgroup ./window-borrow.sh
+#   stage 2 on the default (TESTLOG #96): ARMS="N3 N4" READS_ARMS="N3 N4" READS_BASE=N3 READS_BG_MIN=32768 WINDOW_S=3300 \
+#       BASE_SRV=$R/Strata-143-base ./window-borrow.sh --server-tree $R/Strata-srv-1106   (N4 = N3 + reads, judged vs N3)
 #   verdicts: grep -E 'PASS|FAIL|SKIP' results/borrow/window.log; table: results/borrow/summary.txt
 set -u
 R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs
@@ -77,6 +79,7 @@ ARM_EST=${ARM_EST:-900}; ARM_CAP=${ARM_CAP:-2100}           # per arm: expected 
 READS_ARMS=${READS_ARMS-N2 N4}                              # the arms that also get the reads step (those in ARMS)
 READS_EST=${READS_EST:-420}; READS_CAP=${READS_CAP:-1200}   # the reads step: expected / hard cap (s)
 READS_N=${READS_N:-2}; READS_BG_MIN=${READS_BG_MIN:-4096}   # N4: engine STRATA_READS, server STRATA_READS_BG_MIN
+READS_BASE=${READS_BASE:-N2}                                # N4 = READS_BASE + stage 2 (N2: night of 11-07; N3: the default since)
 WIN_REP=${WIN_REP:-1}                                       # fair_tools win --rep (#88's rep 1 prompts)
 FT=$L/fair_tools.py; NEWTREE=$R/Strata-ll10-borrow
 # the starvation fix (#88: a held read waited 4 x (reads) picks; 063af1fd) adds no string to the binary: its source
@@ -234,7 +237,7 @@ export PY L CF OUT TIER TPORT TAG RP SIZE CYCLES PP_PRESSURE IL_PRESSURE PP_FILL
 cfg_exe() { python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['exe'])" "$1"; }
 
 # ---- summary (no GPU; after production is back) -----------------------------------------------------------------------
-summary() { READS_N=$READS_N READS_BG_MIN=$READS_BG_MIN "$PY" -I - "$OUT" "$L/results/sweep.jsonl" "$L/results/sweep.requests.jsonl" "$L/compare_replies.py" "$TAG" $ARMS <<'PYEOF'
+summary() { READS_N=$READS_N READS_BG_MIN=$READS_BG_MIN READS_BASE=$READS_BASE "$PY" -I - "$OUT" "$L/results/sweep.jsonl" "$L/results/sweep.requests.jsonl" "$L/compare_replies.py" "$TAG" $ARMS <<'PYEOF'
 import argparse, contextlib, io, json, os, re, statistics, subprocess, sys
 from pathlib import Path
 out, sweep, sreq, cmp, tag, arms = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
@@ -361,7 +364,7 @@ print("(pp = pingpong PASS: A2 and A3 >= 95 % reused and above the grid point be
       "w2 first tokens, ag wall = bench_agentic's wall (s): the reads step, arms of READS_ARMS only)")
 
 # ---- stage 2 (background reads): N4 vs N2, TESTLOG #88's rule ---------------------------------------------------------
-RB, RN = "N2", "N4"
+RB, RN = os.environ.get("READS_BASE", "N2"), "N4"
 RA = [a for a in arms if (out / f"win-{a}.json").exists() or a in ag]
 def bgstat(name):
     try:
@@ -593,7 +596,12 @@ mkcfg N1 "$NEW"  "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND
 mkcfg N2 "$NEW"  "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1
 mkcfg N3 "$NEW"  "$NSRV" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_CONV_MMAP=1 STRATA_GATE_EVICT=1 \
     MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=1048576
-mkcfg N4 "$NEW"  "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_READS="$READS_N"   # N2 + stage 2
+case $READS_BASE in
+  N2) mkcfg N4 "$NEW" "$NSRV" "${OFF[@]}" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_READS="$READS_N" ;;   # N2 + stage 2
+  N3) mkcfg N4 "$NEW" "$NSRV" -STRATA_SERVE_STOP_BOUND STRATA_PARK_BORROW=1 STRATA_CONV_MMAP=1 STRATA_GATE_EVICT=1 \
+          MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=1048576 STRATA_READS="$READS_N" ;;                      # N3 + stage 2
+  *) echo "READS_BASE must be N2 or N3"; exit 1 ;;
+esac
 for a in P N0 S0 N1 N2 N3 N4; do
     log "    [cfg] $a: exe $(basename "$(cfg_exe "$CF/$a.json")"), server $(sed 's/ .*//' "$CF/$a.srv")${SRVX[$a]:+ + server env ${SRVX[$a]}}, env vs production: $(python3 -c "
 import json,sys; p=json.load(open(sys.argv[1]))['env']; c=json.load(open(sys.argv[2]))['env']

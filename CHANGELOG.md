@@ -15,7 +15,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `linux/deploy-ll10b.sh` (`--prev`: the 2026-11-06 state, `--rollback`: 1441j-reads2 + server 90f73293).
 - Stage-2 background reads (`STRATA_READS`, arm N4) are **not** on: shorts beside a long read −32 % TTFT and agent-mix
   p95 −37 %, but the 16-user multi-turn follow-up TTFT median +62 % because follow-ups of 4-11K new tokens went to the
-  background at ~740 tok/s (`STRATA_READS_BG_MIN=4096` too low). A higher threshold is the next measurement.
+  background at ~740 tok/s (`STRATA_READS_BG_MIN=4096` too low).
+- Second window 03:30-04:01 CET (TESTLOG #96, 320 W): with `STRATA_READS_BG_MIN=32768` on top of the new default the
+  multi-turn median is unchanged (3.39 → 3.36 s) and shorts beside a 125K read get their first token a third sooner
+  (max 1.37 → 0.92 s, the long read itself 28.2 → 26.9 s), but the agent mix's main agent loses 42 % TTFT: the server
+  counts "new tokens" without the engine's parked RAM cache, so cached main turns are sent to the background. Still off;
+  next: the engine reads such a request in the foreground when its real new tokens are below the threshold.
 
 ### Changed (production) - 2026-11-06
 - 07:44 UTC: `MALLOC_MMAP_THRESHOLD_` 16 MiB → **4 MiB** (TESTLOG #93). Parked conversations were refused at the RAM gate
