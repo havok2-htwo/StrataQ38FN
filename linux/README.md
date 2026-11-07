@@ -496,6 +496,35 @@ to Strata and checks every service, `linux/rollback.sh` goes back. Boot without 
 day 380 W, night mode 280 W from 22:00 to 07:00 (`G3_VLLM/logs/genesis_power_settings.json`, NOPASSWD sudo rule
 for `nvidia-smi -pl`).
 
+**Current production (since 2026-11-07 03:12 CET):** `production.json -> T16-ll10b-g8-mmap1m-prod262r-vision-cpu.json`,
+engine `strata-g3-ll10b`, server Strata-143-prod @22f4781f, conversation cache 124 GiB; deploy and the two ways back:
+`linux/deploy-ll10b.sh [--prev|--rollback]` (see the next section).
+
+## Conversation cache: borrow, mmap'd buffers, evicting RAM gates (default since 2026-11-07)
+
+Three problems lost the cache of long agent chats (Genesis main chat ~130-180K tokens) whenever other requests ran in
+between (TESTLOG #93-#95):
+
+1. **The RAM gate refused every large park.** Freed snapshot memory stayed in glibc's arenas (108 GB arena RSS with
+   ~13 GB parked), so the gate's "available" never rose above the 16 GiB floor; it evicted every parked conversation and
+   refused anyway. Fix: `MALLOC_MMAP_THRESHOLD_` / `MALLOC_TRIM_THRESHOLD_` 1 MiB and `STRATA_CONV_MMAP=1` (parked K/V
+   and checkpoint state mmap'd one by one, so an eviction returns its RAM at once).
+2. **A shallow match consumed the long chat.** A restore took the whole parked entry and pruned its deeper checkpoints,
+   so a sub-agent that shares only the 8192-token root (same tool list head) destroyed the 132K main chat. Fix:
+   `STRATA_PARK_BORROW=1`: such a request borrows a copy up to its checkpoint and the entry stays parked
+   (log line `conversation cache: borrowed N of a parked M-token conversation`).
+3. **A slot's capture was refused without evicting** while the slot was the chat's only copy. Fix: `STRATA_GATE_EVICT=1`
+   (both gates evict what can help, stop when eviction does not return memory) and 4 GiB more host headroom (cache 124 GiB).
+
+Effect on production (Genesis count, long main chat with other calls in between): 5 of 20 hits before, 47 of 51 with
+the borrow engine; prompts ≥100K reused 73.3 % → 91.7 % of their tokens. Every switch is opt-in in the engine (patch
+series `patches/v0.1.44.1-ll10-borrow/`, on the production engine 28de225d) and greedy replies are identical with and
+without them (TESTLOG #95). Not on: stage-2 background reads (`STRATA_READS`), which cut short-request TTFT beside a long
+read by a third but slowed the 16-user multi-turn median by 62 % at `STRATA_READS_BG_MIN=4096`.
+
+Reproduce: `python3 -I linux/repro_park_ram.py --scenarios pingpong --sizes 136000 --cycles 2` (test port 8091 by default,
+`--allow-prod` for production); GPU A/B: `linux/window-borrow.sh` (`DRY=1` first).
+
 ## Images (vision)
 
 Clients send pictures the OpenAI way, as `image_url` parts of a user message (a `data:` URL with base64, an http(s)
@@ -554,6 +583,10 @@ llama.cpp/ggml (MIT); both notices are in [`THIRD_PARTY_NOTICES.md`](../THIRD_PA
 | `results/sweep.jsonl`, `results/*.txt` | all measurement results |
 | `patches/` | Strata engine patches. **Current: `patches/v0.1.43/` (43 patches on v0.1.43; 0041–0043: slot_turn fix, vision guard, image gate)**, the earlier `patches/v0.1.42/` (28 patches on v0.1.42, see Setup); the 0.1.41 series: `0001`/`0002` (more than 8 slots, direct slot copy), `mmq-tab/`, `overlap/`; `experimental/`: overlap prototype (measurement only) |
 | `bench_multiturn.py` | agent/multi-turn benchmark |
+| `repro_park_ram.py` | reproductions of the conversation-cache losses (interleave, checkbranch, pingpong with a sub-agent sharing the tool head); test port by default, `--allow-prod` for production |
+| `window-borrow.sh`, `night-borrow.sh` | GPU A/B window for the ll10-borrow patch set (arms P N0-N4 + stage-2 reads step, production restored on every exit path), and its timer run with AITalk posts |
+| `deploy-ll10b.sh` | current production deploy (N3 of TESTLOG #95); `--prev` (borrow only, 2026-11-06), `--rollback` (1441j-reads2) |
+| `patches/v0.1.44.1-ll10-borrow/`, `patches/v0.1.44.1-srv-1106/` | engine patches on 28de225d (borrow, mmap buffers, evicting gates, upstream ports) and server patches on 90f73293 (upstream server batch, borrow metrics, background-reads server half) |
 | `vision_check.py` | image checks against a running server: pictures alone, two pictures behind one prefix (cache mix-ups), follow-up turns, repeat, optional load |
 | `eval/` | quality set (MMLU-Pro + GSM8K) with answers and results |
 | `upstream/` | issue/PR drafts for Niko1221/Strata (not yet posted; written for 0.1.41, to be redone on the current base), designs (`DESIGN-*.md`), code analyses (`ANALYSIS-*.md`), GPU profile and lever ranking (`PROFILE-next-levers.md`), methodology/patch review (`REVIEW-2026-10-12.md`) |

@@ -4,6 +4,58 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (production) - 2026-11-07
+- **Default start = arm N3 of the night window** (TESTLOG #95): engine `strata-g3-ll10b` (Strata-ll10-borrow @23588120,
+  sha256 99bbe1d2…, `linux/patches/v0.1.44.1-ll10-borrow/` 0001-0008), config
+  `T16-ll10b-g8-mmap1m-prod262r-vision-cpu.json`, server Strata-143-prod @22f4781f (`linux/patches/v0.1.44.1-srv-1106/`
+  0001-0010). Switches on: `STRATA_PARK_BORROW=1`, `STRATA_CONV_MMAP=1`, `STRATA_GATE_EVICT=1`,
+  `STRATA_SERVE_STOP_BOUND` (default on), `MALLOC_MMAP_THRESHOLD_` / `MALLOC_TRIM_THRESHOLD_` 1 MiB; conversation cache
+  **124 GiB** (was 128: the host kept only ~16-18 GiB MemAvailable, right at the 16 GiB floor). Greedy replies identical
+  to the previous production in every check (bench_concurrency, bench_multiturn 48/48). Deployed 03:12 CET with
+  `linux/deploy-ll10b.sh` (`--prev`: the 2026-11-06 state, `--rollback`: 1441j-reads2 + server 90f73293).
+- Stage-2 background reads (`STRATA_READS`, arm N4) are **not** on: shorts beside a long read −32 % TTFT and agent-mix
+  p95 −37 %, but the 16-user multi-turn follow-up TTFT median +62 % because follow-ups of 4-11K new tokens went to the
+  background at ~740 tok/s (`STRATA_READS_BG_MIN=4096` too low). A higher threshold is the next measurement.
+
+### Changed (production) - 2026-11-06
+- 07:44 UTC: `MALLOC_MMAP_THRESHOLD_` 16 MiB → **4 MiB** (TESTLOG #93). Parked conversations were refused at the RAM gate
+  ("physical RAM admission", 142 lines) after evicting every parked conversation for nothing: freed snapshot memory stayed
+  in glibc arenas (108 GB arena RSS with ~13 GB parked), so "available" never rose above the 16 GiB floor + ~2 GiB.
+- 10:27 UTC: engine `strata-g3-ll10-borrow` with `STRATA_PARK_BORROW=1` and the upstream server batch, deployed before
+  its GPU test on the owner's go-ahead (TESTLOG #94). Genesis' long main chat after other calls: **47 of 51 hits**
+  (was 5 of 20); prompts ≥100K reused 91.7 % of their tokens (was 73.3 %).
+
+### Added (engine patch series ll10-borrow, on the production engine 28de225d) - 2026-11-06
+- `STRATA_PARK_BORROW=1`: a request that matches only a shallow checkpoint of a parked conversation (less than half of it,
+  not its live end, not a pinned prefix) borrows a copy and the image goes back to its place. Before, every match took the
+  whole entry and pruned its deeper checkpoints: a sub-agent sharing only the 8192-token root destroyed the 132K main chat
+  (the Genesis ping-pong). A failed copy takes the image as before.
+- `STRATA_CONV_MMAP=1`: parked K/V segments and checkpoint state of 64 KiB or more are mmap'd one by one, so an eviction
+  returns its RAM whatever glibc's thresholds.
+- `STRATA_GATE_EVICT=1`: both RAM gates evict only what can help and stop after 2 evictions that did not raise available
+  RAM; a batch slot's end-of-turn capture may now evict to fit (it refused without evicting, which lost long chats whose
+  only copy was the slot).
+- Ports of upstream 53f72571 (re-parked conversations keep at most 1/8 reserve per K/V buffer) and 243fdb21 (a request
+  commits only the rows it emits, HIP gates removed, also at our spec-lanes site; `STRATA_SERVE_STOP_BOUND=0` disables);
+  063af1fd (background reads wait at most one pick per other read).
+
+### Added (server batch srv-1106, on the production server 90f73293) - 2026-11-06
+- Upstream ports: Pillow decoder format list for `Image.open` (GHSA-78g4-xqwv-q3g8, JPEG 2000 refused; 8090 listens on
+  0.0.0.0), streaming write limit (`STRATA_STREAM_WRITE_TIMEOUT_S`, 60 s; ours cuts only a write that makes **no progress**,
+  upstream c08fd2ec also cut slow readers), `ConvCacheLog.poll` under a lock, no O(n²) tool-body rescans while streaming,
+  quoted tool-call markup inside string arguments kept exact, explicit `reasoning_effort` false/0 kept.
+- `/metrics` counts the borrow engine's lines (`restored N of M tokens`, `borrowed …`) and a new `borrows` counter
+  (it showed `restores: 0` beside 515 restores).
+- Background reads server half (`STRATA_SERVER_READS=1`, from ll7-reads2), off by default.
+- `serve/test_genesis_shapes_replay.py`: the Genesis request shapes through the old and new parser (1,728 variants).
+
+### Added (Linux tooling) - 2026-11-06
+- `linux/repro_park_ram.py`: reproductions of the cache losses (interleave, checkbranch, pingpong with a sub-agent sharing a
+  13,283-token tool head, 2 cycles; `--allow-prod` guard).
+- `linux/window-borrow.sh` (GPU A/B window P / N0-N4 + reads steps, restore guard unit and backstop timer,
+  `BASE_CONFIG`/`BASE_SRV` baseline), `linux/night-borrow.sh` (timer run with AITalk posts), `linux/deploy-ll10-borrow.sh`,
+  `linux/deploy-ll10b.sh`.
+
 ### Added (dashboard: admin login, Strata settings) - 2026-10-18
 - **Everyone sees everything, every change needs the admin login.** One login box for all tabs of ⚙ Einstellungen
   plus a header button (🔒 Anmelden / ✓ Admin); the password is G3's admin password (`dashboard/g3control.py`, no

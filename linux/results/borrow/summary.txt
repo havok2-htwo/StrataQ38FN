@@ -1,0 +1,47 @@
+# window borrow bw11070200: per arm (one server start each); reuse % = reused / prompt; ident = vs P (greedy)
+arm     A2%    A3%           SUB          SUB2 IL A2% IL ttft borrow restor supers refuse parks cap p50 cap max wait max  tps@1  tps@8 tps@16 ttft16 id conc   id mt id A RSS GiB w1 max w2 all ag wall pp   server
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+P      99.8   99.7    8192/29890   29715/29880   99.7    0.64      0     32      1      0    68    55.0   596.2      0.0  123.1  338.9  433.7   0.60     ref     ref  ref  148,01      -      -       - PASS Strata-143-base@90f73293
+N0     99.8   99.7    8192/29890   29715/29880   99.7    0.65      0     32      1      0    68    54.0   568.7      0.0  123.4  338.2  431.8   0.46    same   48/48   =x   90,38      -      -       - PASS Strata-143-base@90f73293
+N1     99.8   99.7    8192/29890   29715/29880   99.7    0.67      0     33      1      0    69    52.9   582.9      0.0  123.3  339.4  434.6   0.44    same   48/48   =x   90,23      -      -       - PASS Strata-srv-1106@22f4781f
+N2     99.8   99.7    8192/29890   29715/29880   99.7    0.66      0     36      1      0    72    56.2   579.0      0.0  123.6  339.9  437.8   0.44    same   48/48   =x   90,06   1.40   5.06   126.4 PASS Strata-srv-1106@22f4781f
+N3     99.8   99.7    8192/29890   29715/29880   99.7    0.68      0     33      1      0    69    53.2   563.9      0.0  123.8  350.1  447.6   0.64    same   48/48   =x   89,77      -      -       - PASS Strata-srv-1106@22f4781f
+N4     99.8   99.7    8192/29890   29715/29880   99.7    0.66      0     31      7      0    73    64.1   599.0     92.4  124.7  349.2  455.6   0.43    same   48/48   =x   91,36   0.94   5.11   149.3 PASS Strata-srv-1106@22f4781f
+==> identity N0 (all new switches off, STRATA_SERVE_STOP_BOUND=0) vs P: conc same, multiturn 48/48, A replies =x PASS
+==> identity N1 vs P (expected exact): conc same, multiturn 48/48, A replies =x INFO
+==> identity N2 vs P (expected exact): conc same, multiturn 48/48, A replies =x INFO
+==> identity N3 vs P (expected exact): conc same, multiturn 48/48, A replies =x INFO
+==> identity N4 vs P (expected exact): conc same, multiturn 48/48, A replies =x INFO
+(pp = pingpong PASS: A2 and A3 >= 95 % reused and above the grid point below the branch; SUB = reused/prompt; IL = interleave; cap = park capture_ms; id A: '=' per scenario when A's greedy reply equals P's; w1 max = every w1 short's TTFT, w2 all = time to all 16 w2 first tokens, ag wall = bench_agentic's wall (s): the reads step, arms of READS_ARMS only)
+
+# stage 2 reads step (one more server start per arm: fair_tools win --rep, then bench_agentic greedy); mt = the arm's own bench_multiturn run; bg rd = background reads handed / ready (reads step, arm run)
+arm  w1 p50 w1 max w1 long w2 all w2 p50 w2 p95 w2 long ag wall  main   sub  chat ag p95 ag tok mt wall mt fol   bg rd  bg arm    RSS
+-------------------------------------------------------------------------------------------------------------------------------------
+N2     1.10   1.40   27.98   5.06   2.70   4.78   22.32   126.4  2.93  2.54  1.62  13.28   8535    93.6   2.73     0/0     0/0  98,64
+N4     0.75   0.94   27.09   5.11   2.72   4.85   22.51   149.3  3.25  1.85  0.83   8.40   8795   103.0   4.43   24/24     8/8 111,96
+(#88 for reference, rep 1-2 medians, production of then: w1 short TTFT max PROD 20.20 / FAIR 1.19 / READS 0.88 s, w2 all 16 first 17.08 / 4.87 / 17.03 s; bench_agentic wall PROD 116.8-116.9 / READS 142.1-148.3 s)
+    [fair_tools] ==> win N2 w1: a cold ~125K read beside 2 decoding streams, 4 shorts at +3/6/9/12 s: shorts TTFT p50 1.10 p95 1.38 max 1.40 s; long read (125014 tok) TTFT 27.57 s, total 27.98 s (median of 1 runs; 0 shorts without a token) INFO
+    [fair_tools] ==> win N2 w2: a cold ~105K read, 16 shorts at once at +4 s: shorts TTFT p50 2.70 p95 4.78 max 5.04 s, all 16 first tokens after 5.06 s; long read (105032 tok) TTFT 21.79 s, total 22.32 s (median of 1 runs; 0 shorts without a token) INFO
+    [fair_tools] ==> win N4 w1: a cold ~125K read beside 2 decoding streams, 4 shorts at +3/6/9/12 s: shorts TTFT p50 0.75 p95 0.92 max 0.94 s; long read (125014 tok) TTFT 26.63 s, total 27.09 s (median of 1 runs; 0 shorts without a token) INFO
+    [fair_tools] ==> win N4 w2: a cold ~105K read, 16 shorts at once at +4 s: shorts TTFT p50 2.72 p95 4.85 max 5.08 s, all 16 first tokens after 5.11 s; long read (105032 tok) TTFT 21.98 s, total 22.51 s (median of 1 runs; 0 shorts without a token) INFO
+    [fair_tools] win N4 vs N2 w1: shorts TTFT p50 1.10 -> 0.75 s INFO
+    [fair_tools] ==> win N4 vs N2 w1: every short TTFT (max) 1.40 -> 0.94 s (want <= 1.00 x), long read TTFT 27.57 -> 26.63 s, total 27.98 -> 27.09 s PASS
+    [fair_tools] ==> win N4 vs N2 w1: the long read's total 27.98 -> 27.09 s (want <= 1.05 x) PASS
+    [fair_tools] ==> win N4 vs N2 w2: time to all 16 first tokens 5.06 -> 5.11 s (want <= 1.00 x), long read TTFT 21.79 -> 21.98 s, total 22.32 -> 22.51 s FAIL
+    [fair_tools] ==> win N4 vs N2 w2: the long read's total 22.32 -> 22.51 s (want <= 1.05 x) PASS
+    [fair_tools] ==> readstat N2: 0 reads to the background (at, n, tokens: []), 0 ready (tok/s median n/a), dropped 0 cancel / 0 err; 0 turns beside the groups (0 paused for a line, drain ms median n/a max n/a), 0 drained (0 ms in all), gate refused 0 time(s); not taken: []; unpinned finishes 0; park verify 0 identical / 0 differ; ERR 0, watchdog 0, pad guard 0, engine starts 1 INFO
+    [fair_tools] ==> readstat N4: 24 reads to the background (at, n, tokens: [(0, 125002, 124995), (7764, 16593, 8822), (7764, 16593, 8822), (38905, 44415, 5503), (40925, 49191, 8259), (7764, 16593, 8822)] ...), 24 ready (tok/s median 1981.92), dropped 0 cancel / 0 err; 61 turns beside the groups (43 paused for a line, drain ms median 8.70 max 19.00), 0 drained (0 ms in all), gate refused 0 time(s); not taken: [];
+    [fair_tools] ==> readstat N4arm: 8 reads to the background (at, n, tokens: [(0, 10986, 10979), (0, 10996, 10989), (16365, 20587, 4215), (11179, 15282, 4096), (11728, 15955, 4220), (16360, 20600, 4233)] ...), 8 ready (tok/s median 740.76), dropped 0 cancel / 0 err; 53 turns beside the groups (47 paused for a line, drain ms median 13.80 max 19.70), 0 drained (0 ms in all), gate refused 0 time(s); not taken: []; 
+    [fair_tools] ==> readstat N4: 24 background reads (want > 0: else its exactness proves nothing about them), 24 ready (want all), 0 dropped with err (want 0), unpinned finishes 0 (want 0) PASS
+    [fair_tools] ==> readstat N4arm: 8 background reads (want > 0: else its exactness proves nothing about them), 8 ready (want all), 0 dropped with err (want 0), unpinned finishes 0 (want 0) PASS
+    [fair_tools] ==> readstat N2: no background read (env unset / production: 0) PASS
+    [fair_tools] ==> readstat N2: ERR 0, watchdog 0, engine starts 1 (<= 1), park verify differ 0, pad guard 0 PASS
+    [fair_tools] ==> readstat N4: ERR 0, watchdog 0, engine starts 1 (<= 1), park verify differ 0, pad guard 0 PASS
+    [fair_tools] ==> readstat N4arm: ERR 0, watchdog 0, engine starts 1 (<= 1), park verify differ 0, pad guard 0 PASS
+==> stage 2 N4 vs N2 w1 (a cold ~125K read beside 2 streams, 4 shorts): every short's TTFT (max) 1.40 -> 0.94 s, p50 1.10 -> 0.75 s (want <= 1.00 x, #88's rule; shorts without a token 0) PASS
+==> stage 2 N4 vs N2 w2 (a cold ~105K read, 16 shorts at once): all 16 first tokens after 5.06 -> 5.11 s, p50 2.70 -> 2.72 s (want <= 1.00 x) FAIL
+==> stage 2 N4 vs N2 long reads: w1 total 27.98 -> 27.09 s, w2 22.32 -> 22.51 s (want <= 1.05 x) PASS
+==> stage 2 N4 vs N2 agent mix: bench_agentic wall 126.4 -> 149.3 s (+18.1 %), main TTFT p50 2.93 -> 3.25 s, 8535 -> 8795 output tokens, 0 request errors; bench_multiturn wall 93.6 -> 103.0 s (+10.0 %), follow-up TTFT p50 2.73 -> 4.43 s (want both walls <= +5 %, no errors) FAIL
+==> stage 2 N4 vs N2 replies (greedy): win 24/24, bench_agentic 61/61 (per request), bench_multiturn 48/48 identical PASS
+==> stage 2 N4 vs N2 background reads: reads step 24 handed / 24 ready / 0 dropped with err / 0 unpinned (want > 0, all ready, none err / unpinned); arm run 8 / 8; N2: 0 (want 0) PASS
+==> stage 2 N4 (N2 + STRATA_READS=2, server STRATA_SERVER_READS=1 STRATA_READS_BG_MIN=4096, the starvation fix 063af1fd) vs N2: FAIL (w2, mix)

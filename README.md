@@ -49,6 +49,10 @@ to Strata.
 
 - KV tiering so long agent conversations are never read twice: 64K–262K context per conversation, parked
   conversations in RAM (asynchronous, off the critical path) and an SSD emergency tier with a daily write budget.
+- A conversation cache that survives multi-agent traffic (2026-11-07): a request that shares only a shallow checkpoint
+  borrows a copy instead of consuming the parked conversation, parked buffers are mmap'd so evictions really free RAM,
+  and the RAM gates evict what helps instead of refusing. Genesis' long main chat after other calls: 5 of 20 → 47 of 51
+  cache hits ([linux/README.md](linux/README.md#conversation-cache-borrow-mmapd-buffers-evicting-ram-gates-default-since-2026-11-07)).
 - Images (vision): OpenAI `image_url` parts through the API (CPU image encoder). Upstream keeps one image position
   table for all batch slots, so an image request runs alone until the per-slot fix (experimental patch 0044) is
   checked on the GPUs (TESTLOG #75,

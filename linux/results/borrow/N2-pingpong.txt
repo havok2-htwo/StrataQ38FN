@@ -1,0 +1,32 @@
+# bw11070200-N2: http://127.0.0.1:8091, engine 0.1.44.1, slots 16, pressure none (available 18102 MiB, floor 16384 MiB), engine log /media/raid0/StrataQ38FN/linux/results/borrow/engine-N2.log
+# bw11070200-N2: pingpong @ 136000 tokens, 2 cycles, head 42 tools (~13000 tok), SUB ~29500 with 44 tools (seed 1952003)
+  A       prompt  137090 reused       0 ttft   25.25s wall   27.06s parks 1 evict 0 restores 0
+          | strata serve: prompt 137090 tokens = 0 reused + 137090 read in 25113 ms (5458.9 tok/s), 200 generated in 1792 ms (111.6 tok/s), drafts accepted 109 of 192, 12 checkpoints
+  CHECK   prompt  137358 reused  137289 ttft    0.49s wall    0.83s parks 0 evict 0 restores 0
+          | strata serve: prompt 137358 tokens = 137289 reused + 69 read in 353 ms (195.3 tok/s), 32 generated in 316 ms (101.2 tok/s), drafts accepted 12 of 23, 12 checkpoints
+  SUB     prompt   29890 reused    8192 ttft    4.23s wall    4.68s parks 1 evict 0 restores 0
+          | strata serve: prompt 29890 tokens = 8192 reused + 21698 read in 4183 ms (5187.3 tok/s), 48 generated in 458 ms (104.9 tok/s), drafts accepted 20 of 32, 5 checkpoints
+  A2      prompt  137629 reused  137292 ttft    0.74s wall    0.91s parks 1 evict 0 restores 1
+          | strata serve: conversation cache: restored 137292 of 137389 tokens (checkpoint) in 206.4 ms; parked=9 bytes=6181937712
+          | strata serve: prompt 137629 tokens = 137292 reused + 337 read in 532 ms (633.9 tok/s), 32 generated in 224 ms (142.7 tok/s), drafts accepted 19 of 26, 12 checkpoints
+  cycle 1: A2 reused 137292 of 137629 (99.8 %, ideal ~137301, grid point below 131072); SUB reused 8192 of 29890; SUB in CHECK's slot: ?; engine [137629, 137292, 337]
+  CHECK2  prompt  137742 reused  137622 ttft    0.75s wall    1.11s parks 1 evict 0 restores 0
+          | strata serve: prompt 137742 tokens = 137622 reused + 120 read in 620 ms (193.5 tok/s), 32 generated in 335 ms (95.6 tok/s), drafts accepted 15 of 24, 12 checkpoints
+  SUB2    prompt   29880 reused   29715 ttft    0.74s wall    1.37s parks 1 evict 0 restores 1
+          | strata serve: conversation cache: dropped 1 superseded copy of this conversation; parked=8
+          | strata serve: conversation cache: restored 29715 of 29937 tokens (checkpoint) in 179.1 ms; parked=9 bytes=6854152976
+          | strata serve: prompt 29880 tokens = 29715 reused + 165 read in 700 ms (235.6 tok/s), 64 generated in 637 ms (100.4 tok/s), drafts accepted 25 of 38, 5 checkpoints
+  A3      prompt  138069 reused  137676 ttft    0.74s wall    0.89s parks 1 evict 0 restores 1
+          | strata serve: conversation cache: restored 137676 of 137773 tokens (checkpoint) in 207.3 ms; parked=9 bytes=6054749696
+          | strata serve: prompt 138069 tokens = 137676 reused + 393 read in 564 ms (696.7 tok/s), 32 generated in 169 ms (189.7 tok/s), drafts accepted 23 of 26, 12 checkpoints
+  cycle 2: A3 reused 137676 of 138069 (99.7 %, ideal ~137685, grid point below 131072); SUB2 reused 29715 of 29880; SUB in CHECK's slot: ?; engine [138069, 137676, 393]
+==> pingpong bw11070200-N2 @136000: A2 99.8%, A3 99.7% (target 95% and above the 8192 grid point below the branch); SUB 8192/29890, SUB2 29715/29880; borrowed 0 restored 3 superseded 1 skip-parking 1; capture_ms p50 54.9 max 579.0 PASS
+
+# bw11070200-N2: A2 after A (and B) - HIT = >= 90 % of A2's prompt reused
+label            scenario       size  B@A  avail  A ttft A2 prompt  reused reuse%  A2 ttft refuse hit
+bw11070200-N2    pingpong     136000    -      -   25.25    137629  137292  99.8%     0.74      0 HIT
+
+# pingpong: per cycle - CHECK (live-slot hit), SUB (shares the head up to tool #43), the next turn (target >= its 'target' reused)
+label               size cyc turn  prompt  reused reuse%   ttft CHECK% SUB prompt SUB reused S@C borrow restor supers skip  cap ms verdict
+bw11070200-N2     136000   1   A2  137629  137292  99.8%   0.74 100.0%      29890       8192   -      0      1      0    0   223.0 ok
+bw11070200-N2     136000   2   A3  138069  137676  99.7%   0.74  99.9%      29880      29715   -      0      2      1    0   579.0 ok

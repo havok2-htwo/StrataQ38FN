@@ -1,0 +1,14 @@
+# bw11070200-P: http://127.0.0.1:8091, engine 0.1.44.1, slots 16, pressure cgroup (available 18102 MiB, floor 16384 MiB), engine log /media/raid0/StrataQ38FN/linux/results/borrow/engine-P.log
+# bw11070200-P: interleave @ 136000 tokens (seed 1952003)
+  A       prompt  131339 reused       0 ttft   24.11s wall   24.73s parks 1 evict 0 restores 0
+  pressure: test scope MemoryMax lowered, guard-style available 18102 MiB (asked 18102; the server's floor 16384)
+  B       prompt     852 reused       0 ttft    0.50s wall    1.44s parks 1 evict 0 restores 0
+  B in A's slot (None): ?
+  A2      prompt  131783 reused  131446 ttft    0.64s wall    0.80s parks 0 evict 0 restores 1
+          | strata serve: conversation cache: skip parking (972 tokens, below the 1024 minimum; parked=18)
+          | strata serve: conversation cache: restored 131446 tokens (live) in 157.9 ms; parked=18 bytes=13164339560
+==> interleave bw11070200-P @136000: A2 reused 131446 of 131783 (99.7%), B in A's slot None, refusals 0, restored 9 borrowed 0 superseded 0 HIT
+
+# bw11070200-P: A2 after A (and B) - HIT = >= 90 % of A2's prompt reused
+label            scenario       size  B@A  avail  A ttft A2 prompt  reused reuse%  A2 ttft refuse hit
+bw11070200-P     interleave   136000    -  18102   24.11    131783  131446  99.7%     0.64      0 HIT
