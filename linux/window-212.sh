@@ -39,12 +39,19 @@
 #       + B's parity pins + STRATA_ATTN_DAILY=0
 #   H2  H - QSA_SLOTS_STREAM + STRATA_ATTN_DAILY=1 (DAILY alone; the rest of the sm_86 table stays off)
 #   H3  the better of H / H2 (short agg at 16 users; T212-H3 or T212-H3d) + IQ4_W4A8=1 + the upstream stack
+#   I   212i (strata-212i, server Strata-212i/serve: v0.2.12 + our ports, the candidate production): production env with
+#       PARK_ASYNC -> PARK_CAPTURE=1, minus what is not ported (PIPE_OVERLAP(_KVS) SPEC_LANES SOLO_PIPELINE READ_YIELD
+#       ATTN_VBATCH READS*), + SERVE_STOP_BOUND=1 + H's parity pins + ATTN_DAILY=0; production's whole server env.  An
+#       exact arm against H (B when H has no replies); its own bt identity (I vs H) and INFO steps (never counted as
+#       crashes in a row): GPU ctest conversation_* on Strata-212i/build, batch_groups_cache with PARK_CAPTURE_VERIFY=1
+#       SLOT_PARK_VERIFY=1, and tools/vision_batch_check.py (server mode) against I's server.  Problems of the 212i
+#       tree / build skip only I (production and the other arms run).  Not in ARMS: none of I's steps run
 #
 #   ./window-212.sh --dry-run        # checks + the plan; touches no service, no GPU, writes nothing
 #   ./window-212.sh                  # the window (refuses before WINDOW_START unless FORCE=1)
 #   ./window-212.sh --summary        # the summary table again from results/w212
 #   ./window-212.sh --gen-configs    # (re)write configs/T212-*.json + T212.manifest.json from production.json
-#   env: ARMS="A B C D E E2 F G H H2 H3" WINDOW_START="2026-11-07 23:45" DEADLINE="2026-11-08 04:00" (or HH:MM)
+#   env: ARMS="A B C D E E2 F G H H2 H3 I" WINDOW_START="2026-11-07 23:45" DEADLINE="2026-11-08 04:00" (or HH:MM)
 #        IDENT_GATE=strict|port|off HTTP_GATE=1 HOST_TESTS=1 GPU_CTEST=1 IDENTITY=1 SPARE=1 FORCE=0 MEMMAX=224G
 #        RSS_MAX_GIB=200 PRESS_MAX=40 VRAM_MIN=300 HANG_S=120 RESTORE_SMOKE=1
 #   verdicts: grep -E 'PASS|FAIL|SKIP|ABORT' results/w212/window.log; table: results/w212/summary.txt
@@ -52,7 +59,7 @@ set -u
 export LC_ALL=C
 R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs
 PY=$R/Strata/.venv/bin/python
-UP=$R/Strata-212; PWT=$R/Strata-212m; PRODSRV=$R/Strata-143-prod; OURS=$R/Strata-ll10-borrow; ENG=$R/Strata/engine
+UP=$R/Strata-212; PWT=$R/Strata-212m; IWT=$R/Strata-212i; PRODSRV=$R/Strata-143-prod; OURS=$R/Strata-ll10-borrow; ENG=$R/Strata/engine
 PPORT=8090; TPORT=${TPORT:-8091}; URL=http://127.0.0.1:$PPORT; TURL=http://127.0.0.1:$TPORT
 OUT=${OUT:-$L/results/w212}; TIER=/media/raid0/strata-kvspill-bench/w212
 BUNIT=w212-bench; HUNIT=w212-host; RUNIT=w212-restore; GUNIT=w212-guard
@@ -68,7 +75,7 @@ while [ $# -gt 0 ]; do
     esac; shift
 done
 [ "${DRY:-0}" = 1 ] && MODE=dry
-ARMS=${ARMS:-A B C D E E2 F G H H2 H3}
+ARMS=${ARMS:-A B C D E E2 F G H I H2 H3}
 IDENT_GATE=${IDENT_GATE:-strict}; HTTP_GATE=${HTTP_GATE:-1}; HOST_TESTS=${HOST_TESTS:-1}; GPU_CTEST=${GPU_CTEST:-1}
 IDENTITY=${IDENTITY:-1}; SPARE=${SPARE:-1}; FORCE=${FORCE:-0}; RESTORE_SMOKE=${RESTORE_SMOKE:-1}
 MEMMAX=${MEMMAX:-224G}; RSS_MAX_GIB=${RSS_MAX_GIB:-200}; PRESS_MAX=${PRESS_MAX:-40}; VRAM_MIN=${VRAM_MIN:-300}
@@ -86,12 +93,18 @@ else DL_TS=$(date -d "$DEADLINE" +%s) || exit 2; fi
 for v in $(compgen -e | grep '^STRATA_'); do unset "$v"; done   # nothing of ours from the calling shell
 
 # arm -> binary key, server tree, engine source tree (for the name checks)
-declare -A BIN_SRC=([prod]=$ENG/strata-g3-ll10b [stocktab]=$ENG/strata-212-stocktab [port]=$ENG/strata-212m-p2)
-declare -A BIN_TREE=([prod]=$OURS [stocktab]=$UP [port]=$PWT)
+declare -A BIN_SRC=([prod]=$ENG/strata-g3-ll10b [stocktab]=$ENG/strata-212-stocktab [port]=$ENG/strata-212m-p2
+                    [int]=$ENG/strata-212i)
+declare -A BIN_TREE=([prod]=$OURS [stocktab]=$UP [port]=$PWT [int]=$IWT)
 declare -A ARM_BIN=([A]=prod [B]=stocktab [C]=stocktab [D]=stocktab [E]=stocktab [E2]=stocktab [F]=stocktab [G]=stocktab
-                    [H]=port [H2]=port [H3]=port [H3d]=port)
-declare -A ARM_SRV=([A]=$PRODSRV [B]=$UP [C]=$UP [D]=$UP [E]=$UP [E2]=$UP [F]=$UP [G]=$UP [H]=$PWT [H2]=$PWT [H3]=$PWT [H3d]=$PWT)
-EXACT_ARMS=" C D H H2 H3 H3d "           # greedy replies must equal B's (upstream / TESTLOG call these exact)
+                    [H]=port [H2]=port [H3]=port [H3d]=port [I]=int)
+declare -A ARM_SRV=([A]=$PRODSRV [B]=$UP [C]=$UP [D]=$UP [E]=$UP [E2]=$UP [F]=$UP [G]=$UP [H]=$PWT [H2]=$PWT [H3]=$PWT [H3d]=$PWT
+                    [I]=$IWT)
+EXACT_ARMS=" C D H H2 H3 H3d I "         # greedy replies must equal B's (I: H's; upstream / TESTLOG call these exact)
+ICB=$IWT/build                           # 212i's ctest build (phase 3's INFO conversation_* tests)
+I_CTESTS="conversation_snapshot_test conversation_snapshot_test_ckpt_async conversation_snapshot_test_ckpt_vram_slots
+ conversation_cache_test conversation_alloc_test conversation_alloc_test_off conversation_tier_test"
+in_arms() { case " $ARMS " in *" $1 "*) return 0 ;; esac; return 1; }
 # INFO lines: WANT_BOOT must be in the engine log after the probe (else the path did not engage: the arm stops),
 # FAILPAT stops the arm when it appears, WANT_END is checked at the arm's end (INFO: proven / not seen); ';;' separates
 SM86='sm_86 \(Ampere\): [0-9]+ exact speed switches on by default'
@@ -102,16 +115,28 @@ IQ4='prompt experts: the IQ4 W4A8 kernel runs'
 # H2 (stream off) the per-row path: its DAILY shows as the line's STRATA_ATTN_DAILY=1
 SLOTS='batch decode attention: slots(-stream)? \(.*STRATA_ATTN_DAILY=0'
 DAILY='batch decode attention: .*STRATA_ATTN_DAILY=1'
+# 212i's told-once start lines (generate.cpp; all printed at the engine's start, before the probe): park capture, slot park,
+# disk tier, mmap buffers, evicting gates, MSG_CKPT_TAIL.  PARK_BORROW, SLOT_CHAIN_REUSE, GIVEBACK_CHECKS and
+# SERVE_STOP_BOUND print nothing; MROPE_SLOTS says mrope_slots=1 on the INFO protocol line (stdout, not the log) and its
+# regions line only when the regions fit: those are end-of-arm INFO
+IPARK='STRATA_PARK_CAPTURE: a finished request.s conversation is captured beside the slots'
+ISLOT='STRATA_SLOT_PARK: a pipelined slot.s conversation is captured when it ends'
+ITIER='conversation tier: on: /media/raid0/strata-kvspill-bench/'
+IMMAP='STRATA_CONV_MMAP: parked K/V segments'; IGATE='STRATA_GATE_EVICT: the physical-RAM gates evict only what can help'
+ITAIL='STRATA_MSG_CKPT_TAIL=[0-9]+: a prompt read also checkpoints'
 declare -A WANT_BOOT=([A]="STRATA_SPEC_LANES=4: lanes on slots;;STRATA_SOLO_PIPELINE;;$MMQD" [B]="$MMQD" [C]="$MMQD;;$SM86"
     [D]="$SM86" [E]="$SM86" [E2]="$SM86" [F]="$SM86;;--pipeline-windows 2 stays on for the solo path"
     [G]="$SM86;;STRATA_PIPED_MTP: [0-9]+ pipelined groups?" [H]="$MMQD;;$ES;;$SLOTS"
-    [H2]="$ES;;$DAILY" [H3]="$ES" [H3d]="$ES;;$DAILY")
+    [H2]="$ES;;$DAILY" [H3]="$ES" [H3d]="$ES;;$DAILY"
+    [I]="$MMQD;;$ES;;$SLOTS;;$IPARK;;$ISLOT;;$ITIER;;$IMMAP;;$IGATE;;$ITAIL")
 declare -A FAILPAT=([B]="$SM86|STRATA_MMQ_DIRECT=[0-9] is ignored" [H]="$SM86" [H2]="$SM86" [H3]="$SM86" [H3d]="$SM86"
     [E]="STRATA_PIPED_CONCURRENT is off beside" [F]="--pipeline-windows 2 is off"
-    [G]="WARNING: STRATA_PIPED_MTP is off|WARNING: --batch-mtp is off")
+    [G]="WARNING: STRATA_PIPED_MTP is off|WARNING: --batch-mtp is off"
+    [I]="$SM86|STRATA_PARK_CAPTURE is off|STRATA_SLOT_PARK is off|STRATA_PARK_ASYNC=1 is ignored|conversation tier: off")
 declare -A WANT_END=([A]="strata overlap: [0-9]+ tokens read;;conversation tier: on" [D]="$IQ4;;two-pass scores on"
     [E]="read [0-9]+ tokens on a thread of its own" [E2]="piped read [0-9]+ tokens in;;read [0-9]+ tokens on a thread of its own"
-    [H]="batch decode attention: slots-stream" [H3]="$IQ4;;batch decode attention: slots-stream" [H3d]="$IQ4")
+    [H]="batch decode attention: slots-stream" [H3]="$IQ4;;batch decode attention: slots-stream" [H3d]="$IQ4"
+    [I]="batch decode attention: slots-stream;;the image position table holds [0-9]+ regions;;conversation cache: borrowed [0-9]+ of a parked;;conversation cache: restored [0-9]+")
 # a dropped lever's INFO line is not wanted any more
 declare -A DROP_PAT=([STRATA_MMQ_DIRECT]="$MMQD" [STRATA_IQ4_W4A8]="$IQ4" [STRATA_EARLY_SAMPLE]="$ES"
     [STRATA_ATTN_DAILY]="$DAILY" [STRATA_QSA_SLOTS_STREAM]="batch decode attention: slots-stream")
@@ -138,9 +163,9 @@ GENV=(CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1,2,3 PATH=/usr/local/
 
 # ---- configs ------------------------------------------------------------------------------------------------------
 gen_configs() {   # configs/T212-<arm>.json + T212.manifest.json from production.json (production.json is only read)
-    "$PY" -I - "$C/production.json" "$C" "$OUT" "$TIER" "$UP" "$PWT" "$OURS" "$ENG" "$TPORT" <<'PYEOF'
+    "$PY" -I - "$C/production.json" "$C" "$OUT" "$TIER" "$UP" "$PWT" "$OURS" "$ENG" "$TPORT" "$IWT" <<'PYEOF'
 import copy, hashlib, json, os, subprocess, sys, time
-prod_path, cdir, outdir, tier, up, port, ours, eng, tport = sys.argv[1:10]
+prod_path, cdir, outdir, tier, up, port, ours, eng, tport, intw = sys.argv[1:11]
 src = os.path.realpath(prod_path)
 raw = open(src, "rb").read()
 prod = json.loads(raw)
@@ -182,22 +207,40 @@ for k, v in (("STRATA_QSA_SLOTS_STREAM", "1"), ("STRATA_GR_DOWN_PF", "2"), ("STR
 envs["H2"] = {k: v for k, v in envs["H"].items() if k != "STRATA_QSA_SLOTS_STREAM"}; envs["H2"]["STRATA_ATTN_DAILY"] = "1"
 envs["H3"] = {**envs["H"], "STRATA_IQ4_W4A8": "1", **STACK}
 envs["H3d"] = {**envs["H2"], "STRATA_IQ4_W4A8": "1", **STACK}
+# I: 212i = v0.2.12 + our ports.  Our park capture is STRATA_PARK_CAPTURE there (STRATA_PARK_ASYNC is upstream's other
+# park: never set); not ported: dropped by name even if a later 212i grows a switch of that name
+NOT_PORTED = ("STRATA_PIPE_OVERLAP", "STRATA_PIPE_OVERLAP_KVS", "STRATA_SPEC_LANES", "STRATA_SOLO_PIPELINE",
+              "STRATA_READ_YIELD", "STRATA_ATTN_VBATCH")
+int_env, int_gone = base(intw)
+for k in list(int_env):
+    if k in NOT_PORTED or k.startswith("STRATA_READS"):
+        int_env.pop(k); int_gone.append(k + " (not ported)")
+if penv.get("STRATA_PARK_ASYNC") == "1":
+    int_env["STRATA_PARK_CAPTURE"] = "1"
+int_env["STRATA_SERVE_STOP_BOUND"] = "1"                 # 212i: opt-in on CUDA (on by default on HIP only)
+int_env["STRATA_CONV_TIER_DIR"] = f"{tier}/I"            # never production's tier dir (a fresh dir per start at run time)
+envs["I"] = {**int_env, **PINS, "STRATA_ATTN_DAILY": "0"}
+for k, v in (("STRATA_QSA_SLOTS_STREAM", "1"), ("STRATA_GR_DOWN_PF", "2"), ("STRATA_EARLY_SAMPLE", "1")):
+    envs["I"].setdefault(k, v)
 notes.update(B="stock arm: production env (upstream names only) + parity pins", C="B + upstream stack + sm_86 table",
              D="C + IQ4_W4A8 + SELECT_TWO_PASS", E="C + SPLIT_MTP_BATCH=0 + PIPED_CONCURRENT=1", E2="E + PIPED_READ_PIECE=16384",
              F="C + PW_WITH_BATCH=1 + --pipeline-windows 2 (CUDA's auto is off)",
              G="C + --batch-mtp + PIPED_MTP=1 + BATCH_SELF_COMMIT=0 (PIPED_MTP refuses SELF_COMMIT)",
              H="212m-p2: production env (212m names) + parity pins + ATTN_DAILY=0", H2="H - QSA_SLOTS_STREAM + ATTN_DAILY=1",
-             H3="H + IQ4_W4A8 + upstream stack (H won)", H3d="H2 + IQ4_W4A8 + upstream stack (H2 won)", A="production as is")
+             H3="H + IQ4_W4A8 + upstream stack (H won)", H3d="H2 + IQ4_W4A8 + upstream stack (H2 won)", A="production as is",
+             I="212i (v0.2.12 + our ports): production env, PARK_ASYNC -> PARK_CAPTURE, minus the not-ported switches, "
+               "+ SERVE_STOP_BOUND=1 + H's parity pins + ATTN_DAILY=0")
 exe = {"A": prod["exe"]}
 for a in ("B", "C", "D", "E", "E2", "F", "G"):
     exe[a] = f"{eng}/strata-212-stocktab"
 for a in ("H", "H2", "H3", "H3d"):
     exe[a] = f"{eng}/strata-212m-p2"
-tree = {a: (ours if a == "A" else port if a.startswith("H") else up) for a in exe}
+exe["I"] = f"{eng}/strata-212i"
+tree = {a: (ours if a == "A" else intw if a == "I" else port if a.startswith("H") else up) for a in exe}
 bad, man = [], {"production": src, "production_sha256": hashlib.sha256(raw).hexdigest(), "generated": time.strftime("%F %T"),
                 "trees": {t: subprocess.run(["git", "-C", t, "rev-parse", "--short=8", "HEAD"], capture_output=True,
-                                            text=True).stdout.strip() for t in (up, port, ours)},
-                "dropped_upstream": up_gone, "dropped_port": port_gone, "arms": {}}
+                                            text=True).stdout.strip() for t in (up, port, ours, intw)},
+                "dropped_upstream": up_gone, "dropped_port": port_gone, "dropped_int": int_gone, "arms": {}}
 for a in exe:
     c = copy.deepcopy(prod)
     c["exe"] = exe[a]; c["port"] = int(tport); c["log"] = f"{outdir}/engine-{a}.log"
@@ -238,7 +281,8 @@ cfgenv() { python3 -c "import json,sys; [print(f'{k}={v}') for k, v in json.load
 gpu_apps() { nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null; }
 vram() { nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | tr '\n' ' '; }
 free_gpus() { local i p e; for i in $(seq 45); do [ -z "$(gpu_apps)" ] && return 0; sleep 2; done
-    for p in $(gpu_apps); do e=$(readlink -f "/proc/$p/exe" 2>/dev/null)
+    for p in $(gpu_apps); do grep -qs '/strata\.service$' "/proc/$p/cgroup" && continue   # never production's engine
+        e=$(readlink -f "/proc/$p/exe" 2>/dev/null)
         case "$e" in "$R"/Strata*|"$OUT"/bin/*) kill "$p" ;; esac; done
     for i in $(seq 30); do [ -z "$(gpu_apps)" ] && return 0; sleep 2; done; return 1; }
 prod_loaded() { curl -s -m 3 "$URL/health" | grep -q '"loaded": *true'; }
@@ -257,13 +301,16 @@ pin_bin() { local k=$1 s=${BIN_SRC[$1]} h d
     [ "$(sha256sum "$d" | cut -c1-16)" = "$h" ] || { rm -f "$d"; return 1; }
     PINNED[$k]=$d; echo "$d"; }
 # the server env of an arm: production's drop-in STRATA_* (read now); a v0.2.12 server gets only the names it reads
+# (in serve/*.py, its tests left out: 212i reads STRATA_PREFIX_DIAG in serve/prefix_diag.py)
 SRVENV_ALL=$(systemctl --user show strata.service -p Environment --value 2>/dev/null | tr ' ' '\n' | grep '^STRATA_' | tr '\n' ' ')
+srv_reads() { local f; for f in "$1"/serve/*.py; do case $f in */test_*) continue ;; esac
+    grep -qF "\"$2\"" "$f" && return 0; done; return 1; }
 srv_env() { local a=$1 kv k out=
     for kv in $SRVENV_ALL; do k=${kv%%=*}
-        if [ "$a" = A ] || grep -qF "\"$k\"" "${ARM_SRV[$a]}/serve/server.py"; then out="$out $kv"; fi; done
+        if [ "$a" = A ] || srv_reads "${ARM_SRV[$a]}" "$k"; then out="$out $kv"; fi; done
     echo "${out# }"; }
 srv_env_dropped() { local a=$1 kv k out=
-    for kv in $SRVENV_ALL; do k=${kv%%=*}; [ "$a" = A ] || grep -qF "\"$k\"" "${ARM_SRV[$a]}/serve/server.py" || out="$out $k"; done
+    for kv in $SRVENV_ALL; do k=${kv%%=*}; [ "$a" = A ] || srv_reads "${ARM_SRV[$a]}" "$k" || out="$out $k"; done
     echo "${out# }"; }
 
 # ---- gates / drops ------------------------------------------------------------------------------------------------
@@ -274,12 +321,16 @@ drop_lever() { case " $DROPS " in *" $1 "*) ;; *) DROPS="$DROPS $1"; log "lever 
 mkrun() { local a=$1 lab=$2 exe f=$OUT/cfg/run-$2.json
     exe=${PINNED[${ARM_BIN[$a]}]:-}; [ -n "$exe" ] || return 1      # (pin_bin runs in the main shell before)
     mkdir -p "$OUT/cfg"; rm -rf "$TIER/$lab"; mkdir -p "$TIER/$lab"; rm -f "$OUT/engine-$lab.log"
-    python3 - "$C/T212-$a.json" "$f" "$exe" "$OUT/engine-$lab.log" "$TIER/$lab" "$a" $DROPS <<'PYEOF' || return 1
-import json, sys
+    W212_PTIER=$PTIER python3 - "$C/T212-$a.json" "$f" "$exe" "$OUT/engine-$lab.log" "$TIER/$lab" "$a" $DROPS <<'PYEOF' || return 1
+import json, os, sys
 src, dst, exe, log, tier, arm = sys.argv[1:7]
 c = json.load(open(src)); e = c["env"]; c["exe"] = exe; c["log"] = log
 if "STRATA_CONV_TIER_DIR" in e:
     e["STRATA_CONV_TIER_DIR"] = tier
+pt = os.environ.get("W212_PTIER", "").rstrip("/")     # production's SSD tier: never in a bench config
+if not pt or not tier.startswith("/media/raid0/strata-kvspill-bench/") or \
+        any(str(v).rstrip("/") == pt or str(v).startswith(pt + "/") for v in e.values()):
+    sys.exit(f"mkrun: production's SSD tier dir {pt or '(unknown)'} in the run config, or no bench tier: refused")
 if arm != "A":
     for k in sys.argv[7:]:
         if k in e and e[k] != "0":
@@ -311,7 +362,9 @@ mon_check() {
     q=$(nvidia-smi --query-gpu=index,memory.free,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
     [ -n "$q" ] && echo "$(date +%s),$(echo "$q" | tr '\n' ';')" >> "$OUT/vram-$MON_LBL.csv"
     while IFS=, read -r i fr u; do
-        [ -z "$i" ] && continue; us=$(( us + u ))
+        [ -z "$i" ] && continue
+        case $fr in ''|*[!0-9]*) continue ;; esac; case $u in ''|*[!0-9]*) u=0 ;; esac   # ("[N/A]" / an error line: no fatal $(( )))
+        us=$(( us + u ))
         if [ "$VRAM_ON" = 1 ]; then
             { [ -z "${VMIN[$i]:-}" ] || [ "$fr" -lt "${VMIN[$i]}" ]; } && VMIN[$i]=$fr
             [ "$fr" -lt "$VRAM_MIN" ] && low=1
@@ -331,11 +384,11 @@ mon_check() {
     if [ $(( now - LAST_PROG )) -ge "$MON_HANG" ]; then MON_WHY="hang:no log growth and GPUs idle for ${MON_HANG}s"; return; fi
 }
 # ABORT_ALL: stop at once and restore production (memory, port 8090, two crashes in a row)
-ABORT_ALL=0; CONSEC_CRASH=0
+ABORT_ALL=0; CONSEC_CRASH=0; INFO_STEP=0     # INFO_STEP=1: phase 4's INFO engine tests (not counted as crashes in a row)
 judge_why() {    # after a step/boot that stopped for MON_WHY
     case $1 in
         rss:*|pressure:*|port$PPORT) ABORT_ALL=1; log "ABORT: $1 - stopping at once, production is restored" ;;
-        crash:*|hang:*) CONSEC_CRASH=$(( CONSEC_CRASH + 1 )); log "crash/hang ($1); nvidia-smi: $(nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv,noheader 2>/dev/null | tr '\n' ';')"
+        crash:*|hang:*) [ "$INFO_STEP" = 1 ] || CONSEC_CRASH=$(( CONSEC_CRASH + 1 )); log "crash/hang ($1); nvidia-smi: $(nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv,noheader 2>/dev/null | tr '\n' ';')"
             [ "$CONSEC_CRASH" -ge 2 ] && { ABORT_ALL=1; log "ABORT: two crashes in a row - production is restored"; } ;;
     esac; }
 STEP_PID=; STEP_RC=0; STEP_WHY=""
@@ -349,7 +402,7 @@ run_step() { local name=$1 cap=$2 l; shift 2; STEP_WHY=""; STEP_RC=0; l=$(left)
     if [ "$l" -lt 60 ]; then STEP_RC=99; STEP_WHY=deadline; log "step $name: SKIP (DEADLINE)"; return 99; fi
     [ "$cap" -gt "$l" ] && cap=$l
     log "step $name: start (cap ${cap} s); VRAM free $(vram)"
-    timeout -s INT -k 60 "$cap" "$@" > "$OUT/$name.txt" 2>&1 < /dev/null &
+    timeout -s INT -k 60 "$cap" "$@" > "$OUT/$name.txt" 2>&1 < /dev/null 9>&- &
     STEP_PID=$!; echo "$STEP_PID" > "$OUT/step.pgid"; mon_reset
     while kill -0 "$STEP_PID" 2>/dev/null; do
         sleep 5; mon_check; [ -n "$MON_WHY" ] && { STEP_WHY=$MON_WHY; log "step $name: stopped: $MON_WHY FAIL"; kill_step; break; }
@@ -367,7 +420,7 @@ srv_up() { local lab=$1 cfg=$2 a=$3 sdir=${ARM_SRV[$3]} senv t0 env_
     stop_bench
     port_busy "$TPORT" && { log "$lab: port $TPORT is in use: not started FAIL"; return 1; }
     senv=$(srv_env "$a")
-    ( cd "$sdir" && exec env "${GENV[@]:2}" $senv "${SCOPE[@]}" "$PY" "$sdir/serve/server.py" --engine strata --config "$cfg" \
+    ( exec 9>&-; cd "$sdir" && exec env "${GENV[@]:2}" $senv "${SCOPE[@]}" "$PY" "$sdir/serve/server.py" --engine strata --config "$cfg" \
         --port "$TPORT" --host 127.0.0.1 ) > "$OUT/server-$lab.out" 2>&1 < /dev/null &
     log "$lab: server $(basename "$sdir")@$(git -C "$sdir" rev-parse --short=8 HEAD) env [$senv]$( [ -n "$(srv_env_dropped "$a")" ] && echo " (not in this server: $(srv_env_dropped "$a"))"), exe $(basename "$(cfgget "$cfg" exe)")"
     WATCH="$OUT/engine-$lab.log $OUT/server-$lab.out"; ENGLOG=$OUT/engine-$lab.log; ENGSTART_BASE=-1
@@ -417,15 +470,17 @@ print(' '.join(d) or 'none', '| args +', ' '.join(x) or '-')" "$C/production.jso
     stw engaged_boot yes; log "arm $lab: INFO lines present: $(echo "${WANT_BOOT[$a]:-none}" | sed 's/;;/ + /g' | tr -d '\\')"
     run_step "$lab-short" 900 $B --label "w212-$lab-short" --levels 1,2,4,8,16 --rounds 2 --max-tok 512 --prompt-tok 100 --out "$OUT/sweep.jsonl"
     [ -n "$STEP_WHY" ] && { stw status fail; stw why "short: $STEP_WHY"; arm_end "$lab"; return 1; }
-    ref=w212-B-short
+    ref=w212-B-short   # I: against H (same kernels), B when H has no short replies tonight
+    [ "$a" = I ] && grep -qF '"label":"w212-H-short"' "$OUT/sweep.requests.jsonl" 2>/dev/null && ref=w212-H-short
+    local rn=${ref#w212-}; rn=${rn%-short}
     if [ "$a" != A ] && [ "$a" != B ]; then
         "$PY" -I "$L/compare_replies.py" "$OUT/sweep.requests.jsonl" "$ref" "w212-$lab-short" --show 3 > "$OUT/$lab-ident.txt" 2>&1; r=$?
         cmp=$( { [ $r = 0 ] && echo same; } || { [ $r = 1 ] && echo DIFF; } || echo "-"); stw ident "$cmp"
-        log "arm $lab: short replies vs B: $cmp $(tail -1 "$OUT/$lab-ident.txt" | cut -c1-160)"
+        log "arm $lab: short replies vs $rn: $cmp $(tail -1 "$OUT/$lab-ident.txt" | cut -c1-160)"
         if [ "$cmp" = DIFF ] && case "$EXACT_ARMS" in *" $a "*) true ;; *) false ;; esac; then
-            if [ "$HTTP_GATE" = 1 ]; then log "arm $lab: an exact arm with other replies than B FAIL - the arm stops (log kept)"
+            if [ "$HTTP_GATE" = 1 ]; then log "arm $lab: an exact arm with other replies than $rn FAIL - the arm stops (log kept)"
                 stw status identfail; arm_end "$lab"; return 1
-            else log "arm $lab: exact arm with other replies than B (HTTP_GATE=0: goes on) FAIL"; fi; fi
+            else log "arm $lab: exact arm with other replies than $rn (HTTP_GATE=0: goes on) FAIL"; fi; fi
     elif [ "$a" = B ]; then
         "$PY" -I "$L/compare_replies.py" "$OUT/sweep.requests.jsonl" w212-A-short "w212-$lab-short" --show 3 > "$OUT/$lab-ident.txt" 2>&1; r=$?
         cmp=$( { [ $r = 0 ] && echo same; } || { [ $r = 1 ] && echo DIFF; } || echo "-"); stw ident "vsA:$cmp"
@@ -444,6 +499,15 @@ print(' '.join(d) or 'none', '| args +', ' '.join(x) or '-')" "$C/production.jso
         run_step "$lab-stop_resend" 600 "$PY" -I -B "$UP/tools/stop_resend_test.py" "$TURL" 40 1
         log "    [stop_resend] ==> $([ "$STEP_RC" = 0 ] && echo PASS || echo "FAIL (rc $STEP_RC)")"
         [ -n "$STEP_WHY" ] && [ "$STEP_WHY" != timeout ] && { stw status fail; stw why "robust: $STEP_WHY"; arm_end "$lab"; return 1; }
+    fi
+    if [ "$a" = I ] && [ "$lab" = I ]; then   # INFO: image and text slots side by side on I's server (not in r2 repeats)
+        if [ -n "${I_VISION_SKIP:-}" ]; then log "    [vision I] ==> SKIP ($I_VISION_SKIP)"
+        else INFO_STEP=1   # (its crash does not count for "two crashes in a row"; I's numbers are in already)
+            run_step "$lab-vision" 900 "$PY" -I -B "$IWT/tools/vision_batch_check.py" --url "$TURL/v1" --out "$OUT/vision-$lab.json"
+            log "    [vision I] ==> rc $STEP_RC${STEP_WHY:+ ($STEP_WHY)} $(grep -a -m1 -E '^  ==> ' "$OUT/$lab-vision.txt" | sed 's/^ *//') (0 GO, 2 NO-GO, 3 INCONCLUSIVE) INFO"
+            stw vision "rc $STEP_RC${STEP_WHY:+ $STEP_WHY}"; INFO_STEP=0
+            [ -n "$STEP_WHY" ] && { stw status ok; stw why "vision (INFO, after the benches): $STEP_WHY"; arm_end "$lab"; return 0; }
+        fi
     fi
     stw status ok; arm_end "$lab"; CONSEC_CRASH=0; return 0; }
 arm_end() { local lab=$1 a cg miss el=$OUT/engine-$1.log
@@ -486,10 +550,10 @@ print("; ".join(out))
 sys.exit(0 if ok and (a.get("batch") or []) else 1)
 PYEOF
 }
-eng_test() {  # <name> <cap> <cfg> <cmd...>: an upstream engine test on 212m-p2 in the bench scope (STRATA_REPO = 212m)
-    local name=$1 cap=$2 cfg=$3; shift 3
+eng_test() {  # <name> <cap> <cfg> <cmd...>: an upstream engine test on 212m-p2 in the bench scope (STRATA_REPO = 212m,
+    local name=$1 cap=$2 cfg=$3; shift 3   # or ET_REPO: 212i's tests)
     WATCH="$OUT/engine-$name.log"; ENGLOG=""; VRAM_ON=1; MON_HANG=$BOOT_HANG; MON_LBL=$name; stop_bench
-    run_step "$name" "$cap" "${SCOPE[@]}" env "${GENV[@]}" $(cfgenv "$cfg") STRATA_REPO="$PWT" STRATA_EXE="$(cfgget "$cfg" exe)" \
+    run_step "$name" "$cap" "${SCOPE[@]}" env "${GENV[@]}" $(cfgenv "$cfg") STRATA_REPO="${ET_REPO:-$PWT}" STRATA_EXE="$(cfgget "$cfg" exe)" \
         SMOKE_LOG="$OUT/engine-$name.log" BATCH_TEST_LOG="$OUT/engine-$name.log" "$@"
     local rc=$STEP_RC; stop_bench; return "$rc"; }
 
@@ -591,7 +655,7 @@ def v(lab, kind, users, key):
 print("\n# decisions (INFO; read the table)")
 def pair(x, y, what, key, kind="short", users=16, lower=False):
     a, b = v(x, kind, users, key), v(y, kind, users, key)
-    if a is None or b is None:
+    if not a or b is None:
         print(f"  {what}: {x} vs {y}: not measured"); return
     print(f"  {what}: {x} {a:.2f} vs {y} {b:.2f} ({100 * (b / a - 1):+.1f} %{', lower is better' if lower else ''})")
 pair("H", "H2", "F14b DAILY vs slots(+stream), short agg 16", "agg_out_tps")
@@ -605,6 +669,9 @@ for x in ("E", "E2"):
 pair("B", "C", "sm_86 table + stack, short agg 16", "agg_out_tps")
 pair("C", "D", "IQ4_W4A8 + TWO_PASS, long agg 16", "agg_out_tps", kind="long")
 pair("A", "H3", "H3 (candidate) vs production, short agg 16", "agg_out_tps")
+pair("A", "I", "I (212i integration, the candidate) vs production, short agg 16", "agg_out_tps")
+pair("A", "I", "I vs production, long agg 16", "agg_out_tps", kind="long")
+pair("H", "I", "I vs H (the ported cache features on the same kernels), short agg 16", "agg_out_tps")
 PYEOF
 }
 if [ "$MODE" = summary ]; then summary; exit 0; fi
@@ -666,9 +733,45 @@ prep() {
     local now; now=$(date +%s)
     [ "$now" -lt "$DL_TS" ] || bad "DEADLINE $(date -d "@$DL_TS" '+%F %T') has passed"
     return $BAD; }
+# arm I's own checks (main shell, after prep): a problem of the 212i tree / build / config skips I only, never the window.
+# int_problems prints one line per problem; vision_problems the reasons the INFO vision step cannot run
+int_problems() { local f=$C/T212-I.json k
+    [ -f "$f" ] || { echo "missing $f (run --gen-configs)"; return; }
+    python3 -c "import json,sys; c=json.load(open(sys.argv[1])); assert c['port']==int(sys.argv[2]) and c['log'].startswith(sys.argv[3]) and c['env']['STRATA_CONV_TIER_DIR'].startswith('/media/raid0/strata-kvspill-bench/')" "$f" "$TPORT" "$OUT/engine-" 2>/dev/null \
+        || echo "$f: port/log/tier dir not as expected (port $TPORT, log under $OUT, tier under the bench dir)"
+    [ -f "$IWT/serve/server.py" ] || { echo "missing $IWT/serve/server.py"; return; }
+    git -C "$IWT" diff --quiet HEAD -- serve 2>/dev/null || echo "$IWT has uncommitted changes under serve/"
+    "$PY" -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$IWT/serve/server.py" 2>/dev/null || echo "$IWT/serve/server.py does not parse"
+    git -C "$IWT" merge-base --is-ancestor 146df3c4 HEAD 2>/dev/null || echo "$IWT does not contain 146df3c4"
+    for k in $(python3 -c "import json,sys; print(' '.join(k for k in json.load(open(sys.argv[1]))['env'] if not k.startswith('MALLOC_')))" "$f"); do
+        git -C "$IWT" grep -q -F "\"$k\"" -- src include serve strata_control || echo "T212-I: $k is not in $IWT"; done
+    grep -q '"STRATA_PARK_ASYNC"' "$f" && echo "T212-I sets STRATA_PARK_ASYNC (upstream's other park in 212i)"
+    [ "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['env'].get('STRATA_PARK_ASYNC', ''))" "$PRODSRC")" = 1 ] \
+        && ! grep -q '"STRATA_PARK_CAPTURE": "1"' "$f" && echo "T212-I lacks STRATA_PARK_CAPTURE=1 (production's STRATA_PARK_ASYNC=1)"
+    if [ -x "${BIN_SRC[int]}" ]; then for k in STRATA_PARK_CAPTURE STRATA_SLOT_PARK STRATA_QSA_SLOTS_STREAM STRATA_GATE_EVICT STRATA_SERVE_STOP_BOUND; do
+        grep -qa "$k" "${BIN_SRC[int]}" || echo "${BIN_SRC[int]} has no $k"; done; fi; }
+vision_problems() { local f=$C/T212-I.json
+    [ -f "$IWT/tools/vision_batch_check.py" ] || { echo "no $IWT/tools/vision_batch_check.py"; return; }
+    "$PY" -I -c 'import PIL.Image' 2>/dev/null || echo "no Pillow in $PY"
+    # 212i's server starts the encoder from the config's "vision" block as before (Vision.reader_args: exe, mmproj, model,
+    # gpu, threads, max_tokens; the same ENC / OK / READY lines), so production's block is used as it is
+    python3 - "$f" <<'PYEOF' 2>/dev/null || echo "T212-I.json cannot be read"
+import json, os, sys
+c = json.load(open(sys.argv[1])); v = c.get("vision") or {}
+for k in ("exe", "mmproj", "model"):
+    if not v.get(k) or not os.path.exists(v[k]):
+        print(f'the config\'s "vision" block has no usable {k} ({v.get(k)})')
+if "--vision" not in c.get("args", []):
+    print("no --vision in the args")
+if c.get("env", {}).get("STRATA_MROPE_SLOTS") != "1":
+    print("STRATA_MROPE_SLOTS is not 1 in the env (the server would run every image request alone)")
+PYEOF
+}
 
 # ---- restore --------------------------------------------------------------------------------------------------------
 STOPPED=0; BACK_DONE=0; WD=; T_STOP=0; PEXE=$(cfgget "$PRODSRC" exe); PRODCFG_SHA=$(sha256sum "$PRODSRC" | cut -c1-16)
+PTIER=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['env'].get('STRATA_CONV_TIER_DIR', ''))" "$PRODSRC" 2>/dev/null)
+PTIER=${PTIER:-/media/raid0/strata-kvspill}
 start_prod() { local t0; log "starting production as before (production.json -> $(readlink "$C/production.json"))"
     systemctl --user start strata.service; t0=$(date +%s)
     until prod_loaded; do
@@ -733,13 +836,20 @@ if [ "$MODE" = dry ]; then
     echo "=== window 212, DRY RUN: nothing is started, stopped or written ($(date '+%F %T'))"
     echo "prep checks:"; prep; PREP_RC=$?
     [ "$PREP_RC" = 0 ] && echo "  prep: ok" || echo "  prep: PROBLEMS above - the real run would refuse to start"
+    if in_arms I; then
+        ip=$(int_problems); vp=$(vision_problems)
+        echo "arm I checks (a problem skips I only): ${ip:-ok}$( [ -x "${BIN_SRC[int]}" ] && echo ", binary sha256 $(sha256sum "${BIN_SRC[int]}" | cut -c1-16) $(date -r "${BIN_SRC[int]}" '+%F %T')" || echo ", binary ${BIN_SRC[int]} MISSING now (I and its steps are skipped unless it exists at run time)")"
+        echo "  vision step: ${vp:-ok}; 212i ctest build $ICB: $([ -f "$ICB/CTestTestfile.cmake" ] && echo present || echo missing)$(for t in conversation_snapshot_test conversation_cache_test conversation_alloc_test conversation_tier_test; do [ -x "$ICB/$t" ] || printf ' (%s not built yet)' "$t"; done)"
+    fi
     echo "window: start $(date -d "@$WS_TS" '+%F %T') (refused earlier unless FORCE=1), DEADLINE $(date -d "@$DL_TS" '+%F %T') (no step starts later; restore then), HARD_STOP $(date -d "@$(( DL_TS + HARD_GRACE ))" '+%T'), $RUNIT.timer $(date -d "@$(( DL_TS + RESTORE_GRACE ))" '+%T')"
     echo "gates: IDENT_GATE=$IDENT_GATE HTTP_GATE=$HTTP_GATE; aborts: free VRAM < $VRAM_MIN MiB (2 samples), scope anon+shmem > $RSS_MAX_GIB GiB, user@$(id -u) memory pressure >= $PRESS_MAX %, hang $HANG_S s, crash lines, two crashes in a row, anything on :$PPORT"
     echo "server env (production's drop-in, read now): $SRVENV_ALL"
     echo
     echo "phase 1 (production serving, ~15 min cap): host ctest on $CTB (CUDA_VISIBLE_DEVICES= , -j4, scope MemoryMax 8G), serve unittests of $PWT (MemoryMax 4G)"
     echo "phase 3 (~25 min): GPU ctest on card 0: $(echo $GPU_TESTS | wc -w) tests + $DAILY_TESTS"
+    in_arms I && echo "         + INFO (~5 min): GPU ctest on card 0 of $ICB: $(echo $I_CTESTS)"
     echo "phase 4 (~35 min): batch_test A / B / H (16 slots, 40K prompt, solo + batch), interleave / groups_cache MOVE 1+0 / cancel_park on 212m-p2"
+    in_arms I && echo "         + (~15 min): batch_test I (I vs H, B when H has no dump: IDENT_GATE=$IDENT_GATE), INFO groups_cache on 212i with STRATA_PARK_CAPTURE_VERIFY=1 STRATA_SLOT_PARK_VERIFY=1$( [ -f "$IWT/tools/cache_reuse_check.py" ] && echo ' + cache_reuse_check' || echo ' (no tools/cache_reuse_check.py in 212i: not run)')"
     echo "phase 5 arms (~${ARM_EST}s each):"
     printf '  %-4s %-9s %-10s %-26s %s\n' arm binary present server "env vs production / args"
     for a in $ARMS; do
@@ -748,7 +858,7 @@ if [ "$MODE" = dry ]; then
         diffs=$(python3 - "$C" "$a" <<'PYEOF' 2>/dev/null
 import json, sys
 cdir, a = sys.argv[1:3]
-ref = {"A": "production", "B": "production", "H": "production"}.get(a, "H" if a.startswith("H") else "B")
+ref = {"A": "production", "B": "production", "H": "production", "I": "production"}.get(a, "H" if a.startswith("H") else "B")
 c = json.load(open(f"{cdir}/T212-{a}.json"))
 r = json.load(open(f"{cdir}/production.json" if ref == "production" else f"{cdir}/T212-{ref}.json"))
 e, p = c["env"], r["env"]
@@ -763,12 +873,15 @@ PYEOF
         echo "       server env: $(srv_env "$a")$( [ -n "$(srv_env_dropped "$a")" ] && echo " (dropped, not in this server: $(srv_env_dropped "$a"))")"
         echo "       INFO lines after the probe: $(echo "${WANT_BOOT[$a]:-none}" | sed 's/;;/ + /g' | tr -d '\\')${FAILPAT[$a]:+; stops on: $(echo "${FAILPAT[$a]}" | tr -d '\\')}${WANT_END[$a]:+; at the end (INFO): $(echo "${WANT_END[$a]}" | sed 's/;;/ + /g' | tr -d '\\')}"
         [ "$a" = H3 ] && echo "       (H3 = T212-H3 when H's short agg at 16 users >= H2's, else T212-H3d)"
+        [ "$a" = I ] && echo "       (short replies vs H, B without H; after the join: INFO vision_batch_check --url $TURL/v1, cap 900 s)"
     done
     n=$(echo $ARMS | wc -w)
     echo "  steps per arm: boot (cap $BOOT_CAP s), warm-up, 4-user probe + INFO check, short 1/2/4/8/16 (greedy, identity vs B for$EXACT_ARMS), long 16, multiturn 16x3, join cold32k$( echo " $ARMS " | grep -q ' H ' && echo '; H also early_close + stop_resend')"
     echo "  then r2 repeats of close pairs (|delta| < 3 %) while >= $ARM_EST s are left"
-    est=$(( 25 + 35 + n * ARM_EST / 60 + 6 ))
-    echo "expected outage: ~$est min (GPU ctest ~25, identity ~35, $n arms x ~$(( ARM_EST / 60 )), restore ~6) from the stop at ~00:00: production back ~$(date -d "@$(( WS_TS + 900 + est * 60 ))" +%H:%M) (spare r2 runs fill up to DEADLINE)"
+    iex=0; in_arms I && iex=$(( 5 + 15 + 10 ))     # I: 212i ctest, bt-I + groups_cache, the vision step after its benches
+    est=$(( 25 + 35 + n * ARM_EST / 60 + iex + 6 ))
+    echo "expected outage: ~$est min (GPU ctest ~25, identity ~35, $n arms x ~$(( ARM_EST / 60 ))$( [ $iex -gt 0 ] && echo ", I's extra steps ~$iex"), restore ~6) from the stop at ~00:00: production back ~$(date -d "@$(( WS_TS + 900 + est * 60 ))" +%H:%M) (spare r2 runs fill up to DEADLINE)"
+    [ $(( WS_TS + 900 + est * 60 )) -gt $(( DL_TS - ARM_EST )) ] && echo "  note: that is past DEADLINE - $ARM_EST s: the last arms in ARMS order (I is last) may be skipped; a shorter ARMS list or I earlier in it keeps I"
     exit 0
 fi
 
@@ -776,13 +889,22 @@ fi
 now=$(date +%s)
 if [ "$now" -lt "$WS_TS" ] && [ "$FORCE" != 1 ]; then echo "too early: GPU use from $(date -d "@$WS_TS" '+%F %T') only (FORCE=1 overrides)"; exit 1; fi
 [ "$now" -ge "$DL_TS" ] && { echo "DEADLINE $(date -d "@$DL_TS" '+%F %T') has passed"; exit 1; }
-trap 'echo "window aborted before production was stopped"; systemctl --user stop "$HUNIT.scope" 2>/dev/null; exit 1' INT TERM HUP
+# one window-212 at a time (prep's pgrep check leaves out window-212.sh itself, and a second one would stop this one's
+# restore timer and fight over the GPUs); long-lived children close fd 9
+LOCK=/run/user/$(id -u)/window-212.lock
+exec 9> "$LOCK" && flock -n 9 || { echo "another window-212.sh holds $LOCK: refused"; exit 1; }
+trap 'echo "window aborted before production was stopped"; systemctl --user stop "$HUNIT.scope" 2>/dev/null; disarm; exit 1' INT TERM HUP
 [ -e "$OUT" ] && { mv "$OUT" "$OUT.prev-$(date +%Y%m%d-%H%M%S)" || { echo "cannot move $OUT aside"; exit 1; }; }
 mkdir -p "$OUT" "$OUT/cfg" "$OUT/bin"
 log "=== window 212 prep (deadline $(date -d "@$DL_TS" '+%F %T'); arms $ARMS; IDENT_GATE=$IDENT_GATE HTTP_GATE=$HTTP_GATE)"
 prep 2>&1 | tee -a "$OUT/window.log"; [ "${PIPESTATUS[0]}" = 0 ] || { log "ABORT before the window: prep failed (production untouched)"; exit 1; }
 systemctl --user is-active -q strata.service || { log "ABORT: strata.service is not active: start it first"; exit 1; }
-for k in prod stocktab port; do pin_bin "$k" > /dev/null && log "pinned $k: ${PINNED[$k]}" || log "binary $k missing now (pinned at first use if it appears)"; done
+for k in prod stocktab port int; do pin_bin "$k" > /dev/null && log "pinned $k: ${PINNED[$k]}" || log "binary $k missing now (pinned at first use if it appears)"; done
+I_VISION_SKIP=""
+if in_arms I; then   # arm I's own checks: a problem skips I (and its steps) only
+    ip=$(int_problems); [ -n "$ip" ] && { SKIP_BIN[int]="212i checks: $(echo "$ip" | head -3 | tr '\n' ';')"; log "arm I: ${SKIP_BIN[int]}"; }
+    I_VISION_SKIP=$(vision_problems | head -3 | tr '\n' ';'); [ -n "$I_VISION_SKIP" ] && log "arm I: the vision step will be skipped: $I_VISION_SKIP"
+fi
 # ---- phase 0: production as it is
 mkdir -p "$OUT/prod-before"
 { echo "production.json -> $PRODSRC sha256 $PRODCFG_SHA"; echo "exe $PEXE sha256 $(sha256sum "$PEXE" | cut -c1-16)"
@@ -835,7 +957,7 @@ trap '' INT TERM HUP; trap final EXIT
 systemctl --user stop strata.service
 STOPPED=1; T_STOP=$(date +%s)
 trap 'on_sig signal' INT TERM HUP
-( sleep $(( DL_TS + HARD_GRACE - $(date +%s) )); tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null | grep -q window-212 && kill -TERM $$ ) 2>/dev/null & WD=$!
+( exec 9>&-; sleep $(( DL_TS + HARD_GRACE - $(date +%s) )); tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null | grep -q window-212 && kill -TERM $$ ) 2>/dev/null & WD=$!
 for _ in $(seq 60); do port_busy $PPORT || break; sleep 2; done
 port_busy $PPORT && { log "ABORT: port $PPORT still open after the stop"; exit 1; }
 free_gpus || { log "ABORT: GPUs not free after the stop"; exit 1; }
@@ -855,6 +977,16 @@ if [ "$GPU_CTEST" = 1 ] && [ -f "$CTB/CTestTestfile.cmake" ] && [ "$ABORT_ALL" =
     ctest_status "$OUT/gpu_ctest_all.txt" > "$OUT/gpu_ctest_status.txt"
     log "    [gpu ctest] ==> $(awk '{c[$2]++} END {for (k in c) printf "%s %d, ", k, c[k]}' "$OUT/gpu_ctest_status.txt")missing: $(for t in $GPU_TESTS $DAILY_TESTS; do grep -q "^$t " "$OUT/gpu_ctest_status.txt" || printf '%s ' "$t"; done)"
 else log "gpu ctest: SKIP (GPU_CTEST=$GPU_CTEST, build $([ -f "$CTB/CTestTestfile.cmake" ] && echo present || echo missing))"; fi
+# INFO: 212i's conversation tests on one card (never a lever drop, never "two crashes in a row"; the tier test's files go
+# under the bench tier, removed at the end)
+if in_arms I && [ "$GPU_CTEST" = 1 ] && [ -f "$ICB/CTestTestfile.cmake" ] && [ "$ABORT_ALL" = 0 ] && [ -z "${SKIP_BIN[int]:-}" ]; then
+    WATCH=""; ENGLOG=""; VRAM_ON=0; MON_HANG=99999; MON_LBL=ctest-212i; INFO_STEP=1; mkdir -p "$TIER/ctest-212i"
+    run_step gpu_ctest_212i 900 "${SCOPE[@]}" env CUDA_VISIBLE_DEVICES=0 TMPDIR="$TIER/ctest-212i" ctest --test-dir "$ICB" \
+        -R "^($(echo $I_CTESTS | tr ' ' '|'))\$" -j1 --timeout 300 --output-on-failure
+    INFO_STEP=0; stop_bench
+    ctest_status "$OUT/gpu_ctest_212i.txt" > "$OUT/gpu_ctest_212i_status.txt"
+    log "    [gpu ctest 212i] ==> $(awk '{printf "%s %s, ", $1, $2}' "$OUT/gpu_ctest_212i_status.txt")missing: $(for t in $I_CTESTS; do grep -q "^$t " "$OUT/gpu_ctest_212i_status.txt" || printf '%s ' "$t"; done)INFO"
+elif in_arms I; then log "gpu ctest 212i: SKIP (GPU_CTEST=$GPU_CTEST, build $ICB $([ -f "$ICB/CTestTestfile.cmake" ] && echo present || echo missing)${SKIP_BIN[int]:+, ${SKIP_BIN[int]}})"; fi
 # the levers whose parity test failed (host: sampler_same_test; GPU: the rest; a GPU test's host-phase result is not used)
 for k in "${!LEVER_TESTS[@]}"; do for t in ${LEVER_TESTS[$k]}; do
     case " $GPU_TESTS $DAILY_TESTS " in *" $t "*) sf=$OUT/gpu_ctest_status.txt ;; *) sf=$OUT/host_ctest_status.txt ;; esac
@@ -866,7 +998,7 @@ for a in "${!ARM_POINT[@]}"; do n=0; m=0; for k in ${ARM_POINT[$a]}; do m=$((m +
 
 # ---- phase 4: identity
 if [ "$IDENTITY" = 1 ] && [ "$ABORT_ALL" = 0 ]; then
-    for a in A B H; do [ "$ABORT_ALL" = 1 ] && break
+    for a in A B H $(in_arms I && echo I); do [ "$ABORT_ALL" = 1 ] && break
         [ -n "${SKIP_BIN[${ARM_BIN[$a]}]:-}" ] && { log "identity bt-$a: SKIP (${SKIP_BIN[${ARM_BIN[$a]}]})"; continue; }
         bt_run "$a"; done
     r_ba=$(bt_same A B); c_ba=$?; r_hb=$(bt_same B H); c_hb=$?; r_ha=$(bt_same A H); c_ha=$?
@@ -879,8 +1011,14 @@ if [ "$IDENTITY" = 1 ] && [ "$ABORT_ALL" = 0 ]; then
         port)   [ $c_hb = 1 ] && SKIP_BIN[port]="batch_test H != B (IDENT_GATE=port)" ;;
     esac
     for k in stocktab port; do [ -n "${SKIP_BIN[$k]:-}" ] && log "IDENT gate: the $k arms are skipped: ${SKIP_BIN[$k]}"; done
+    if in_arms I && [ -z "${SKIP_BIN[int]:-}" ]; then   # I is exact against H (same kernels + cache features); B without H's dump
+        iref=H; r_i=$(bt_same H I); c_i=$?; [ $c_i = 2 ] && [ -f "$OUT/bt-I.json" ] && { iref=B; r_i=$(bt_same B I); c_i=$?; }
+        log "    [IDENT bt I vs $iref] ==> $r_i $([ $c_i = 0 ] && echo PASS || { [ $c_i = 1 ] && echo FAIL || echo SKIP; })"
+        [ "$IDENT_GATE" != off ] && [ $c_i = 1 ] && { SKIP_BIN[int]="batch_test I != $iref (IDENT_GATE=$IDENT_GATE)"; log "IDENT gate: arm I is skipped: ${SKIP_BIN[int]}"; }
+    fi
     pin_bin port > /dev/null
     if [ -z "${SKIP_BIN[port]:-}" ] && [ "$ABORT_ALL" = 0 ] && cfg=$(mkrun H et-H); then
+        INFO_STEP=1     # (INFO tests: a crash here does not count for "two crashes in a row"; the plan means arms)
         eng_test interleave 900 "$cfg" "$PY" -I -B "$PWT/tools/batch_interleave_test.py" --exe "$(cfgget "$cfg" exe)" --config "$cfg" \
             --extra "$BT_EXTRA --no-prefill-borrow" --dump "$OUT/interleave.json"
         log "    [interleave] ==> $([ "$STEP_RC" = 0 ] && echo PASS || echo "FAIL (rc $STEP_RC)") $(grep -aE 'PASS|FAIL' "$OUT/interleave.txt" | tail -1 | cut -c1-140)"
@@ -894,6 +1032,21 @@ try: a,b=json.load(open(sys.argv[1])),json.load(open(sys.argv[2])); print([x.get
 except Exception as e: print('missing', e)" "$OUT/bgc-move1.json" "$OUT/bgc-move0.json") INFO"
         [ "$ABORT_ALL" = 0 ] && eng_test cancel_park 600 "$cfg" env STRATA_EXTRA_ARGS="" "$PY" -I -B "$PWT/tools/cancel_park_test.py" "$cfg"
         log "    [cancel_park] ==> $(grep -E '^(PASS|FAIL)' "$OUT/cancel_park.txt" | tail -1) INFO"
+        INFO_STEP=0
+    fi
+    # INFO: 212i's cache paths with their byte checks (a capture beside the slots / a slot's capture against a plain one;
+    # the engine stops with ERR on a mismatch), production's SLOT_CKPT_MOVE=1
+    pin_bin int > /dev/null
+    if in_arms I && [ -z "${SKIP_BIN[int]:-}" ] && [ "$ABORT_ALL" = 0 ] && cfg=$(mkrun I et-I); then
+        INFO_STEP=1; ET_REPO=$IWT
+        c2=$OUT/cfg/run-bgc-I.json
+        python3 -c "import json,sys; c=json.load(open(sys.argv[1])); c['env'].update(STRATA_PARK_CAPTURE_VERIFY='1', STRATA_SLOT_PARK_VERIFY='1'); c['log']=sys.argv[2]; json.dump(c,open(sys.argv[3],'w'),indent=1)" "$cfg" "$OUT/engine-bgc-I.log" "$c2"
+        eng_test bgc-I 900 "$c2" env STRATA_EXTRA_ARGS="" "$PY" -I -B -u "$IWT/tools/batch_groups_cache_test.py" "$c2" "$OUT/bgc-I.json"
+        log "    [bgc-I verify] ==> $(grep -E '^(PASS|FAIL)$' "$OUT/bgc-I.txt" | tail -1) rc $STEP_RC; verified: $(grep -a -c 'STRATA_PARK_CAPTURE_VERIFY: [0-9]* tokens, [0-9]* bytes identical' "$OUT/engine-bgc-I.log" 2>/dev/null) park captures, $(grep -a -c 'STRATA_SLOT_PARK_VERIFY: slot [0-9]*, [0-9]* tokens, [0-9]* bytes identical' "$OUT/engine-bgc-I.log" 2>/dev/null) slot captures identical; mismatches: $(grep -a -c -E 'VERIFY: (the capture beside the slots differs|slot [0-9]+.s capture \(stage|slot [0-9]+ was written before)' "$OUT/engine-bgc-I.log" 2>/dev/null) INFO"
+        # (tools/cache_reuse_check.py is not in 212i as of 98001378; should it appear, it is not run: its arguments were not checked)
+        [ -f "$IWT/tools/cache_reuse_check.py" ] && log "    [cache_reuse-I] ==> SKIP (tools/cache_reuse_check.py appeared in $IWT; not wired up tonight)" \
+            || log "    [cache_reuse-I] ==> SKIP (no tools/cache_reuse_check.py in $IWT)"
+        ET_REPO=""; INFO_STEP=0
     fi
 else log "identity: SKIP (IDENTITY=$IDENTITY)"; fi
 
