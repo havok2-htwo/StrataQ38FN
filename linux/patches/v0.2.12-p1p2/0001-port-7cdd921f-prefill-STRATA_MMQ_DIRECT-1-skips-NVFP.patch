@@ -1,0 +1,37 @@
+From abbaf026a11b6d4eaf15b17d0997daa03222ad44 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 13:56:24 +0100
+Subject: [PATCH 1/8] port 7cdd921f: prefill: STRATA_MMQ_DIRECT=1 skips NVFP4
+ layers (tail_off)
+
+v0.1.45's port of our 7cdd921f (upstream 7d9b50dc) dropped the NVFP4
+guard in mmq_plan. Re-add only that clause: a layer with per-expert scales
+(tail_off) is never marked direct, since a direct group's compact gathers
+would place the scales away from the group position the scaled swiglu and
+the down row scales index. Behaviour is unchanged with STRATA_MMQ_DIRECT
+unset and for every non-NVFP4 layer.
+
+(cherry picked from commit 7cdd921ff43e, the guard hunk only)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/prefill/prefill.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 0ef3cce9..5034bca9 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1592,6 +1592,9 @@ const MmqPlan& mmq_plan() {
+                 if (mmq::overread_bytes(gt, N) != 0 || mmq::overread_bytes(dt, 640) > mmq::kSlotGuard) continue;
+                 if (f.up_off != mmq::matrix_bytes(gt, 1280, N) / 2 || f.down_off != 2 * f.up_off) continue;
+                 if (mmq::matrix_bytes(dt, N, 640) != f.bytes - f.down_off) continue;
++                // an NVFP4 layer's per-expert scales (tail_off) sit at the group position the scaled swiglu and the
++                // down scales index; a direct group's compact gathers would put them elsewhere
++                if (f.tail_off) continue;
+                 p.direct[(size_t) l] = 1;
+                 p.d_over[(size_t) l] = (uint32_t) mmq::overread_bytes(dt, 640);
+                 ++nd;
+-- 
+2.43.0
+

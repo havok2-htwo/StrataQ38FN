@@ -1,0 +1,404 @@
+From ac6f8e665438dba9862c43afa492fe155ef4dfca Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:48:01 +0100
+Subject: [PATCH 2/2] port 16c85fc4: conversation cache: the physical-RAM gates
+ stop evicting when the memory does not come back, and a slot's capture can
+ evict to fit (opt-in STRATA_GATE_EVICT=1, #3115)
+
+The park admission gate evicts the least recently active parked conversations until the guard's reading admits
+the snapshot.  With plain malloc glibc keeps what an eviction frees in its arenas, the reading does not rise, and
+the loop emptied the whole cache and refused anyway (measured on the production host).  Against an unknown
+reading (which never admits) it did the same.
+
+STRATA_GATE_EVICT=1 (default off; off is the gate exactly as before) runs the park gate through
+gate_evict_to_fit (conversation_memory.hpp, pure, header-only):
+* no eviction at all when every evictable entry, all of it returned, could not cover allocation + floor, or
+  when the reading is unknown; the same check after each eviction against the rest;
+* one entry at a time, oldest first (evict_oldest, as before), and a stop after 2 evictions in a row that each
+  did not raise the reading by at least half of the entry's accounted bytes (a returning one resets the count).
+One new line says why it stopped ("STRATA_GATE_EVICT: stopped evicting after N (...)"); the existing refusal and
+"evicted N parked conversations" lines keep their format.
+
+ConversationCache::evictable_bytes() / oldest_evictable_bytes(): the bytes of the entries evict_oldest() may
+take and of the next victim.  Tests: conversation_memory_test (stop rule, can-help, returned, saturation,
+unknown, bounds), conversation_cache_test (pinned entries are not counted).
+
+Adaptations to v0.2.12:
+- Park-gate half only.  The slot-capture half (slot_park_start evicting to fit the RAM floor) needs
+  STRATA_SLOT_PARK, which v0.2.12 does not have; it follows with that port.  The env comment and the startup
+  line no longer mention the slot capture.
+- evictable_bytes() / oldest_evictable_bytes() also leave out upstream's guard()ed borrow donor (#1164), which
+  upstream's evict_oldest() skips; a conversation_cache_test case checks it.  No EvictSink / <functional>
+  (that belongs to STRATA_CONV_TIER_DIR, a later group).
+- The park gate (inside upstream's park_source, shared by park_current and park_slot) re-placed by function;
+  gate_evict_env() sits after the slot_copy_batchsync switch (our base had it beside slot_park_env).
+- conversation_memory_test: our cases appended after upstream's auto_conversation_cache_mib checks.
+
+(cherry picked from commit 16c85fc4d99059cfbb77470929d294c253daccb3)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/conversation_cache.hpp  | 15 ++++
+ include/strata/core/conversation_memory.hpp | 70 +++++++++++++++
+ src/core/conversation_cache_test.cpp        | 13 +++
+ src/core/conversation_memory_test.cpp       | 95 +++++++++++++++++++++
+ src/program/generate.cpp                    | 63 +++++++++++++-
+ 5 files changed, 252 insertions(+), 4 deletions(-)
+
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index d1513295..f92a3202 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -10,6 +10,7 @@
+ #include <cstdint>
+ #include <deque>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -425,6 +426,20 @@ public:
+         }
+         return false;
+     }
++    // STRATA_GATE_EVICT (conversation_memory.hpp, gate_evict_to_fit): what the physical-RAM gates could get back.
++    // The accounted bytes of every entry evict_oldest() may take (all but the pinned ones and the guarded donor), and
++    // of the one it takes next (nullopt: none can go).
++    size_t evictable_bytes() const {
++        size_t n = 0;
++        for (size_t i = 0; i < entries_.size(); ++i)
++            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) n += entries_[i].bytes();
++        return n;
++    }
++    std::optional<size_t> oldest_evictable_bytes() const {
++        for (size_t i = 0; i < entries_.size(); ++i)
++            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) return entries_[i].bytes();
++        return std::nullopt;
++    }
+ 
+     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
+     // may carry the poison.  Returns how many were parked.
+diff --git a/include/strata/core/conversation_memory.hpp b/include/strata/core/conversation_memory.hpp
+index 97fc1bef..0718bca2 100644
+--- a/include/strata/core/conversation_memory.hpp
++++ b/include/strata/core/conversation_memory.hpp
+@@ -84,4 +84,74 @@ inline bool conversation_memory_admit(std::optional<uint64_t> available,
+     return available && *available >= floor && allocation <= *available - floor;
+ }
+ 
++// ---- STRATA_GATE_EVICT=1 (default off): the physical-RAM gates' evict-to-fit loop with a stop rule (#3115)
++//
++// The gates in generate.cpp (a park's admission, a batch slot's capture) evict the least recently active parked
++// conversations until the reading admits the allocation.  Whether an eviction raises the next reading depends on the
++// allocator (conversation_alloc.hpp, STRATA_CONV_MMAP): with plain malloc, glibc keeps what an eviction frees in its
++// arenas, MemAvailable stays where it was, and the old loop emptied the whole cache and refused anyway (measured on the
++// production host).  This loop evicts one entry at a time as before, but
++//   * not at all when evicting every evictable entry could not cover the need even if all of it came back
++//     (available + evictable < allocation + floor), or when the reading is unknown (the old loop evicted everything
++//     against an unknown reading, which never admits);
++//   * stops when the rest of the cache could no longer cover the need from the current reading;
++//   * stops after `stall_limit` evictions in a row that each did not raise the reading by at least half of the
++//     evicted entry's accounted bytes (gate_evict_returned) - the memory is not coming back to the kernel, so
++//     further evictions only throw away cache for nothing.  A returning eviction resets the count.
++// Not a reservation and not exact: other writers move the reading between samples, which is what the half-size
++// margin and the k-in-a-row rule absorb (a lone noisy sample stops nothing).
++
++/// Did one eviction give its memory back?  `before`/`after` the readings around it, `freed` its accounted bytes.
++/// An unknown reading on either side counts as not returned.
++inline bool gate_evict_returned(std::optional<uint64_t> before, std::optional<uint64_t> after, uint64_t freed) {
++    return before && after && *after >= *before && *after - *before >= freed / 2;
++}
++
++/// Could evicting `evictable` bytes, all of them returned, let `allocation` in above `floor`?  Unknown: no.
++inline bool gate_evict_can_help(std::optional<uint64_t> available, uint64_t evictable, uint64_t allocation,
++                                uint64_t floor) {
++    if (!available) return false;
++    const uint64_t best = evictable > UINT64_MAX - *available ? UINT64_MAX : *available + evictable;
++    return conversation_memory_admit(best, allocation, floor);
++}
++
++struct GateEvictOutcome {
++    bool admitted = false;   ///< the last reading admits the allocation
++    bool hopeless = false;   ///< stopped (or never started) because the evictable rest could not cover the need
++    bool stalled = false;    ///< stopped after stall_limit evictions in a row that did not raise the reading
++    size_t evicted = 0;
++    uint64_t freed = 0;      ///< the evicted entries' accounted bytes
++    std::optional<uint64_t> first, last;   ///< the readings before the first eviction and after the last
++    /// the reading's change from first to last in bytes (0 when either is unknown)
++    int64_t rose() const { return first && last ? (int64_t) (*last - *first) : 0; }
++};
++
++/// The loop.  sample(): the guard's reading (std::optional<uint64_t>); victim_bytes(): the accounted bytes of the entry
++/// evict() would take next (std::optional<uint64_t>, nullopt: none can go); evict(): evicts it (false: none went).
++/// `evictable`: the accounted bytes of every entry that can go.  `max_evictions` bounds the loop (the cache's slots).
++template<class Sample, class VictimBytes, class Evict>
++GateEvictOutcome gate_evict_to_fit(Sample&& sample, VictimBytes&& victim_bytes, Evict&& evict, uint64_t evictable,
++                                   uint64_t allocation, uint64_t floor, size_t max_evictions,
++                                   unsigned stall_limit = 2) {
++    GateEvictOutcome out;
++    std::optional<uint64_t> now = sample();
++    out.first = now;
++    unsigned stalls = 0;
++    for (;;) {
++        if (conversation_memory_admit(now, allocation, floor)) { out.admitted = true; break; }
++        if (!gate_evict_can_help(now, evictable - out.freed, allocation, floor)) { out.hopeless = true; break; }
++        if (out.evicted >= max_evictions) break;
++        const std::optional<uint64_t> bytes = victim_bytes();
++        if (!bytes || !evict()) break;
++        ++out.evicted;
++        out.freed += *bytes > evictable - out.freed ? evictable - out.freed : *bytes;
++        const std::optional<uint64_t> after = sample();
++        stalls = gate_evict_returned(now, after, *bytes) ? 0 : stalls + 1;
++        now = after;
++        if (stalls >= stall_limit && !conversation_memory_admit(now, allocation, floor)) { out.stalled = true; break; }
++    }
++    out.last = now;
++    return out;
++}
++
+ } // namespace strata::core
+diff --git a/src/core/conversation_cache_test.cpp b/src/core/conversation_cache_test.cpp
+index 7c4dba46..5732168a 100644
+--- a/src/core/conversation_cache_test.cpp
++++ b/src/core/conversation_cache_test.cpp
+@@ -162,8 +162,16 @@ int main() {
+         pinned.checkpoints.back().gdn.resize(64, 1);
+         cache.put(std::move(pinned));
+         cache.put(image({9, 8, 7}));
++        // STRATA_GATE_EVICT's view of the same choice: the pinned entry counts for nothing, the next victim is the
++        // unpinned one evict_oldest() takes
++        const size_t unpinned = image({9, 8, 7}).bytes();
++        check(cache.evictable_bytes() == unpinned, "evictable_bytes counts the unpinned entries only");
++        check(cache.oldest_evictable_bytes() == std::optional<size_t>(unpinned),
++              "oldest_evictable_bytes is the entry evict_oldest takes (past the older pinned one)");
+         check(cache.evict_oldest() && cache.size() == 1, "the oldest unpinned conversation went (the pinned one is older)");
+         check(!cache.evict_oldest() && cache.size() == 1, "only a pinned one is left: nothing more can go");
++        check(cache.evictable_bytes() == 0 && !cache.oldest_evictable_bytes(),
++              "only a pinned one is left: nothing evictable, no victim");
+         // #879: after non-finite logits every parked conversation goes, the pinned one too
+         cache.put(image({4, 5, 6}));
+         std::vector<ConversationKv> kv(1);
+@@ -512,7 +520,12 @@ int main() {
+         two.guard(m2.serial);
+         check(!two.put(image({9, 9, 9})) && two.guard_blocked() && two.size() == 2 && two.evictions() == 0,
+               "no slot beside the donor and the pinned document: refused before evicting anything");
++        // STRATA_GATE_EVICT: neither the guarded donor nor the pinned document is evictable
++        check(two.evictable_bytes() == 0 && !two.oldest_evictable_bytes(), "guarded donor and pin: nothing evictable");
+         two.unguard();
++        check(two.evictable_bytes() == two.find(m2.serial)->bytes() &&
++                  two.oldest_evictable_bytes() == std::optional<size_t>(two.find(m2.serial)->bytes()),
++              "unguarded, the donor is the next victim");
+         // a match that reaches the pinned prefix is taken, not borrowed: one conversation keeps holding the pin
+         const auto on_pin = two.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6, 77}, {}, true);
+         check(on_pin.tokens == 6 && !on_pin.live && !two.borrows(on_pin), "a pinned prefix is taken, not borrowed");
+diff --git a/src/core/conversation_memory_test.cpp b/src/core/conversation_memory_test.cpp
+index 35d18df1..3c6eaabb 100644
+--- a/src/core/conversation_memory_test.cpp
++++ b/src/core/conversation_memory_test.cpp
+@@ -4,6 +4,7 @@
+ #include <cstdlib>
+ #include <limits>
+ #include <sstream>
++#include <vector>
+ 
+ #if defined(_WIN32)
+ #ifndef NOMINMAX
+@@ -59,6 +60,100 @@ int main() {
+     check(auto_conversation_cache_mib(GiB(40), 2560) == 8192, "capped at 8 GiB");
+     check(auto_conversation_cache_mib(GiB(1000), 0) == 8192, "a big server: still the cap");
+     check(auto_conversation_cache_mib(GiB(40), 1000000) == 0, "a floor above the RAM: off, no underflow");
++    // ---- STRATA_GATE_EVICT: gate_evict_to_fit's stop rule against a fake cache and a fake reading
++    check(gate_evict_returned(100, 150, 100), "an eviction that raised the reading by half its size returned");
++    check(!gate_evict_returned(100, 149, 100), "one byte under half its size: not returned");
++    check(!gate_evict_returned(100, 90, 0), "a falling reading is not returned, even for an empty entry");
++    check(gate_evict_returned(100, 100, 1), "half of one byte rounds down: an unchanged reading counts");
++    check(!gate_evict_returned({}, 200, 10) && !gate_evict_returned(100, {}, 10), "unknown on either side: not returned");
++    check(gate_evict_can_help(50, 60, 40, 70), "all evictable back would just cover it");
++    check(!gate_evict_can_help(50, 59, 40, 70), "one byte short even with everything back");
++    check(!gate_evict_can_help({}, 1000, 0, 0), "unknown reading: evicting cannot be shown to help");
++    check(gate_evict_can_help(std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(), 1, 1),
++          "available plus evictable saturates instead of wrapping");
++    struct Fake {
++        std::vector<uint64_t> entries;   // accounted bytes, oldest first
++        std::vector<uint64_t> returns;   // what the k-th eviction gives back to the reading (default: all of it)
++        std::optional<uint64_t> avail;
++        size_t samples = 0, evicted = 0;
++        uint64_t evictable() const { uint64_t n = 0; for (uint64_t e : entries) n += e; return n; }
++        GateEvictOutcome run(uint64_t allocation, uint64_t floor, size_t max_evictions) {
++            return gate_evict_to_fit(
++                [&]() -> std::optional<uint64_t> { ++samples; return avail; },
++                [&]() -> std::optional<uint64_t> {
++                    return entries.empty() ? std::nullopt : std::optional<uint64_t>(entries.front());
++                },
++                [&] {
++                    if (entries.empty()) return false;
++                    const uint64_t back = evicted < returns.size() ? returns[evicted] : entries.front();
++                    if (avail) *avail += back;
++                    entries.erase(entries.begin());
++                    ++evicted;
++                    return true;
++                },
++                evictable(), allocation, floor, max_evictions);
++        }
++    };
++    {   // it fits already: one reading, nothing evicted
++        Fake f{{100, 100}, {}, 500};
++        const auto r = f.run(100, 100, 8);
++        check(r.admitted && r.evicted == 0 && f.samples == 1 && f.entries.size() == 2, "fits: nothing evicted");
++    }
++    {   // every eviction returns its memory: oldest first, stop as soon as it fits
++        Fake f{{100, 100, 100, 100}, {}, 0};
++        const auto r = f.run(150, 0, 8);
++        check(r.admitted && r.evicted == 2 && r.freed == 200 && r.rose() == 200 && f.entries.size() == 2,
++              "returning evictions: just enough of them, oldest first");
++    }
++    {   // malloc keeps everything (#3115): two evictions in a row gave nothing back - stop, the rest stays parked
++        Fake f{{100, 100, 100, 100, 100}, {0, 0, 0, 0, 0}, 0};
++        const auto r = f.run(150, 0, 8);
++        check(!r.admitted && r.stalled && !r.hopeless && r.evicted == 2 && f.entries.size() == 3 && r.rose() == 0,
++              "two non-returning evictions in a row stop the loop; the cache is not emptied for nothing");
++    }
++    {   // a returning eviction resets the count: stall, return, stall, stall -> stops after four
++        Fake f{{100, 100, 100, 100, 100, 100}, {0, 100, 0, 0}, 0};
++        const auto r = f.run(1000, 0, 8);
++        check(r.evicted == 0 && r.hopeless, "600 evictable cannot cover 1000: nothing is evicted at all");
++        Fake g{{100, 100, 100, 100, 100, 100}, {0, 100, 0, 0}, 0};
++        const auto s = g.run(350, 0, 8);
++        check(!s.admitted && s.stalled && s.evicted == 4 && s.rose() == 100 && g.entries.size() == 2,
++              "the stall count is consecutive: a returning eviction in between resets it");
++    }
++    {   // half-returned is returned: 60 of 100 back each time, keeps going until it fits
++        Fake f{{100, 100, 100, 100}, {60, 60, 60, 60}, 0};
++        const auto r = f.run(150, 0, 8);
++        check(r.admitted && r.evicted == 3 && r.rose() == 180, "evictions returning more than half their size go on");
++    }
++    {   // the rest can no longer cover it: stop early (hopeless), here after the first half-return
++        Fake f{{100, 100, 100}, {50, 0, 0}, 0};
++        const auto r = f.run(300, 0, 8);
++        check(!r.admitted && r.hopeless && !r.stalled && r.evicted == 1 && f.entries.size() == 2,
++              "after a partial return the rest (200) cannot lift 50 to 300: stop");
++    }
++    {   // the floor counts as part of the need; the slot bound caps the loop
++        Fake f{{100, 100, 100, 100}, {}, 0};
++        const auto r = f.run(100, 200, 2);
++        check(!r.admitted && r.evicted == 2 && !r.stalled && !r.hopeless, "max_evictions bounds the loop");
++        Fake g{{100, 100, 100, 100}, {}, 0};
++        check(g.run(100, 200, 8).evicted == 3, "allocation plus floor: three of 100 for 100 + 200");
++    }
++    {   // unknown reading: no eviction (the old loop emptied the cache against it and refused anyway)
++        Fake f{{100, 100}, {}, std::nullopt};
++        const auto r = f.run(0, 0, 8);
++        check(!r.admitted && r.hopeless && r.evicted == 0 && f.entries.size() == 2, "unknown reading: nothing evicted");
++    }
++    {   // nothing evictable (empty, or only pinned entries: evictable 0) and short: hopeless at once
++        Fake f{{}, {}, 10};
++        const auto r = f.run(100, 0, 8);
++        check(!r.admitted && r.hopeless && r.evicted == 0 && f.samples == 1, "empty cache: one reading, no loop");
++    }
++    {   // a fit reached on the stalling eviction still admits (the stop rule only applies while it does not fit)
++        Fake f{{100, 100, 100}, {0, 40}, 60};
++        const auto r = f.run(100, 0, 8);
++        check(r.admitted && !r.stalled && r.evicted == 2 && f.entries.size() == 1,
++              "the second short return still lifts it to the need: admitted, not stalled");
++    }
+     // Test the real provider without assuming any particular amount of free RAM.
+     const auto available = available_host_bytes();
+     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3f9ec41d..ee8f5b33 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -427,6 +427,17 @@ bool slot_copy_batchsync_env() {
+     }();
+     return on;
+ }
++// STRATA_GATE_EVICT=1 (default off; #3115): the physical-RAM gate evicts with a stop rule (gate_evict_to_fit,
++// strata/core/conversation_memory.hpp): nothing when evicting all that can go could not cover the need, and no more
++// once two evictions in a row did not raise the reading by half their size (the allocator keeps what they freed -
++// plain malloc; STRATA_CONV_MMAP returns it).  Off: the gate as before
++bool gate_evict_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_GATE_EVICT");
++        return v && v[0] != '0';
++    }();
++    return on;
++}
+ 
+ // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
+ // A file-backed arena on AMD (STRATA_ARENA_MMAP; the engine raises ROCclr's pin-in-place threshold, see main): an
+@@ -1513,6 +1524,24 @@ static std::string ram_note(const std::optional<strata::core::HostMemoryReading>
+     return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
+ }
+ 
++// STRATA_GATE_EVICT: why a gate's eviction loop stopped short (gate_evict_to_fit); "" when it did not.  The caller
++// prefixes it and prints its own refusal line after it, as without the switch
++static std::string gate_evict_note(const strata::core::GateEvictOutcome& r, size_t evictable_left, size_t parked) {
++    if (r.admitted || (!r.stalled && !r.hopeless)) return std::string();
++    char buf[320];
++    if (r.stalled)
++        std::snprintf(buf, sizeof buf, "STRATA_GATE_EVICT: stopped evicting after %zu (2 in a row did not raise the "
++                      "available RAM by half their size: the allocator keeps the memory; %llu MiB evicted, available "
++                      "rose %lld MiB, %zu still parked)", r.evicted, (unsigned long long) (r.freed >> 20),
++                      (long long) (r.rose() / (1 << 20)), parked);
++    else
++        std::snprintf(buf, sizeof buf, "STRATA_GATE_EVICT: stopped evicting after %zu (the evictable rest, %zu MiB, "
++                      "cannot cover the need; %llu MiB evicted, available rose %lld MiB, %zu still parked)", r.evicted,
++                      evictable_left >> 20, (unsigned long long) (r.freed >> 20), (long long) (r.rose() / (1 << 20)),
++                      parked);
++    return buf;
++}
++
+ // ---- issue #31: what the watchdog prints before it stops a stalled engine
+ struct MemSample {
+     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard (Linux) / all (Windows)
+@@ -12046,6 +12075,10 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata serve: STRATA_CONV_MMAP: parked K/V segments and checkpoint state of 64 KiB "
+                                  "or more are mapped one by one and unmapped when freed (an eviction returns its RAM "
+                                  "to the kernel at once)\n");
++        if (gate_evict_env())
++            std::fprintf(stderr, "strata serve: STRATA_GATE_EVICT: the physical-RAM gate evicts only what can help and "
++                                 "stops after 2 evictions in a row that did not raise the available RAM by half their "
++                                 "size\n");
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+         // STRATA_PARK_ASYNC: set by the request around its park - the live checkpoints it drops right after (they move
+@@ -12208,10 +12241,32 @@ int main(int argc, char** argv) {
+                     return strata::core::conversation_memory_admit(
+                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
+                 };
+-                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
+-                       conversations.evict_oldest())
+-                    ++evicted;
+-                if (!admit()) {
++                // STRATA_GATE_EVICT: the same eviction order, but none that cannot help and none after two in a row
++                // that gave nothing back (gate_evict_to_fit); its own line says why it stopped, the refusal follows
++                bool admitted = false;
++                if (gate_evict_env()) {
++                    const auto r = strata::core::gate_evict_to_fit(
++                        [&]() -> std::optional<uint64_t> {
++                            mem = strata::core::sample_host_memory();
++                            return mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
++                        },
++                        [&]() -> std::optional<uint64_t> {
++                            const auto b = conversations.oldest_evictable_bytes();
++                            return b ? std::optional<uint64_t>(*b) : std::nullopt;
++                        },
++                        [&] { return conversations.evict_oldest(); }, conversations.evictable_bytes(), additional, floor,
++                        conversations.slots());
++                    evicted = r.evicted;
++                    admitted = r.admitted;
++                    const std::string note = gate_evict_note(r, conversations.evictable_bytes(), conversations.size());
++                    if (!note.empty()) std::fprintf(stderr, "strata serve: conversation cache: %s\n", note.c_str());
++                } else {
++                    while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
++                           conversations.evict_oldest())
++                        ++evicted;
++                    admitted = admit();
++                }
++                if (!admitted) {
+                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
+                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
+                                  evicted, conversations.size());
+-- 
+2.43.0
+

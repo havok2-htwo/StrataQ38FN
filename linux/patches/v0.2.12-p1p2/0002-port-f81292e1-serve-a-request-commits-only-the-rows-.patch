@@ -1,0 +1,99 @@
+From 8e7039298f5822670153a08520fe6b7686822d50 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 13:57:09 +0100
+Subject: [PATCH 2/8] port f81292e1: serve: a request commits only the rows it
+ can emit, so the parked snapshot matches what the client got (#4677)
+
+Upstream already carries 243fdb21 (header, policy test, CMake), but gated
+to HIP: its commit says "HIP only (STRATA_USE_HIP), where it was measured".
+That gate is deliberate scoping, so this delta keeps upstream's HIP default
+and makes the bound a CUDA opt-in instead of our unconditional default-on:
+
+- the include and both call sites (pipelined and serial loop) are no
+  longer inside #if defined(STRATA_USE_HIP); only the default of the
+  switch depends on the backend: HIP on unless STRATA_SERVE_STOP_BOUND=0
+  (unchanged), elsewhere off unless STRATA_SERVE_STOP_BOUND=1.  With the
+  variable unset a CUDA build behaves exactly as stock v0.2.12.
+- both sites cap only while produced_n < max_new, as in our f81292e1:
+  with nothing left to emit serve_stop_bound() returns 0 and a would be
+  -1 (pl_commit_async(0), outp[-1]).
+
+Production on a v0.2.12 engine must now set STRATA_SERVE_STOP_BOUND=1
+explicitly to keep the ll10b N3 behaviour (TESTLOG #95).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 23 +++++++++++------------
+ 1 file changed, 11 insertions(+), 12 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 03113d5a..40e3c55c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -33,9 +33,7 @@
+ #include "strata/core/expert_nibble.hpp"
+ #include "strata/core/conversation_snapshot.hpp"
+ #include "strata/core/lookup_default.hpp"
+-#if defined(STRATA_USE_HIP)
+ #include "strata/core/serve_stop_bound.hpp"
+-#endif
+ #include "strata/core/conversation_file.hpp"
+ #include "strata/core/session_save_reclaim.hpp"
+ #include "strata/core/conversation_memory.hpp"
+@@ -18071,14 +18069,17 @@ int main(int argc, char** argv) {
+                 if (fol_next < fol_sets.size() && !fol_sets[fol_next].empty()) fol = &fol_sets[fol_next];
+                 ++fol_next;
+             }
+-#if defined(STRATA_USE_HIP)
+-            // on by default (HIP, where it was measured: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations fell back to the older
+-            // checkpoint against 4 of 16 without it, #4677); STRATA_SERVE_STOP_BOUND=0 turns it off
++            // on by default on HIP (where it was measured: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations fell back to the older
++            // checkpoint against 4 of 16 without it, #4677); STRATA_SERVE_STOP_BOUND=0 turns it off.  Elsewhere opt-in with
++            // STRATA_SERVE_STOP_BOUND=1 (nothing in it is backend-specific; not measured there yet)
+             static const bool stop_bound = [] {
+                 const char* v = std::getenv("STRATA_SERVE_STOP_BOUND");
++#if defined(STRATA_USE_HIP)
+                 return v == nullptr || std::strcmp(v, "0") != 0;
+-            }();
++#else
++                return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+ #endif
++            }();
+             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
+             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
+             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
+@@ -18634,12 +18635,12 @@ int main(int argc, char** argv) {
+                     chain_kind = 0;
+                     int a = 0;
+                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
+-#if defined(STRATA_USE_HIP)
+-                    if (stop_bound)
++                    // (produced_n < max_new: a window with nothing left to emit commits as before - serve_stop_bound
++                    // would give 0 rows and a = -1)
++                    if (stop_bound && produced_n < max_new)
+                         a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
+                             return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                         }) - 1;
+-#endif
+                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
+                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
+                     draft_offered += A.T - 1;
+@@ -19177,14 +19178,12 @@ int main(int argc, char** argv) {
+                     if (!ver.window_logprobs(fol_tg.data(), a + 1, p, 248046, fol_lp, fe))
+                         std::fprintf(stderr, "strata serve: STRATA_FOLLOW_LOGPOS: %s\n", fe.c_str());
+                 }
+-#if defined(STRATA_USE_HIP)
+                 // A merged window contains prompt rows: every one must still be committed.
+                 // Otherwise do not cache accepted rows whose outputs this request cannot emit.
+-                if (stop_bound && !merged)
++                if (stop_bound && !merged && produced_n < max_new)
+                     a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
+                         return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                     }) - 1;
+-#endif
+                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
+                 if (!from_sfx && !first_window)
+-- 
+2.43.0
+

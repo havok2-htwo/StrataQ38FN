@@ -1,0 +1,33 @@
+From 691930883327c10447c8896f713b48b2fd9171d1 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 14:18:56 +0100
+Subject: [PATCH 6/6] fixup port c0cdd140: serve: --batch runs an image request
+ alone - an engine never started has no image line
+
+_take_control (stands_back), load_counts and _may_go_solo read self.image_line, which is made only in the
+post-READY admission block next to slot_cv. A StrataEngine built lazy (or by hand) with its own admission state
+has none: upstream's serve/test_admit_order.py (engine_without_process: StrataEngine(..., lazy=True) plus slot_cv,
+waiting, wait_lens, arrivals, ctl) calls _take_control(new=True), and stands_back() raised AttributeError in every
+waiter thread. image_line now has a class default () beside `standing = 0` (read-only: empty, no image request);
+a started engine still makes its own list.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/serve/server.py b/serve/server.py
+index 4bbe5fdc..b177ec55 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1150,6 +1150,7 @@ class StrataEngine:
+     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
+     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+     standing = 0                         # new requests standing back while an image request has the engine (/v1/load)
++    image_line = ()                      # (the started engine's own list, made with slot_cv; one never started has none)
+     _ctl_mode = _RequestOwned()          # the request that has the control lines: solo / batch (see _RequestOwned)
+     _ctl_result = _RequestOwned()
+     _yielded = _RequestOwned()
+-- 
+2.43.0
+
