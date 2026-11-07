@@ -1,0 +1,57 @@
+From a0b8eb5ebc5e92d8298517b4814329c479c45144 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 16:18:33 +0100
+Subject: [PATCH 17/17] fixup port d9927ecf: a chain hit's shorter chain
+ checkpoints go ahead of the one continued from, so the root is index 0 again
+
+The port copied the chosen chain checkpoint first (upstream's #2526 give-back order) and appended chain_along's
+shorter ones after it, so checks[0] - the root conv_cache's eviction_victim / spread_victim pin - was the chosen deep
+checkpoint and the conversation's real root rotated by LRU. d9927ecf put chain_along's copies first and the chosen one
+last on purpose ("the cache keeps the first one longest"). Now the shorter chain copies are made into a local vector
+and inserted at the front (capacity reserved first, so the insert allocates nothing); the chosen one is still copied
+first, before anything that may run out of memory, and slot_ck is still pointed into `checks` afterwards. Out of
+memory skips all of the chain copies (the log says so). Switch unset: unchanged (slot_ck_chain is false).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 497862cb..d71ca63c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -17965,20 +17965,25 @@ int main(int argc, char** argv) {
+                     }
+                     // STRATA_SLOT_CHAIN_REUSE: the slot's shorter chain checkpoints come along too (copies: the slot
+                     // keeps its chain, its own checkpoints and its image for the conversation it holds, which is parked
+-                    // when the slot is overwritten, as without the switch), so the main session's checkpoints hold the
+-                    // conversation's root as after a read from 0
++                    // when the slot is overwritten, as without the switch), ahead of the others, so the main session's
++                    // checkpoints start with the conversation's root as after a read from 0 (index 0 is the root the
++                    // retention policy pins, conv_cache.hpp)
+                     if (slot_ck_chain) {
+                         const BSlot& sl = bs[(size_t) slot_source];
+                         const int at = (int) (slot_ck - sl.chain.data());
+                         auto starts = [&](const ConvCheckpoint& c) { return starts_with(c.ids, c.imgs); };
+                         try {
++                            std::vector<ConvCheckpoint> along;
+                             for (size_t i : sch::chain_along(sl.chain, sl.ids, stages.size(), at, starts))
+                                 if (std::none_of(checks.begin(), checks.end(),
+                                                  [&](const ConvCheckpoint& k) { return k.ids == sl.chain[i].ids; }))
+-                                    checks.push_back(sl.chain[i]);
++                                    along.push_back(sl.chain[i]);
++                            checks.reserve(checks.size() + along.size());   // (the insert below then allocates nothing)
++                            checks.insert(checks.begin(), std::make_move_iterator(along.begin()),
++                                          std::make_move_iterator(along.end()));
+                         } catch (const std::bad_alloc&) {
+-                            std::fprintf(stderr, "strata batch: slot %d: its shorter chain checkpoints were not all "
+-                                                 "copied (out of memory); the rest are skipped\n", slot_source);
++                            std::fprintf(stderr, "strata batch: slot %d: its shorter chain checkpoints were not copied "
++                                                 "(out of memory); they are skipped\n", slot_source);
+                         }
+                     }
+                     if (slot_ck != nullptr) {
+-- 
+2.43.0
+

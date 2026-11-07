@@ -1,0 +1,43 @@
+From b2d5db6d1481dcd98d3905b83227377f6bf5fa6d Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:43:47 +0100
+Subject: [PATCH 11/17] fixup port 177472ea: the tier's eviction sink spends an
+ evicted image's background-copy tokens on the host thread
+
+v0.2.12's STRATA_PARK_ASYNC leaves tokens in a parked image (SavedConversation::pending, live_pending and, with
+STRATA_PARK_VRAM_MIB, ConversationKv::pending per layer) whose deleters join the copy and release the image's VRAM
+slot (conversation_park_slot_release).  The VRAM slots are host thread only (conversation_snapshot.cpp, VramKv).
+An image the tier queues is freed by its writer thread (ConversationTier::writer_loop, e->image.reset()), so those deleters
+ran there, beside the host thread's vram_kv_take / release_all: a data race on vram_kv().slots, and the queued
+image kept its VRAM slot until it was written.  The sink now resets the tokens right after its joins, on the host
+thread; the copies have landed, so the deleters only release the slot, and a queued image read back restores from
+its host bytes.  Only with STRATA_CONV_TIER_DIR (and for the slot, STRATA_PARK_VRAM_MIB).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index fc425daf..f024bf63 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12408,6 +12408,15 @@ int main(int argc, char** argv) {
+                                        // (STRATA_CKPT_ASYNC, STRATA_PARK_ASYNC) land first, as before a SAVE
+                             strata::core::conversation_checkpoint_join(nullptr);
+                             strata::core::conversation_park_join();
++                            // and the copies' tokens go here: their deleters release the image's STRATA_PARK_VRAM_MIB
++                            // slot, which only the host thread may touch (the writer frees the image on its own)
++                            auto spend = [](strata::core::SavedConversation& im) {
++                                im.pending.reset();
++                                im.live_pending.reset();
++                                for (auto& k : im.kv) k.pending.reset();
++                            };
++                            spend(image);
++                            for (auto& si : image.stage_images) spend(si);
+                         }
+                         tier->evicted(std::move(image), spill);
+                     });
+-- 
+2.43.0
+

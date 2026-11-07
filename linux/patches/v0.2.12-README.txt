@@ -2,9 +2,9 @@ Port of our production onto upstream v0.2.12 (146df3c4), plan: linux/upstream/PL
 Branches in the Strata repo (worktrees Strata-212m/c/v/s, integration Strata-212i = g3-212-int):
   v0.2.12-p1p2     g3-212m         P1+P2: NVFP4 guard, STOP_BOUND on CUDA (opt-in STRATA_SERVE_STOP_BOUND=1), snapshot test sync,
                                     SPLIT_OWN_RESERVE_MIB, gr_parity, QSA_SLOTS_STREAM (+ attention-path INFO line), GR_DOWN_PF, EARLY_SAMPLE
-  v0.2.12-convmem  g3-212-convmem  P3: CONV_MMAP, GATE_EVICT (park half; slot-capture half waits for SLOT_PARK)
+  v0.2.12-convmem  g3-212-convmem  P3-P7: CONV_MMAP, GATE_EVICT, PARK_CAPTURE (= our old PARK_ASYNC, renamed!), SLOT_PARK,
+                                    CONV_TIER (SSD) + metrics, PARK_BORROW on a split, SLOT_CHAIN_REUSE, GIVEBACK_CHECKS, MSG_CKPT_TAIL
   v0.2.12-vision   g3-212-vision   P8: vision batch guard, per-slot M-RoPE (STRATA_MROPE_SLOTS=1), vision_batch_check
-  v0.2.12-serve    g3-212-serve    ProgressWriter, GET /v1/load, PREFIX_DIAG, image gate, Genesis replay
-Apply: git checkout -b x v0.2.12 && git am <dir>/*.patch (each dir on its own; they merge cleanly into each other).
-Still open: P4 PARK_CAPTURE (rename of our PARK_ASYNC!) + SLOT_PARK, P5 SSD tier, P6 borrow on a split, P7 chain reuse /
-giveback / MSG_CKPT_TAIL, P9 PIPE_OVERLAP, P10 SPEC_LANES/SOLO_PIPELINE, P11 READ_YIELD, F26 server admission.
+  v0.2.12-serve    g3-212-serve    ProgressWriter, GET /v1/load, PREFIX_DIAG, image gate, Genesis replay, F26 ADMIT_BY_NEW/YIELD_SHORT
+Apply: git checkout -b x v0.2.12 && git am <dir>/*.patch per dir; integration g3-212-int = p1p2 + convmem + vision + serve (one trivial conflict in generate.cpp, both sides kept).
+Still open (decided by the 2026-11-07 night A/B): P9 PIPE_OVERLAP, P10 SPEC_LANES/SOLO_PIPELINE, P11 READ_YIELD (engine),

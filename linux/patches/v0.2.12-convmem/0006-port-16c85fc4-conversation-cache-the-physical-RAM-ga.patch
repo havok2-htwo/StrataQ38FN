@@ -1,0 +1,110 @@
+From 3261acbef3732d6ebe3d90a3cf587c4bcf72eb80 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:12:49 +0100
+Subject: [PATCH 06/17] port 16c85fc4: conversation cache: the physical-RAM
+ gates stop evicting when the memory does not come back, and a slot's capture
+ can evict to fit (opt-in STRATA_GATE_EVICT=1, #3115)
+
+The slot-capture half, left out of ac6f8e66 until STRATA_SLOT_PARK was
+ported: slot_park_start (the pipelined pump's BDONE) evicts to fit the
+RAM floor by gate_evict_to_fit's rule when STRATA_GATE_EVICT is set,
+instead of refusing the capture; its own note line and the eviction
+line as in the source.  gate_evict_env's comment and the startup line
+now say so ("the physical-RAM gates ...; a batch slot's capture evicts
+to fit the RAM floor"), as in the source.
+
+Adapted: the safety comment names upstream's paths - park_source
+instead of park_current_body, no lane_park (spec lanes are not ported),
+and a pump inside a prompt read (STRATA_PIPED_CONCURRENT) holds no cache
+index either (the request's lookups and takes come before its read, the
+borrow donor is found by serial).
+
+(cherry picked from commit 16c85fc4d99059cfbb77470929d294c253daccb3)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 45 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 546c0cfc..1b519e76 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -510,10 +510,11 @@ bool slot_copy_batchsync_env() {
+     }();
+     return on;
+ }
+-// STRATA_GATE_EVICT=1 (default off; #3115): the physical-RAM gate evicts with a stop rule (gate_evict_to_fit,
++// STRATA_GATE_EVICT=1 (default off; #3115): the physical-RAM gates evict with a stop rule (gate_evict_to_fit,
+ // strata/core/conversation_memory.hpp): nothing when evicting all that can go could not cover the need, and no more
+ // once two evictions in a row did not raise the reading by half their size (the allocator keeps what they freed -
+-// plain malloc; STRATA_CONV_MMAP returns it).  Off: the gate as before
++// plain malloc; STRATA_CONV_MMAP returns it).  A batch slot's capture (STRATA_SLOT_PARK), which otherwise refuses
++// when the RAM floor is short, evicts to fit by the same rule.  Off: the gates as before
+ bool gate_evict_env() {
+     static const bool on = [] {
+         const char* v = std::getenv("STRATA_GATE_EVICT");
+@@ -12300,9 +12301,9 @@ int main(int argc, char** argv) {
+                                  "or more are mapped one by one and unmapped when freed (an eviction returns its RAM "
+                                  "to the kernel at once)\n");
+         if (gate_evict_env())
+-            std::fprintf(stderr, "strata serve: STRATA_GATE_EVICT: the physical-RAM gate evicts only what can help and "
+-                                 "stops after 2 evictions in a row that did not raise the available RAM by half their "
+-                                 "size\n");
++            std::fprintf(stderr, "strata serve: STRATA_GATE_EVICT: the physical-RAM gates evict only what can help and "
++                                 "stop after 2 evictions in a row that did not raise the available RAM by half their "
++                                 "size; a batch slot's capture evicts to fit the RAM floor\n");
+         // STRATA_PARK_CAPTURE: the capture of the main sessions a request left (park_capture_start, after it), on one
+         // ParkThreads thread per stage device, that the next request's park decision takes (park_capture_take) or stops
+         // (park_capture_drop).  Declared before the threads: the threads stop first (park_stop), then this goes
+@@ -15391,7 +15392,8 @@ int main(int argc, char** argv) {
+             }
+         };
+         // slot b has ended (BDONE): start its capture, if it is to be parked and its image fits the cache's budget and
+-        // the RAM floor without evicting anything (the image evicts when it is parked, as a park's does)
++        // the RAM floor without evicting anything (the image evicts when it is parked, as a park's does; with
++        // STRATA_GATE_EVICT the RAM floor's evictions start here, by gate_evict_to_fit's rule)
+         auto slot_park_start = [&](int b) {
+             BSlot& sl = bs[(size_t) b];
+             if (!sl.parks) return;
+@@ -15414,7 +15416,36 @@ int main(int argc, char** argv) {
+             }
+             bool fits = estimate <= conversations.budget();
+             std::optional<strata::core::HostMemoryReading> mem;
+-            if (fits) {
++            if (fits && gate_evict_env()) {
++                // STRATA_GATE_EVICT: evict to fit the RAM floor, as a park's admission gate does (gate_evict_to_fit).
++                // This runs on the serve thread - the pipelined pump's BDONE, the thread that owns the cache:
++                // slot_park_put, park_source and the request path evict, make_room and take() there too, and the
++                // capture threads touch only the slot's own SlotPark - so evicting here is safe.  No cache index
++                // (best()'s Match) is alive across a batch step: a pump inside a prompt read (STRATA_PIPED_CONCURRENT)
++                // comes after the request's lookups and takes, and the borrow donor is found by its serial.  The
++                // evicted images are freed here, at once (with STRATA_CONV_MMAP: munmap'ed), so the next reading sees
++                // them; the stop rule bounds the time
++                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
++                const auto r = strata::core::gate_evict_to_fit(
++                    [&]() -> std::optional<uint64_t> {
++                        mem = strata::core::sample_host_memory();
++                        return mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
++                    },
++                    [&]() -> std::optional<uint64_t> {
++                        const auto by = conversations.oldest_evictable_bytes();
++                        return by ? std::optional<uint64_t>(*by) : std::nullopt;
++                    },
++                    [&] { return conversations.evict_oldest(); }, conversations.evictable_bytes(), estimate, floor,
++                    conversations.slots());
++                fits = r.admitted;
++                const std::string note = gate_evict_note(r, conversations.evictable_bytes(), conversations.size());
++                if (!note.empty()) std::fprintf(stderr, "strata batch: slot %d: %s\n", b, note.c_str());
++                if (r.evicted && r.admitted)
++                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit "
++                                         "slot %d's capture (%zu MiB plus %lld MiB floor)\n", r.evicted,
++                                 r.evicted == 1 ? "" : "s", b, estimate >> 20,
++                                 (long long) o.conversation_cache_min_free_mib);
++            } else if (fits) {
+                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                 mem = strata::core::sample_host_memory();
+                 fits = strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
+-- 
+2.43.0
+

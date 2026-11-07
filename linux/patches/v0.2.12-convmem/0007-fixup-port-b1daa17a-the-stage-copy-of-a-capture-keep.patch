@@ -1,0 +1,64 @@
+From e50204d279e232604b120b58ee8689338cdb4d71 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:14:06 +0100
+Subject: [PATCH 07/17] fixup port b1daa17a: the stage copy of a capture keeps
+ stage 0's prompt plan and VRAM copy tag, as split does
+
+conversation_checkpoints_stage_copy built every stage's part from the
+ids, pictures, marks and running state only.  In v0.2.12 a checkpoint
+also carries its --prefill-pipe prompt plan (and the STRATA_CKPT_VRAM_SLOTS
+tag), and conversation_checkpoints_split keeps both in stage0 (it moves
+the checkpoint itself there): a capture beside the slots
+(STRATA_PARK_CAPTURE) parked stage 0's checkpoints without their plan,
+so a read that resumed from one could be chunked differently than after
+a synchronous park.  Stage 0's copy now takes both; the later stages'
+parts stay as split makes them.  Test: the plan rides with stage 0's
+list only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/conversation_cache.hpp | 4 ++++
+ src/core/conversation_cache_test.cpp       | 5 +++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index ffd6e125..059b06d3 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -209,6 +209,10 @@ inline std::vector<ConversationCheckpoint> conversation_checkpoints_stage_copy(
+         part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned; part.slot_turn = c.slot_turn;
+         part.gdn = state.gdn; part.ple = state.ple; part.tails = state.tails; part.dead = state.dead;
+         part.block_pos = state.block_pos;
++        if (k == 0) {   // stage0 is the checkpoint itself in split: its prompt plan and VRAM copy tag too
++            part.plan = c.plan;
++            part.dev_tag = c.dev_tag;
++        }
+         out.push_back(std::move(part));
+     }
+     return out;
+diff --git a/src/core/conversation_cache_test.cpp b/src/core/conversation_cache_test.cpp
+index ffbe3909..56b7d907 100644
+--- a/src/core/conversation_cache_test.cpp
++++ b/src/core/conversation_cache_test.cpp
+@@ -625,6 +625,7 @@ int main() {
+         chain[2].pinned = true;
+         chain[0].tails.assign(16, 4);
+         chain[2].stage_parts[0].dead.assign(8, 6);
++        chain[2].plan.chunk = 4096; chain[2].plan.from = 0; chain[2].plan.to = 9000;
+         const auto before = chain;
+         auto moved = conversation_checkpoints_split(std::vector<ConversationCheckpoint>(chain), 2);
+         for (size_t k = 0; k <= 2; ++k) {
+@@ -633,6 +634,10 @@ int main() {
+             bool equal = copied.size() == want.size();
+             for (size_t j = 0; equal && j < copied.size(); ++j) equal = conversation_checkpoint_same(copied[j], want[j]);
+             check(equal, "stage copy == the split's list for that stage");
++            bool plans = true;   // (the prompt plan rides with stage 0's list only, as split leaves it)
++            for (size_t j = 0; plans && j < copied.size(); ++j)
++                plans = copied[j].plan.chunk == want[j].plan.chunk && copied[j].plan.to == want[j].plan.to;
++            check(plans, "stage copy keeps the prompt plan where split does");
+             size_t bytes_c = 0, bytes_w = 0;   // what a parked image is charged: the copy a capture makes of the list
+             for (const auto& c : copied) bytes_c += c.bytes();
+             for (const auto& c : std::vector<ConversationCheckpoint>(want)) bytes_w += c.bytes();
+-- 
+2.43.0
+

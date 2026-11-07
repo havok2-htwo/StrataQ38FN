@@ -1,0 +1,36 @@
+From a9ab3f9c99d6b2594dc1528e42aa857934c4c444 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:38:27 +0100
+Subject: [PATCH 10/17] fixup port 177472ea: the tier's writer reads an evicted
+ image only after v0.2.12's background copies have landed
+
+v0.2.12 has background copies into a parked image's host bytes that our base did not have: STRATA_CKPT_ASYNC (a
+checkpoint's GDN state) and upstream's STRATA_PARK_ASYNC / STRATA_PARK_VRAM_MIB (the K/V, SavedConversation::pending).
+Their rule is that every reader of those bytes joins first (conversation_checkpoint_join / conversation_park_join, as
+the SAVE path does).  The tier's writer thread is such a reader, so the eviction sink joins both before it hands a
+spillable image over.  Both joins are no-ops when nothing is in flight; the sink only exists with STRATA_CONV_TIER_DIR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 45924928..fc425daf 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12404,6 +12404,11 @@ int main(int argc, char** argv) {
+                     tier.reset();
+                 } else {
+                     conversations.set_evict_sink([&tier](strata::core::SavedConversation&& image, bool spill) {
++                        if (spill) {   // the writer reads the image's bytes on its own thread: the background copies
++                                       // (STRATA_CKPT_ASYNC, STRATA_PARK_ASYNC) land first, as before a SAVE
++                            strata::core::conversation_checkpoint_join(nullptr);
++                            strata::core::conversation_park_join();
++                        }
+                         tier->evicted(std::move(image), spill);
+                     });
+                 }
+-- 
+2.43.0
+

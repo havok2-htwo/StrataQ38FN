@@ -1,0 +1,448 @@
+From c91ec085f2a492d0d61a6ceedd322d174baafae7 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 16:11:48 +0100
+Subject: [PATCH 16/17] port 7f86f97c: generate: STRATA_MSG_CKPT_TAIL=N
+ checkpoints a prompt before its last message (opt-in, layer split too)
+
+Adaptations to v0.2.12:
+- The message-boundary site moved (read_part's cuts, ~19500) and the checkpoint save there now survives a failed
+  copy (#3350); message_cut() replaces upstream's message_at expression and only the as_tail argument of that
+  checkpoint_at changed, upstream's survivable-failure branch is kept as is.
+- Beside --prompt-cache-tail: our cut is an ordinary checkpoint (as_tail false), so the one evict-first tail stays
+  upstream's (--prompt-cache-tail's near-end chunk boundary, or STRATA_CACHE_MESSAGE_BOUNDARY's when MSG_CKPT_TAIL is
+  unset); tail_ckpt_len is never set by it. When the batched read's tail checkpoint lands on the same length,
+  checkpoint_at's existing rule turns it into a normal item (as for the turn checkpoint).
+- The startup line sits after the STRATA_PARK_CAPTURE setup (the old STRATA_PARK_ASYNC anchor), the env helper after
+  giveback_checks_env, message_cut_test after slot_chain_test in CMakeLists.
+- Not in this commit: tools/msg_ckpt_check.py and the tools/vision_check_fake_engine.py hunk (they import
+  vision_batch_check / cache_reuse_check and extend the fake engine of f8a41fff, on g3-212-vision only); they go on
+  top of the integration branch.
+
+STRATA_MSG_CKPT_TAIL unset: message_cut() returns upstream's expression (legacy && !multi_gpu, the tail kind), so
+message_at and the as_tail flag are upstream's exactly.
+
+(cherry picked from commit 7f86f97c100d619da8fdd0bda9157a7ce0554eee)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                              |   5 +
+ include/strata/program/message_boundary.hpp |  39 +++
+ src/program/generate.cpp                    |  27 +-
+ tests/program/message_cut_test.cpp          | 275 ++++++++++++++++++++
+ 4 files changed, 342 insertions(+), 4 deletions(-)
+ create mode 100644 tests/program/message_cut_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 19224914..ddd94a52 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -409,6 +409,11 @@ if(STRATA_BUILD_TESTS)
+   add_executable(slot_chain_test tests/program/slot_chain_test.cpp)
+   target_include_directories(slot_chain_test PRIVATE include)
+   add_test(NAME slot_chain_test COMMAND slot_chain_test)
++  # STRATA_MSG_CKPT_TAIL: where a prompt read checkpoints in front of its last message (against the default path and
++  # STRATA_CACHE_MESSAGE_BOUNDARY as it was), and a host model of an agent's turns (header-only, CPU)
++  add_executable(message_cut_test tests/program/message_cut_test.cpp)
++  target_include_directories(message_cut_test PRIVATE include)
++  add_test(NAME message_cut_test COMMAND message_cut_test)
+ 
+   # the prompt planner's host-memory model (#2824): header-only, no GPU
+   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
+diff --git a/include/strata/program/message_boundary.hpp b/include/strata/program/message_boundary.hpp
+index cef9dbc5..3c0e7833 100644
+--- a/include/strata/program/message_boundary.hpp
++++ b/include/strata/program/message_boundary.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <vector>
+ 
+ namespace strata::program {
+@@ -17,4 +18,42 @@ inline int64_t message_checkpoint_boundary(const std::vector<int64_t>& ids, int6
+     return -1;
+ }
+ 
++/// STRATA_MSG_CKPT_TAIL=N (opt-in): the longest last message, in tokens, that a prompt read checkpoints in front of.
++/// Unset, empty, 0, negative or not a number: 0 (off).  At most 1 << 20.
++inline int64_t msg_ckpt_tail_parse(const char* v) {
++    if (v == nullptr || v[0] == '\0') return 0;
++    char* end = nullptr;
++    const long long n = std::strtoll(v, &end, 10);
++    if (end == v || *end != '\0' || n <= 0) return 0;
++    return n > (1LL << 20) ? (1LL << 20) : (int64_t) n;
++}
++
++/// Where a prompt read takes its message-boundary checkpoint (`at`, -1: none) and whether it is the "tail" kind (the
++/// first to be evicted, one alive at a time).
++///   tail > 0 (STRATA_MSG_CKPT_TAIL): the <|im_start|> of the last message before the turn boundary when that message
++///     is at most `tail` tokens and the prefix at least 8192 - on every layout, a layer split too - as an ordinary
++///     checkpoint.  An agent that sends a transient last user message (a reminder, its environment) each turn and drops
++///     it from the next request's history parts there, before the turn checkpoint: the next turn resumes from it.
++///   else STRATA_CACHE_MESSAGE_BOUNDARY=1 (`legacy`) as before: a tail of at most 1024, not with a layer split, the
++///     tail kind.
++///   Neither, or no prompt cache: none (the default path).
++struct MessageCut {
++    int64_t at = -1;
++    bool as_tail = false;
++};
++inline MessageCut message_cut(const std::vector<int64_t>& ids, int64_t resume, int64_t turn_at, int64_t turn_token,
++                              bool prompt_cache_on, bool legacy, bool multi_gpu, int64_t tail) {
++    MessageCut c;
++    if (!prompt_cache_on) return c;
++    if (tail > 0) {
++        c.at = message_checkpoint_boundary(ids, resume, turn_at, turn_token, 8192, tail);
++        return c;
++    }
++    if (legacy && !multi_gpu) {
++        c.at = message_checkpoint_boundary(ids, resume, turn_at, turn_token);
++        c.as_tail = true;
++    }
++    return c;
++}
++
+ } // namespace strata::program
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 83ad03a8..497862cb 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -567,6 +567,17 @@ bool giveback_checks_env() {
+     }();
+     return on;
+ }
++// STRATA_MSG_CKPT_TAIL=N (read once; off by default): a prompt read also checkpoints in front of its last message (the
++// <|im_start|> before the turn boundary) when that message is at most N tokens and the prefix at least 8192, on every
++// layout (a layer split too) and as an ordinary checkpoint, not the evict-first tail kind of
++// STRATA_CACHE_MESSAGE_BOUNDARY.  An agent that appends a transient user message each turn (a reminder, its environment)
++// and drops it from the next request parts from the last request right there, before its turn checkpoint; the next
++// turn resumes from this one instead of the last periodic checkpoint.  Text and image requests alike: the checkpoint is
++// the main session's, with the pictures below it (message_boundary.hpp message_cut)
++int64_t msg_ckpt_tail_env() {
++    static const int64_t n = strata::program::msg_ckpt_tail_parse(std::getenv("STRATA_MSG_CKPT_TAIL"));
++    return n;
++}
+ 
+ // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
+ // A file-backed arena on AMD (STRATA_ARENA_MMAP; the engine raises ROCclr's pin-in-place threshold, see main): an
+@@ -12541,6 +12552,11 @@ int main(int argc, char** argv) {
+                 std::fprintf(stderr, "strata serve: STRATA_PARK_CAPTURE is off: the pinned staging or a copy stream "
+                                      "could not be set up; parking as before\n");
+         }
++        if (msg_ckpt_tail_env() > 0)
++            std::fprintf(stderr, "strata serve: STRATA_MSG_CKPT_TAIL=%lld: a prompt read also checkpoints in front of a "
++                                 "last message of up to %lld tokens (a prefix of 8192 or more)%s\n",
++                         (long long) msg_ckpt_tail_env(), (long long) msg_ckpt_tail_env(),
++                         o.prompt_cache > 0 ? "" : "; off: --prompt-cache 0");
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+         // STRATA_PARK_ASYNC: set by the request around its park - the live checkpoints it drops right after (they move
+@@ -19489,9 +19505,11 @@ int main(int argc, char** argv) {
+                 const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
+                 return e != nullptr && std::atoi(e) != 0;
+             }();
+-            // Only add a snapshot; the existing token and image checks still decide reuse.
+-            const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
+-                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
++            // Only add a snapshot; the existing token and image checks still decide reuse.  STRATA_MSG_CKPT_TAIL: on a
++            // layer split too, with a longer last message, as an ordinary checkpoint (message_cut)
++            const strata::program::MessageCut msg_cut = strata::program::message_cut(
++                ids, resume, turn_at, o.turn_token, o.prompt_cache > 0, message_checkpoint, multi_gpu, msg_ckpt_tail_env());
++            const int64_t message_at = msg_cut.at;
+             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
+             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
+             int64_t pin_at = -1;
+@@ -19604,7 +19622,8 @@ int main(int argc, char** argv) {
+                 }
+                 at = to;
+                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
+-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
++                    !checkpoint_at(to, nullptr, msg_cut.as_tail && to == message_at && to != turn_at && to != root_at &&
++                                                    to != pin_at)) {   // the tail kind leaves first
+                     if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {   // #3350: only an unwell GPU ends the request
+                         std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                         return 1;
+diff --git a/tests/program/message_cut_test.cpp b/tests/program/message_cut_test.cpp
+new file mode 100644
+index 00000000..2c812ca9
+--- /dev/null
++++ b/tests/program/message_cut_test.cpp
+@@ -0,0 +1,275 @@
++// STRATA_MSG_CKPT_TAIL: where a prompt read takes its message-boundary checkpoint (include/strata/program/
++// message_boundary.hpp, message_cut), against STRATA_CACHE_MESSAGE_BOUNDARY as it was and the default path (none), and
++// a host model of an agent's turns that shows which checkpoint the next turn can resume from.  Header-only, CPU: no
++// model, no GPU.
++//
++// The agent (measured on production, 2026-10-14 06:43-07:37, the prefix diagnostic): every request ends with a
++// transient user message of about 2531 tokens that the next request no longer carries; the next request has the reply
++// and a tool result in its place.  So the last request's turn checkpoint (at its last <|im_start|>, after that
++// message) is never a prefix of the next prompt, and the next turn resumes at the last periodic checkpoint, about 10K
++// tokens back on average.  A checkpoint in front of the transient message is a prefix.
++//
++// What this does not test: the engine's prompt read, checkpoint_at and the conversation cache (the GPU check,
++// tools/msg_ckpt_check.py, does that).  `starts` below is a transcription of generate.cpp's starts_with (the n - 1 rule
++// and the picture keys below the length), so the model can say which checkpoint a turn resumes from; `read` (where
++// the checkpoints land) is a transcription too.  Only message_cut, msg_ckpt_tail_parse and the eviction policy
++// (conv_cache.hpp) are the engine's own code.  The tokens-read-again numbers it prints are a model, not a measurement.
++#include "strata/program/conv_cache.hpp"
++#include "strata/program/message_boundary.hpp"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++namespace mb = strata::program;
++
++namespace {
++int failures = 0, checks = 0;
++void check(bool ok, const char* what) {
++    ++checks;
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++constexpr int64_t kTurn = 248045;    // <|im_start|>
++constexpr int64_t kPad = 248056;     // <|image_pad|>
++constexpr int64_t kEvery = 16384;    // --prompt-cache-every
++constexpr int64_t kRoot = 2048;      // --prompt-cache-root
++constexpr int64_t kTransient = 2531; // the agent's last user message, measured
++
++struct Img {
++    int64_t start;
++    uint64_t hash;
++    bool operator==(const Img& o) const { return start == o.start && hash == o.hash; }
++};
++struct Prompt {
++    std::vector<int64_t> ids;
++    std::vector<Img> imgs;
++};
++struct Check {
++    int64_t len;
++    std::vector<Img> imgs;
++};
++
++std::vector<Img> below(const std::vector<Img>& all, int64_t L) {
++    std::vector<Img> v;
++    for (const Img& k : all) if (k.start < L) v.push_back(k);
++    return v;
++}
++
++// one message: <|im_start|>, a role word, `n` tokens of text from stream `seed`
++void message(Prompt& p, int64_t role, int64_t n, uint32_t seed) {
++    p.ids.push_back(kTurn);
++    p.ids.push_back(role);
++    uint32_t x = seed * 2654435761u + 7u;
++    for (int64_t i = 0; i < n; ++i) {
++        x = x * 1664525u + 1013904223u;
++        p.ids.push_back(1000 + (int64_t) (x >> 12) % 150000);
++    }
++}
++void picture(Prompt& p, int64_t rows, uint64_t hash) {
++    p.imgs.push_back({(int64_t) p.ids.size(), hash});
++    for (int64_t i = 0; i < rows; ++i) p.ids.push_back(kPad);
++}
++constexpr int64_t kSystem = 1, kUser = 2, kAssistant = 3;
++
++// the conversation's history after `turns` turns: a system prompt, message 3 with three pictures, then per turn the
++// reply and a tool result (the parts every later request carries)
++Prompt history(int turns, uint64_t pic_hash = 0xabc) {
++    Prompt p;
++    message(p, kSystem, 7200, 1);
++    message(p, kUser, 400, 2);
++    message(p, kAssistant, 300, 3);
++    message(p, kUser, 50, 4);
++    picture(p, 1200, pic_hash);
++    picture(p, 1200, pic_hash + 1);
++    picture(p, 1200, pic_hash + 2);
++    for (int t = 0; t < turns; ++t) {
++        message(p, kAssistant, 600 + 37 * t, 100 + t);
++        message(p, kUser, 900 + 53 * t, 200 + t);
++    }
++    return p;
++}
++// the request of turn `t`: the history, the transient message, the assistant header
++Prompt request(int t, uint64_t pic_hash = 0xabc) {
++    Prompt p = history(t, pic_hash);
++    message(p, kUser, kTransient - 2, 9000 + t);   // a different reminder each turn
++    p.ids.push_back(kTurn);
++    p.ids.push_back(kAssistant);
++    p.ids.push_back(10);
++    return p;
++}
++
++// generate.cpp's starts_with: tokens and the pictures below the length, at most n - 1 of them
++bool starts(const Prompt& p, const Prompt& from, const Check& c) {
++    const int64_t n = (int64_t) p.ids.size();
++    if (c.len < 1 || c.len > n - 1 || c.len > (int64_t) from.ids.size()) return false;
++    if (!std::equal(from.ids.begin(), from.ids.begin() + c.len, p.ids.begin())) return false;
++    return below(p.imgs, c.len) == c.imgs;
++}
++
++int64_t last_turn(const std::vector<int64_t>& ids, int64_t resume) {
++    for (int64_t i = (int64_t) ids.size() - 1; i > resume; --i)
++        if (ids[(size_t) i] == kTurn) return i;
++    return -1;
++}
++
++// the checkpoints a read of `p` from `resume` takes (the root from 0, every kEvery from resume, the turn checkpoint
++// and the message cut), as generate.cpp's cuts and pp_next_check place them (the periodic ones at their nominal
++// positions: the engine takes them at the next chunk end, which this model does not need)
++std::vector<Check> read(const Prompt& p, int64_t resume, bool multi_gpu, int64_t tail, bool legacy,
++                        int64_t* msg_at = nullptr) {
++    std::vector<Check> out;
++    const int64_t n = (int64_t) p.ids.size();
++    const int64_t turn_at = last_turn(p.ids, resume);
++    if (resume == 0)
++        for (int64_t i = 1; i < turn_at; ++i)
++            if (p.ids[(size_t) i] == kTurn) {
++                if (i >= kRoot) out.push_back({i, below(p.imgs, i)});
++                break;
++            }
++    for (int64_t L = resume + kEvery; L < n - 1; L += kEvery) out.push_back({L, below(p.imgs, L)});
++    const mb::MessageCut cut = mb::message_cut(p.ids, resume, turn_at, kTurn, true, legacy, multi_gpu, tail);
++    if (msg_at) *msg_at = cut.at;
++    if (cut.at > resume) out.push_back({cut.at, below(p.imgs, cut.at)});
++    if (turn_at > resume) out.push_back({turn_at, below(p.imgs, turn_at)});
++    return out;
++}
++
++int64_t resume_of(const Prompt& next, const Prompt& prev, const std::vector<Check>& cs) {
++    int64_t r = 0;
++    for (const Check& c : cs)
++        if (c.len > r && starts(next, prev, c)) r = c.len;
++    return r;
++}
++}  // namespace
++
++int main() {
++    // ---- the switch's value
++    check(mb::msg_ckpt_tail_parse(nullptr) == 0, "unset: off");
++    check(mb::msg_ckpt_tail_parse("") == 0, "empty: off");
++    check(mb::msg_ckpt_tail_parse("0") == 0, "0: off");
++    check(mb::msg_ckpt_tail_parse("-4096") == 0, "negative: off");
++    check(mb::msg_ckpt_tail_parse("abc") == 0, "not a number: off");
++    check(mb::msg_ckpt_tail_parse("4096x") == 0, "trailing garbage: off");
++    check(mb::msg_ckpt_tail_parse("4096") == 4096, "4096");
++    check(mb::msg_ckpt_tail_parse("99999999999") == (1LL << 20), "clamped to 1 << 20");
++
++    // ---- the default path and STRATA_CACHE_MESSAGE_BOUNDARY as before (the old expression, side by side)
++    const Prompt r3 = request(3);
++    const int64_t t3 = last_turn(r3.ids, 0);
++    for (int64_t resume : {(int64_t) 0, (int64_t) 8000, t3 - 10})
++        for (int legacy = 0; legacy < 2; ++legacy)
++            for (int multi = 0; multi < 2; ++multi)
++                for (int cache = 0; cache < 2; ++cache) {
++                    const mb::MessageCut c = mb::message_cut(r3.ids, resume, t3, kTurn, cache, legacy, multi, 0);
++                    const int64_t old = legacy && !multi && cache
++                                        ? mb::message_checkpoint_boundary(r3.ids, resume, t3, kTurn) : -1;
++                    check(c.at == old, "tail 0: message_at is the old expression's");
++                    check(c.as_tail == (legacy && !multi && cache), "tail 0: the tail kind exactly where it was on");
++                }
++    check(mb::message_cut(r3.ids, 0, t3, kTurn, true, true, false, 0).at == -1,
++          "STRATA_CACHE_MESSAGE_BOUNDARY alone: the agent's 2531-token message is past its 1024-token tail");
++
++    // ---- the switch: in front of the transient message, on a layer split too, an ordinary checkpoint
++    const int64_t front = (int64_t) history(3).ids.size();   // the transient message's <|im_start|>
++    for (int multi = 0; multi < 2; ++multi) {
++        const mb::MessageCut c = mb::message_cut(r3.ids, 0, t3, kTurn, true, false, multi, 4096);
++        check(c.at == front, "tail 4096: at the transient message's <|im_start|>");
++        check(!c.as_tail, "tail 4096: an ordinary checkpoint (not evicted first)");
++        check(mb::message_cut(r3.ids, 0, t3, kTurn, true, true, multi, 4096).at == front,
++              "tail 4096 wins over STRATA_CACHE_MESSAGE_BOUNDARY");
++    }
++    check(mb::message_cut(r3.ids, 0, t3, kTurn, false, false, true, 4096).at == -1, "no prompt cache: none");
++    check(mb::message_cut(r3.ids, 0, t3, kTurn, true, false, true, kTransient - 10).at == -1,
++          "a tail below the message: none");
++    check(mb::message_cut(r3.ids, front, t3, kTurn, true, false, true, 4096).at == -1,
++          "resumed at the boundary itself: nothing new to take");
++    check(mb::message_cut(r3.ids, 0, -1, kTurn, true, false, true, 4096).at == -1, "ckpt=0 (no turn_at): none");
++
++    // ---- the agent's turns: which checkpoint the next turn resumes from
++    int64_t reread_off = 0, reread_on = 0;
++    for (int t = 3; t < 40; ++t) {
++        const Prompt prev = request(t), next = request(t + 1);
++        const int64_t prev_turn = last_turn(prev.ids, 0);
++        int64_t at = -1;
++        const std::vector<Check> off = read(prev, 0, true, 0, false);
++        const std::vector<Check> on = read(prev, 0, true, 8192, false, &at);
++        const int64_t r_off = resume_of(next, prev, off), r_on = resume_of(next, prev, on);
++        check(!starts(next, prev, {prev_turn, below(prev.imgs, prev_turn)}),
++              "the last request's turn checkpoint is never a prefix of the next prompt");
++        check(at == (int64_t) history(t).ids.size(), "the message cut is in front of the transient message");
++        check(r_on == at, "on: the next turn resumes at the message cut");
++        check(r_off > 0 && r_off < at && (r_off % kEvery == 0 || r_off < kEvery),
++              "off: the next turn resumes at a periodic checkpoint (or the root)");
++        reread_off += (int64_t) next.ids.size() - r_off;
++        reread_on += (int64_t) next.ids.size() - r_on;
++        // the pictures: another picture at the same tokens (another hash) resumes from none of them past message 3
++        const Prompt other = request(t + 1, 0xdef);
++        check(resume_of(other, prev, on) < other.imgs[0].start + 1, "other pictures: nothing past them resumes");
++    }
++    check(reread_on * 2 < reread_off, "on: under half the tokens read again");
++    std::printf("message_cut_test: tokens read again over 37 agent turns: %lld off, %lld on (a model, not a "
++                "measurement)\n", (long long) reread_off, (long long) reread_on);
++
++    // ---- production's size with --prompt-cache 6: the cut survives the eviction (conv_cache.hpp's real policy: the
++    // root pinned, the rest least recently used; a checkpoint's stamp advances when created and when a request resumes
++    // from it, generate.cpp 8877/8984/12477).  The conversation is read from 0 at turn 30 (about 96K tokens: the root,
++    // five periodic checkpoints, the cut and the turn checkpoint, more than 6) and then turn by turn to about 168K; the
++    // chain the main session holds is what it parks (all of `checks`), so it is what the next turn finds.
++    {
++        struct Item {
++            Check c;
++            uint64_t used;
++        };
++        std::vector<Item> chain;
++        uint64_t clock = 0;
++        int64_t resume = 0;
++        int evicted = 0;
++        bool cut_kept = true, resumed_at_cut = true;
++        for (int t = 30; t < 46; ++t) {
++            const Prompt cur = request(t), next = request(t + 1);
++            // what is kept: the checkpoints the request resumed through (a prefix of it); the one it resumed from bumped
++            std::vector<Item> kept;
++            for (Item& it : chain)
++                if (it.c.len <= resume) {
++                    if (it.c.len == resume) it.used = ++clock;
++                    kept.push_back(it);
++                }
++            chain = kept;
++            int64_t at = -1;
++            for (const Check& c : read(cur, resume, true, 8192, false, &at)) {
++                chain.push_back({c, ++clock});
++                while ((int) chain.size() > 6) {
++                    std::vector<uint64_t> stamps;
++                    for (const Item& it : chain) stamps.push_back(it.used);
++                    chain.erase(chain.begin() + (std::ptrdiff_t) strata::program::conv_cache::eviction_victim(
++                                                    stamps.data(), stamps.size(), 6));
++                    ++evicted;
++                }
++            }
++            cut_kept = cut_kept && std::any_of(chain.begin(), chain.end(), [&](const Item& it) { return it.c.len == at; });
++            std::vector<Check> cs;
++            for (const Item& it : chain) cs.push_back(it.c);
++            const int64_t r = resume_of(next, cur, cs);
++            resumed_at_cut = resumed_at_cut && r == at;
++            resume = r;
++        }
++        check(evicted > 0, "production size: the eviction runs");
++        check(cut_kept, "production size, --prompt-cache 6: every turn's cut is still in the chain after its read");
++        check(resumed_at_cut, "production size, --prompt-cache 6: every next turn resumes at the cut");
++        check(chain.front().c.len < kEvery && chain.front().c.len >= kRoot, "the root is still the chain's first");
++        std::printf("message_cut_test: 16 turns at %zu-%zu tokens, --prompt-cache 6: %d evicted, the cut always kept\n",
++                    request(30).ids.size(), request(45).ids.size(), evicted);
++    }
++
++    if (failures) {
++        std::fprintf(stderr, "message_cut_test: %d of %d checks FAILED\n", failures, checks);
++        return 1;
++    }
++    std::printf("message_cut_test OK (%d checks)\n", checks);
++    return 0;
++}
+-- 
+2.43.0
+

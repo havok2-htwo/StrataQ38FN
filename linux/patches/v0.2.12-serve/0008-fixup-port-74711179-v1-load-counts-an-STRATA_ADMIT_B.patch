@@ -1,0 +1,92 @@
+From a88014b7b7faafc6cb7e896464355d1694c9e420 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:16:15 +0100
+Subject: [PATCH 8/8] fixup port 74711179: /v1/load counts an
+ STRATA_ADMIT_BY_NEW request back from a slot wait once
+
+With STRATA_ADMIT_BY_NEW the re-take after waiting for a free slot asks again
+with new=True (9db053af, its place in the order).  load_counts (6aaa20cf) only
+treats entries without `new` as already in, so such a request was counted in
+`waiting` and in `admitting` at the same time (slots.waiting and would_wait in
+GET /v1/load too high under load).  The entry now carries `unadmitted` as a
+named field and load_counts counts it like upstream's unadmitted re-take
+(new=False): in `resuming`, not in `waiting`.  Unset STRATA_ADMIT_BY_NEW: no
+change (an unadmitted entry has new=False and was counted there already).
+
+SlotsBusy in serve/test_admit_est.py checks the counts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py         | 17 ++++++++++-------
+ serve/test_admit_est.py |  2 ++
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 69ab38e4..5260f4ad 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1189,18 +1189,21 @@ class WaitEntry(list):
+     request]` as before (plen: its length, or with STRATA_ADMIT_BY_NEW the estimate of its new tokens; new: ordered by
+     STRATA_ADMIT_SHORT_FIRST; prompt and request: for STRATA_COALESCE_PREFILL), with the named fields beside it that
+     only our switches use, so they can not shadow one another: `total` (its length, /v1/load), `ids` (its tokens,
+-    STRATA_YIELD_SHORT) and `held` (the cached new-token count, see StrataEngine._entry_new).  Compared by identity
+-    (`entry in wait_lens` never compares the prompts)."""
+-    __slots__ = ("total", "ids", "held")
++    STRATA_YIELD_SHORT), `held` (the cached new-token count, see StrataEngine._entry_new) and `unadmitted` (back from
++    waiting for a slot: /v1/load counts it in `admitting` already).  Compared by identity (`entry in wait_lens` never
++    compares the prompts)."""
++    __slots__ = ("total", "ids", "held", "unadmitted")
+     __eq__ = object.__eq__
+     __ne__ = object.__ne__
+     __hash__ = object.__hash__
+ 
+-    def __init__(self, plen, arrival, new=False, prompt=None, request=None, *, total=None, ids=None):
++    def __init__(self, plen, arrival, new=False, prompt=None, request=None, *, total=None, ids=None,
++                 unadmitted=False):
+         super().__init__((plen, arrival, new, prompt, request))
+         self.total = plen if total is None else int(total)
+         self.ids = ids
+         self.held = None
++        self.unadmitted = bool(unadmitted)
+ 
+     plen = property(lambda self: self[0])
+     arrival = property(lambda self: self[1])
+@@ -2223,7 +2226,7 @@ class StrataEngine:
+         def stands_back():                              # (the caller holds slot_cv)
+             return (new or unadmitted) and bool(self.image_line) and getattr(cancel, "_strata_preslot", None) is None
+         entry = WaitEntry(plen, time.monotonic() if since is None else float(since), new, prompt, cancel,
+-                          total=total, ids=ids if YIELD_SHORT > 0 else None)
++                          total=total, ids=ids if YIELD_SHORT > 0 else None, unadmitted=unadmitted)
+ 
+         def may_go():                                   # (the caller holds slot_cv)
+             go = (counted or quiet) and (after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1)
+@@ -2414,8 +2417,8 @@ class StrataEngine:
+             for e in self.wait_lens:                    # [plen, arrival, new, prompt, request] (see _take_control)
+                 if len(e) > 4 and getattr(e[4], "_strata_preslot", None) is not None:
+                     coalesced += 1
+-                elif not (len(e) > 2 and e[2]):
+-                    resuming += 1
++                elif not (len(e) > 2 and e[2]) or getattr(e, "unadmitted", False):
++                    resuming += 1                       # (back from a slot wait: in `admitting`, also when new=True)
+             c = {"slots_busy": sum(1 for b in self.slot_busy if b),
+                  "waiting": max(0, int(self.waiting) - coalesced - resuming),
+                  "admitting": int(self.admitting), "resuming": resuming, "coalesced": coalesced,
+diff --git a/serve/test_admit_est.py b/serve/test_admit_est.py
+index 229e713e..44c8f91b 100644
+--- a/serve/test_admit_est.py
++++ b/serve/test_admit_est.py
+@@ -235,9 +235,11 @@ class SlotsBusy(unittest.TestCase):
+                     until(lambda: len(e.wait_lens) == 2, 5)
+                     with e.slot_cv:
+                         ents = [(x[0], x[1], x[2], x.total) for x in e.wait_lens]
++                    c = e.load_counts()                 # /v1/load: each counted once (in `admitting`)
+                 finally:
+                     e.ctl.release()
+                 self.assertEqual(len(ents), 2, ents)
++                self.assertEqual((c["waiting"], c["admitting"], c["resuming"]), (0, 2, 2), c)
+                 ents.sort(key=lambda x: x[1])
+                 cold, fu = ents
+                 self.assertEqual((cold[0], cold[3]), (11000, 11000))
+-- 
+2.43.0
+

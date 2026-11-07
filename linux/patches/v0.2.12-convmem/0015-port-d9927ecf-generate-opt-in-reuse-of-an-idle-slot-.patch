@@ -1,0 +1,803 @@
+From 025bd80b7f24a7554dd304650f20fa74ea4879a6 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 16:10:34 +0100
+Subject: [PATCH 15/17] port d9927ecf: generate: opt-in reuse of an idle slot's
+ chain (STRATA_SLOT_CHAIN_REUSE) and of a give-back's checkpoints
+ (STRATA_GIVEBACK_CHECKS)
+
+Adaptations to v0.2.12:
+- E1 (STRATA_SLOT_CHAIN_REUSE): the slot search is the same loop as before, so scan_slot replaces it as in the
+  original (switch off: the old loop's pick, slot_chain_test's oracle). The give-back was reworked upstream (#2526,
+  cea3ed40: the slot's checkpoints that are prefixes of the tokens copied back come along, the one continued from
+  first). A chain hit now goes through that code: the chain checkpoint is copied first, the slot's own shorter
+  prefixes are copied (never moved: move_cks is off after a chain hit, the slot keeps its conversation), then
+  chain_along's shorter chain checkpoints are copied (deduplicated, out-of-memory skips them like upstream's shorter
+  ones), before upstream's fix-up loop points slot_ck into `checks`. The SLOT_PARK discard and chain move are skipped
+  after a chain hit, as before. Plain copies (upstream's give-back does not use STRATA_CKPT_POOL there), so the
+  original push_copy helper is gone.
+- E2 (STRATA_GIVEBACK_CHECKS): upstream's give-back already hands the slot's own prefix checkpoints over without a
+  switch (copied; moved with STRATA_SLOT_CKPT_MOVE). What remains of ours is giveback_plan's hand_move: with the switch,
+  a give-back of all a slot holds into the slot the request is admitted to moves them through upstream's move_cks
+  path instead of copying them, plus the "and N checkpoints of its own" log text. giveback_picks is no longer called
+  by the engine; it stays in slot_chain.hpp as the rule's model for slot_chain_test (header comment says so).
+- slot_chain.hpp include placed after pipe_probe.hpp, and slot_chain_test after split_walk_test in CMakeLists, so the
+  merge with g3-212-vision (mrope_regions next to batch_groups / gguf_geometry_test) does not collide.
+- Not in this commit: tools/cache_reuse_check.py (and its fix bbf90765) and the tools/vision_check_fake_engine.py
+  hunk. They import tools/vision_batch_check.py and extend the fake engine of f8a41fff, which is only on
+  g3-212-vision (3591ee27); they go on top of the integration branch.
+
+Both switches unset: the search picks what upstream's loop picks, move_cks is upstream's expression, the SLOT_PARK
+block runs as upstream's and the log line is upstream's.
+
+(cherry picked from commit d9927ecfb2b039d6431f3e1eb426d999aebbecb6)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                        |   5 +
+ include/strata/program/slot_chain.hpp | 159 ++++++++++
+ src/program/generate.cpp              | 104 ++++++-
+ tests/program/slot_chain_test.cpp     | 402 ++++++++++++++++++++++++++
+ 4 files changed, 655 insertions(+), 15 deletions(-)
+ create mode 100644 include/strata/program/slot_chain.hpp
+ create mode 100644 tests/program/slot_chain_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b481a439..19224914 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -404,6 +404,11 @@ if(STRATA_BUILD_TESTS)
+   add_executable(split_walk_test tests/program/split_walk_test.cpp)
+   target_include_directories(split_walk_test PRIVATE include)
+   add_test(NAME split_walk_test COMMAND split_walk_test)
++  # STRATA_SLOT_CHAIN_REUSE / STRATA_GIVEBACK_CHECKS: which checkpoints an idle batch slot hands to a request, the order
++  # of a slot's sources (against the loop as it was, switch off) and what a give-back does with the slot (header-only, CPU)
++  add_executable(slot_chain_test tests/program/slot_chain_test.cpp)
++  target_include_directories(slot_chain_test PRIVATE include)
++  add_test(NAME slot_chain_test COMMAND slot_chain_test)
+ 
+   # the prompt planner's host-memory model (#2824): header-only, no GPU
+   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
+diff --git a/include/strata/program/slot_chain.hpp b/include/strata/program/slot_chain.hpp
+new file mode 100644
+index 00000000..d0a6950c
+--- /dev/null
++++ b/include/strata/program/slot_chain.hpp
+@@ -0,0 +1,159 @@
++// include/strata/program/slot_chain.hpp - which checkpoints an idle batch slot can hand to a request, and what a
++// give-back does with the slot's checkpoints (header-only: it compares token lists and flags).
++//
++// With STRATA_SLOT_PARK a slot's conversation stays in the slot until the slot is overwritten.  Its sessions' cells
++// [0, ids) hold the K/V of `ids` (its prompt and reply), so a checkpoint c whose tokens are a prefix of `ids` can be
++// continued from there: the slot's K/V up to c plus c's running state is what the conversation cache gives back when
++// it restores the slot's image and mounts c, because that image is a capture of the same cells and carries c along
++// (slot_park_put's along_ok rule, the same test as slot_prefix_ok below).
++//
++// STRATA_SLOT_CHAIN_REUSE (E1): the slot's chain (its prompt's root and periodic checkpoints) is a source too, not
++// only its turn checkpoint and its end.  STRATA_GIVEBACK_CHECKS (E2): a slot that gives back everything it holds also
++// hands over its own checkpoints (the turn checkpoint of the request it served), which the next turn needs once the
++// client drops that turn's thinking.  Upstream's give-back now copies them without the switch (#2526: the slot's
++// checkpoints that are prefixes of the tokens copied back), so generate.cpp only takes giveback_plan's hand_move from
++// it (moved, not copied, into the slot the request is admitted to); giveback_picks stays as the rule's model for the
++// test.
++//
++// generate.cpp calls scan_slot for every slot a request may continue from and giveback_plan once a slot has been
++// copied back, so the order of the sources and what happens to the slot's image, chain and checkpoints are decided
++// here, where tests/program/slot_chain_test.cpp can reach them without a GPU.
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace strata::program::slot_chain {
++
++/// c is a complete checkpoint of the conversation `held` (what a slot's cells hold): every stage's part, no pictures,
++/// and its tokens a non-empty prefix of `held`.  A checkpoint with pictures is never matched by tokens alone, and one
++/// without every stage's part cannot be mounted on a layer split.
++template <class Ck>
++inline bool slot_prefix_ok(const Ck& c, const std::vector<int32_t>& held, size_t n_stage_parts) {
++    return c.stage_parts.size() == n_stage_parts && !c.ids.empty() && c.ids.size() <= held.size() && c.imgs.empty() &&
++           std::equal(c.ids.begin(), c.ids.end(), held.begin());
++}
++
++/// The chain checkpoint of an idle slot a request continues from: the longest one that slot_prefix_ok accepts for the
++/// slot's tokens, that is longer than `floor` (what the live session, the other checkpoints and the other slots
++/// already give) and that `starts_prompt` accepts (its tokens and pictures are the start of the new prompt, at most
++/// n - 1 of them).  -1: none.
++template <class Ck, class StartsPrompt>
++inline int best_chain(const std::vector<Ck>& chain, const std::vector<int32_t>& slot_ids, size_t n_stage_parts,
++                      int64_t floor, StartsPrompt&& starts_prompt) {
++    int best = -1;
++    int64_t best_len = floor;
++    for (size_t i = 0; i < chain.size(); ++i) {
++        const Ck& c = chain[i];
++        const int64_t len = (int64_t) c.ids.size();
++        if (len > best_len && slot_prefix_ok(c, slot_ids, n_stage_parts) && starts_prompt(c)) {
++            best = (int) i;
++            best_len = len;
++        }
++    }
++    return best;
++}
++
++/// The other chain checkpoints that come along with the one at `chosen` (best_chain's pick), in chain order: the
++/// shorter ones the same rules accept.  The main session's checkpoints then start with the conversation's root as
++/// they would after a read from 0 (the cache keeps the first one of them longest), not with the chosen one alone.
++template <class Ck, class StartsPrompt>
++inline std::vector<size_t> chain_along(const std::vector<Ck>& chain, const std::vector<int32_t>& slot_ids,
++                                       size_t n_stage_parts, int chosen, StartsPrompt&& starts_prompt) {
++    std::vector<size_t> out;
++    if (chosen < 0 || (size_t) chosen >= chain.size()) return out;
++    const size_t len = chain[(size_t) chosen].ids.size();
++    for (size_t i = 0; i < chain.size(); ++i) {
++        const Ck& c = chain[i];
++        if (i == (size_t) chosen || c.ids.size() >= len || !slot_prefix_ok(c, slot_ids, n_stage_parts) ||
++            !starts_prompt(c))
++            continue;
++        bool dup = false;
++        for (size_t j : out) dup = dup || chain[j].ids == c.ids;
++        if (!dup) out.push_back(i);
++    }
++    return out;
++}
++
++/// A slot gave back everything it holds (`held`, now the main session's tokens): the places in `slot_checks` of the
++/// checkpoints that go along into the main session's `checks`.  Each is slot_prefix_ok for `held`, and none has the
++/// same tokens as one `checks` already has or as an earlier pick (a copy of a chain checkpoint the slot kept).
++template <class Ck>
++inline std::vector<size_t> giveback_picks(const std::vector<Ck>& slot_checks, const std::vector<Ck>& checks,
++                                          const std::vector<int32_t>& held, size_t n_stage_parts) {
++    std::vector<size_t> picks;
++    for (size_t i = 0; i < slot_checks.size(); ++i) {
++        const Ck& c = slot_checks[i];
++        if (!slot_prefix_ok(c, held, n_stage_parts)) continue;
++        bool dup = false;
++        for (const Ck& k : checks) dup = dup || k.ids == c.ids;
++        for (size_t j : picks) dup = dup || slot_checks[j].ids == c.ids;
++        if (!dup) picks.push_back(i);
++    }
++    return picks;
++}
++
++/// Where in one slot a request can start: nothing, all the slot holds (an idle slot only), one of its own checkpoints
++/// (sl.checks: its turn checkpoint, or a yielded read's) or one of its chain (STRATA_SLOT_CHAIN_REUSE).
++enum class Source { none, end, own, chain };
++struct SlotPick {
++    Source kind = Source::none;
++    int index = -1;       ///< the checkpoint's place in sl.checks (own) or sl.chain (chain)
++    int64_t tokens = 0;   ///< where the request goes on from
++};
++
++/// One slot of the request path's search (generate.cpp, "an idle slot that holds the start of this prompt"): the
++/// longest start past `floor` (what the live session, the main checkpoints and the slots before this one give), the
++/// later kind winning a tie only when strictly longer, in the order the engine has always tried them: the slot's end,
++/// then its own checkpoints, then (chain_on, an idle slot that is not a yielded read) its chain.  The caller has
++/// already skipped a slot of another control vector or one that is neither an idle source nor an active one.
++/// starts_ids(ids): the slot's tokens are a start of the prompt; starts_ck(c): a checkpoint's tokens and pictures are.
++template <class Slot, class StartsIds, class StartsCk>
++inline SlotPick scan_slot(const Slot& sl, bool idle_source, bool chain_on, size_t n_stage_parts, int64_t floor,
++                          StartsIds&& starts_ids, StartsCk&& starts_ck) {
++    SlotPick p;
++    int64_t at = floor;
++    if (idle_source && (int64_t) sl.ids.size() > at && starts_ids(sl.ids)) {
++        p = SlotPick{Source::end, -1, (int64_t) sl.ids.size()};
++        at = p.tokens;
++    }
++    for (size_t i = 0; i < sl.checks.size(); ++i) {
++        const auto& c = sl.checks[i];
++        if ((int64_t) c.ids.size() > at && starts_ck(c)) {
++            p = SlotPick{Source::own, (int) i, (int64_t) c.ids.size()};
++            at = p.tokens;
++        }
++    }
++    // a yielded read (`partial`) has no chain: its checkpoints are in sl.checks
++    if (chain_on && idle_source && !sl.partial) {
++        const int i = best_chain(sl.chain, sl.ids, n_stage_parts, at, starts_ck);
++        if (i >= 0) p = SlotPick{Source::chain, i, (int64_t) sl.chain[(size_t) i].ids.size()};
++    }
++    return p;
++}
++
++/// What a request that was just copied back from a slot does with the slot (the give-back branch of the request
++/// path).  discard_park / move_chain: the slot's pending image capture is dropped and its chain moves into the main
++/// session (its conversation goes on here) - not after a chain checkpoint (the slot keeps its conversation, which parts
++/// from this one, and parks it when it is overwritten).  hand_checks (STRATA_GIVEBACK_CHECKS): the slot gave back
++/// everything it holds, so its own checkpoints come along too - not from a yielded read the slot keeps (`partial`
++/// still set: it goes on with them later).  hand_move: moved, because the request is admitted to that same slot,
++/// whose admission drops them; otherwise copied, so the untouched slot can still serve a sibling from them.
++struct GiveBack {
++    bool discard_park = false;
++    bool move_chain = false;
++    bool hand_checks = false;
++    bool hand_move = false;
++};
++inline GiveBack giveback_plan(bool slot_park_on, Source from, bool giveback_on, bool partial_after,
++                              bool admitted_here) {
++    GiveBack g;
++    g.discard_park = g.move_chain = slot_park_on && from != Source::chain;
++    g.hand_checks = giveback_on && from == Source::end && !partial_after;
++    g.hand_move = g.hand_checks && admitted_here;
++    return g;
++}
++
++}  // namespace strata::program::slot_chain
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index c53de4ac..83ad03a8 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -127,6 +127,7 @@
+ #include <unistd.h>
+ #endif
+ #include "strata/program/pipe_probe.hpp"
++#include "strata/program/slot_chain.hpp"
+ #include "strata/kernels/cvec.hpp"
+ #include "strata/core/progress.hpp"
+ #include "strata/core/device.hpp"
+@@ -537,6 +538,35 @@ bool park_borrow_env() {
+     }();
+     return on;
+ }
++// STRATA_SLOT_CHAIN_REUSE=1 (read once; off by default): with STRATA_SLOT_PARK an idle slot's chain (the root and
++// periodic checkpoints its prompt was read with, kept for its image) is a source for a request too, not only the
++// slot's turn checkpoint and its end.  A request that parts from the slot's conversation before the turn checkpoint
++// but after a chain checkpoint then continues from the slot's K/V below it and that checkpoint's state instead of
++// reading from 0 (or from the conversation cache, whose copy of the slot is only made when the slot is overwritten).
++// The slot's cells below the checkpoint are the ones its image would carry, so the state is the one a restore of the
++// image and a mount of the same checkpoint gives.  The slot keeps its conversation and its image as before; the main
++// session gets copies of that checkpoint and of the shorter ones of the chain (its root first)
++bool slot_chain_reuse_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_SLOT_CHAIN_REUSE");
++        return v && v[0] != '\0' && v[0] != '0';
++    }();
++    return on;
++}
++// STRATA_GIVEBACK_CHECKS=1 (read once; off by default): a slot that gives back everything it holds (a request goes on
++// with its conversation in the main sessions) moves its own checkpoints - the turn checkpoint of the request it served
++// - into the main session when the request is admitted to that same slot (whose admission drops them), instead of
++// copying them (~112 MB of host vectors each).  The give-back hands them over either way (#2526: the slot's checkpoints
++// that are prefixes of the tokens copied back); copied when admitted elsewhere, so the untouched slot still serves a
++// sibling from them, and nothing moves from a yielded read the slot keeps for later.  It also names them in the
++// give-back's log line
++bool giveback_checks_env() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_GIVEBACK_CHECKS");
++        return v && v[0] != '\0' && v[0] != '0';
++    }();
++    return on;
++}
+ 
+ // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
+ // A file-backed arena on AMD (STRATA_ARENA_MMAP; the engine raises ROCclr's pin-in-place threshold, see main): an
+@@ -17551,6 +17581,10 @@ int main(int argc, char** argv) {
+             ConvCheckpoint::PromptPlan resume_plan;
+             int64_t resume_plan_at = -1, resume_plan_end = -1;   // where it goes on, and the segment end it needs
+             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
++            // STRATA_SLOT_CHAIN_REUSE: slot_ck is one of the slot's chain (sl.chain), not of its own checkpoints
++            namespace sch = strata::program::slot_chain;
++            bool slot_ck_chain = false;
++            const bool slot_chain_on = slot_park_on && slot_chain_reuse_env();
+             if (o.prompt_cache > 0 && req_imgs.empty())
+                 for (int b = 0; b < (int) bs.size(); ++b) {
+                     const BSlot& sl = bs[(size_t) b];
+@@ -17560,17 +17594,22 @@ int main(int argc, char** argv) {
+                     const bool active_source = sl.active && !sl.tainted && slot_ckpt_move_env() &&
+                                                (!use_mtp || batch_mtp || admit_slot >= 0);
+                     if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
+-                    if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
++                    // the slot's end, its own checkpoints, then (STRATA_SLOT_CHAIN_REUSE) an idle slot's chain: its
++                    // cells below a chain checkpoint that is a prefix of its tokens still hold that checkpoint's history
++                    // (nothing has written the slot since it ended: `cached`), so the copy below is the slot's image
++                    // restored and that checkpoint mounted (slot_chain.hpp)
++                    const sch::SlotPick pk = sch::scan_slot(
++                        sl, idle_source, slot_chain_on, stages.size(), std::max(resume, slot_tokens),
++                        [&](const std::vector<int32_t>& v) { return starts_with(v, {}); },
++                        [&](const ConvCheckpoint& c) { return starts_with(c.ids, c.imgs); });
++                    if (pk.kind != sch::Source::none) {
+                         slot_source = b;
+-                        slot_tokens = (int64_t) sl.ids.size();
+-                        slot_ck = nullptr;
++                        slot_tokens = pk.tokens;
++                        slot_ck = pk.kind == sch::Source::own     ? &sl.checks[(size_t) pk.index]
++                                  : pk.kind == sch::Source::chain ? &sl.chain[(size_t) pk.index]
++                                                                  : nullptr;
++                        slot_ck_chain = pk.kind == sch::Source::chain;
+                     }
+-                    for (const ConvCheckpoint& c : sl.checks)
+-                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+-                            slot_source = b;
+-                            slot_tokens = (int64_t) c.ids.size();
+-                            slot_ck = &c;
+-                        }
+                 }
+             // #2228: a checkpoint or the live state whose TOKENS this prompt starts with, deeper than what is reused, but
+             // whose pictures differ (a picture is its grid and the hash of its embeddings: an image encoded again with
+@@ -17861,8 +17900,16 @@ int main(int argc, char** argv) {
+                     // copies of this conversation a turn back - whose deepest checkpoint the chain holds again - go
+                     // as superseded (#342) instead of taking a parked entry each until the cache evicts another chat.
+                     // STRATA_SLOT_CKPT_MOVE: the slot this request continues in drops its checkpoints at the
+-                    // admission, so they move (the one continued from moves on into the slot then: moved_in)
+-                    const bool move_cks = slot_ckpt_move_env() && admit_slot == slot_source;
++                    // admission, so they move (the one continued from moves on into the slot then: moved_in).
++                    // STRATA_GIVEBACK_CHECKS: the same for a slot that gave back all it holds (gb.hand_move: its
++                    // own checkpoints move instead of being copied).  Never after a chain checkpoint
++                    // (STRATA_SLOT_CHAIN_REUSE): the slot keeps its conversation, which parts from this one, for its image
++                    const sch::GiveBack gb = sch::giveback_plan(
++                        slot_park_on, slot_ck_chain ? sch::Source::chain : slot_ck != nullptr ? sch::Source::own
++                                                                                            : sch::Source::end,
++                        giveback_checks_env(), bs[(size_t) slot_source].partial, admit_slot == slot_source);
++                    const bool move_cks =
++                        !slot_ck_chain && ((slot_ckpt_move_env() && admit_slot == slot_source) || gb.hand_move);
+                     const int64_t ck_len = slot_ck != nullptr ? (int64_t) slot_ck->ids.size() : -1;
+                     std::vector<ConvCheckpoint>& sc = bs[(size_t) slot_source].checks;
+                     // a shorter checkpoint comes along only when it is a prefix of the tokens copied back (text only):
+@@ -17900,6 +17947,24 @@ int main(int argc, char** argv) {
+                         std::fprintf(stderr, "strata batch: slot %d: its shorter checkpoints were not all copied (out of "
+                                              "memory); the rest are skipped\n", slot_source);
+                     }
++                    // STRATA_SLOT_CHAIN_REUSE: the slot's shorter chain checkpoints come along too (copies: the slot
++                    // keeps its chain, its own checkpoints and its image for the conversation it holds, which is parked
++                    // when the slot is overwritten, as without the switch), so the main session's checkpoints hold the
++                    // conversation's root as after a read from 0
++                    if (slot_ck_chain) {
++                        const BSlot& sl = bs[(size_t) slot_source];
++                        const int at = (int) (slot_ck - sl.chain.data());
++                        auto starts = [&](const ConvCheckpoint& c) { return starts_with(c.ids, c.imgs); };
++                        try {
++                            for (size_t i : sch::chain_along(sl.chain, sl.ids, stages.size(), at, starts))
++                                if (std::none_of(checks.begin(), checks.end(),
++                                                 [&](const ConvCheckpoint& k) { return k.ids == sl.chain[i].ids; }))
++                                    checks.push_back(sl.chain[i]);
++                        } catch (const std::bad_alloc&) {
++                            std::fprintf(stderr, "strata batch: slot %d: its shorter chain checkpoints were not all "
++                                                 "copied (out of memory); the rest are skipped\n", slot_source);
++                        }
++                    }
+                     if (slot_ck != nullptr) {
+                         for (ConvCheckpoint& c : checks)   // the main session's chain has it now
+                             if ((int64_t) c.ids.size() == ck_len) {
+@@ -17914,9 +17979,12 @@ int main(int argc, char** argv) {
+                     live_imgs.clear();
+                     resume = slot_tokens;
+                     from_live = true;
+-                    if (slot_park_on) {
++                    const size_t own_n = checks.size();   // (STRATA_GIVEBACK_CHECKS' log: the slot's own ones)
++                    if (slot_park_on && !slot_ck_chain) {
+                         // STRATA_SLOT_PARK: the conversation goes on here, so the slot's image goes, and the chain its
+-                        // prompt was read with comes along (the cells below each checkpoint are the ones just copied)
++                        // prompt was read with comes along (the cells below each checkpoint are the ones just copied).
++                        // Not after a chain checkpoint (STRATA_SLOT_CHAIN_REUSE): the slot parks its own when
++                        // it is overwritten
+                         slot_park_discard(slot_source);
+                         for (ConvCheckpoint& c : bs[(size_t) slot_source].chain) {
+                             bool held = false;
+@@ -17927,9 +17995,15 @@ int main(int argc, char** argv) {
+                         }
+                         bs[(size_t) slot_source].chain.clear();
+                     }
++                    char what[96];
++                    if (gb.hand_checks && own_n > 0)   // STRATA_GIVEBACK_CHECKS (its log only)
++                        std::snprintf(what, sizeof what, "all it holds, and %zu checkpoint%s of its own%s", own_n,
++                                      own_n == 1 ? "" : "s", gb.hand_move ? ", moved" : "");
++                    else
++                        std::snprintf(what, sizeof what, "%s", slot_ck_chain ? "a checkpoint of its chain" :
++                                      slot_ck != nullptr ? "its turn checkpoint" : "all it holds");
+                     std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
+-                                 "%.1f ms\n", slot_source, (long long) slot_tokens,
+-                                 slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
++                                 "%.1f ms\n", slot_source, (long long) slot_tokens, what,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                 }
+             }
+diff --git a/tests/program/slot_chain_test.cpp b/tests/program/slot_chain_test.cpp
+new file mode 100644
+index 00000000..9cfbabee
+--- /dev/null
++++ b/tests/program/slot_chain_test.cpp
+@@ -0,0 +1,402 @@
++// Which checkpoints an idle batch slot hands to a request (include/strata/program/slot_chain.hpp):
++// STRATA_SLOT_CHAIN_REUSE's pick from a slot's chain, the order of a slot's sources (scan_slot, which generate.cpp's
++// request path calls for every slot), what a give-back does with the slot (giveback_plan) and STRATA_GIVEBACK_CHECKS's
++// hand-over, on the engine's own checkpoint type.  Header-only, CPU: no model, no GPU.
++//
++// What this does not test: the engine's starts_with (`starts` below is a transcription of it, the n - 1 rule
++// included), copy_from_slot, slot_park_put and the main session's own resume loop.  The host model of a slot's cells
++// near the end illustrates why a mount from the slot's chain is the image's state; it builds both sides with the same
++// operations, so it shows the argument and proves nothing about the engine's copies (the GPU check does that:
++// tools/cache_reuse_check.py).
++#include "strata/core/conversation_cache.hpp"
++#include "strata/program/slot_chain.hpp"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++namespace sc = strata::program::slot_chain;
++using Ck = strata::core::ConversationCheckpoint;
++
++namespace {
++int failures = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++constexpr size_t kStages = 3;   // a 4-GPU layer split: the first stage's part plus three stage_parts
++
++// a conversation's tokens: `n` tokens of stream `seed` (two seeds part at token 0, the same seed agrees throughout)
++std::vector<int32_t> tokens(size_t n, uint32_t seed) {
++    std::vector<int32_t> v(n);
++    uint32_t x = seed * 2654435761u + 1u;
++    for (size_t i = 0; i < n; ++i) {
++        x = x * 1664525u + 1013904223u;
++        v[i] = (int32_t) (x >> 8) % 151000;
++    }
++    return v;
++}
++// `a` up to `at`, then `b`'s tokens after it: a sibling or a rewritten history that parts from `a` at `at`
++std::vector<int32_t> part_at(const std::vector<int32_t>& a, size_t at, size_t n, uint32_t seed) {
++    std::vector<int32_t> v(a.begin(), a.begin() + (std::ptrdiff_t) at);
++    const std::vector<int32_t> t = tokens(n - at, seed);
++    v.insert(v.end(), t.begin(), t.end());
++    return v;
++}
++Ck ck(const std::vector<int32_t>& conv, size_t len, size_t parts = kStages) {
++    Ck c;
++    c.ids.assign(conv.begin(), conv.begin() + (std::ptrdiff_t) len);
++    c.stage_parts.resize(parts);
++    for (Ck& p : c.stage_parts) p.ids = c.ids;
++    return c;
++}
++// the engine's starts_with (generate.cpp, the request path): tokens and pictures the start of the prompt, at most
++// n - 1 of them (the last prompt token is always the first window's)
++bool starts(const Ck& c, const std::vector<int32_t>& prompt) {
++    const size_t L = c.ids.size();
++    if (L < 1 || L + 1 > prompt.size()) return false;
++    for (size_t i = 0; i < L; ++i)
++        if (c.ids[i] != prompt[i]) return false;
++    return c.imgs.empty();
++}
++
++// A host model of the sessions: cell i's K/V and the running state after token i are a hash of tokens [0, i], so a
++// cell written for another history (or a state of another prefix) shows up in the end state.
++uint64_t step(uint64_t h, int32_t t) { return (h ^ (uint64_t) (uint32_t) t) * 1099511628211ull + 0x9e3779b97f4a7c15ull; }
++struct Session {
++    std::vector<uint64_t> cells;   // K/V per cell
++    uint64_t state = 1469598103934665603ull;
++    void read(const std::vector<int32_t>& ids, size_t from) {   // the prompt read from `from` on
++        cells.resize(from);
++        for (size_t i = from; i < ids.size(); ++i) {
++            // attention reads every cell below i: a wrong cell changes everything after it
++            uint64_t a = state;
++            for (size_t j = (i > 4 ? i - 4 : 0); j < i; ++j) a ^= cells[j];
++            state = step(a, ids[i]);
++            cells.push_back(state);
++        }
++    }
++};
++uint64_t state_at(const std::vector<int32_t>& ids, size_t L) {   // a checkpoint's state, as the read that took it saw
++    Session s;
++    std::vector<int32_t> pre(ids.begin(), ids.begin() + (std::ptrdiff_t) L);
++    s.read(pre, 0);
++    return s.state;
++}
++// a batch slot as scan_slot sees it (generate.cpp's BSlot: the fields it reads)
++struct FakeSlot {
++    std::vector<int32_t> ids;
++    std::vector<Ck> checks, chain;
++    bool partial = false;
++};
++// the request path's slot loop before STRATA_SLOT_CHAIN_REUSE, transcribed from generate.cpp at g3-143 (0d162062): the
++// oracle scan_slot must equal with the switch off.  Returns {slot, tokens, place in sl.checks or -1 for the end}
++struct OldPick {
++    int slot = -1;
++    int64_t tokens = 0;
++    int ck = -1;
++};
++OldPick old_loop(const std::vector<FakeSlot>& bs, const std::vector<bool>& idle, int64_t resume,
++                 const std::vector<int32_t>& prompt) {
++    OldPick r;
++    for (int b = 0; b < (int) bs.size(); ++b) {
++        const FakeSlot& sl = bs[(size_t) b];
++        const bool idle_source = idle[(size_t) b];
++        if (idle_source && (int64_t) sl.ids.size() > std::max(resume, r.tokens) &&
++            starts(ck(sl.ids, sl.ids.size()), prompt)) {
++            r = OldPick{b, (int64_t) sl.ids.size(), -1};
++        }
++        for (size_t i = 0; i < sl.checks.size(); ++i) {
++            const Ck& c = sl.checks[i];
++            if ((int64_t) c.ids.size() > std::max(resume, r.tokens) && starts(c, prompt))
++                r = OldPick{b, (int64_t) c.ids.size(), (int) i};
++        }
++    }
++    return r;
++}
++// the new loop: scan_slot per slot, as generate.cpp calls it
++struct NewPick {
++    int slot = -1;
++    sc::SlotPick pick;
++};
++NewPick new_loop(const std::vector<FakeSlot>& bs, const std::vector<bool>& idle, int64_t resume, bool chain_on,
++                 const std::vector<int32_t>& prompt) {
++    NewPick r;
++    for (int b = 0; b < (int) bs.size(); ++b) {
++        const sc::SlotPick p = sc::scan_slot(
++            bs[(size_t) b], idle[(size_t) b], chain_on, kStages, std::max(resume, r.pick.tokens),
++            [&](const std::vector<int32_t>& v) { return starts(ck(v, v.size()), prompt); },
++            [&](const Ck& c) { return starts(c, prompt); });
++        if (p.kind != sc::Source::none) r = NewPick{b, p};
++    }
++    return r;
++}
++}  // namespace
++
++int main() {
++    // the production shape: a 2.5K system prompt, the root at the first turn boundary >= 2048, a periodic checkpoint
++    // every 16384 tokens, the turn checkpoint at the last <|im_start|>; the slot holds the prompt and its reply
++    const std::vector<int32_t> conv = tokens(21000, 1);
++    const size_t root = 2533, periodic = 16384, turn = 19876;
++    std::vector<Ck> chain;
++    chain.push_back(ck(conv, root));
++    chain.push_back(ck(conv, periodic));
++    const std::vector<Ck> own{ck(conv, turn)};
++
++    auto pick = [&](const std::vector<int32_t>& prompt, int64_t floor) {
++        return sc::best_chain(chain, conv, kStages, floor, [&](const Ck& c) { return starts(c, prompt); });
++    };
++    // E1: a sibling that parts after the periodic checkpoint but before the turn one continues from the periodic one
++    {
++        const std::vector<int32_t> p = part_at(conv, 18000, 20500, 7);
++        check(pick(p, 0) == 1, "parts at 18000: the periodic checkpoint (16384)");
++        check(!starts(own[0], p), "parts at 18000: the turn checkpoint (19876) is not a start of it");
++        check(pick(p, (int64_t) periodic) == -1, "a source as long as the periodic one already: none from the chain");
++        check(pick(p, (int64_t) root) == 1, "a shorter source (the root, elsewhere): the periodic one is longer");
++    }
++    {
++        const std::vector<int32_t> p = part_at(conv, 9000, 12000, 8);
++        check(pick(p, 0) == 0, "parts at 9000: the root (2533)");
++    }
++    {
++        const std::vector<int32_t> p = part_at(conv, 1500, 9000, 9);
++        check(pick(p, 0) == -1, "parts before the root: nothing (read from 0 as before)");
++    }
++    {
++        const std::vector<int32_t> p(conv.begin(), conv.begin() + (std::ptrdiff_t) periodic);
++        check(pick(p, 0) == 0, "a prompt exactly the periodic checkpoint's tokens: not that one (n - 1), the root");
++    }
++    // what the chain must never hand over
++    {
++        const std::vector<int32_t> p = part_at(conv, 18000, 20500, 7);
++        std::vector<Ck> bad;
++        bad.push_back(ck(conv, periodic, kStages - 1));   // a stage's part missing
++        Ck img = ck(conv, periodic);
++        img.imgs.push_back({100, 42});                    // pictures: never matched by tokens alone
++        bad.push_back(img);
++        Ck other = ck(part_at(conv, 4000, 17000, 3), periodic);   // not a prefix of what the slot holds
++        bad.push_back(other);
++        bad.push_back(Ck{});                              // empty (a moved-from checkpoint)
++        Ck longer = ck(tokens(30000, 1), 22000);          // past what the slot holds
++        bad.push_back(longer);
++        const int at = sc::best_chain(bad, conv, kStages, 0, [&](const Ck& c) { return starts(c, p); });
++        check(at == -1, "incomplete, with pictures, of another history, empty or past the slot's tokens: refused");
++        // the one of another history WOULD start the prompt if the prompt followed it: the slot's cells decide
++        const std::vector<int32_t> q = part_at(other.ids, other.ids.size(), 20000, 11);
++        check(starts(other, q) && !sc::slot_prefix_ok(other, conv, kStages),
++              "a checkpoint that starts the prompt but is not on the slot's tokens: refused (its cells are not there)");
++    }
++    // illustration only (see the top): the slot's cells below the chain checkpoint plus its state, then the rest of the
++    // new prompt read, end where a restore of the slot's image with the same checkpoint mounted ends, because that
++    // image is a capture of the same cells
++    {
++        Session slot;
++        slot.read(conv, 0);   // the slot's prompt read and its reply: its cells
++        const std::vector<int32_t> p = part_at(conv, 18000, 20500, 7);
++        const int at = pick(p, 0);
++        check(at == 1, "mount: the periodic checkpoint");
++        const size_t L = chain[(size_t) at].ids.size();
++        Session from_slot;   // copy_from_slot(b, &c): K/V [0, L) from the slot, the state from the checkpoint
++        from_slot.cells.assign(slot.cells.begin(), slot.cells.begin() + (std::ptrdiff_t) L);
++        from_slot.state = state_at(conv, L);
++        from_slot.read(p, L);
++        Session image = slot;   // the parked image restored whole, then the checkpoint mounted
++        image.cells.resize(L);
++        image.state = state_at(conv, L);
++        image.read(p, L);
++        check(from_slot.state == image.state && from_slot.cells == image.cells,
++              "illustration: mount from the slot's chain = restore of the slot's image + the same checkpoint");
++        // negative control: a checkpoint of another history mounted on the slot's cells ends elsewhere
++        const std::vector<int32_t> other = part_at(conv, 4000, 20500, 3);
++        Session wrong;
++        wrong.cells.assign(slot.cells.begin(), slot.cells.begin() + (std::ptrdiff_t) L);
++        wrong.state = state_at(other, L);
++        std::vector<int32_t> po(other.begin(), other.begin() + (std::ptrdiff_t) L);
++        const std::vector<int32_t> rest = tokens(2000, 5);
++        po.insert(po.end(), rest.begin(), rest.end());
++        wrong.read(po, L);
++        Session want;
++        want.read(po, 0);
++        check(wrong.state != want.state, "negative control: the model sees cells of another history");
++    }
++    // E2: a give-back of everything the slot holds hands over its turn checkpoint (and nothing the main session has)
++    {
++        std::vector<Ck> slot_checks{ck(conv, turn)};
++        std::vector<Ck> checks;   // after the give-back: the chain moved in
++        checks.push_back(ck(conv, root));
++        checks.push_back(ck(conv, periodic));
++        std::vector<size_t> p = sc::giveback_picks(slot_checks, checks, conv, kStages);
++        check(p.size() == 1 && p[0] == 0, "give-back: the slot's turn checkpoint goes along");
++        // the next turn renders the served turn again without its thinking: it parts right after the turn checkpoint
++        // (the loop below stands for the main session's resume loop in generate.cpp, which is not in the header)
++        const std::vector<int32_t> next = part_at(conv, turn, 26000, 13);
++        checks.push_back(slot_checks[p[0]]);
++        int64_t resume = 0;
++        for (const Ck& c : checks)
++            if ((int64_t) c.ids.size() > resume && starts(c, next)) resume = (int64_t) c.ids.size();
++        check(resume == (int64_t) turn, "the next turn resumes at the turn checkpoint, not at an older one");
++        std::vector<Ck> without(checks.begin(), checks.end() - 1);
++        int64_t old = 0;
++        for (const Ck& c : without)
++            if ((int64_t) c.ids.size() > old && starts(c, next)) old = (int64_t) c.ids.size();
++        check(old == (int64_t) periodic, "without it: the periodic one (today's fallback)");
++    }
++    {
++        std::vector<Ck> slot_checks;
++        slot_checks.push_back(ck(conv, periodic));           // a copy of a chain checkpoint the main session has
++        slot_checks.push_back(ck(conv, turn, kStages - 1));  // incomplete
++        Ck img = ck(conv, turn);
++        img.imgs.push_back({3, 9});
++        slot_checks.push_back(img);                          // pictures
++        slot_checks.push_back(ck(part_at(conv, 100, 21000, 4), turn));   // of another history
++        slot_checks.push_back(ck(conv, 20000));              // the one to hand over
++        slot_checks.push_back(ck(conv, 20000));              // the same tokens again: once
++        std::vector<Ck> checks;
++        checks.push_back(ck(conv, periodic));
++        const std::vector<size_t> p = sc::giveback_picks(slot_checks, checks, conv, kStages);
++        check(p.size() == 1 && p[0] == 4, "give-back: no duplicate, nothing incomplete, with pictures or off the tokens");
++        check(sc::giveback_picks(std::vector<Ck>{}, checks, conv, kStages).empty(), "a slot without checkpoints: none");
++    }
++    // scan_slot: the order of a slot's sources and who may use the chain
++    {
++        FakeSlot sl;
++        sl.ids = conv;
++        sl.checks.push_back(ck(conv, turn));
++        sl.chain = chain;
++        auto scan = [&](const FakeSlot& s, bool idle, bool chain_on, const std::vector<int32_t>& prompt,
++                        int64_t floor = 0) {
++            return sc::scan_slot(s, idle, chain_on, kStages, floor,
++                                 [&](const std::vector<int32_t>& v) { return starts(ck(v, v.size()), prompt); },
++                                 [&](const Ck& c) { return starts(c, prompt); });
++        };
++        std::vector<int32_t> next(conv);   // the next turn: all the slot holds, then more
++        const std::vector<int32_t> more = tokens(500, 21);
++        next.insert(next.end(), more.begin(), more.end());
++        sc::SlotPick p = scan(sl, true, true, next);
++        check(p.kind == sc::Source::end && p.tokens == (int64_t) conv.size(), "scan: the next turn takes all it holds");
++        const std::vector<int32_t> after_turn = part_at(conv, turn, 20500, 22);
++        p = scan(sl, true, true, after_turn);
++        check(p.kind == sc::Source::own && p.index == 0 && p.tokens == (int64_t) turn,
++              "scan: parts after the turn checkpoint: its own checkpoint, not the chain");
++        const std::vector<int32_t> sib = part_at(conv, 18000, 20500, 7);
++        p = scan(sl, true, true, sib);
++        check(p.kind == sc::Source::chain && p.index == 1 && p.tokens == (int64_t) periodic,
++              "scan: a sibling before the turn checkpoint: the chain's periodic one");
++        check(scan(sl, true, false, sib).kind == sc::Source::none, "scan: the switch off: no chain (read from 0)");
++        check(scan(sl, false, true, sib).kind == sc::Source::none, "scan: an active slot: never its chain");
++        p = scan(sl, false, true, after_turn);
++        check(p.kind == sc::Source::own, "scan: an active slot: its own checkpoints as before (STRATA_SLOT_CKPT_MOVE)");
++        p = scan(sl, false, true, next);
++        check(p.kind == sc::Source::own && p.tokens == (int64_t) turn, "scan: an active slot: never its end");
++        FakeSlot part = sl;
++        part.partial = true;
++        check(scan(part, true, true, sib).kind == sc::Source::none, "scan: a yielded read: never a chain");
++        check(scan(sl, true, true, sib, (int64_t) periodic).kind == sc::Source::none,
++              "scan: an earlier source as long as the chain's: kept (only a longer one wins)");
++        p = scan(sl, true, true, sib, (int64_t) root);
++        check(p.kind == sc::Source::chain && p.tokens == (int64_t) periodic, "scan: a shorter earlier source: the chain");
++        // a chain checkpoint that is as long as the slot's own one does not take its place
++        FakeSlot tie = sl;
++        tie.chain.push_back(ck(conv, turn));
++        p = scan(tie, true, true, after_turn);
++        check(p.kind == sc::Source::own, "scan: a tie between its own checkpoint and the chain: its own");
++        // ties among its own checkpoints and with the floor: the first one found, and nothing at the floor itself
++        FakeSlot two = sl;
++        two.checks.push_back(ck(conv, turn));
++        p = scan(two, true, true, after_turn);
++        check(p.kind == sc::Source::own && p.index == 0, "scan: two own checkpoints of one length: the first");
++        check(scan(two, true, true, after_turn, (int64_t) turn).kind == sc::Source::none,
++              "scan: an own checkpoint as long as the floor: not taken");
++    }
++    // with the switch off the new loop is the old one, over many slots (the default path, decided in the header)
++    {
++        uint32_t x = 12345u;
++        auto rnd = [&](uint32_t m) {
++            x = x * 1664525u + 1013904223u;
++            return (x >> 8) % m;
++        };
++        int same = 0, cases = 0;
++        for (int t = 0; t < 4000; ++t) {
++            const std::vector<int32_t> base = tokens(3000, 1 + rnd(3));
++            const std::vector<int32_t> prompt = part_at(base, 200 + rnd(2700), 3000, 50 + rnd(5));
++            std::vector<FakeSlot> bs(1 + rnd(5));
++            std::vector<bool> idle(bs.size());
++            for (size_t b = 0; b < bs.size(); ++b) {
++                const std::vector<int32_t> h = rnd(2) ? base : part_at(base, rnd(3000), 3000, 70 + rnd(9));
++                bs[b].ids.assign(h.begin(), h.begin() + (std::ptrdiff_t) (1 + rnd(3000)));
++                for (uint32_t k = rnd(3); k-- > 0;) bs[b].checks.push_back(ck(h, 1 + rnd(2999), rnd(4) ? kStages : 1));
++                for (uint32_t k = rnd(3); k-- > 0;) bs[b].chain.push_back(ck(h, 1 + rnd(2999)));
++                bs[b].partial = rnd(4) == 0;
++                idle[b] = rnd(3) != 0;
++            }
++            const int64_t resume = rnd(3) ? 0 : (int64_t) rnd(3000);
++            const OldPick o = old_loop(bs, idle, resume, prompt);
++            const NewPick n = new_loop(bs, idle, resume, false, prompt);
++            const bool eq = o.slot == n.slot && o.tokens == (n.slot < 0 ? 0 : n.pick.tokens) &&
++                            (n.slot < 0 || (o.ck < 0 ? n.pick.kind == sc::Source::end
++                                                     : n.pick.kind == sc::Source::own && n.pick.index == o.ck));
++            same += eq ? 1 : 0;
++            ++cases;
++            // with the switch on: never shorter than the old pick, and a chain pick always a prefix of its slot
++            const NewPick on = new_loop(bs, idle, resume, true, prompt);
++            if (on.slot >= 0 && on.pick.kind == sc::Source::chain) {
++                const FakeSlot& sl = bs[(size_t) on.slot];
++                check(idle[(size_t) on.slot] && !sl.partial &&
++                          sc::slot_prefix_ok(sl.chain[(size_t) on.pick.index], sl.ids, kStages),
++                      "oracle: a chain pick is an idle, not yielded slot's complete prefix");
++            }
++            check((on.slot < 0 ? 0 : on.pick.tokens) >= o.tokens, "oracle: the switch on never starts earlier");
++        }
++        check(same == cases, "oracle: with the switch off scan_slot picks what the old loop picked, every case");
++    }
++    // chain_along: what comes along with the chosen chain checkpoint
++    {
++        const std::vector<int32_t> sib = part_at(conv, 18000, 20500, 7);
++        auto st = [&](const Ck& c) { return starts(c, sib); };
++        std::vector<size_t> a = sc::chain_along(chain, conv, kStages, 1, st);
++        check(a.size() == 1 && a[0] == 0, "along: the periodic one chosen: the root comes along (first)");
++        check(sc::chain_along(chain, conv, kStages, 0, st).empty(), "along: the root chosen: nothing shorter");
++        check(sc::chain_along(chain, conv, kStages, -1, st).empty(), "along: nothing chosen: nothing");
++        std::vector<Ck> c2 = chain;
++        c2.insert(c2.begin(), ck(conv, root));                 // the root twice (a copy): once
++        c2.push_back(ck(conv, 9000, kStages - 1));             // incomplete
++        c2.push_back(ck(part_at(conv, 3000, 17000, 5), 9000)); // of another history
++        a = sc::chain_along(c2, conv, kStages, 2, st);
++        check(a.size() == 1 && a[0] == 0, "along: no duplicate, nothing incomplete or off the slot's tokens");
++        std::vector<Ck> c3 = chain;
++        c3.push_back(ck(conv, periodic));                      // a copy of the chosen one: not along
++        a = sc::chain_along(c3, conv, kStages, 1, st);
++        check(a.size() == 1 && a[0] == 0, "along: a copy of the chosen one does not come along");
++    }
++    // giveback_plan: what happens to the slot's image, chain and checkpoints
++    {
++        using S = sc::Source;
++        for (int park = 0; park < 2; ++park)
++            for (int on = 0; on < 2; ++on)
++                for (int part = 0; part < 2; ++part)
++                    for (int here = 0; here < 2; ++here)
++                        for (S from : {S::end, S::own, S::chain}) {
++                            const sc::GiveBack g = sc::giveback_plan(park, from, on, part, here);
++                            check(g.discard_park == g.move_chain, "plan: the image goes exactly when the chain moves");
++                            check(g.discard_park == (park && from != S::chain),
++                                  "plan: a chain hit keeps the slot's image and chain; any other give-back, as before");
++                            if (!on) check(!g.hand_checks && !g.hand_move, "plan: STRATA_GIVEBACK_CHECKS off: nothing");
++                            if (from != S::end) check(!g.hand_checks, "plan: only a give-back of all it holds hands over");
++                            if (part) check(!g.hand_checks, "plan: a yielded read the slot keeps keeps its checkpoints");
++                            if (g.hand_move) check(g.hand_checks && here, "plan: moved only into the same slot");
++                        }
++        sc::GiveBack g = sc::giveback_plan(true, S::end, true, false, true);
++        check(g.hand_checks && g.hand_move, "plan: admitted to the same slot: moved (its admission drops them)");
++        g = sc::giveback_plan(true, S::end, true, false, false);
++        check(g.hand_checks && !g.hand_move, "plan: alone or into another slot: copied (the slot can still serve them)");
++        g = sc::giveback_plan(false, S::end, true, false, false);
++        check(g.hand_checks && !g.discard_park, "plan: without STRATA_SLOT_PARK: handed over, no image to drop");
++    }
++    if (failures != 0) return EXIT_FAILURE;
++    std::printf("slot_chain_test: ok\n");
++    return EXIT_SUCCESS;
++}
+-- 
+2.43.0
+
