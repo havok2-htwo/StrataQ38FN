@@ -515,6 +515,15 @@ run_step() { local name=$1 cap=$2 l; shift 2; STEP_WHY=""; STEP_RC=0; l=$(left)
     [ -n "$STEP_WHY" ] && judge_why "$STEP_WHY"
     return "$STEP_RC"; }
 
+# settle_pressure: wait (cap 180 s) until user@'s memory pressure some avg10 is below 5 % (production's teardown frees
+# its conversation cache while the first arm would already read ~88 GB of GGUF: w212d's first try stopped at 41.7 %)
+settle_pressure() { local t0=$(date +%s) p
+    while :; do p=$(awk '/^some/ {split($2, a, "="); print a[2]}' "$PRESS" 2>/dev/null)
+        awk -v p="${p:-0}" 'BEGIN { exit !(p < 5) }' && break
+        [ $(( $(date +%s) - t0 )) -ge 180 ] && { log "memory pressure still ${p}% after 180 s: going on"; return 0; }
+        sleep 5; done
+    log "memory pressure ${p}% (settled after $(( $(date +%s) - t0 )) s)"; }
+
 # ---- bench server ----------------------------------------------------------------------------------------------------
 # srv_up <LABEL> <CFG> <ARM>: the arm's server in $BUNIT.scope on 127.0.0.1:$TPORT, 0 once loaded
 srv_up() { local lab=$1 cfg=$2 a=$3 sdir=${ARM_SRV[$3]} senv t0 env_
@@ -530,7 +539,11 @@ srv_up() { local lab=$1 cfg=$2 a=$3 sdir=${ARM_SRV[$3]} senv t0 env_
         systemctl --user is-active -q "$BUNIT.scope" || { log "$lab: the server died during its start FAIL"; tail -5 "$OUT/server-$lab.out" | sed 's/^/    /' | tee -a "$OUT/window.log"; STEP_WHY="crash:boot"; judge_why "$STEP_WHY"; return 1; }
         [ $(( $(date +%s) - t0 )) -gt "$BOOT_CAP" ] && { log "$lab: start timeout ($BOOT_CAP s) FAIL"; STEP_WHY="hang:boot"; judge_why "$STEP_WHY"; return 1; }
         [ "$(left)" -lt 30 ] && { log "$lab: DEADLINE during the start"; STEP_WHY=deadline; return 1; }
-        mon_check; [ -n "$MON_WHY" ] && { log "$lab: start stopped: $MON_WHY FAIL"; STEP_WHY=$MON_WHY; judge_why "$MON_WHY"; return 1; }
+        mon_check
+        if [ "$a" = S ] && [[ $MON_WHY == pressure:* ]]; then   # w212d: stock without --resident-experts reads the GGUF
+            log "$lab: start stopped: $MON_WHY - arm S only (its own boot), the server is stopped and the window goes on FAIL"
+            stop_bench; settle_pressure; STEP_WHY="pressure-boot"; return 1; fi   # through the page cache at its boot
+        [ -n "$MON_WHY" ] && { log "$lab: start stopped: $MON_WHY FAIL"; STEP_WHY=$MON_WHY; judge_why "$MON_WHY"; return 1; }
         sleep 5; done
     BOOT_S=$(( $(date +%s) - t0 )); ENGSTART_BASE=$(grep -a -c 'engine started' "$ENGLOG" 2>/dev/null)
     VRAM_ON=1; MON_HANG=$HANG_S
@@ -1346,6 +1359,7 @@ for _ in $(seq 60); do port_busy $PPORT || break; sleep 2; done
 port_busy $PPORT && { log "ABORT: port $PPORT still open after the stop"; exit 1; }
 free_gpus || { log "ABORT: GPUs not free after the stop"; exit 1; }
 log "production stopped; VRAM free $(vram)"
+settle_pressure
 
 # ---- phase 3: GPU ctest subset (one card, 212m build; 212p's with only pipe arms, + P_GPU_TESTS)
 if [ "$GPU_CTEST" = 1 ] && [ -f "$CTB/CTestTestfile.cmake" ] && [ "$ABORT_ALL" = 0 ]; then
