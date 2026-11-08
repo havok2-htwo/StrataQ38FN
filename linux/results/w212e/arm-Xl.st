@@ -1,0 +1,16 @@
+arm=Xl
+label=Xl
+bin=pipe
+server=Strata-212p@e55fa457
+sha=74702164d1e5e37d
+boot_s=97
+vram_boot=0,1523 1,1514 2,2414 3,1722 
+engaged_boot=yes
+ident=same
+status=ok
+mem_peak_gib=84.6
+rss_max_gib=84
+vram_min=0:1340 1:1336 2:2236 3:1550 
+engaged_end=all seen
+warn=
+engine_starts=1

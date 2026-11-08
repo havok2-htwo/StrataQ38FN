@@ -221,10 +221,11 @@ declare -A ARM_POINT=([D]="STRATA_IQ4_W4A8 STRATA_SELECT_TWO_PASS" [H2]="STRATA_
     [PTD]="STRATA_ATTN_DAILY" [PT4]="STRATA_IQ4_W4A8 STRATA_SELECT_TWO_PASS")
 # ablation arms (w212e on): ABL=<json> {"<arm>": {"env": {"STRATA_X": "0" | null, ...}, "srv": "pipe" | "stock",
 #   "exact": true|false, "drop": ["LANES", ...], "fail_drop": ["STRATA_SPEC_LANES is off", ...], "note": "...",
-#   "srv_env": {"STRATA_ADMIT_BY_NEW": null, ...}}}: each arm
+#   "srv_env": {"STRATA_ADMIT_BY_NEW": null, ...}, "late": ["SLOTSS", ...]}}: each arm
 #   is T212-PT.json with the env changes (null removes the key) on 212p's binary, its server 212p's (pipe) or stock's; drop
 #   names the INFO pattern variables above it no longer wants ("bin": "pipeq" = strata-212q instead of 212p) (boot and end), fail_drop the P_FAIL alternatives it may
-#   print.  Compared with this run's PT (short replies; exact arms gate like PT's) and C; the summary reads $OUT/abl.json
+#   print, late the boot patterns checked at the arm's end instead (without the overlapped read the first batch
+#   window, and its attention line, comes after the probe).  Compared with this run's PT (short replies; exact arms gate like PT's) and C; the summary reads $OUT/abl.json
 ABL=${ABL:-}; ABL_ARMS=""; declare -A ABL_NOTE=() ABL_SRV=()   # ABL_SRV: "K=V K=" (empty: K removed) over srv_env
 is_abl() { case " $ABL_ARMS " in *" $1 "*) return 0 ;; esac; return 1; }
 if [ -n "$ABL" ]; then
@@ -246,10 +247,11 @@ for a, d in spec.items():
     json.dump(c, open(f"{cdir}/T212-{a}.json", "w"), indent=1)
     print("\x1f".join([a, d.get("srv", "pipe") + ":" + d.get("bin", "pipe"), "1" if d.get("exact", True) else "0", " ".join(d.get("drop", [])),
                      ";;".join(d.get("fail_drop", [])), d.get("note", "").replace("\x1f", " "),
-                     " ".join(f"{k}={'' if v is None else v}" for k, v in d.get("srv_env", {}).items())]))
+                     " ".join(f"{k}={'' if v is None else v}" for k, v in d.get("srv_env", {}).items()),
+                     " ".join(d.get("late", []))]))
 PYEOF
 ) || { echo "ABL $ABL: cannot make the ablation configs"; exit 2; }
-    while IFS=$'\x1f' read -r _a _srv _ex _drop _fdrop _note _senv; do
+    while IFS=$'\x1f' read -r _a _srv _ex _drop _fdrop _note _senv _late; do
         [ -n "$_a" ] || continue
         ABL_ARMS="$ABL_ARMS $_a"; ABL_NOTE[$_a]=$_note; ABL_SRV[$_a]=$_senv; ARM_BIN[$_a]=${_srv#*:}; _srv=${_srv%%:*}
         case ${ARM_BIN[$_a]} in pipe|pipeq) ;; *) echo "ABL $_a: bin must be pipe or pipeq"; exit 2 ;; esac
@@ -259,6 +261,8 @@ PYEOF
         _wb=${WANT_BOOT[PT]}; _we=${WANT_END[PT]}
         for _n in $_drop; do [ -n "${!_n+x}" ] || { echo "ABL $_a: no pattern variable $_n"; exit 2; }
             _p=${!_n}; _wb=${_wb//"$_p"/}; _we=${_we//"$_p"/}; done
+        for _n in $_late; do [ -n "${!_n+x}" ] || { echo "ABL $_a: no pattern variable $_n"; exit 2; }
+            _p=${!_n}; case $_wb in *"$_p"*) _wb=${_wb//"$_p"/}; _we="$_we;;$_p" ;; esac; done
         WANT_BOOT[$_a]=$_wb; WANT_END[$_a]=$_we
         FAILPAT[$_a]=$(python3 -c 'import sys; f=sys.argv[2].split(";;"); print("|".join(x for x in sys.argv[1].split("|") if x and x not in f))' "${FAILPAT[PT]}" "$_fdrop")
     done <<< "$_abl"

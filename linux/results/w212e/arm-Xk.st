@@ -1,0 +1,16 @@
+arm=Xk
+label=Xk
+bin=pipe
+server=Strata-212p@e55fa457
+sha=74702164d1e5e37d
+boot_s=97
+vram_boot=0,1029 1,1016 2,1920 3,960 
+engaged_boot=yes
+ident=same
+status=ok
+mem_peak_gib=84.1
+rss_max_gib=83
+vram_min=0:871 1:862 2:1764 3:814 
+engaged_end=all seen
+warn=
+engine_starts=1

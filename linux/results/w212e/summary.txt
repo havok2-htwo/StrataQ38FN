@@ -1,0 +1,186 @@
+# window 212: one fresh server per arm on 127.0.0.1:8091, greedy; agg = aggregate output tok/s, TTFT in s, dec = per-user decode p50 tok/s at 1/2/4 users, mt = bench_multiturn 16x3 (wall s / follow-up TTFT p50 s), join = cold 32K joiner beside 4 streams (joiner TTFT / worst stream gap s), pfx = prefix reuse %, VRAM = lowest free MiB per card during the arm, mem = memory.peak GiB of the scope
+arm    status     boot  agg16s   vsPT    vsB TTFT s p50/p95/max  agg16l   vsPT TTFT l p50/p95        dec 1/2/4  mt wall/fu join ttft/gap   pfx   mem    ident  VRAM min
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+PT     ok           97   528.0   +0.0      -     0.37/4.29/4.82   406.4   +0.0      0.79/9.38 146.5/129.3/90.6   90.3/3.13     8.06/0.10     -  86.8     same  0:859 1:862 2:1768 3:814 
+Q512   notengaged   97       -      -      -              -/-/-       -      -            -/-            -/-/-         -/-           -/-     -  60.9        -  0:973 1:956 2:1856 3:898 
+Xo     notengaged   97       -      -      -              -/-/-       -      -            -/-            -/-/-         -/-           -/-     -  60.9        -  0:973 1:956 2:1860 3:898 
+Xp     ok           98   530.3   +0.4      -     0.35/4.00/4.48   415.1   +2.1      0.74/8.55 145.5/128.3/91.2   88.3/2.81     7.25/0.11     -  85.4     same  0:872 1:862 2:1768 3:814 
+Xk     ok           97   524.1   -0.7      -     0.37/4.37/4.90   387.0   -4.8     0.82/10.42 144.9/130.3/91.6  104.1/4.54     8.10/0.12     -  84.1     same  0:871 1:862 2:1764 3:814 
+Xl     ok           97   528.8   +0.2      -     0.37/4.27/4.79   408.3   +0.5      0.83/9.39  127.7/83.9/73.9   90.8/2.96     7.98/0.12     -  84.6     same  0:1340 1:1336 2:2236 3:1550 
+C      ok           93   540.6   +2.4      -     0.99/3.06/3.42   403.5   -0.7      2.54/7.60  132.0/87.1/75.8   98.2/2.14     5.82/5.82     -  77.1     same  0:1389 1:1384 2:2280 3:1598 
+PT-r2  ok           97   529.6   +0.3      -     0.38/4.26/4.79   404.8   -0.4      0.83/9.52 145.7/129.7/91.1   90.3/3.36     8.19/0.11     -  85.6     same  0:876 1:862 2:1768 3:814 
+
+  PT: engaged_end=all seen
+  Q512: why=missing [batch decode attention: slots(-stream)? \(.*STRATA_ATTN_DAILY=0] [batch decode attention: slots-stream \(.*STRATA_ATTN_DAILY=0]; engaged_end=[overlapped read of [0-9]+ tokens] [STRATA_PIPE_OVERLAP_KVS=1: first overlapped read with a streamed] [conversation cache: restored [0-9]+] [batch decode attention: slots-stream]
+  Xo: why=missing [batch decode attention: slots(-stream)? \(.*STRATA_ATTN_DAILY=0] [batch decode attention: slots-stream \(.*STRATA_ATTN_DAILY=0]; engaged_end=[conversation cache: restored [0-9]+] [batch decode attention: slots-stream]
+  Xp: engaged_end=all seen
+  Xk: engaged_end=all seen
+  Xl: engaged_end=all seen
+  PT-r2: engaged_end=all seen
+
+# identity / tests / gates (window.log)
+  === window 212 prep (deadline 2026-11-08 22:01:41; arms PT Q512 Xo Xp Xk Xl C; IDENT_GATE=strict HTTP_GATE=1)
+  host tests: SKIP (HOST_TESTS=0, /media/raid0/StrataQ38FN/Strata-212m/build/CTestTestfile.cmake present)
+  gpu ctest: SKIP (GPU_CTEST=0, build present)
+  gpu ctest 212p: SKIP (GPU_CTEST=0, build /media/raid0/StrataQ38FN/Strata-212p/build present)
+  identity: SKIP (IDENTITY=0)
+  [early_close PT] ==> PASS
+  [stop_resend PT] ==> PASS
+  [vision PT] ==> rc 0 ==> GO (0 GO, 2 NO-GO, 3 INCONCLUSIVE) INFO
+  arm Q512: NOT ENGAGED FAIL: missing [batch decode attention: slots(-stream)? \(.*STRATA_ATTN_DAILY=0] [batch decode attention: slots-stream \(.*STRATA_ATTN_DAILY=0] - the arm stops
+  arm Xo: NOT ENGAGED FAIL: missing [batch decode attention: slots(-stream)? \(.*STRATA_ATTN_DAILY=0] [batch decode attention: slots-stream \(.*STRATA_ATTN_DAILY=0] - the arm stops
+  [prod] ==> production.json sha256 4c402ffb2de27219 (at the start 4c402ffb2de27219), engine running: /media/raid0/StrataQ38FN/Strata/engine/strata-vision-cpu /media/raid0/StrataQ38FN/Strata/engine/strata-212p-74702164 : PASS
+  [prod] /v1/models: {"object": "list", "data": [{"id": "qwen3.8-flash-next-unsloth-ud-iq4_xs", "object": "model", "status": {"value": "loaded"}, "meta": {"n_ctx": 262144}, "architecture": {"input_modalities": ["text", "i
+  [prod] GET /v1/load: {"admit_by_new": {"short_first": 8192, "max_wait_s": 45.0, "waiting": []}, "load_pct": 0, "level": "idle", "would_wait": false, "image_alone": false, "loaded": true, "slots": {"total": 16, "busy": 0, "decoding": 0, "reading_prompt": 0, "fre
+  [prod] /metrics: 1 lines, {"engine": {"model": "qwen3.8-flash-next-unsloth-ud-iq4_xs", "max_context": 262144, "images": true, "version": "0.1.58",;
+  [prod] engine log since its start: 4 of the lanes / tier / overlap / mmap / gate-evict lines (want >= 5)
+  [prod] chat: ok: 'We need to respond to user: "Say OK." Simple'
+  [prod] image: ok: 'The user wants a single short sentence describing the colors'
+
+# decisions (INFO; read the table)
+  F14b DAILY vs slots(+stream), short agg 16: H vs H2: not measured
+  F16 PW_WITH_BATCH vs SOLO_PIPELINE/lanes, dec p50 at 1 user(s): A vs F: not measured
+  F16 PIPED_MTP vs lanes, dec p50 at 1 user(s): A vs G: not measured
+  F16 PW_WITH_BATCH vs SOLO_PIPELINE/lanes, dec p50 at 2 user(s): A vs F: not measured
+  F16 PIPED_MTP vs lanes, dec p50 at 2 user(s): A vs G: not measured
+  F16 PW_WITH_BATCH vs SOLO_PIPELINE/lanes, dec p50 at 4 user(s): A vs F: not measured
+  F16 PIPED_MTP vs lanes, dec p50 at 4 user(s): A vs G: not measured
+  F15 join pause A vs E: worst stream gap - vs - s, joiner TTFT - vs - s
+  F15 join pause A vs E2: worst stream gap - vs - s, joiner TTFT - vs - s
+  sm_86 table + stack, short agg 16: B vs C: not measured
+  IQ4_W4A8 + TWO_PASS, long agg 16: C vs D: not measured
+  H3 (candidate) vs production, short agg 16: A vs H3: not measured
+  I (212i integration, the candidate) vs production, short agg 16: A vs I: not measured
+  I vs production, long agg 16: A vs I: not measured
+  I vs H (the ported cache features on the same kernels), short agg 16: H vs I: not measured
+  engine identity (batch_test, 16 slots, solo + batch): not run
+  -- PT (candidate) vs production
+  short agg 16: A vs PT: not measured
+  long agg 16: A vs PT: not measured
+  decode p50 per user at 1 user(s): A vs PT: not measured
+  decode p50 per user at 2 user(s): A vs PT: not measured
+  decode p50 per user at 4 user(s): A vs PT: not measured
+  join: cold 32K joiner beside 4 streams, worst stream gap A - vs PT 0.10 s, joiner TTFT - vs 8.06 s
+     PT: status ok, short replies same
+  -- PT vs P (the sm_86 table + upstream stack: the table gain)
+  short agg 16: P vs PT: not measured
+  long agg 16: P vs PT: not measured
+  decode p50 per user at 1 user(s): P vs PT: not measured
+  decode p50 per user at 2 user(s): P vs PT: not measured
+  decode p50 per user at 4 user(s): P vs PT: not measured
+     PT: status ok, short replies same
+  -- P vs production (212p with production's switches, no table)
+  short agg 16: A vs P: not measured
+  long agg 16: A vs P: not measured
+  decode p50 per user at 1 user(s): A vs P: not measured
+  decode p50 per user at 2 user(s): A vs P: not measured
+  decode p50 per user at 4 user(s): A vs P: not measured
+  join: A vs P: not measured
+     P: status -, short replies -
+  -- PTD vs PT (the table's DAILY attention against slots-stream)
+  short agg 16: PT vs PTD: not measured
+  long agg 16: PT vs PTD: not measured
+     PTD: status -, short replies -
+  -- PT4 vs PT (IQ4_W4A8 + SELECT_TWO_PASS)
+  short agg 16: PT vs PT4: not measured
+  long agg 16: PT vs PT4: not measured
+     PT4: status -, short replies -
+  -- PTX vs PT (non-exact: the bit-changing upstream defaults on - how much speed is on the table; never a candidate)
+  short agg 16: PT vs PTX: not measured
+  long agg 16: PT vs PTX: not measured
+  decode p50 per user at 1 user(s): PT vs PTX: not measured
+  decode p50 per user at 2 user(s): PT vs PTX: not measured
+  decode p50 per user at 4 user(s): PT vs PTX: not measured
+     PTX: status -, short replies -
+  -- ablation arms (PT with one lever changed; means over the arm's runs)
+     PT short 16: TTFT p95 4.28 s, e2e p95 18.40 s, steady 600.4 tok/s (2 run(s))
+     PT long 16: TTFT p95 9.45 s, e2e p95 26.70 s, steady 500.6 tok/s (2 run(s))
+     C short 16: TTFT p95 3.06 s, e2e p95 17.10 s, steady 575.0 tok/s (1 run(s))
+     C long 16: TTFT p95 7.60 s, e2e p95 25.40 s, steady 455.5 tok/s (1 run(s))
+  -- Q512 vs PT: 212q: segments < 512 new tokens read serially (STRATA_PIPE_OVERLAP_MIN, e55fa457) (env {"STRATA_PIPE_OVERLAP_MIN": "512"})
+  short agg 16: PT vs Q512: not measured
+  long agg 16: PT vs Q512: not measured
+  decode p50 per user at 1 user(s): PT vs Q512: not measured
+  decode p50 per user at 2 user(s): PT vs Q512: not measured
+  decode p50 per user at 4 user(s): PT vs Q512: not measured
+  join: cold 32K joiner beside 4 streams, worst stream gap PT 0.10 vs Q512 - s, joiner TTFT 8.06 vs - s
+     Q512: status notengaged, short replies -
+  short agg 16 vs C: C vs Q512: not measured
+  long agg 16 vs C: C vs Q512: not measured
+  TTFT p95 short 16 vs PT: PT vs Q512: not measured
+  e2e p95 short 16 vs PT: PT vs Q512: not measured
+  steady agg short 16 vs PT: PT vs Q512: not measured
+  TTFT p95 long 16 vs PT: PT vs Q512: not measured
+  e2e p95 long 16 vs PT: PT vs Q512: not measured
+  steady agg long 16 vs PT: PT vs Q512: not measured
+     Q512 mt: -
+  -- Xo vs PT: overlapped read off (env {"STRATA_PIPE_OVERLAP": "0", "STRATA_PIPE_OVERLAP_KVS": "0"})
+  short agg 16: PT vs Xo: not measured
+  long agg 16: PT vs Xo: not measured
+  decode p50 per user at 1 user(s): PT vs Xo: not measured
+  decode p50 per user at 2 user(s): PT vs Xo: not measured
+  decode p50 per user at 4 user(s): PT vs Xo: not measured
+  join: cold 32K joiner beside 4 streams, worst stream gap PT 0.10 vs Xo - s, joiner TTFT 8.06 vs - s
+     Xo: status notengaged, short replies -
+  short agg 16 vs C: C vs Xo: not measured
+  long agg 16 vs C: C vs Xo: not measured
+  TTFT p95 short 16 vs PT: PT vs Xo: not measured
+  e2e p95 short 16 vs PT: PT vs Xo: not measured
+  steady agg short 16 vs PT: PT vs Xo: not measured
+  TTFT p95 long 16 vs PT: PT vs Xo: not measured
+  e2e p95 long 16 vs PT: PT vs Xo: not measured
+  steady agg long 16 vs PT: PT vs Xo: not measured
+     Xo mt: -
+  -- Xp vs PT: overlap kept, window streams not top priority (env {"STRATA_PIPE_OVERLAP_PRIO": "0"})
+  short agg 16: PT 528.80 vs Xp 530.30 (+0.3 %; mean of 2 / 1 run(s))
+  long agg 16: PT 405.60 vs Xp 415.10 (+2.3 %; mean of 2 / 1 run(s))
+  decode p50 per user at 1 user(s): PT 146.10 vs Xp 145.50 (-0.4 %; mean of 2 / 1 run(s))
+  decode p50 per user at 2 user(s): PT 129.50 vs Xp 128.30 (-0.9 %; mean of 2 / 1 run(s))
+  decode p50 per user at 4 user(s): PT 90.85 vs Xp 91.20 (+0.4 %; mean of 2 / 1 run(s))
+  join: cold 32K joiner beside 4 streams, worst stream gap PT 0.10 vs Xp 0.11 s, joiner TTFT 8.06 vs 7.25 s
+     Xp: status ok, short replies same
+  short agg 16 vs C: C 540.60 vs Xp 530.30 (-1.9 %; mean of 1 / 1 run(s))
+  long agg 16 vs C: C 403.50 vs Xp 415.10 (+2.9 %; mean of 1 / 1 run(s))
+  TTFT p95 short 16 vs PT: PT 4.28 vs Xp 4.00 (-6.4 %, lower is better; mean of 2 / 1 run(s))
+  e2e p95 short 16 vs PT: PT 18.40 vs Xp 18.30 (-0.5 %, lower is better; mean of 2 / 1 run(s))
+  steady agg short 16 vs PT: PT 600.35 vs Xp 593.60 (-1.1 %; mean of 2 / 1 run(s))
+  TTFT p95 long 16 vs PT: PT 9.45 vs Xp 8.55 (-9.5 %, lower is better; mean of 2 / 1 run(s))
+  e2e p95 long 16 vs PT: PT 26.70 vs Xp 26.00 (-2.6 %, lower is better; mean of 2 / 1 run(s))
+  steady agg long 16 vs PT: PT 500.60 vs Xp 500.00 (-0.1 %; mean of 2 / 1 run(s))
+     Xp mt: wall 88.3 s
+  -- Xk vs PT: park captures off (long-phase waits; diagnosis only) (env {"STRATA_SLOT_PARK": "0", "STRATA_PARK_CAPTURE": "0"})
+  short agg 16: PT 528.80 vs Xk 524.10 (-0.9 %; mean of 2 / 1 run(s))
+  long agg 16: PT 405.60 vs Xk 387.00 (-4.6 %; mean of 2 / 1 run(s))
+  decode p50 per user at 1 user(s): PT 146.10 vs Xk 144.90 (-0.8 %; mean of 2 / 1 run(s))
+  decode p50 per user at 2 user(s): PT 129.50 vs Xk 130.30 (+0.6 %; mean of 2 / 1 run(s))
+  decode p50 per user at 4 user(s): PT 90.85 vs Xk 91.60 (+0.8 %; mean of 2 / 1 run(s))
+  join: cold 32K joiner beside 4 streams, worst stream gap PT 0.10 vs Xk 0.12 s, joiner TTFT 8.06 vs 8.10 s
+     Xk: status ok, short replies same
+  short agg 16 vs C: C 540.60 vs Xk 524.10 (-3.1 %; mean of 1 / 1 run(s))
+  long agg 16 vs C: C 403.50 vs Xk 387.00 (-4.1 %; mean of 1 / 1 run(s))
+  TTFT p95 short 16 vs PT: PT 4.28 vs Xk 4.37 (+2.2 %, lower is better; mean of 2 / 1 run(s))
+  e2e p95 short 16 vs PT: PT 18.40 vs Xk 18.60 (+1.1 %, lower is better; mean of 2 / 1 run(s))
+  steady agg short 16 vs PT: PT 600.35 vs Xk 595.80 (-0.8 %; mean of 2 / 1 run(s))
+  TTFT p95 long 16 vs PT: PT 9.45 vs Xk 10.42 (+10.3 %, lower is better; mean of 2 / 1 run(s))
+  e2e p95 long 16 vs PT: PT 26.70 vs Xk 28.50 (+6.7 %, lower is better; mean of 2 / 1 run(s))
+  steady agg long 16 vs PT: PT 500.60 vs Xk 478.20 (-4.5 %; mean of 2 / 1 run(s))
+     Xk mt: wall 104.1 s
+  -- Xl vs PT: spec lanes + solo pipeline off (control) (env {"STRATA_SPEC_LANES": "0", "STRATA_SOLO_PIPELINE": "0"})
+  short agg 16: PT 528.80 vs Xl 528.80 (+0.0 %; mean of 2 / 1 run(s))
+  long agg 16: PT 405.60 vs Xl 408.30 (+0.7 %; mean of 2 / 1 run(s))
+  decode p50 per user at 1 user(s): PT 146.10 vs Xl 127.70 (-12.6 %; mean of 2 / 1 run(s))
+  decode p50 per user at 2 user(s): PT 129.50 vs Xl 83.90 (-35.2 %; mean of 2 / 1 run(s))
+  decode p50 per user at 4 user(s): PT 90.85 vs Xl 73.90 (-18.7 %; mean of 2 / 1 run(s))
+  join: cold 32K joiner beside 4 streams, worst stream gap PT 0.10 vs Xl 0.12 s, joiner TTFT 8.06 vs 7.98 s
+     Xl: status ok, short replies same
+  short agg 16 vs C: C 540.60 vs Xl 528.80 (-2.2 %; mean of 1 / 1 run(s))
+  long agg 16 vs C: C 403.50 vs Xl 408.30 (+1.2 %; mean of 1 / 1 run(s))
+  TTFT p95 short 16 vs PT: PT 4.28 vs Xl 4.27 (-0.1 %, lower is better; mean of 2 / 1 run(s))
+  e2e p95 short 16 vs PT: PT 18.40 vs Xl 18.40 (+0.0 %, lower is better; mean of 2 / 1 run(s))
+  steady agg short 16 vs PT: PT 600.35 vs Xl 600.50 (+0.0 %; mean of 2 / 1 run(s))
+  TTFT p95 long 16 vs PT: PT 9.45 vs Xl 9.39 (-0.6 %, lower is better; mean of 2 / 1 run(s))
+  e2e p95 long 16 vs PT: PT 26.70 vs Xl 26.50 (-0.7 %, lower is better; mean of 2 / 1 run(s))
+  steady agg long 16 vs PT: PT 500.60 vs Xl 503.70 (+0.6 %; mean of 2 / 1 run(s))
+     Xl mt: wall 90.8 s
+
+# upstream's own benchmarks (INFO)

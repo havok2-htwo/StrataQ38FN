@@ -1,0 +1,15 @@
+arm=C
+label=C
+bin=stocktab
+server=Strata-212@146df3c4
+sha=f83fd81691a5b053
+boot_s=93
+vram_boot=0,1571 1,1562 2,2462 3,1770 
+engaged_boot=yes
+ident=same
+status=ok
+mem_peak_gib=77.1
+rss_max_gib=76
+vram_min=0:1389 1:1384 2:2280 3:1598 
+warn=
+engine_starts=1
