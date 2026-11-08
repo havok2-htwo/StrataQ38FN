@@ -1,0 +1,31 @@
+references: every request alone
+control: text only, at the same concurrency
+  OK   control: text 0: 421 tokens, reference 421
+  OK   control: text 1: 402 tokens, reference 402
+  OK   control: text 2: 483 tokens, reference 483
+  OK   control: text 3: 454 tokens, reference 454
+  OK   control: text 4: 459 tokens, reference 459
+(i)/(ii): a long image prompt beside text requests
+  OK   (i) text 0 while the image is read and decodes: 421 tokens, reference 421
+  OK   (i) text 1 while the image is read and decodes: 402 tokens, reference 402
+  OK   (i) text 2 while the image is read and decodes: 483 tokens, reference 483
+  OK   (i) text 3 while the image is read and decodes: 454 tokens, reference 454
+  OK   (i) text 4 while the image is read and decodes: 459 tokens, reference 459
+  OK   (i) text 5 admitted while the image decodes: 382 tokens, reference 382
+  FAIL (ii) the long image request in a busy batch: 352 tokens, reference 380, differs at 90
+(iii): two images at once
+  OK   (iii) image A: 378 tokens, reference 378
+  OK   (iii) image B: 405 tokens, reference 405
+  OK   (iii) text 0 beside them: 421 tokens, reference 421
+(iv): the follow-up turn in a busy batch
+  OK   (iv) follow-up beside text requests: 166 tokens, reference 166
+  OK   (iv) text 1 beside it: 402 tokens, reference 402
+
+==== GO / NO-GO: server mode, http://127.0.0.1:8091/v1 ====
+  GO            text requests beside images == alone
+                8 of 8
+  NO-GO         image requests in a busy server == alone
+                3 of 4; (ii) the long image request in a busy batch (differs at 90)
+  info          control: text only at the same concurrency == alone (decides the two above)
+                5 of 5
+  ==> NO-GO

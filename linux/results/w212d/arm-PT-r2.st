@@ -1,0 +1,17 @@
+arm=PT
+label=PT-r2
+bin=pipe
+server=Strata-212p@a099d295
+sha=74702164d1e5e37d
+boot_s=98
+vram_boot=0,1028 1,1016 2,1920 3,960 
+stdbench=rc 0
+engaged_boot=yes
+ident=same
+status=ok
+mem_peak_gib=89.8
+rss_max_gib=89
+vram_min=0:880 1:856 2:1764 3:810 
+engaged_end=all seen
+warn=
+engine_starts=1

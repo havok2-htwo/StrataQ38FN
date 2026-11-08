@@ -1,0 +1,17 @@
+arm=S
+label=S
+bin=stock
+server=Strata-212@146df3c4
+sha=f83fd81691a5b053
+boot_s=51
+vram_boot=0,2319 1,3522 2,3122 3,1164 
+stdbench=rc 0
+quick=rc 0
+engaged_boot=yes
+ident=DIFF-expected:DIFF
+status=ok
+mem_peak_gib=72.5
+rss_max_gib=72
+vram_min=0:2162 1:2982 2:2956 3:1002 
+warn=
+engine_starts=1

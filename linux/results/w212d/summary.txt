@@ -1,0 +1,136 @@
+# window 212: one fresh server per arm on 127.0.0.1:8091, greedy; agg = aggregate output tok/s, TTFT in s, dec = per-user decode p50 tok/s at 1/2/4 users, mt = bench_multiturn 16x3 (wall s / follow-up TTFT p50 s), join = cold 32K joiner beside 4 streams (joiner TTFT / worst stream gap s), pfx = prefix reuse %, VRAM = lowest free MiB per card during the arm, mem = memory.peak GiB of the scope
+arm    status     boot  agg16s   vsPT    vsB TTFT s p50/p95/max  agg16l   vsPT TTFT l p50/p95        dec 1/2/4  mt wall/fu join ttft/gap   pfx   mem    ident  VRAM min
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+C      ok           97   540.6   +2.5      -     0.99/2.95/3.27   400.6   -0.6      2.54/7.76  131.4/87.1/75.5   97.7/2.03     5.80/5.80     -  92.7     same  0:1388 1:1372 2:2274 3:1584 
+PT     ok           97   527.5   +0.0      -     0.38/4.23/4.75   403.1   +0.0      0.79/9.42 144.5/127.7/89.1   91.3/2.74     8.25/0.11     - 101.1     same  0:880 1:856 2:1764 3:810 
+S      ok           51   220.5  -58.2      -  20.52/44.53/48.59   175.2  -56.5    18.72/65.79  142.1/87.5/81.9 266.0/23.57    16.70/7.37     -  72.5 DIFF-expected:DIFF  0:2162 1:2982 2:2956 3:1002 
+C-r2   ok           98   537.4   +1.9      -     0.99/3.08/3.44   400.9   -0.5      2.54/7.78  130.9/87.1/75.4   97.6/2.08     5.80/5.80     -  82.1     same  0:1390 1:1372 2:2274 3:1586 
+PT-r2  ok           98   526.8   -0.1      -     0.37/4.32/4.85   407.0   +1.0      0.79/9.39 145.3/129.0/91.0   90.8/2.95     8.18/0.10     -  89.8     same  0:880 1:856 2:1764 3:810 
+S-r2   ok           52   219.7  -58.4      -  14.56/51.52/61.73   174.1  -56.8    18.83/69.37  142.2/84.9/81.3 280.5/48.77    25.57/7.32     -  71.2 DIFF-expected:DIFF  0:2170 1:2990 2:2964 3:1008 
+
+  PT: engaged_end=all seen
+  PT-r2: engaged_end=all seen
+
+# identity / tests / gates (window.log)
+  === window 212 prep (deadline 2026-11-08 21:19:57; arms C PT S; IDENT_GATE=strict HTTP_GATE=0)
+  host tests: SKIP (HOST_TESTS=0, /media/raid0/StrataQ38FN/Strata-212m/build/CTestTestfile.cmake present)
+  gpu ctest: SKIP (GPU_CTEST=0, build present)
+  gpu ctest 212p: SKIP (GPU_CTEST=0, build /media/raid0/StrataQ38FN/Strata-212p/build present)
+  identity: SKIP (IDENTITY=0)
+  [stdbench C] ==> rc 0 complete [] INFO
+  [quick C] ==> rc 0 2026-11-08-community-4x-rtx-3090-qwen3-8-flash-next-unsloth-ud-iq4-xs INFO
+  [vision C, stock] ==> rc 2 ==> NO-GO (0 GO, 2 NO-GO = #1242 still there, 3 INCONCLUSIVE) INFO
+  [stdbench PT] ==> rc 0 complete [] INFO
+  [quick PT] ==> rc 0 2026-11-08-community-4x-rtx-3090-qwen3-8-flash-next-unsloth-ud-iq4-xs INFO
+  [early_close PT] ==> PASS
+  [stop_resend PT] ==> PASS
+  [vision PT] ==> rc 0 ==> GO (0 GO, 2 NO-GO, 3 INCONCLUSIVE) INFO
+  arm S: env vs production: STRATA_HC_Q8=1 STRATA_ROUTE_TAIL_SKIP=0 -STRATA_MMQ_DIRECT -STRATA_SLOT_COPY_DIRECT -STRATA_PIPE_BYIELD_NODRAIN -STRATA_ADMIT_MERGE_FIRST -STRATA_CKPT_POOL -STRATA_CKPT_THREADS -STRATA_SLOT_CKPT_MOVE -STRATA_SLOT_COPY_BATCHSYNC -STRATA_SPLIT_MTP_BATCH -STRATA_MMQ_GROUP_SORT
+  [stdbench S] ==> rc 0 complete [] INFO
+  [quick S] ==> rc 0 2026-11-08-community-4x-rtx-3090-qwen3-8-flash-next-unsloth-ud-iq4-xs INFO
+  [stdbench C-r2] ==> rc 0 complete [] INFO
+  [stdbench PT-r2] ==> rc 0 complete [] INFO
+  arm S-r2: env vs production: STRATA_HC_Q8=1 STRATA_ROUTE_TAIL_SKIP=0 -STRATA_MMQ_DIRECT -STRATA_SLOT_COPY_DIRECT -STRATA_PIPE_BYIELD_NODRAIN -STRATA_ADMIT_MERGE_FIRST -STRATA_CKPT_POOL -STRATA_CKPT_THREADS -STRATA_SLOT_CKPT_MOVE -STRATA_SLOT_COPY_BATCHSYNC -STRATA_SPLIT_MTP_BATCH -STRATA_MMQ_GROUP_S
+  [stdbench S-r2] ==> rc 0 complete [] INFO
+  [prod] ==> production.json sha256 4c402ffb2de27219 (at the start 4c402ffb2de27219), engine running: /media/raid0/StrataQ38FN/Strata/engine/strata-vision-cpu /media/raid0/StrataQ38FN/Strata/engine/strata-212p-74702164 : PASS
+  [prod] /v1/models: {"object": "list", "data": [{"id": "qwen3.8-flash-next-unsloth-ud-iq4_xs", "object": "model", "status": {"value": "loaded"}, "meta": {"n_ctx": 262144}, "architecture": {"input_modalities": ["text", "i
+  [prod] GET /v1/load: {"admit_by_new": {"short_first": 8192, "max_wait_s": 45.0, "waiting": []}, "load_pct": 0, "level": "idle", "would_wait": false, "image_alone": false, "loaded": true, "slots": {"total": 16, "busy": 0, "decoding": 0, "reading_prompt": 0, "fre
+  [prod] /metrics: 1 lines, {"engine": {"model": "qwen3.8-flash-next-unsloth-ud-iq4_xs", "max_context": 262144, "images": true, "version": "0.1.58",;
+  [prod] engine log since its start: 4 of the lanes / tier / overlap / mmap / gate-evict lines (want >= 5)
+  [prod] chat: ok: 'We need to respond to user: "Say OK." Simple'
+  [prod] image: ok: 'The user wants a single short sentence describing the colors'
+
+# decisions (INFO; read the table)
+  F14b DAILY vs slots(+stream), short agg 16: H vs H2: not measured
+  F16 PW_WITH_BATCH vs SOLO_PIPELINE/lanes, dec p50 at 1 user(s): A vs F: not measured
+  F16 PIPED_MTP vs lanes, dec p50 at 1 user(s): A vs G: not measured
+  F16 PW_WITH_BATCH vs SOLO_PIPELINE/lanes, dec p50 at 2 user(s): A vs F: not measured
+  F16 PIPED_MTP vs lanes, dec p50 at 2 user(s): A vs G: not measured
+  F16 PW_WITH_BATCH vs SOLO_PIPELINE/lanes, dec p50 at 4 user(s): A vs F: not measured
+  F16 PIPED_MTP vs lanes, dec p50 at 4 user(s): A vs G: not measured
+  F15 join pause A vs E: worst stream gap - vs - s, joiner TTFT - vs - s
+  F15 join pause A vs E2: worst stream gap - vs - s, joiner TTFT - vs - s
+  sm_86 table + stack, short agg 16: B vs C: not measured
+  IQ4_W4A8 + TWO_PASS, long agg 16: C vs D: not measured
+  H3 (candidate) vs production, short agg 16: A vs H3: not measured
+  I (212i integration, the candidate) vs production, short agg 16: A vs I: not measured
+  I vs production, long agg 16: A vs I: not measured
+  I vs H (the ported cache features on the same kernels), short agg 16: H vs I: not measured
+  engine identity (batch_test, 16 slots, solo + batch): not run
+  -- PT (candidate) vs production
+  short agg 16: A vs PT: not measured
+  long agg 16: A vs PT: not measured
+  decode p50 per user at 1 user(s): A vs PT: not measured
+  decode p50 per user at 2 user(s): A vs PT: not measured
+  decode p50 per user at 4 user(s): A vs PT: not measured
+  join: cold 32K joiner beside 4 streams, worst stream gap A - vs PT 0.11 s, joiner TTFT - vs 8.25 s
+     PT: status ok, short replies same
+  -- PT vs P (the sm_86 table + upstream stack: the table gain)
+  short agg 16: P vs PT: not measured
+  long agg 16: P vs PT: not measured
+  decode p50 per user at 1 user(s): P vs PT: not measured
+  decode p50 per user at 2 user(s): P vs PT: not measured
+  decode p50 per user at 4 user(s): P vs PT: not measured
+     PT: status ok, short replies same
+  -- P vs production (212p with production's switches, no table)
+  short agg 16: A vs P: not measured
+  long agg 16: A vs P: not measured
+  decode p50 per user at 1 user(s): A vs P: not measured
+  decode p50 per user at 2 user(s): A vs P: not measured
+  decode p50 per user at 4 user(s): A vs P: not measured
+  join: A vs P: not measured
+     P: status -, short replies -
+  -- PTD vs PT (the table's DAILY attention against slots-stream)
+  short agg 16: PT vs PTD: not measured
+  long agg 16: PT vs PTD: not measured
+     PTD: status -, short replies -
+  -- PT4 vs PT (IQ4_W4A8 + SELECT_TWO_PASS)
+  short agg 16: PT vs PT4: not measured
+  long agg 16: PT vs PT4: not measured
+     PT4: status -, short replies -
+  -- PTX vs PT (non-exact: the bit-changing upstream defaults on - how much speed is on the table; never a candidate)
+  short agg 16: PT vs PTX: not measured
+  long agg 16: PT vs PTX: not measured
+  decode p50 per user at 1 user(s): PT vs PTX: not measured
+  decode p50 per user at 2 user(s): PT vs PTX: not measured
+  decode p50 per user at 4 user(s): PT vs PTX: not measured
+     PTX: status -, short replies -
+  -- PT vs stock as shipped (S: stock setup's config, parallel 3, presence 0; S's join is queue-bound, not shown)
+  short agg 16: S 220.10 vs PT 527.15 (+139.5 %; mean of 2 / 2 run(s))
+  long agg 16: S 174.65 vs PT 405.05 (+131.9 %; mean of 2 / 2 run(s))
+  decode p50 per user at 1 user(s): S 142.15 vs PT 144.90 (+1.9 %; mean of 2 / 2 run(s))
+  decode p50 per user at 2 user(s): S 86.20 vs PT 128.35 (+48.9 %; mean of 2 / 2 run(s))
+  decode p50 per user at 4 user(s): S 81.60 vs PT 90.05 (+10.4 %; mean of 2 / 2 run(s))
+     PT: status ok, short replies same
+  -- PT vs stock + our args + sm_86 table (C, presence 0; exact)
+  short agg 16: C 539.00 vs PT 527.15 (-2.2 %; mean of 2 / 2 run(s))
+  long agg 16: C 400.75 vs PT 405.05 (+1.1 %; mean of 2 / 2 run(s))
+  decode p50 per user at 1 user(s): C 131.15 vs PT 144.90 (+10.5 %; mean of 2 / 2 run(s))
+  decode p50 per user at 2 user(s): C 87.10 vs PT 128.35 (+47.4 %; mean of 2 / 2 run(s))
+  decode p50 per user at 4 user(s): C 75.45 vs PT 90.05 (+19.4 %; mean of 2 / 2 run(s))
+  join: cold 32K joiner beside 4 streams, worst stream gap C 5.80 vs PT 0.11 s, joiner TTFT 5.80 vs 8.25 s
+     PT: status ok, short replies same
+  -- C vs S (what our production args alone give stock)
+  short agg 16: S 220.10 vs C 539.00 (+144.9 %; mean of 2 / 2 run(s))
+  long agg 16: S 174.65 vs C 400.75 (+129.5 %; mean of 2 / 2 run(s))
+  decode p50 per user at 1 user(s): S 142.15 vs C 131.15 (-7.7 %; mean of 2 / 2 run(s))
+  decode p50 per user at 2 user(s): S 86.20 vs C 87.10 (+1.0 %; mean of 2 / 2 run(s))
+  decode p50 per user at 4 user(s): S 81.60 vs C 75.45 (-7.5 %; mean of 2 / 2 run(s))
+     C: status ok, short replies same
+
+# upstream's own benchmarks (INFO)
+  stdbench-C: status complete 
+    [{"phase":"performance","case_id":"short","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":177.583026,"min":177.419355,"max":580.256217,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"decode_tps","unit":"tokens/s","median":136.140624,"min":129.360465,"max":136.676281,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"ttft_s","unit":"s","median":0.448408,"min":0.148048,"max":0.449601,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"first_answer_s","unit":"s","median":1.069247,"min":1.030592,"max":1.347138,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"total_s","unit":"s","median":2.889012,"min":2.69107,"max":3.51563,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"prompt-4k","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":4997.557998,"min":4960.610835,"max":5009.178803,"n":3,"included_request_ids":["performance-prompt-4k-r1
+  stdbench-C-r2: status complete 
+    [{"phase":"performance","case_id":"short","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":177.829099,"min":177.378484,"max":582.450832,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"decode_tps","unit":"tokens/s","median":136.664601,"min":129.482796,"max":136.882805,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"ttft_s","unit":"s","median":0.448508,"min":0.147242,"max":0.448999,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"first_answer_s","unit":"s","median":1.067852,"min":1.026823,"max":1.345301,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"total_s","unit":"s","median":2.885788,"min":2.688293,"max":3.503134,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"prompt-4k","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":5000.610874,"min":4992.681142,"max":5002.44439,"n":3,"included_request_ids":["performance-prompt-4k-r
+  stdbench-PT: status complete 
+    [{"phase":"performance","case_id":"short","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":355.493998,"min":352.402746,"max":606.77699,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"decode_tps","unit":"tokens/s","median":154.276667,"min":145.466432,"max":154.999748,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"ttft_s","unit":"s","median":0.232056,"min":0.142719,"max":0.234585,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"first_answer_s","unit":"s","median":0.793679,"min":0.744985,"max":1.25131,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"total_s","unit":"s","median":2.578785,"min":2.209871,"max":2.936699,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"prompt-4k","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":4999.389276,"min":4986.598441,"max":5003.667482,"n":3,"included_request_ids":["performance-prompt-4k-r1
+  stdbench-PT-r2: status complete 
+    [{"phase":"performance","case_id":"short","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":355.002305,"min":352.887259,"max":605.822187,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"decode_tps","unit":"tokens/s","median":155.736462,"min":145.817973,"max":155.773663,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"ttft_s","unit":"s","median":0.232433,"min":0.142814,"max":0.233745,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"first_answer_s","unit":"s","median":0.788623,"min":0.736698,"max":1.251538,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"total_s","unit":"s","median":2.572979,"min":2.200115,"max":2.911121,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"prompt-4k","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":5030.72763,"min":5024.551927,"max":5043.124692,"n":3,"included_request_ids":["performance-prompt-4k-r
+  stdbench-S: status complete 
+    [{"phase":"performance","case_id":"short","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":161.594963,"min":160.483535,"max":212.942478,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"decode_tps","unit":"tokens/s","median":127.390643,"min":125.462692,"max":137.115305,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"ttft_s","unit":"s","median":0.490545,"min":0.375529,"max":0.49378,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"first_answer_s","unit":"s","median":1.792542,"min":1.291943,"max":1.962745,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"total_s","unit":"s","median":3.046021,"min":3.019421,"max":3.50503,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"prompt-4k","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":1921.415829,"min":1912.884984,"max":1995.806515,"n":3,"included_request_ids":["performance-prompt-4k-r1
+  stdbench-S-r2: status complete 
+    [{"phase":"performance","case_id":"short","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":161.222781,"min":159.784188,"max":212.589729,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"decode_tps","unit":"tokens/s","median":129.082009,"min":126.637039,"max":136.054422,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"ttft_s","unit":"s","median":0.49197,"min":0.376439,"max":0.496052,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"first_answer_s","unit":"s","median":1.778241,"min":1.298248,"max":1.931005,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"short","concurrency":1,"metric":"total_s","unit":"s","median":3.040913,"min":3.023552,"max":3.46769,"n":3,"included_request_ids":["performance-short-r1","performance-short-r2","performance-short-r3"],"excluded":[]},{"phase":"performance","case_id":"prompt-4k","concurrency":1,"metric":"prompt_tps","unit":"tokens/s","median":1915.481093,"min":1910.474235,"max":1986.507474,"n":3,"included_request_ids":["performance-prompt-4k-r1
+  community-C/2026-11-08-community-4x-rtx-3090-qwen3-8-flash-next-unsloth-ud-iq4-xs: {"schema":1,"tool":"tools/strata_bench.py","date":"2026-11-08","params":{"runs":3,"think":false,"clients":16,"long":true,"started_server":false,"command":"python tools/strata_bench.py --clients 16 --long"},"elapsed_s":81.00268340110779,"machine":{"gpu":["NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090"],"gpu_vram_mib":98304,"gpu_driver":"580.196.07","gpu_detail":[{"power_limit_w":"320.00","power_draw_w":"293.41","pcie":"gen3 x16","pstate":"P2","temp_c":"66"},{"power_limit_w":"320.00","power_draw_w":"275.73","pcie":"gen3 x16","pstate":"P2","temp_c":"66"},{"power_limit_w":"320.00","power_draw_w":"287.46","pcie":"gen4 x8","pstate":"P2","temp_c":"59"},{"power_limit_w":"320.00","power_draw_w":"287.46","pcie":"gen4 x8","pstate":"P2","temp_c":"68"}],"cuda":"13.0","engine_build":null,"cpu":"AMD Ryzen Threadripper 3990X 64-Core Processor","cpu_cores":64,"storage":"sda     Samsung SSD 860 EVO 500GB sata; nvme1n1 CT1000P310SSD8            nvme; nvme2n1 CT1000P310SSD8            nvme; nvme0n1 CT1000P310SSD8            nvme","cpu_threads":128,"ram_gib":251.5,"os":"Linux 7.0.0-38-generic","python":"3.12.3","strata_version":"0.1.58","strata_commit":"146df3c4","engine_version":"0.1.58","model":"qwen3.8-flash-next-unsloth-ud-iq4_xs","quant":"UD-IQ4_XS","context":262144,"parallel_slots":16,"config":{"exe":"strata-212-stocktab-f83fd81691a5b053","args":["--pack","unsloth-ud-iq4_xs","--native","Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
+  community-PT/2026-11-08-community-4x-rtx-3090-qwen3-8-flash-next-unsloth-ud-iq4-xs: {"schema":1,"tool":"tools/strata_bench.py","date":"2026-11-08","params":{"runs":3,"think":false,"clients":16,"long":true,"started_server":false,"command":"python tools/strata_bench.py --clients 16 --long"},"elapsed_s":77.52412676811218,"machine":{"gpu":["NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090"],"gpu_vram_mib":98304,"gpu_driver":"580.196.07","gpu_detail":[{"power_limit_w":"320.00","power_draw_w":"293.07","pcie":"gen3 x16","pstate":"P2","temp_c":"70"},{"power_limit_w":"320.00","power_draw_w":"289.43","pcie":"gen3 x16","pstate":"P2","temp_c":"71"},{"power_limit_w":"320.00","power_draw_w":"292.30","pcie":"gen4 x8","pstate":"P2","temp_c":"65"},{"power_limit_w":"320.00","power_draw_w":"294.16","pcie":"gen4 x8","pstate":"P2","temp_c":"72"}],"cuda":"13.0","engine_build":null,"cpu":"AMD Ryzen Threadripper 3990X 64-Core Processor","cpu_cores":64,"storage":"sda     Samsung SSD 860 EVO 500GB sata; nvme1n1 CT1000P310SSD8            nvme; nvme2n1 CT1000P310SSD8            nvme; nvme0n1 CT1000P310SSD8            nvme","cpu_threads":128,"ram_gib":251.5,"os":"Linux 7.0.0-38-generic","python":"3.12.3","strata_version":"0.1.58","strata_commit":"a099d295","engine_version":"0.1.58","model":"qwen3.8-flash-next-unsloth-ud-iq4_xs","quant":"UD-IQ4_XS","context":262144,"parallel_slots":16,"config":{"exe":"strata-212p-74702164d1e5e37d","args":["--pack","unsloth-ud-iq4_xs","--native","Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf","--expe
+  community-S/2026-11-08-community-4x-rtx-3090-qwen3-8-flash-next-unsloth-ud-iq4-xs: {"schema":1,"tool":"tools/strata_bench.py","date":"2026-11-08","params":{"runs":3,"think":false,"clients":16,"long":true,"started_server":false,"command":"python tools/strata_bench.py --clients 16 --long"},"elapsed_s":125.03053641319275,"machine":{"gpu":["NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090","NVIDIA GeForce RTX 3090"],"gpu_vram_mib":98304,"gpu_driver":"580.196.07","gpu_detail":[{"power_limit_w":"320.00","power_draw_w":"131.62","pcie":"gen3 x16","pstate":"P2","temp_c":"61"},{"power_limit_w":"320.00","power_draw_w":"138.50","pcie":"gen3 x16","pstate":"P2","temp_c":"61"},{"power_limit_w":"320.00","power_draw_w":"139.41","pcie":"gen4 x8","pstate":"P2","temp_c":"54"},{"power_limit_w":"320.00","power_draw_w":"211.99","pcie":"gen4 x8","pstate":"P2","temp_c":"64"}],"cuda":"13.0","engine_build":null,"cpu":"AMD Ryzen Threadripper 3990X 64-Core Processor","cpu_cores":64,"storage":"sda     Samsung SSD 860 EVO 500GB sata; nvme1n1 CT1000P310SSD8            nvme; nvme2n1 CT1000P310SSD8            nvme; nvme0n1 CT1000P310SSD8            nvme","cpu_threads":128,"ram_gib":251.5,"os":"Linux 7.0.0-38-generic","python":"3.12.3","strata_version":"0.1.58","strata_commit":"146df3c4","engine_version":"0.1.58","model":"qwen3.8-flash-next-unsloth-ud-iq4_xs","quant":"UD-IQ4_XS","context":131072,"parallel_slots":3,"config":{"exe":"strata-212-stocktab-f83fd81691a5b053","args":["--pack","unsloth-ud-iq4_xs","--native","Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
