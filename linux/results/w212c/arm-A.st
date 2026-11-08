@@ -1,0 +1,15 @@
+arm=A
+label=A
+bin=prod
+server=Strata-143-prod@22f4781f
+sha=99bbe1d2304201de
+boot_s=92
+vram_boot=0,1184 1,1178 2,2080 3,1116 
+engaged_boot=yes
+status=ok
+mem_peak_gib=85.2
+rss_max_gib=84
+vram_min=0:1029 1:1030 2:1930 3:976 
+engaged_end=all seen
+warn=
+engine_starts=1
