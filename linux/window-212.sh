@@ -588,6 +588,8 @@ def st(lab):
 labs = sorted({p.name[4:-3] for p in out.glob("arm-*.st")},
               key=lambda s: (os.path.getmtime(out / f"arm-{s}.st")))
 def f(x, d=1):
+    if isinstance(x, list):   # bench_join reports one value per joiner
+        return "-" if not x else "|".join(f(v, d) for v in x)
     return "-" if x is None else f"{x:.{d}f}"
 def g(lab, kind, users, key):
     r = sw.get((f"w212-{lab}-{kind}", users))
@@ -793,7 +795,7 @@ restore_checks() { local P PE NOWCFG m
     log "    [prod] engine log since its start: $(tail -n +"${n:-1}" "$el" | grep -a -c -E 'STRATA_SPEC_LANES=4: lanes|conversation tier: on|STRATA_PIPE_OVERLAP_KVS|STRATA_CONV_MMAP|STRATA_GATE_EVICT') of the lanes / tier / overlap / mmap / gate-evict lines (want >= 5)"
     if [ "$RESTORE_SMOKE" = 1 ]; then
         log "    [prod] chat: $(curl -s -m 120 "$URL/v1/chat/completions" -H 'Content-Type: application/json' -d '{"model":"x","max_tokens":12,"temperature":0,"messages":[{"role":"user","content":"Say OK."}]}' | python3 -c 'import json,sys
-try: d=json.load(sys.stdin); print("ok:", repr(d["choices"][0]["message"].get("content","")[:60]))
+try: d=json.load(sys.stdin); m=d["choices"][0]["message"]; print("ok:", repr((m.get("content") or m.get("reasoning_content") or "")[:60]))
 except Exception as e: print("FAIL", e)')"
         log "    [prod] image: $(python3 - "$URL" <<'PYEOF'
 import base64, json, struct, sys, urllib.request, zlib
