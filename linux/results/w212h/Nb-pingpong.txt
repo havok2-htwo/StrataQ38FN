@@ -1,0 +1,38 @@
+# w212-Nb: http://127.0.0.1:8091, engine 0.1.58, slots 16, pressure none (available 18102 MiB, floor 16384 MiB), engine log /media/raid0/StrataQ38FN/linux/results/w212h/engine-Nb.log
+# w212-Nb: pingpong @ 136000 tokens, 2 cycles, head 42 tools (~13000 tok), SUB ~29500 with 44 tools (seed 1952003)
+  A       prompt  137090 reused       0 ttft   24.36s wall   26.07s parks 1 evict 0 restores 0
+          | strata serve: prompt 137090 tokens = 0 reused + 137090 read in 24213 ms (5661.8 tok/s), 200 generated in 1695 ms (118.0 tok/s), drafts accepted 109 of 192, 12 checkpoints
+  CHECK   prompt  137358 reused  137289 ttft    0.43s wall    0.75s parks 0 evict 0 restores 0
+          | strata serve: prompt 137358 tokens = 137289 reused + 69 read in 359 ms (192.2 tok/s), 32 generated in 304 ms (105.4 tok/s), drafts accepted 12 of 23, 12 checkpoints
+  OTHER   prompt     888 reused       0 ttft    0.50s wall    1.25s parks 1 evict 0 restores 0
+          | strata serve: prompt 888 tokens = 0 reused + 888 read in 482 ms (1843.2 tok/s), 120 generated in 763 ms (157.3 tok/s), drafts accepted 64 of 93, 1 checkpoints
+  SUB     prompt   29890 reused    8192 ttft    4.25s wall    4.69s parks 0 evict 0 restores 1
+          | strata serve: conversation cache: skip parking (1007 tokens, below the 1024 minimum; parked=4)
+          | strata serve: conversation cache: restored 8192 tokens (checkpoint) in 165.9 ms; parked=4 bytes=3653998900
+          | strata serve: prompt 29890 tokens = 8192 reused + 21698 read in 4207 ms (5157.5 tok/s), 48 generated in 440 ms (109.1 tok/s), drafts accepted 20 of 30, 5 checkpoints
+  A2      prompt  137629 reused    8192 ttft   23.05s wall   23.21s parks 1 evict 0 restores 0
+          | strata serve: prompt 137629 tokens = 8192 reused + 129437 read in 22912 ms (5649.2 tok/s), 32 generated in 205 ms (155.7 tok/s), drafts accepted 19 of 25, 12 checkpoints
+  cycle 1: A2 reused 8192 of 137629 (5.9 %, ideal ~137301, grid point below 131072 = GRID FALLBACK); SUB reused 8192 of 29890; SUB in CHECK's slot: ?; engine [137629, 8192, 129437]
+  CHECK2  prompt  137743 reused  137622 ttft    0.65s wall    1.02s parks 1 evict 0 restores 0
+          | strata serve: prompt 137743 tokens = 137622 reused + 121 read in 582 ms (208.0 tok/s), 32 generated in 348 ms (91.9 tok/s), drafts accepted 13 of 25, 12 checkpoints
+  OTHER2  prompt     847 reused       0 ttft    0.83s wall    1.67s parks 1 evict 0 restores 0
+          | strata serve: conversation cache: dropped 1 superseded copy of this conversation; parked=5
+          | strata serve: prompt 847 tokens = 0 reused + 847 read in 809 ms (1046.4 tok/s), 120 generated in 859 ms (139.7 tok/s), drafts accepted 60 of 108, 1 checkpoints
+  SUB2    prompt   29880 reused   29715 ttft    0.30s wall    0.91s parks 0 evict 0 restores 1
+          | strata serve: conversation cache: skip parking (966 tokens, below the 1024 minimum; parked=5)
+          | strata serve: conversation cache: restored 29715 tokens (checkpoint) in 64.3 ms; parked=5 bytes=5743040916
+          | strata serve: prompt 29880 tokens = 29715 reused + 165 read in 272 ms (606.8 tok/s), 64 generated in 612 ms (104.6 tok/s), drafts accepted 25 of 34, 5 checkpoints
+  A3      prompt  138070 reused  137677 ttft    0.67s wall    0.87s parks 1 evict 0 restores 1
+          | strata serve: conversation cache: restored 137677 tokens (checkpoint) in 208.5 ms; parked=5 bytes=4888432056
+          | strata serve: prompt 138070 tokens = 137677 reused + 393 read in 560 ms (702.2 tok/s), 32 generated in 223 ms (143.6 tok/s), drafts accepted 20 of 35, 12 checkpoints
+  cycle 2: A3 reused 137677 of 138070 (99.7 %, ideal ~137686, grid point below 131072); SUB2 reused 29715 of 29880; SUB in CHECK's slot: ?; engine [138070, 137677, 393]
+==> pingpong w212-Nb @136000: A2 5.9% (grid fallback), A3 99.7% (target 95% and above the 8192 grid point below the branch); SUB 8192/29890, SUB2 29715/29880; borrowed 0 restored 3 superseded 1 skip-parking 3; capture_ms p50 104.5 max 600.0 FAIL
+
+# w212-Nb: A2 after A (and B) - HIT = >= 90 % of A2's prompt reused
+label            scenario       size  B@A  avail  A ttft A2 prompt  reused reuse%  A2 ttft refuse hit
+w212-Nb          pingpong     136000    -      -   24.36    137629    8192   5.9%    23.05      0 MISS
+
+# pingpong: per cycle - CHECK (live-slot hit), SUB (shares the head up to tool #43), the next turn (target >= its 'target' reused)
+label               size cyc turn  prompt  reused reuse%   ttft CHECK% SUB prompt SUB reused S@C borrow restor supers skip  cap ms verdict
+w212-Nb           136000   1   A2  137629    8192   5.9%  23.05 100.0%      29890       8192   -      0      1      0    1   213.8 GRID
+w212-Nb           136000   2   A3  138070  137677  99.7%   0.67  99.9%      29880      29715   -      0      2      0    1   600.0 ok

@@ -1,0 +1,86 @@
+# window 212: one fresh server per arm on 127.0.0.1:8091, greedy; agg = aggregate output tok/s, TTFT in s, dec = per-user decode p50 tok/s at 1/2/4 users, mt = bench_multiturn 16x3 (wall s / follow-up TTFT p50 s), join = cold 32K joiner beside 4 streams (joiner TTFT / worst stream gap s), pfx = prefix reuse %, VRAM = lowest free MiB per card during the arm, mem = memory.peak GiB of the scope
+arm    status     boot  agg16s   vsPT    vsB TTFT s p50/p95/max  agg16l   vsPT TTFT l p50/p95        dec 1/2/4  mt wall/fu join ttft/gap   pfx   mem    ident  VRAM min
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Bb     ok           97       -      -      -              -/-/-       -      -            -/-            -/-/-         -/-           -/-     -  71.7        -  0:955 1:950 2:1854 3:898 
+Nb     ok           97       -      -      -              -/-/-       -      -            -/-            -/-/-         -/-           -/-     -  72.2        -  0:958 1:950 2:1854 3:898 
+Cb     ok           92       -      -      -              -/-/-       -      -            -/-            -/-/-         -/-           -/-     -  67.0        -  0:1455 1:1450 2:2350 3:1662 
+
+  Bb: engaged_end=[overlapped read of [0-9]+ tokens] [STRATA_PIPE_OVERLAP_KVS=1: first overlapped read with a streamed] [batch decode attention: slots-stream] [batch decode attention: slots-stream \(.*STRATA_ATTN_DAILY=0] [batch decode attention: slots(-stream)? \(.*STRATA_ATTN_DAILY=0]
+  Nb: engaged_end=[overlapped read of [0-9]+ tokens] [STRATA_PIPE_OVERLAP_KVS=1: first overlapped read with a streamed] [batch decode attention: slots-stream] [batch decode attention: slots-stream \(.*STRATA_ATTN_DAILY=0] [batch decode attention: slots(-stream)? \(.*STRATA_ATTN_DAILY=0]
+
+# identity / tests / gates (window.log)
+  === window 212 prep (deadline 2026-11-08 23:54:51; arms Bb Nb Cb; IDENT_GATE=strict HTTP_GATE=0)
+  host tests: SKIP (HOST_TESTS=0, /media/raid0/StrataQ38FN/Strata-212p/build/CTestTestfile.cmake present)
+  gpu ctest: SKIP (GPU_CTEST=0, build present)
+  gpu ctest 212p: SKIP (GPU_CTEST=0, build /media/raid0/StrataQ38FN/Strata-212p/build present)
+  identity: SKIP (IDENTITY=0)
+  [pingpong Bb] ==> rc 0 ==> pingpong w212-Bb @136000: A2 99.8%, A3 99.7% (target 95% and above the 8192 grid point below the branch); SUB 8192/29890, SUB2 29715/29880; borrowed 1 restored 3 superseded 1 skip-parking 3; capture_ms p50 102.0 max 582.0 PASS 
+  [pingpong Nb] ==> rc 0 ==> pingpong w212-Nb @136000: A2 5.9% (grid fallback), A3 99.7% (target 95% and above the 8192 grid point below the branch); SUB 8192/29890, SUB2 29715/29880; borrowed 0 restored 3 superseded 1 skip-parking 3; capture_ms p50 104.5 max 600.0 FAIL 
+  [pingpong Cb] ==> rc 0 ==> pingpong w212-Cb @136000: A2 5.9% (grid fallback), A3 99.7% (target 95% and above the 8192 grid point below the branch); SUB 8192/29890, SUB2 24576/29880; borrowed 0 restored 3 superseded 1 skip-parking 3; capture_ms p50 - max - FAIL 
+  [prod] ==> production.json sha256 270d5ba3f01d6a15 (at the start 270d5ba3f01d6a15), engine running: /media/raid0/StrataQ38FN/Strata/engine/strata-vision-cpu /media/raid0/StrataQ38FN/Strata/engine/strata-212q-9743c131 : PASS
+  [prod] /v1/models: {"object": "list", "data": [{"id": "qwen3.8-flash-next-unsloth-ud-iq4_xs", "object": "model", "status": {"value": "loaded"}, "meta": {"n_ctx": 262144}, "architecture": {"input_modalities": ["text", "i
+  [prod] GET /v1/load: {"admit_by_new": {"short_first": 8192, "max_wait_s": 45.0, "waiting": []}, "load_pct": 0, "level": "idle", "would_wait": false, "image_alone": false, "loaded": true, "slots": {"total": 16, "busy": 0, "decoding": 0, "reading_prompt": 0, "fre
+  [prod] /metrics: 1 lines, {"engine": {"model": "qwen3.8-flash-next-unsloth-ud-iq4_xs", "max_context": 262144, "images": true, "version": "0.1.58",;
+  [prod] engine log since its start: 4 of the lanes / tier / overlap / mmap / gate-evict lines (want >= 5)
+  [prod] chat: ok: 'We need to respond to user: "Say OK." Simple'
+  [prod] image: ok: 'The user wants a single short sentence describing the colors'
+
+# decisions (INFO; read the table)
+  -- ablation arms (PT with one lever changed; means over the arm's runs)
+     PT short 16: TTFT p95 - s, e2e p95 - s, steady - tok/s (0 run(s))
+     PT long 16: TTFT p95 - s, e2e p95 - s, steady - tok/s (0 run(s))
+     C short 16: TTFT p95 - s, e2e p95 - s, steady - tok/s (0 run(s))
+     C long 16: TTFT p95 - s, e2e p95 - s, steady - tok/s (0 run(s))
+  -- Bb vs PT: production (Q8k): branch borrow on (STRATA_PARK_BORROW=1) (env {"STRATA_PIPE_OVERLAP_MIN": "8192", "STRATA_PIPE_OVERLAP_PRIO": "0"})
+  short agg 16: PT vs Bb: not measured
+  long agg 16: PT vs Bb: not measured
+  decode p50 per user at 1 user(s): PT vs Bb: not measured
+  decode p50 per user at 2 user(s): PT vs Bb: not measured
+  decode p50 per user at 4 user(s): PT vs Bb: not measured
+  join: PT vs Bb: not measured
+     Bb: status ok, short replies -
+  short agg 16 vs C: C vs Bb: not measured
+  long agg 16 vs C: C vs Bb: not measured
+  TTFT p95 short 16 vs PT: PT vs Bb: not measured
+  e2e p95 short 16 vs PT: PT vs Bb: not measured
+  steady agg short 16 vs PT: PT vs Bb: not measured
+  TTFT p95 long 16 vs PT: PT vs Bb: not measured
+  e2e p95 long 16 vs PT: PT vs Bb: not measured
+  steady agg long 16 vs PT: PT vs Bb: not measured
+     Bb mt: -
+  -- Nb vs PT: production without the borrow (STRATA_PARK_BORROW=0) (env {"STRATA_PIPE_OVERLAP_MIN": "8192", "STRATA_PIPE_OVERLAP_PRIO": "0", "STRATA_PARK_BORROW": "0"})
+  short agg 16: PT vs Nb: not measured
+  long agg 16: PT vs Nb: not measured
+  decode p50 per user at 1 user(s): PT vs Nb: not measured
+  decode p50 per user at 2 user(s): PT vs Nb: not measured
+  decode p50 per user at 4 user(s): PT vs Nb: not measured
+  join: PT vs Nb: not measured
+     Nb: status ok, short replies -
+  short agg 16 vs C: C vs Nb: not measured
+  long agg 16 vs C: C vs Nb: not measured
+  TTFT p95 short 16 vs PT: PT vs Nb: not measured
+  e2e p95 short 16 vs PT: PT vs Nb: not measured
+  steady agg short 16 vs PT: PT vs Nb: not measured
+  TTFT p95 long 16 vs PT: PT vs Nb: not measured
+  e2e p95 long 16 vs PT: PT vs Nb: not measured
+  steady agg long 16 vs PT: PT vs Nb: not measured
+     Nb mt: -
+  -- Cb vs PT: stock v0.2.12 binary + server with our config (upstream borrows only without a layer split) (env {})
+  short agg 16: PT vs Cb: not measured
+  long agg 16: PT vs Cb: not measured
+  decode p50 per user at 1 user(s): PT vs Cb: not measured
+  decode p50 per user at 2 user(s): PT vs Cb: not measured
+  decode p50 per user at 4 user(s): PT vs Cb: not measured
+  join: PT vs Cb: not measured
+     Cb: status ok, short replies -
+  short agg 16 vs C: C vs Cb: not measured
+  long agg 16 vs C: C vs Cb: not measured
+  TTFT p95 short 16 vs PT: PT vs Cb: not measured
+  e2e p95 short 16 vs PT: PT vs Cb: not measured
+  steady agg short 16 vs PT: PT vs Cb: not measured
+  TTFT p95 long 16 vs PT: PT vs Cb: not measured
+  e2e p95 long 16 vs PT: PT vs Cb: not measured
+  steady agg long 16 vs PT: PT vs Cb: not measured
+     Cb mt: -
+
+# upstream's own benchmarks (INFO)
