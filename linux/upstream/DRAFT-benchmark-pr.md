@@ -41,7 +41,7 @@ Run order: C, PT, S, C-r2, PT-r2, S-r2.
 | prompt-16k | prompt tok/s | 3,219 | 5,774 | 6,009 |
 | prompt-16k | decode tok/s | 127.9 | 117.4 | 124.6 |
 | prompt-16k | TTFT s | 5.12 | 2.86 | 2.75 |
-| short-burst (c4) | aggregate tok/s, 3 rounds | 198 / 202 / 196 | 279 / 283 / 268 | 282 / 296 / 278 |
+| short-burst (c4) | aggregate tok/s, 3 rounds | 198 / 202 / 196 | 278 / 283 / 268 | 282 / 296 / 277 |
 | short-burst (c4) | TTFT s | 0.75 | 0.40 | 0.49 |
 
 **Multi-user, custom harness.** Greedy (temperature 0), with `sampling.presence_penalty: 0` in every arm's config. Values are the mean of 2 runs per arm, or the range where both runs are shown.
@@ -157,7 +157,7 @@ Run order: C, PT, S, C-r2, PT-r2, S-r2.
   - `strata_bench.py` at 16 clients is -3 %, inside the overlap of the run ranges.
 - **No end-to-end speed claim at 16 users:** over two interleaved pairs, PT vs C is -2.2 % (short) and +1.1 % (long). The gains are in per-user decode at 1-4 users, in single-request decode, and in stream continuity during a join.
 - **The large S-vs-PT ratios at 16 users come from configuration:** 16 slots, prefill 512 and the caches. S queues 16 clients on 3 slots. These ratios do not measure the engine.
-- **Memory:** PT leaves less VRAM headroom: the lowest free VRAM was 810 MiB on card 3, against a minimum of 1,372 MiB for C. Peak host memory of the server's scope is 90-101 GiB, against 82-93 GiB for C.
+- **Memory:** PT leaves less VRAM headroom: the lowest free VRAM was 810 MiB on card 3, against a minimum of 1,372 MiB for C. Peak host memory of the server's systemd scope (`memory.peak`, recorded by our window script, not in `data/`) is 90-101 GiB, against 82-93 GiB for C.
 - **One machine, one model and quant, one day.** The protocol is still a draft (`draft.1`). The model-card, tokenizer, source-model and quant-repo revisions are `null`, each with a reason.
 - **Prompt reuse:** the conversation and prompt caches are on in C and PT. In the standard runs the runner flagged no unexpected reuse, so it excluded no request.
 
