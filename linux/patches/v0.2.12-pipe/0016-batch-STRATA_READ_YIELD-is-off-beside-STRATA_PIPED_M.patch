@@ -1,0 +1,242 @@
+From fc538bde07a7fe6bd548ac0214e4d3ef5b992c9e Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 04:11:04 +0100
+Subject: [PATCH 16/17] batch: STRATA_READ_YIELD is off beside
+ STRATA_PIPED_MTP, STRATA_KVA, the elastic K/V and without the prompt cache,
+ so every read path takes a BYIELD as without it (#656's give_way) instead of
+ answering YIELDNO final (STRATA_READ_YIELD, fixup of 044326f8)
+
+yield_arm refused every BYIELD there with YIELDNO final, while the
+request paths had already swallowed the line (the concurrent loop's
+continue, the pieces' ys = -1): #656's preemption was gone altogether,
+worse than the switch being unset, and the server, without INFO
+read_yield, still sent BYIELD by the #656 rule. One read_yield_on,
+decided before READY, now stands for read_yield_env() on every request
+path; the boot line names the reason. Production (a 4-card split, the
+prompt cache, none of the three) is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 70 +++++++++++++++++++++-------------------
+ 1 file changed, 37 insertions(+), 33 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 0036f54f..bbca4691 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -415,7 +415,8 @@ bool pipe_byield_nodrain_env() {
+ // way without the switch - into a slot no pad row writes (the top row of a group: read_yield.hpp), keeping the slot's
+ // parked conversation, the read's checkpoint layout, --prefill-pipe plan and cuts and the lane drafter's cells; a
+ // BYIELD it does not take is answered with YIELDNO <slot> later|final.  Off beside STRATA_PIPED_MTP (its deferred
+-// commits).  Unset: as before
++// commits), STRATA_KVA, the elastic K/V and without the prompt cache, where a BYIELD is taken as without it
++// (read_yield_on).  Unset: as before
+ bool read_yield_env() {
+     static const bool on = strata::program::read_yield::env_on(std::getenv("STRATA_READ_YIELD"));
+     return on;
+@@ -15569,15 +15570,23 @@ int main(int argc, char** argv) {
+                 }).detach();
+         }
+         // STRATA_READ_YIELD: the server's slot choice for a read that may give way (BYIELD into slot b needs b % k == k - 1).
+-        // Not beside STRATA_PIPED_MTP: its commits wait past a slot's last window, which neither copy into a slot knows
+-        if (read_yield_env() && o.batch > 0) {
+-            if (piped_mtp)
+-                std::fprintf(stderr, "strata generate: STRATA_READ_YIELD is off beside STRATA_PIPED_MTP (its deferred commits): "
+-                                     "a BYIELD is answered YIELDNO final\n");
+-            else
+-                std::printf("INFO read_yield=1 yield_row=%d\n",
+-                            strata::program::read_yield::yield_row(piped_groups, o.batch, o.batch_groups));
+-        }
++        // Off beside STRATA_PIPED_MTP (its commits wait past a slot's last window, which neither copy into a slot knows),
++        // STRATA_KVA (its floor counts chunks from the run's first position: a read in two runs would approximate
++        // otherwise) and the elastic K/V: every read path then takes a BYIELD as without the switch (#656's give_way).
++        // Nor without the prompt cache, where no part read is kept (give_way declines it too)
++        const char* read_yield_off = !read_yield_env()                  ? nullptr
++                                     : piped_mtp                        ? "STRATA_PIPED_MTP (its deferred commits)"
++                                     : strata::prefill::kva_config().on ? "STRATA_KVA"
++                                     : kvg.on                           ? "the elastic K/V"
++                                     : o.prompt_cache <= 0              ? "no prompt cache (--prompt-cache 0)"
++                                                                        : nullptr;
++        const bool read_yield_on = read_yield_env() && read_yield_off == nullptr;
++        if (read_yield_off != nullptr && o.batch > 0)
++            std::fprintf(stderr, "strata generate: STRATA_READ_YIELD is off beside %s: a BYIELD is taken as without it\n",
++                         read_yield_off);
++        if (read_yield_on && o.batch > 0)
++            std::printf("INFO read_yield=1 yield_row=%d\n",
++                        strata::program::read_yield::yield_row(piped_groups, o.batch, o.batch_groups));
+         strata::core::pin_sim_report("at READY");
+         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
+@@ -17503,7 +17512,7 @@ int main(int argc, char** argv) {
+                                     std::printf("ERR %s\n", err.c_str());
+                                     return false;
+                                 }
+-                                if (sl.partial && read_yield_env()) {   // (never a slot a yield took: read_yield.hpp)
++                                if (sl.partial && read_yield_on) {   // (never a slot a yield took: read_yield.hpp)
+                                     std::fprintf(stderr, "strata batch: a pad row writes slot %d, which holds a read that gave "
+                                                          "way: it reads again from what else holds it\n", pick * GS + t);
+                                     sl.partial = false;
+@@ -18496,7 +18505,7 @@ int main(int argc, char** argv) {
+                     if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                     it = in_lines.erase(it);
+                 } else if (it->rfind("BYIELD", 0) == 0) {
+-                    if (read_yield_env()) yield_asked = std::atoi(it->c_str() + 6);   // (checked by the read: yield_arm)
++                    if (read_yield_on) yield_asked = std::atoi(it->c_str() + 6);   // (checked by the read: yield_arm)
+                     it = in_lines.erase(it);
+                 } else {
+                     ++it;
+@@ -19456,7 +19465,7 @@ int main(int argc, char** argv) {
+             // checkpoint (STRATA_SLOT_CHAIN_REUSE), an active slot's (STRATA_SLOT_CKPT_MOVE), the RAM cache (taken or
+             // borrowed) or the SSD tier would read the rest without the read's checkpoint progress and cut origin
+             int yield_pin = -1;
+-            if (read_yield_env() && o.prompt_cache > 0 && req_imgs.empty()) {
++            if (read_yield_on && o.prompt_cache > 0 && req_imgs.empty()) {
+                 yield_pin = strata::program::read_yield::pin_slot(bs, req_yslot, admit_slot, n, [&](const BSlot& sl) {
+                     return sl.cvec == want_cvec && !sl.tainted && starts_with(sl.ids, {});
+                 });
+@@ -19757,7 +19766,7 @@ int main(int argc, char** argv) {
+                         bs[(size_t) slot_source].partial = false;
+                         bs[(size_t) slot_source].partial_plan = {};
+                         const BSlot& ps = bs[(size_t) slot_source];
+-                        if (read_yield_env() && ps.partial_next_check >= 0 && (int64_t) ps.ids.size() == slot_tokens) {
++                        if (read_yield_on && ps.partial_next_check >= 0 && (int64_t) ps.ids.size() == slot_tokens) {
+                             ycarry.on = true;
+                             ycarry.next_check = ps.partial_next_check;
+                             ycarry.resume0 = ps.partial_resume0;
+@@ -19777,13 +19786,13 @@ int main(int argc, char** argv) {
+                     const sch::GiveBack gb = sch::giveback_plan(
+                         slot_park_on, slot_ck_chain ? sch::Source::chain : slot_ck != nullptr ? sch::Source::own
+                                                                                             : sch::Source::end,
+-                        giveback_checks_env(), bs[(size_t) slot_source].partial || (read_yield_env() && was_partial),
++                        giveback_checks_env(), bs[(size_t) slot_source].partial || (read_yield_on && was_partial),
+                         admit_slot == slot_source);
+                     // (STRATA_READ_YIELD: the checkpoints of the read the pin goes on with move - no second copy stays in
+                     // the slot)
+                     const bool move_cks =
+                         !slot_ck_chain && ((slot_ckpt_move_env() && admit_slot == slot_source) || gb.hand_move ||
+-                                           (read_yield_env() && yield_pin >= 0 && slot_source == yield_pin));
++                                           (read_yield_on && yield_pin >= 0 && slot_source == yield_pin));
+                     const int64_t ck_len = slot_ck != nullptr ? (int64_t) slot_ck->ids.size() : -1;
+                     std::vector<ConvCheckpoint>& sc = bs[(size_t) slot_source].checks;
+                     // a shorter checkpoint comes along only when it is a prefix of the tokens copied back (text only):
+@@ -20647,17 +20656,12 @@ int main(int argc, char** argv) {
+             // pause (this admission's own, or a free one: the request then decodes in its admission's slot, yslot= on
+             // the resumed BGEN), text only, and a slot no pad row writes meanwhile; the position is the read's own
+             // check (the hook, at each chunk boundary).  Pictures never give way (S2: nor does the server ask for them).
+-            // Never beside STRATA_PIPED_MTP (commits deferred past a slot's last window), STRATA_KVA (its floor counts
+-            // chunks from the run's first position: a read in two runs would approximate otherwise) or the elastic K/V
++            // (never beside STRATA_PIPED_MTP, STRATA_KVA, the elastic K/V or without the prompt cache: read_yield_on)
+             auto yield_arm = [&](int ys) {
+                 std::string why;
+                 bool final_no = true;
+                 if (ys < 0 || ys >= (int) bs.size()) why = "no such slot";
+                 else if (!req_imgs.empty()) why = "a picture in the prompt";
+-                else if (o.prompt_cache <= 0) why = "no prompt cache";
+-                else if (piped_mtp) why = "STRATA_PIPED_MTP";
+-                else if (strata::prefill::kva_config().on) why = "STRATA_KVA is on";
+-                else if (kvg.on) why = "the elastic K/V";
+                 else if (!strata::program::read_yield::slot_pad_safe(ys, yield_k))
+                     why = "a pad row could write the slot (only the top row of a group, slot % " + std::to_string(yield_k) +
+                           " == " + std::to_string(yield_k - 1) + ", keeps a read)";
+@@ -21051,7 +21055,7 @@ int main(int argc, char** argv) {
+                     decltype(sp)& p;
+                     ~HookReset() { p.should_yield = nullptr; }
+                 } hook_reset{sp};
+-                if (read_yield_env()) {
++                if (read_yield_on) {
+                     yield_take_asked();
+                     sp.should_yield = yield_hook(a0, b0);
+                 }
+@@ -21138,7 +21142,7 @@ int main(int argc, char** argv) {
+                     while (!done.load(std::memory_order_acquire)) {
+                         if (!pump(true)) { pump_ok = false; break; }   // pump answered ERR
+                         scan_ctl_lines();
+-                        if (read_yield_env()) yield_take_asked();
++                        if (read_yield_on) yield_take_asked();
+                         const int64_t b = ov_read_beat.load(std::memory_order_relaxed);
+                         if (b != beat_seen) {
+                             beat_seen = b;
+@@ -21227,7 +21231,7 @@ int main(int argc, char** argv) {
+                     kva_floors.note(ids.data(), sp.kva_floor());
+                     if (use_mtp && mtp.cell_floor_enabled()) mtp.set_cell_floor(sp.kva_floor());
+                 }
+-                if (read_yield_env() && sp.yielded_at() >= 0) return yield_finish(sp.yielded_at(), e);   // (the groups drained)
++                if (read_yield_on && sp.yielded_at() >= 0) return yield_finish(sp.yielded_at(), e);   // (the groups drained)
+                 return true;
+             };
+             auto read_part_once = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+@@ -21678,7 +21682,7 @@ int main(int argc, char** argv) {
+                             decltype(sp)& p;
+                             ~HookReset() { p.should_yield = nullptr; }
+                         } hook_reset{sp};
+-                        if (read_yield_env()) sp.should_yield = yield_hook(q0, b0);
++                        if (read_yield_on) sp.should_yield = yield_hook(q0, b0);
+                         else sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
+                         share_gate();   // on this thread, before the reader starts
+                         std::thread reader([&] {
+@@ -21725,7 +21729,7 @@ int main(int argc, char** argv) {
+                                     const int b = std::atoi(it->c_str() + 6);
+                                     if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                     it = in_lines.erase(it);
+-                                } else if (read_yield_env() && it->rfind("BYIELD", 0) == 0) {
++                                } else if (read_yield_on && it->rfind("BYIELD", 0) == 0) {
+                                     y_line = std::atoi(it->c_str() + 6);
+                                     it = in_lines.erase(it);
+                                 } else if (it->rfind("BYIELD ", 0) == 0 && want_yield.load() < 0) {
+@@ -21750,7 +21754,7 @@ int main(int argc, char** argv) {
+                             return false;
+                         }
+                         const int64_t q = read_ok && sp.stopped_at() >= 0 ? q0 + sp.stopped_at()
+-                                          : read_ok && read_yield_env() && sp.yielded_at() >= 0 ? sp.yielded_at() : b0;
++                                          : read_ok && read_yield_on && sp.yielded_at() >= 0 ? sp.yielded_at() : b0;
+                         const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
+                         std::string per;
+                         for (int k = 0; k < n_pipe; ++k) {
+@@ -21773,7 +21777,7 @@ int main(int argc, char** argv) {
+                             e = read_err;
+                             return false;
+                         }
+-                        if (read_yield_env()) {   // STRATA_READ_YIELD: parked, or on from q in this loop
++                        if (read_yield_on) {   // STRATA_READ_YIELD: parked, or on from q in this loop
+                             if (q < b0) {
+                                 if (!yield_finish(q, e) && yield_cont_at < 0) return false;   // parked, or a CUDA fault
+                                 yield_cont_at = -1;
+@@ -21853,7 +21857,7 @@ int main(int argc, char** argv) {
+                     }
+                 }
+                 int64_t piece = piece_now();
+-                if (piece <= 0 && read_yield_env() && !(!co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty())) {
++                if (piece <= 0 && read_yield_on && !(!co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty())) {
+                     // STRATA_READ_YIELD: one run, which stops at a chunk boundary for an armed BYIELD.  The hook runs on
+                     // this thread (the first stage's), so it takes the BYIELD lines itself (BSTOPs stay for the loop).
+                     // Not for a run that co-reads (STRATA_COALESCE_PREFILL: layer-major, which never asks the hook)
+@@ -21908,7 +21912,7 @@ int main(int argc, char** argv) {
+                     }
+                     // STRATA_READ_YIELD: the checks and the copy of the other paths; an armed yield is looked at every
+                     // boundary (one asked where pos_ok said no waits for the next one), not only where a line came
+-                    if (read_yield_env() && (ys >= 0 || ov_yield_slot.load() >= 0)) {
++                    if (read_yield_on && (ys >= 0 || ov_yield_slot.load() >= 0)) {
+                         if (ys >= 0 && ov_yield_slot.load() < 0) yield_arm(ys);
+                         if (ov_yield_slot.load() >= 0 && yield_hook(a0, b0)(q)) {
+                             if (!yield_finish(q, e) && yield_cont_at < 0) return false;   // parked, or a CUDA fault
+@@ -22211,7 +22215,7 @@ int main(int argc, char** argv) {
+                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                 return 1;
+             }
+-            if (read_yield_env()) {   // STRATA_READ_YIELD: a BYIELD this read took but did not act on is answered
++            if (read_yield_on) {   // STRATA_READ_YIELD: a BYIELD this read took but did not act on is answered
+                 const int armed = ov_yield_slot.exchange(-1);
+                 const int asked = yield_asked;
+                 yield_asked = -1;
+@@ -23882,7 +23886,7 @@ int main(int argc, char** argv) {
+             if (o.lookup_chain > 0)
+                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
+                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+-            if (read_yield_env()) {   // (STRATA_READ_YIELD: answered when the prompt was done)
++            if (read_yield_on) {   // (STRATA_READ_YIELD: answered when the prompt was done)
+                 ov_yield_slot.store(-1);
+                 yield_asked = -1;
+             }
+-- 
+2.43.0
+

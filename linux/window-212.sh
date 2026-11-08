@@ -133,7 +133,7 @@ declare -A FAILPAT=([B]="$SM86|STRATA_MMQ_DIRECT=[0-9] is ignored" [H]="$SM86" [
     [E]="STRATA_PIPED_CONCURRENT is off beside" [F]="--pipeline-windows 2 is off"
     [G]="WARNING: STRATA_PIPED_MTP is off|WARNING: --batch-mtp is off"
     [I]="$SM86|STRATA_PARK_CAPTURE is off|STRATA_SLOT_PARK is off|STRATA_PARK_ASYNC=1 is ignored|conversation tier: off")
-declare -A WANT_END=([A]="strata overlap: [0-9]+ tokens read;;conversation tier: on" [D]="$IQ4;;two-pass scores on"
+declare -A WANT_END=([A]="overlapped read of [0-9]+ tokens;;conversation tier: on" [D]="$IQ4;;two-pass scores on"
     [E]="read [0-9]+ tokens on a thread of its own" [E2]="piped read [0-9]+ tokens in;;read [0-9]+ tokens on a thread of its own"
     [H]="batch decode attention: slots-stream" [H3]="$IQ4;;batch decode attention: slots-stream" [H3d]="$IQ4"
     [I]="batch decode attention: slots-stream;;the image position table holds [0-9]+ regions;;conversation cache: borrowed [0-9]+ of a parked;;conversation cache: restored [0-9]+")

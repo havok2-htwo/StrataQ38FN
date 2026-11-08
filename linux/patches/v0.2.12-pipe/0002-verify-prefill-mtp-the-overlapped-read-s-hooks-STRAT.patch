@@ -1,0 +1,413 @@
+From 8dbfa1393745c1731164dfea7d887962c02f4b32 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:05:29 +0100
+Subject: [PATCH 02/17] verify, prefill, mtp: the overlapped read's hooks
+ (STRATA_PIPE_OVERLAP, our 377f1b33 74a3b4f2 c6939188 ffed4ec3 4c7616fc)
+
+The device-side hooks STRATA_PIPE_OVERLAP's read (next commit) calls; with the env off nothing calls them.
+- Verifier: set_stream_priority_high (before init: the window stream at the greatest priority, told once per card),
+  has_batch_layout / layout_captured, ensure_batch_layouts (c6939188 form, the narrower widths a group may shrink to
+  first), set_no_capture (stage_batch then fails with "not captured before an overlapped read"), the urgent PLE
+  gather's ms_ple_urgent / n_ple_urgent.
+- MtpDrafter::set_stream_priority (STRATA_PIPE_OVERLAP_MTP_PRIO), the want_hi form in load.
+- Prefill: device(), overlap_safe(why), chain_cuda_error() with cuda_err_ (reset per run), join_chain(), and
+  run_impl's PLE predicate factored into ple_on_() / ple_batched_() (the same expression, read live).
+
+Adaptations to v0.2.12:
+- Verifier::ar_live() is upstream already (ADMIT_MERGE_FIRST's gate): not added again.
+- Verifier::init builds its streams through make_stream (STRATA_PIPED_CONCURRENT[_PRIO], STRATA_GRAPH_PRIO). Ours
+  comes first and only for cs_ (not with set_stream / ext_stream_); when it made the stream, make_stream is skipped,
+  otherwise make_stream runs as upstream. copy_ and sh_cs_ are untouched.
+- MtpDrafter::reserve_prefill(n) (upstream, #31) is a superset of our reserve_prefill_records (it also reserves the
+  pinned record ring) and prefill_per_group_sync() is already factored: neither of ours is ported.
+- ensure_batch_layouts / has_batch_layout size their row lists by kVerifyMaxT (the 12/16-row builds,
+  STRATA_VERIFY_MAX_T) instead of 8 and refuse a wider group. Both graphs are captured unconditionally: PIPED_MTP's
+  deferred commits (staging_deferred_) never get here, the gate refuses it.
+- Production's STRATA_BATCH_SELF_COMMIT follow-up (4c7616fc) is upstream's batch_self_commits here: layout_captured
+  asks for no commit graph and ensure_batch_layouts uploads none for a self-committing layout.
+- ple_batched_ uses upstream's ple_batch_enabled() (the CUDA 12.8 / CC 12.0 default) in place of our env read.
+- cuda_err_ is captured on both chain launches: the std::async one and STRATA_HANDOFF_PIPE's persistent HandWorker
+  (before its cudaGetLastError; upstream's HANDOFF_PIPE port had no chain_cuda_error, production runs HANDOFF_PIPE=8).
+  The layer-major walk's lm_run thread does not capture (the gate refuses layer-major, as production's had none).
+
+Checked: verify.cpp, mtp.cpp, prefill.cpp pass -fsyntax-only with the integration build's flags (212i's compile DB).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/mtp.hpp        |  4 ++
+ include/strata/core/verify.hpp     | 20 +++++++
+ include/strata/prefill/prefill.hpp | 21 +++++++
+ src/core/mtp.cpp                   |  3 +-
+ src/core/verify.cpp                | 90 +++++++++++++++++++++++++++++-
+ src/prefill/prefill.cpp            | 71 ++++++++++++++++++++---
+ 6 files changed, 198 insertions(+), 11 deletions(-)
+
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index 11c65931..920263b0 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -123,6 +123,9 @@ public:
+     /// input records sized for chunks of up to n rows now, with nothing in flight.  On the read's thread a capture or
+     /// a free waits for the device, whose windows wait for the main thread's doorbell service (#31).
+     bool reserve_prefill(int64_t n, std::string& err);
++    /// STRATA_PIPE_OVERLAP_MTP_PRIO (an A/B knob): 1 = the drafter's stream at the device's greatest priority, 0 = at
++    /// the default one; -1 (default) = as set_force_capture decides.  Before `load`.
++    void set_stream_priority(int p) { stream_prio_ = p; }
+     cudaStream_t stream() const { return cs_; }
+ 
+     /// Successful producer result, including a generated row that failed admission.
+@@ -291,6 +294,7 @@ private:
+     // --pipeline-windows 2 (chain_launch)
+     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
+     bool force_on_ = false, chain_live_ = false;
++    int stream_prio_ = -1;   ///< set_stream_priority
+     const float* src_R_ = nullptr;
+     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
+     cudaEvent_t ev_chain_ = nullptr;
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index f77b6773..2e6d06ca 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -260,6 +260,21 @@ public:
+     /// STRATA_PIPE_OVERLAP: a pipeline stage's batch window asks for its PLE rows as urgent (PleTable::gather_batch),
+     /// ahead of a prompt chunk's rows read at the same time. Off by default; the rows are the same either way.
+     void set_ple_urgent(bool on) { ple_urgent_ = on; }
++    /// STRATA_PIPE_OVERLAP (STRATA_PIPE_OVERLAP_PRIO, default on): the window stream is made at the device's greatest
++    /// priority, so the batch windows' blocks go ahead of a prompt read's on the same card (a normal stream when that
++    /// fails).  Before `init`; only the order work starts in, never a result.
++    void set_stream_priority_high(bool on) { prio_high_ = on; }
++    /// Are the window and commit graphs of the pipeline group layout (slots base .. base + S - 1, its hand-off rows
++    /// from `base`) captured for the graph variant the last look at the table chose?
++    bool has_batch_layout(int base, int S) const;
++    /// STRATA_PIPE_OVERLAP, with nothing in flight: capture the full layout (S = GS) of each of `groups` pipeline
++    /// groups that is missing, and of group gi every narrower layout S = 1 .. narrow[gi] (when given; the widths it may
++    /// shrink to), as a window would on first use (`captured`: how many).  False with `err` when one could not be
++    /// captured or is missing after.
++    bool ensure_batch_layouts(int GS, int groups, int& captured, std::string& err, const std::vector<int>* narrow = nullptr);
++    /// STRATA_PIPE_OVERLAP: while set, a batch window whose layout was never captured fails with an error instead of
++    /// capturing it (no capture may run beside a prompt read).
++    void set_no_capture(bool on) { no_capture_ = on; }
+ 
+     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
+     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
+@@ -438,6 +453,8 @@ public:
+     bool pcie_balance_on() const { return bal_ != nullptr && m_bal_ != nullptr; }
+ 
+     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
++    double ms_ple_urgent = 0;              ///< set_ple_urgent: the batch windows' PLE gathers (ms, how many)
++    int64_t n_ple_urgent = 0;
+     int64_t windows = 0;
+     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
+     /// window), as one line; empty when off.
+@@ -461,6 +478,9 @@ private:
+     uint64_t bm_tick_ = 0;
+     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
+     bool ple_urgent_ = false;              ///< set_ple_urgent: stage_batch's PLE gather is urgent
++    bool prio_high_ = false;               ///< set_stream_priority_high
++    bool no_capture_ = false;              ///< set_no_capture
++    bool layout_captured(const std::vector<int>& key) const;   ///< both graphs of a batch key, instantiated
+     int last_rows_[strata::kernels::kWindowMaxT] = {};                ///< the slots of the last batch window's rows
+     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
+         std::vector<int> k = batch_key(rows, S, hbase);
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 80a7006f..4382a0bd 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -18,6 +18,7 @@
+ #include "strata/core/session.hpp"
+ #include "strata/core/weights.hpp"
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <functional>
+ #include <future>
+@@ -296,6 +297,23 @@ public:
+     /// (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take it.
+     static void set_share_blocked(bool blocked);
+ 
++    /// The device `init` ran on (-1 before it).
++    int device() const;
++    /// STRATA_PIPE_OVERLAP: may this prompt path and the stages after it read a prompt while the batch slots' windows
++    /// run on the same cards?  Only where the read shares nothing the windows write or read as changing: no
++    /// --peer-device peer or stage helper (STRATA_PREFILL_HELP), no CPU pool, buffers of its own (not lent cache
++    /// slots), no K/V streaming, and the PLE block batched (the per-token block writes the session's PLE scratch,
++    /// which the stage-0 windows use too).  False with `why`.
++    bool overlap_safe(std::string& why) const;
++    /// The first CUDA error a later stage's thread had after one of its chunks since the last `run` (0: none).  A
++    /// stage's chunks run on threads of their own, which take their error state with them; only a sticky fault
++    /// (an illegal address, a trap) outlives the error paths, which read and clear the error they report.
++    int chain_cuda_error() const;
++    /// After `run` threw (a thread that could not start, an allocation): wait for every later stage's chunk still
++    /// running, whatever it returns or throws, so nothing of this read runs on after it.  `run` itself joins them
++    /// only when it returns.  STRATA_PIPE_OVERLAP's read thread calls it; nothing else does.
++    void join_chain() noexcept;
++
+     /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
+     /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
+     /// On a layer split it is the last stage's (the one that reports the rows), asked through the first.
+@@ -319,6 +337,9 @@ public:
+     }
+ 
+ private:
++    bool ple_on_() const;        ///< this stage holds layer 1, where the PLE block runs
++    bool ple_batched_() const;   ///< ... and runs it batched over the chunk (run_impl's choice)
++    std::atomic<int> cuda_err_{0};   ///< chain_cuda_error: this stage's (set by the stage before it)
+     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                       bool owned_pages, bool src);
+     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 1589bdb1..910709c5 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -480,7 +480,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+ #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)   // (HIP, Metal: the default priority)
+     static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
+     int prio_lo = 0, prio_hi = 0;
+-    if (force_on_ && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
++    const bool want_hi = stream_prio_ < 0 ? force_on_ && hi_prio : stream_prio_ > 0;   // (set_stream_priority)
++    if (want_hi && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
+         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
+     cudaGetLastError();
+ #endif
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index b6abd1f8..bfe15526 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -1255,8 +1255,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         err = "verify: copy stream create failed";
+         return false;
+     }
++    bool prio = false;   // set_stream_priority_high (STRATA_PIPE_OVERLAP): the device's greatest priority, else make_stream's
++#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)   // (HIP: the default priority)
++    if (prio_high_ && ext_stream_ == nullptr) {
++        int prio_lo = 0, prio_hi = 0;
++        if (cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
++            prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
++        if (!prio) cs_ = nullptr;
++        cudaGetLastError();
++        std::fprintf(stderr, "strata verify: CUDA%d's window stream %s\n", device_,
++                     prio ? ("at priority " + std::to_string(prio_hi) + " (the greatest)").c_str()
++                          : "at the default priority (no greater one could be made)");
++    }
++#endif
+     if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
+-    else if (make_stream(&cs_, gp_mid) != cudaSuccess) cs_ = nullptr;
++    else if (!prio && make_stream(&cs_, gp_mid) != cudaSuccess) cs_ = nullptr;
+     if (cs_ == nullptr || make_stream(&sh_cs_, gp_lo) != cudaSuccess) {
+         err = "verify: stream create failed";
+         return false;
+@@ -4663,6 +4676,10 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
+     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
+     const auto key = bkey(rows, S, hbase);
++    if (no_capture_ && !layout_captured(key)) {
++        err = "verify: a batch layout was not captured before an overlapped read";
++        return false;
++    }
+     bool evicted = false;
+     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
+         !evict_batch_graph(key, evicted, err))
+@@ -4692,7 +4709,12 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+             }
+             ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
+         }
++        const Clock::time_point tg = ple_urgent_ ? Clock::now() : Clock::time_point{};
+         if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err, ple_urgent_)) return false;
++        if (ple_urgent_) {   // STRATA_PIPE_OVERLAP's stats line: how long a window's rows took beside a prompt's
++            ms_ple_urgent += ms_since(tg);
++            ++n_ple_urgent;
++        }
+     }
+     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
+     // decoding may change the prefix length after comparing the draft with these picks.
+@@ -5004,6 +5026,72 @@ bool Verifier::sample_rows(int S, std::string& err) {
+ #endif
+ }
+ 
++bool Verifier::has_batch_layout(int base, int S) const {
++    if (S < 1 || S > strata::kernels::kVerifyMaxT) return false;
++    int rows[strata::kernels::kVerifyMaxT] = {};
++    for (int t = 0; t < S; ++t) rows[t] = base + t;
++    return layout_captured(bkey(rows, S, base));
++}
++
++bool Verifier::layout_captured(const std::vector<int>& key) const {
++    const auto e = exec_bm_.find(key);   // (find: a failed capture leaves a null entry)
++    const auto c = commit_bm_.find(key);
++    if (key.size() >= 3 && batch_self_commits(key.data() + 1, (int) key.size() - 2))   // [hbase, rows.., ar_off_]
++        return e != exec_bm_.end() && e->second != nullptr;   // the window keeps its rows: no commit graph
++    return e != exec_bm_.end() && e->second != nullptr && c != commit_bm_.end() && c->second != nullptr;
++}
++
++// The captures stage_batch makes on a layout's first window, made ahead (the graphs are the same: record_window reads
++// only what is fixed while nothing runs - the slots' sessions, the table's verdict, the PLE setup).  The commit graph
++// is uploaded too, so its first launch does not.  Both graphs, always: STRATA_PIPED_MTP's deferred commits (no commit
++// graph, staging_deferred_) never reach this (the overlap gate refuses it).
++bool Verifier::ensure_batch_layouts(int GS, int groups, int& captured, std::string& err, const std::vector<int>* narrow) {
++    const OnDevice on_device(device_);
++    captured = 0;
++    if (g_ == nullptr || slots_.empty()) { err = "verify: batch layouts before init_slots"; return false; }
++    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
++    if (GS < 1 || GS > max_t_ || GS > strata::kernels::kVerifyMaxT || groups < 1 || groups * GS > (int) slots_.size()) {
++        err = "verify: batch layouts out of range";
++        return false;
++    }
++    refresh_ar();
++    // the narrower ones first, each one held marked as used too: an LRU limit evicts none of them here, and the full
++    // widths, which must be kept, last of all
++    std::vector<std::pair<int, int>> want;   // (base, S)
++    if (narrow != nullptr)
++        for (int gi = 0; gi < groups && gi < (int) narrow->size(); ++gi)
++            for (int S = 1; S <= std::min((*narrow)[(size_t) gi], GS - 1); ++S) want.emplace_back(gi * GS, S);
++    for (int gi = 0; gi < groups; ++gi) want.emplace_back(gi * GS, GS);
++    for (const auto& [base, S] : want) {
++        int rows[strata::kernels::kVerifyMaxT] = {};
++        for (int t = 0; t < S; ++t) rows[t] = base + t;
++        const auto key = bkey(rows, S, base);
++        if (layout_captured(key)) {
++            bm_used_[key] = ++bm_tick_;
++            continue;
++        }
++        bool evicted = false;
++        if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
++            !evict_batch_graph(key, evicted, err))
++            return false;
++        bm_used_[key] = ++bm_tick_;
++        if (!capture_batch(rows, S, base, err) || !capture_commit_batch(rows, S, base, err)) return false;
++        if (!batch_self_commits(rows, S)) cudaGraphUpload(commit_bm_[key], cs_);
++        ++captured;
++    }
++    if (captured > 0 && cudaStreamSynchronize(cs_) != cudaSuccess) {
++        err = std::string("verify: batch layouts: ") + cudaGetErrorString(cudaGetLastError());
++        return false;
++    }
++    for (int gi = 0; gi < groups; ++gi)   // a later capture may have evicted an earlier one (no VRAM)
++        if (!has_batch_layout(gi * GS, GS)) {
++            err = "verify: the batch layout over slots " + std::to_string(gi * GS) + ".." + std::to_string(gi * GS + GS - 1) +
++                  " could not be kept";
++            return false;
++        }
++    return true;
++}
++
+ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
+     const OnDevice on_device(device_);
+     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 5034bca9..02fb25c2 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -3301,6 +3301,48 @@ struct KvaTap {
+ };
+ }  // namespace
+ 
++bool Prefill::ple_on_() const {
++    return impl_->ss != nullptr && impl_->ss->ple.ready() && stage_lb_ <= 1 && 1 < stage_le_;
++}
++
++// the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
++// STRATA_PLE_BATCH=0 keeps the per-token block (the A/B).  Read live: a relayout changes region_bytes.
++bool Prefill::ple_batched_() const {
++    const Impl& m = *impl_;
++    return ple_on_() && ple_batch_enabled() && strata::kernels::ple_native_postops_enabled() &&
++           (m.ss->ple.w.key_bf16 != nullptr || m.ss->ple.w.key_native_data != nullptr) &&
++           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
++}
++
++int Prefill::device() const { return impl_->device; }
++
++bool Prefill::overlap_safe(std::string& why) const {
++    for (const Prefill* p = this; p != nullptr; p = p->next_) {
++        const Impl& m = *p->impl_;
++        const std::string dev = "CUDA" + std::to_string(m.device) + "'s prompt path";
++        if (m.g == nullptr || m.ss == nullptr) { why = dev + " is not set up"; return false; }
++        if (m.pp) { why = dev + " has a --peer-device peer"; return false; }
++        if (m.help_pp || p->helper_ != nullptr) { why = dev + " has a stage helper (STRATA_PREFILL_HELP)"; return false; }
++        if (p->cpu_pool_ != nullptr) { why = dev + " has the CPU expert pool"; return false; }
++        if (m.borrowed) { why = dev + " reads in lent expert cache slots"; return false; }
++        if (m.ss->qsa_states != nullptr && m.ss->qsa_states[m.ss->qsa_primary()].kv_mode == 1) {
++            why = dev + " streams the K/V (--kv-resident)";
++            return false;
++        }
++        if (p->ple_on_() && !p->ple_batched_()) {
++            why = dev + " runs the PLE block token by token (STRATA_PLE_BATCH=0, or no native postops or key)";
++            return false;
++        }
++    }
++    return true;
++}
++
++int Prefill::chain_cuda_error() const {
++    for (const Prefill* p = this; p != nullptr; p = p->next_)
++        if (const int e = p->cuda_err_.load()) return e;
++    return 0;
++}
++
+ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+     err.clear();
+     // force_chunk is for this run only: taken before any early return can leave it to the next one
+@@ -3412,13 +3454,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
+     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
+     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
+-    const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
+-    // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
+-    // STRATA_PLE_BATCH=0 keeps the per-token block (the A/B)
+-    const bool ple_batch_env = ple_batch_enabled();
+-    const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+-                           (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
+-                           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
++    const bool ple_on = ple_on_();
++    const bool ple_batch = ple_batched_();
+     const int32_t prev0[2] = {prev[0], prev[1]};
+     auto ple_gather = [&m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
+         const int64_t T = std::min(C, n - c0);
+@@ -6294,13 +6331,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                 if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
+                 next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
+                     const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
+-                    (void) cudaGetLastError();   // clear what a thread's end cleared (std::async)
++                    int none = 0;   // keep the first fault for chain_cuda_error, then clear what a thread's end cleared
++                    if (const int e = (int) cudaPeekAtLastError(); e != 0) next_->cuda_err_.compare_exchange_strong(none, e);
++                    (void) cudaGetLastError();   // (std::async)
+                     return r;
+                 }));
+             } else
+             next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                 strata::aux_cpus::pin_current_thread();
+-                return next_->run_impl(tokens + c0, T, p0, next_err_);
++                const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
++                int none = 0;   // the thread's error state ends with it: keep the first fault for chain_cuda_error
++                if (const int e = (int) cudaPeekAtLastError(); e != 0) next_->cuda_err_.compare_exchange_strong(none, e);
++                return r;
+             });
+             hand_buf_ ^= 1;
+             continue;   // the last stage reports the chunk (on_chunk)
+@@ -7909,6 +7951,16 @@ bool Prefill::drain_pipeline(std::string& err) {
+     return ok;
+ }
+ 
++void Prefill::join_chain() noexcept {
++    for (Prefill* p = this; p != nullptr; p = p->next_)   // stage k's future is stage k+1's chunk (it may start k+2's)
++        if (p->next_run_.valid()) {
++            try {
++                (void) p->next_run_.get();
++            } catch (...) {
++            }
++        }
++}
++
+ bool Prefill::reserve_uploads(int64_t T) {
+     bool ok = true;
+     if (impl_ != nullptr && T > 0) {
+@@ -7991,6 +8043,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+             std::fprintf(stderr, "strata prefill: layer-major off for this prompt: %s\n", why.c_str());
+         }
+     }
++    for (Prefill* p = this; p != nullptr; p = p->next_) p->cuda_err_.store(0);
+     const bool body_ok = run_impl(tokens, n, pos0, err);
+ 
+     std::string drain_err;
+-- 
+2.43.0
+

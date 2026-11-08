@@ -1,0 +1,54 @@
+From e33f8112c277fdf36c6a3349f367d2dfae452b9d Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:49:11 +0100
+Subject: [PATCH 13/17] generate: with the adaptive tier lagging the solo
+ pipeline's main verifiers publish every activation, and an always-publishing
+ verifier captures its pipelined graphs again (STRATA_SOLO_PIPELINE /
+ STRATA_SPEC_LANES, fixup of fed5a555)
+
+With solo_pl `pipe` is on beside --batch, so v0.2.12's tier block saw no
+serial windows (evict_sync, res_pairs and the res_sync hook off) although the
+even verifiers still run the serial and batch windows unpublished: on one slot
+group with STRATA_ADAPT_NOWAIT / ADAPT_LAG > 1 (EVICT_SYNC) or ADAPT_FETCH they
+now set_always_publish, as upstream's piped_groups branch does (said once).
+Either branch after the lanes' boot capture left pl_prepared true with the
+even verifiers' graphs in exec_pl_, while set_pl_mode's always_publish_ return
+sends pl_launch to the uncaptured exec_ (die at the first pipelined request):
+pl_prepared is reset, capture_all only adds what is missing.  Neither tier
+switch is set in production.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index fea9e9f1..c25a76cb 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14502,9 +14502,21 @@ int main(int argc, char** argv) {
+         const bool serial_windows = !pipe && !piped_groups;
+         const bool tier_lags = !drive.d.usage.empty() && (adapt_nowait() || adapt_lag() > 1);
+         drive.d.evict_sync = serial_windows && tier_lags && (adapt_evict_sync() || drive.d.fetch_admit > 0);
+-        if (piped_groups && tier_lags && adapt_evict_sync()) {
++        // STRATA_SOLO_PIPELINE: `pipe` is on beside --batch, but the even (main) verifiers still run the serial and the
++        // batch windows unpublished (set_pl_mode), which the hook above no longer reaches - one slot group: they publish
++        // every activation too, where the serial windows would have taken the hook (said once)
++        const bool solo_pl_publish = solo_pl && pipe && !piped_groups &&
++                                     ((tier_lags && adapt_evict_sync()) || drive.d.fetch_admit > 0);
++        if ((piped_groups && tier_lags && adapt_evict_sync()) || solo_pl_publish) {
+             ver.set_always_publish(true);
+             for (auto& st : stages) st->ver.set_always_publish(true);
++            if (solo_pl_publish)
++                std::fprintf(stderr, "strata serve: STRATA_SOLO_PIPELINE: with the adaptive tier lagging (STRATA_ADAPT_NOWAIT / "
++                                     "STRATA_ADAPT_LAG) or STRATA_ADAPT_FETCH, the main verifiers' serial and batch windows "
++                                     "publish every activation\n");
++            // STRATA_SOLO_PIPELINE: set_pl_mode leaves an always-publishing verifier on its normal graphs, which the boot
++            // capture (STRATA_SPEC_LANES) recorded into exec_pl_ - the first pipelined request captures them again
++            if (solo_pl) pl_prepared = false;
+         }
+         const bool res_checking = std::getenv("STRATA_ADAPT_CHECKRES") != nullptr && serial_windows;
+         std::vector<int32_t> res_back;
+-- 
+2.43.0
+

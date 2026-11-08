@@ -1,0 +1,46 @@
+From 8d74eec9d1915d7e24389af998b331590433304f Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:23:39 +0100
+Subject: [PATCH 06/17] generate: the overlapped prompt read's thread and the
+ host's inheritors off the host's core without --aux-cpus, as upstream's
+ PIPED_CONCURRENT read (STRATA_PIPE_OVERLAP, fixup of 2042f8fa)
+
+Without --aux-cpus the read's thread inherited the host thread's one pinned
+core and shared it with pump() and the prompt path's copy threads.  Now
+release_host_inheritors() before the read and place_off_host() on its thread,
+under the same STRATA_PIPED_CONCURRENT_UNPIN switch (default on).  With
+--aux-cpus (production) nothing changes; affinity only, outputs unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index b96a112b..d4af100e 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -19385,8 +19385,20 @@ int main(int argc, char** argv) {
+                 in_prompt_read = true;
+                 ov_reading.store(true);
+                 const bool planned = plan.chunk > 0, plan_single = planned && plan.single;
++                // without --aux-cpus the read's thread would inherit the host thread's one core and share it with
++                // pump() and the prompt path's copy threads (started there by the first prompt): both off it, as
++                // upstream's STRATA_PIPED_CONCURRENT read does (its STRATA_PIPED_CONCURRENT_UNPIN=0 keeps them, an A/B)
++                static const bool ov_unpin = [] {
++                    const char* v = std::getenv("STRATA_PIPED_CONCURRENT_UNPIN");
++                    return v == nullptr || std::atoi(v) != 0;
++                }();
++                if (ov_unpin && !strata::aux_cpus::enabled())
++                    if (const int moved = strata::aux_cpus::release_host_inheritors(); moved > 0)
++                        std::fprintf(stderr, "strata batch: %d threads that ran on the host thread's core moved off "
++                                             "it, for overlapped prompt reads\n", moved);
+                 guard.w = std::thread([&] {
+                     strata::aux_cpus::pin_current_thread();   // --aux-cpus (off: nothing), as the prompt path's stage threads
++                    if (ov_unpin && !strata::aux_cpus::enabled()) (void) strata::aux_cpus::place_off_host();
+                     try {
+                         if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);   // (read_part's run does)
+                         wok = sp.run(ids.data() + a0, b0 - a0, a0, we);
+-- 
+2.43.0
+

@@ -1,0 +1,85 @@
+From 8df1c2270855e1a43c4590d6d01c2273754b6581 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:49:02 +0100
+Subject: [PATCH 11/17] generate: with STRATA_GRAPH_PRIO the solo pipeline's
+ and the lanes' window streams at its gp_mid, not the device's top priority
+ (STRATA_SOLO_PIPELINE / STRATA_SPEC_LANES, fixup of fed5a555)
+
+make_pl_stream (solo_pl && PIPE_OVERLAP_PRIO) and the lane streams were made
+at the greatest priority, and set_stream hands them to the verifiers as cs_,
+past 8a21a129's gp_mid rule in Verifier::init: level with GRAPH_PRIO's side_.
+Both now go through make_prio_stream, which under STRATA_GRAPH_PRIO takes the
+middle of the range (said once).  Timing only; GRAPH_PRIO is not in production.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 39 ++++++++++++++++++++++++++-------------
+ 1 file changed, 26 insertions(+), 13 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 8c541285..4e138a97 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12070,6 +12070,29 @@ int main(int argc, char** argv) {
+         }();
+         const bool pipe_overlap_prio = pipe_overlap_env() && pipe_overlap_prio_env && o.batch > 0 && o.batch_groups > 1 &&
+                                        !stages.empty();
++        // STRATA_GRAPH_PRIO with it: the streams made here for the windows (the solo pipeline's, the lanes') at its
++        // middle priority, as Verifier::init keeps cs_ at gp_mid (side_ above them); else the device's greatest.  Said once
++        auto make_prio_stream = [&](cudaStream_t& s_) -> bool {
++#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
++            static const bool gp_env = [] { const char* v = std::getenv("STRATA_GRAPH_PRIO"); return v != nullptr && std::atoi(v) != 0; }();
++            int lo = 0, hi = 0;
++            if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess) {
++                const bool gp = gp_env && lo != hi;
++                static bool told = false;
++                if (gp && !told) {
++                    told = true;
++                    std::fprintf(stderr, "strata serve: STRATA_PIPE_OVERLAP_PRIO: the solo pipeline's and the lanes' window "
++                                         "streams at STRATA_GRAPH_PRIO's priority %d (its side streams above them)\n",
++                                 (lo + hi) / 2);
++                }
++                if (cudaStreamCreateWithPriority(&s_, cudaStreamNonBlocking, gp ? (lo + hi) / 2 : hi) == cudaSuccess) return true;
++            }
++            (void) cudaGetLastError();
++#else
++            (void) s_;
++#endif
++            return false;
++        };
+         // a layer split's hand-off buffers (and its pipelined windows) hold kVerifyMaxT rows: --lookup-max-t stops there
+         if (n_stages > 1 && o.spec > strata::kernels::kVerifyNarrowT) {
+             std::fprintf(stderr, "strata serve: --lookup-max-t %d: a layer split's windows stop at %d tokens\n",
+@@ -12124,13 +12147,7 @@ int main(int argc, char** argv) {
+             // at the greatest priority, see Verifier::set_stream_priority_high)
+             auto make_pl_stream = [&](cudaStream_t& s_) -> bool {
+ #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+-                if (solo_pl && pipe_overlap_prio) {
+-                    int lo = 0, hi = 0;
+-                    if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+-                        cudaStreamCreateWithPriority(&s_, cudaStreamNonBlocking, hi) == cudaSuccess)
+-                        return true;
+-                    (void) cudaGetLastError();
+-                }
++                if (solo_pl && pipe_overlap_prio && make_prio_stream(s_)) return true;
+ #endif
+                 return cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking) == cudaSuccess;
+             };
+@@ -12880,12 +12897,8 @@ int main(int argc, char** argv) {
+                     const strata::core::OnDevice on(lane_dev(st));
+                     bool made = false;
+ #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+-                    if (pipe_overlap_prio) {   // as the batch windows' streams (STRATA_PIPE_OVERLAP_PRIO)
+-                        int lo = 0, hi = 0;
+-                        made = cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+-                               cudaStreamCreateWithPriority(&lane_stream[(size_t) st], cudaStreamNonBlocking, hi) == cudaSuccess;
+-                        (void) cudaGetLastError();
+-                    }
++                    if (pipe_overlap_prio)   // as the batch windows' streams (STRATA_PIPE_OVERLAP_PRIO)
++                        made = make_prio_stream(lane_stream[(size_t) st]);
+ #endif
+                     if (!made && cudaStreamCreateWithFlags(&lane_stream[(size_t) st], cudaStreamNonBlocking) != cudaSuccess)
+                         return fail("a stream could not be created");
+-- 
+2.43.0
+

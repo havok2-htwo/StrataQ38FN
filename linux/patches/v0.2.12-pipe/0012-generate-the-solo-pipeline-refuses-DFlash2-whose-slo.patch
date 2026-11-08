@@ -1,0 +1,34 @@
+From 01c44beec1901e80fb6ba89d9cdf578050410666 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:49:11 +0100
+Subject: [PATCH 12/17] generate: the solo pipeline refuses DFlash2, whose slot
+ drafts turn --batch-mtp on later (STRATA_SOLO_PIPELINE, fixup of fed5a555)
+
+The "not with --batch-mtp" gate read only o.batch_mtp and STRATA_BATCH_MTP,
+but v0.2.12's batch_df2_wanted sets batch_mtp after it (--draft dflash2
+--draft-fallback mtp with --batch on one slot group), so solo_pl stayed on
+beside the slots' drafters.  Refused for --draft dflash2 as the lanes do
+(lanes_upstream_off).  Production has no DFlash2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 4e138a97..fea9e9f1 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -6184,6 +6184,9 @@ int main(int argc, char** argv) {
+                         : solo_pl_asked && (o.batch_mtp || [] { const char* v = std::getenv("STRATA_BATCH_MTP");
+                                                                 return v != nullptr && v[0] != '\0' && v[0] != '0'; }())
+                             ? "STRATA_SOLO_PIPELINE: not with --batch-mtp"
++                        // (v0.2.12's DFlash2 slot drafts turn --batch-mtp on later, batch_df2_wanted; as the lanes refuse it)
++                        : solo_pl_asked && o.draft == "dflash2"
++                            ? "STRATA_SOLO_PIPELINE: not with DFlash2 (--draft dflash2 / auto: its slot drafts are --batch-mtp's)"
+                         : o.peer_device >= 1 ? "not with --peer-device"
+                         : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
+                         : nullptr;
+-- 
+2.43.0
+

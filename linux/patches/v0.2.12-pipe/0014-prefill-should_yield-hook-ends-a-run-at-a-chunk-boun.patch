@@ -1,0 +1,85 @@
+From d77cb1391c4609cc62eb1a3b36c23594058867f9 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:50:41 +0100
+Subject: [PATCH 14/17] prefill: should_yield hook ends a run at a chunk
+ boundary, beside upstream's stop_at_chunk (opt-in STRATA_READ_YIELD=1, our
+ 45073129)
+
+Our hook stays a sibling of upstream's stop_at_chunk: it is asked with the
+absolute position and yielded_at() is absolute (generate's pos_ok and
+yield_finish use it). It is reset at the top of Prefill::run, so every way
+out reports its own stop. lm_prepare declines the layer-major walk when it
+is set, as upstream does for stop_at_chunk (that walk never consults it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/prefill/prefill.hpp | 12 ++++++++++++
+ src/prefill/prefill.cpp            |  8 ++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 3173f7a2..9db73101 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -246,6 +246,17 @@ public:
+     /// for its grouping on the host; a policy may count them. Not called on the paths that keep the ids on the GPU.
+     std::function<void(int64_t layer, const int32_t* ids, int64_t n)> on_routes;
+     int64_t stopped_at() const { return stopped_at_; }
++    /// STRATA_READ_YIELD (opt-in; unset: never set, nothing changes): the sibling of stop_at_chunk that is asked with
++    /// the absolute position, and yielded_at() is absolute.  Checked on the first stage before every chunk but the
++    /// run's first, after `should_stop` and stop_at_chunk, with the position that chunk would start at.  True ends the
++    /// run there as if the prompt had ended: every stage's chunks before it finish (ple_prev written back, the chain
++    /// drained by `run`), so each stage's state holds exactly [pos0, next_pos), and `run` returns true with
++    /// yielded_at() = next_pos.  A run from next_pos on reads the same chunks the uninterrupted run would have (the
++    /// chunk grid is relative to pos0, and next_pos is on it).  Runs on the thread that calls `run`.  The layer-major
++    /// walk declines a run with it set (lm_prepare), as it does for stop_at_chunk.
++    std::function<bool(int64_t next_pos)> should_yield;
++    /// Where the last `run` stopped for should_yield (-1: it read all it was given, or failed).
++    int64_t yielded_at() const { return yielded_at_; }
+     /// KVA: the end of the positions the last run approximated (they are a prefix: chunks from the run's first position
+     /// on), i.e. the first position whose final rows are real; 0 when that run approximated nothing.  Raised chunk by
+     /// chunk, before on_chunk reports the chunk, so the draft layer can skip the chunk's cells.  Reset by every run.
+@@ -376,6 +387,7 @@ private:
+     Prefill* helper_ = nullptr;         ///< set_stage_helper
+     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
+     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
++    int64_t yielded_at_ = -1;           ///< should_yield's stop (yielded_at)
+     int64_t kva_floor_ = 0;             ///< kva_floor()
+     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
+     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index e88dffa4..70d5e2ab 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -3524,6 +3524,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+             stopped_at_ = c0;
+             break;
+         }
++        // STRATA_READ_YIELD: the run ends at this chunk boundary (the first stage only; never before its first chunk).
++        // A break, not a return: ple_prev is written back below and run() drains the later stages' chunks
++        if (should_yield && hand_in_ == nullptr && c0 > 0 && should_yield(pos0 + c0)) {
++            yielded_at_ = pos0 + c0;
++            break;
++        }
+         if (std::getenv("STRATA_TRACE")) {
+             static Clock::time_point t0;   // process-wide: the stages run on different threads
+             static bool set = false;
+@@ -6690,6 +6696,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+     if (!tap_layers_.empty() && (split || !on_taps || tap_cap_ <= 0)) { why = "the DFlash2 drafter's prompt taps on a layer split"; return 0; }
+     if (kva_config().on) { why = "STRATA_KVA is on"; return 0; }
+     if (stop_at_chunk) { why = "a batch read that yields at chunk boundaries"; return 0; }
++    if (should_yield) { why = "a batch read that yields at chunk boundaries (STRATA_READ_YIELD)"; return 0; }
+     if (force_chunk_ > 0) { why = "a --prefill-pipe plan sets the chunks of this read"; return 0; }   // (left set for run_impl)
+ #if STRATA_EXPERT_NIBBLE_BUILT   // the 4-bit expert slots (STRATA_EXPERT_NIBBLE) are gathered for MMQ only by run_impl
+     for (int64_t l = 0; l < g.n_layers; ++l)
+@@ -7993,6 +8000,7 @@ bool Prefill::reserve_uploads(int64_t T) {
+ }
+ 
+ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
++    yielded_at_ = -1;   // STRATA_READ_YIELD: every way out of this run reports its own stop
+ #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+     (void) strata::kernels::qsa_two_pass_on();   // HIP: a set STRATA_SELECT_TWO_PASS says once it is not used
+ #endif
+-- 
+2.43.0
+

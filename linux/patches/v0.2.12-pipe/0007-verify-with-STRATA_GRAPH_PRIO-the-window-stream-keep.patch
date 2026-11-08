@@ -1,0 +1,38 @@
+From 8a21a129611acbb2b9f260d114ff522ba3407cb1 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:23:39 +0100
+Subject: [PATCH 07/17] verify: with STRATA_GRAPH_PRIO the window stream keeps
+ its gp_mid, not the device's top priority (STRATA_PIPE_OVERLAP, fixup of
+ 8dbfa139)
+
+set_stream_priority_high made cs_ at the greatest priority before make_stream,
+which put it level with GRAPH_PRIO's side_ and lost that ordering.  Under
+GRAPH_PRIO cs_ now stays at gp_mid (already above the prompt read's default
+priority) and a line says so.  Neither switch pair is set in production.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/verify.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index bfe15526..2a60f704 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -1257,7 +1257,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+     }
+     bool prio = false;   // set_stream_priority_high (STRATA_PIPE_OVERLAP): the device's greatest priority, else make_stream's
+ #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)   // (HIP: the default priority)
+-    if (prio_high_ && ext_stream_ == nullptr) {
++    // STRATA_GRAPH_PRIO orders the window's own streams (side above cs / side2 above the shared expert): cs stays at
++    // its gp_mid there, already above the default priority the prompt path's streams run at
++    if (prio_high_ && ext_stream_ == nullptr && gprio)
++        std::fprintf(stderr, "strata verify: CUDA%d's window stream at STRATA_GRAPH_PRIO's priority %d (above the "
++                             "prompt read's default one)\n", device_, gp_mid);
++    if (prio_high_ && ext_stream_ == nullptr && !gprio) {
+         int prio_lo = 0, prio_hi = 0;
+         if (cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
+             prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
+-- 
+2.43.0
+

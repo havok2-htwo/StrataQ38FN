@@ -1,0 +1,553 @@
+From f6a9a10d54ea72f3d26183163a1aef0cb4df21ca Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:27:37 +0100
+Subject: [PATCH 08/17] verify: pipelined windows of a batch verifier with
+ their own graphs, lane rope base, shared arenas and carve signature
+ (STRATA_SOLO_PIPELINE / STRATA_SPEC_LANES, our 81015495 7db06746 25221fc9
+ ba107591)
+
+set_pl_mode / exec_pl_[2][kVerifyLongT + 1] / pl_exec(sl, T) follow upstream's [sel_long_][T] graph arrays;
+capture_all(err, up_to) applies up_to inside each select variant. v0.2.12's window-graph eviction (#3702) can free
+an exec_[sl][T] that an all-resident stage's pl_exec shares: set_pl_mode(true) captures again (under NoEvict) what
+capture_all made and is gone, or refuses. kLiveMax 32. Off (rope_base_ 0, pl_mode_ off, no external arena): the
+same graphs and bytes as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      |   4 +
+ include/strata/core/arena_carve.hpp |  35 +++++++
+ include/strata/core/verify.hpp      |  57 ++++++++++-
+ src/core/verify.cpp                 | 143 ++++++++++++++++++++++------
+ tests/core/arena_carve_test.cpp     |  67 +++++++++++++
+ 5 files changed, 274 insertions(+), 32 deletions(-)
+ create mode 100644 include/strata/core/arena_carve.hpp
+ create mode 100644 tests/core/arena_carve_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bc01de28..0b9c571d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -385,6 +385,10 @@ if(STRATA_BUILD_TESTS)
+   add_executable(mrope_regions_test tests/program/mrope_regions_test.cpp)
+   target_include_directories(mrope_regions_test PRIVATE include)
+   add_test(NAME mrope_regions_test COMMAND mrope_regions_test)
++  # STRATA_SPEC_LANES' shared arenas: the verifier's carve, its signature and poison_arena's keep range (header-only, CPU)
++  add_executable(arena_carve_test tests/core/arena_carve_test.cpp)
++  target_include_directories(arena_carve_test PRIVATE include)
++  add_test(NAME arena_carve_test COMMAND arena_carve_test)
+ 
+   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
+   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
+diff --git a/include/strata/core/arena_carve.hpp b/include/strata/core/arena_carve.hpp
+new file mode 100644
+index 00000000..2894e8cd
+--- /dev/null
++++ b/include/strata/core/arena_carve.hpp
+@@ -0,0 +1,35 @@
++// include/strata/core/arena_carve.hpp - the verifier's device-arena carve (header-only, host: no CUDA).
++//
++// Verifier::init lays every device buffer out in one arena: a counting pass (base null) sizes it, a second pass with
++// the allocation's base hands out the pointers.  Each buffer starts 256-aligned.  The signature is an FNV-1a hash of
++// every buffer's offset and size, so two verifiers with the same signature lay their buffers out alike
++// (Verifier::carve_signature; STRATA_SPEC_LANES' shared arenas check it before a verifier carves another's arena).
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace strata::core::arena_carve {
++
++struct Bump {
++    uint8_t* base = nullptr;
++    uint64_t used = 0;
++    uint64_t sig = 1469598103934665603ull;   // FNV-1a over every buffer's offset and size
++    template <typename T> T* take(uint64_t n) {
++        T* p = base ? (T*) (base + used) : nullptr;
++        const uint64_t sz = (n * sizeof(T) + 255) & ~255ull;
++        sig = (sig ^ used) * 1099511628211ull;
++        sig = (sig ^ sz) * 1099511628211ull;
++        used += sz;
++        return p;
++    }
++};
++
++/// Verifier::poison_arena's precondition: inside the arena [a, a + bytes) the buffers a window reads before it writes
++/// them - argmax_rows' scratch (`keep0`) and the constant 1 (`one`) - lie in that order, followed by the buffer carved
++/// next (`keep1`), so filling [a, keep0) and [keep1, a + bytes) leaves exactly those two alone.
++inline bool keep_range_ok(const uint8_t* a, size_t bytes, const uint8_t* keep0, const uint8_t* one, const uint8_t* keep1) {
++    return a != nullptr && a <= keep0 && keep0 < one && one < keep1 && keep1 <= a + bytes;
++}
++
++}  // namespace strata::core::arena_carve
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 2e6d06ca..617d4f20 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -358,6 +358,47 @@ public:
+         always_publish_ = on;
+         if (on) device_plan_ = false;
+     }
++    /// STRATA_SOLO_PIPELINE (opt-in; --pipeline-windows 2 beside --batch slots): this verifier (a stage's even one) also
++    /// runs the batch windows and the serial solo windows, so it is not set_always_publish.  On, its pipelined windows
++    /// (capture_all, pl_launch) run graphs recorded as set_always_publish would record them: every layer publishes its
++    /// rows, no one-token self-commit.  Those are its own graphs (exec_pl_), except a T >= 2 window of an all-resident
++    /// stage, whose zero-doorbell graph is the same either way (it shares exec_).  Refused (false, `err`) with a window
++    /// in flight, the device-planned layers (E-6) or an all-resident stage that has experts out of VRAM now.  A graph
++    /// capture_all made and the window-graph eviction (#3702) freed since is captured again here (nothing in flight);
++    /// if that fails it is refused too.  Off: everything as before.  Nothing in flight.
++    bool set_pl_mode(bool on, std::string& err);
++    bool pl_mode() const { return pl_mode_; }
++    /// STRATA_SPEC_LANES (opt-in): a lane's verifier runs solo windows on a batch slot's sessions, whose rows read the
++    /// slot's own region of the M-RoPE table (SessionState::mrope_base): its windows and commits then rotate at
++    /// `base` + cell, as the slot's batch rows do (the cells - KV writes, steps - are unchanged).  0 (the default, and
++    /// every other verifier): the cell itself, as before.  Before the first capture.
++    void set_rope_base(int32_t base) { rope_base_ = base; }
++    /// STRATA_SPEC_LANES (opt-in, the low-concurrency modes): carve this verifier's device buffers out of `base`
++    /// (`bytes` long), the arena of another verifier of the same card that never runs a window while this one has a
++    /// window, a commit or a reader of its rows outstanding (the engine fences the streams at every switch).  `sig`:
++    /// the owner's carve_signature (0: not checked).  `init` then takes no arena of its own, does not zero this one
++    /// (the owner did) and writes only the constant (one_, the same bytes); it fails when the carve is larger than
++    /// `bytes` or another layout.  The owner frees it; this verifier never does.  Before `init`.
++    void set_external_arena(void* base, size_t bytes, uint64_t sig) { ext_arena_ = base; ext_bytes_ = bytes; ext_sig_ = sig; }
++    /// The device arena (`init`'s, or the one set_external_arena gave), its bytes and a hash of its carve (the offsets
++    /// and sizes of every buffer: two verifiers with the same signature lay their buffers out alike).  After `init`.
++    void* arena() const { return arena_; }
++    size_t arena_bytes() const { return arena_bytes_; }
++    uint64_t carve_signature() const { return carve_sig_; }
++    bool arena_external() const { return arena_ext_; }
++    /// The offset of the arena's first buffer that outlives a window (argmax_rows' self-resetting counter, then the
++    /// constant 1; poison_arena keeps both): what lies below it is the windows' scratch, which another user of the
++    /// arena (the solo pipeline's GDN snapshots in lane 2's, STRATA_SPEC_LANES) may overwrite between windows.  After
++    /// `init` (before it: 0).
++    size_t persist_offset() const {
++        return arena_ != nullptr && arg_scratch_ != nullptr ? (size_t) (arg_scratch_ - (const uint8_t*) arena_) : 0;
++    }
++    /// STRATA_LC_POISON (testing): queue on `s` a fill of every arena byte with `byte`, except the buffers a window
++    /// reads before it writes them: one_ (the constant 1) and argmax_rows' scratch (its counter resets itself to 0 at
++    /// the end of each launch, so the next launch needs it 0).  cudaMemsetAsync only (no kernel).  Nothing in flight.
++    bool poison_arena(cudaStream_t s, int byte, std::string& err);
++    /// All the stage's experts are in its VRAM cache (the zero-doorbell graph is its normal one; ar_live: right now)
++    bool all_resident() const { return all_resident_; }
+     /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
+     /// which never ask the host.  The pointer must outlive the verifier's windows.
+     bool set_adapt_gate(AdaptGate* g) {
+@@ -369,7 +410,8 @@ public:
+     cudaStream_t stream() const { return cs_; }
+     int device() const { return device_; }
+     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
+-    bool capture_all(std::string& err);
++    /// `up_to` > 0: the window sizes 1 .. up_to only (STRATA_SOLO_PIPELINE: the pipelined windows' largest).
++    bool capture_all(std::string& err, int up_to = 0);
+     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
+     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
+@@ -570,6 +612,9 @@ private:
+     // pipelined windows (pl_launch ...)
+     cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
+     bool always_publish_ = false;
++    bool pl_mode_ = false;                ///< set_pl_mode (STRATA_SOLO_PIPELINE)
++    int32_t rope_base_ = 0;               ///< set_rope_base (STRATA_SPEC_LANES)
++    int pl_up_to_ = 0;                    ///< capture_all's `up_to` (set_pl_mode captures again what #3702 freed)
+     bool adapt_gate_wait(int32_t layer, std::string& err);
+     AdaptGate* adapt_gate_ = nullptr;     ///< 0.1.43: STRATA_ADAPT_OVERLAP's gate (null: off)
+     void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
+@@ -692,6 +737,10 @@ private:
+     cudaGraphExec_t exec_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+     bool launched_[2][strata::kernels::kVerifyLongT + 1] = {}, launched_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+     int sel_long_ = 0;
++    /// set_pl_mode (STRATA_SOLO_PIPELINE): the pipelined windows' own graphs, [sel_long_][T] as exec_
++    cudaGraphExec_t exec_pl_[2][strata::kernels::kVerifyLongT + 1] = {};
++    /// set_pl_mode: the graph a pipelined window of T tokens runs (see set_pl_mode)
++    cudaGraphExec_t& pl_exec(int sl, int T) { return all_resident_ && T >= 2 ? exec_[sl][T] : exec_pl_[sl][T]; }
+     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
+     // mixer's projections, joined before the recurrence / the attention
+     cudaStream_t side_ = nullptr;
+@@ -770,6 +819,12 @@ private:
+ 
+     // device
+     void* arena_ = nullptr;
++    size_t arena_bytes_ = 0;               ///< the carve's bytes (arena_bytes)
++    uint64_t carve_sig_ = 0;               ///< carve_signature
++    void* ext_arena_ = nullptr;            ///< set_external_arena (null: init allocates its own)
++    size_t ext_bytes_ = 0;
++    uint64_t ext_sig_ = 0;
++    bool arena_ext_ = false;               ///< arena_ is another verifier's: never freed here
+     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
+     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 2a60f704..9d09a6e1 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -10,6 +10,7 @@
+ #include "strata/core/defaults_026.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/core/verify.hpp"
++#include "strata/core/arena_carve.hpp"
+ #include "strata/core/window_evict.hpp"
+ #include "strata/core/expert_nibble.hpp"
+ #include "strata/core/pin_budget.hpp"
+@@ -294,15 +295,7 @@ inline bool g_early_sample() { static const bool on = [] { const char* v = std::
+ inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+ #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
+ 
+-struct Bump {
+-    uint8_t* base = nullptr;
+-    uint64_t used = 0;
+-    template <typename T> T* take(uint64_t n) {
+-        T* p = base ? (T*) (base + used) : nullptr;
+-        used += (n * sizeof(T) + 255) & ~255ull;
+-        return p;
+-    }
+-};
++using Bump = strata::core::arena_carve::Bump;   // (strata/core/arena_carve.hpp: the carve and its signature)
+ 
+ // #649 (HIP, opt-in A/Bs for the gfx1030 verify timeouts; CUDA never reads them)
+ //   STRATA_VERIFY_COHERENT=1  the handshake words and rows in explicitly coherent (fine-grained) host memory
+@@ -573,8 +566,9 @@ std::atomic<const Verifier*> g_diag_verifier{nullptr};
+ void diag_active_verifier(std::FILE* f) {
+     if (const Verifier* v = g_diag_verifier.load()) v->diag(f);
+ }
+-// #267: every live verifier (a layer split has one per stage), for the release before the engine ends
+-constexpr int kLiveMax = 16;
++// #267: every live verifier (a layer split has one per stage), for the release before the engine ends.  32: four stages
++// with --pipeline-windows' second verifiers (8) and STRATA_SPEC_LANES' two per stage (8) were 16 already
++constexpr int kLiveMax = 32;
+ std::atomic<Verifier*> g_live[kLiveMax];
+ void release_live_verifiers(std::FILE* f) {
+     for (auto& slot : g_live)
+@@ -743,6 +737,9 @@ Verifier::~Verifier() {
+     for (auto& row : exec_nr_)
+         for (auto& e : row)
+             if (e) cudaGraphExecDestroy(e);
++    for (auto& row : exec_pl_)
++        for (auto& e : row)
++            if (e) cudaGraphExecDestroy(e);
+     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+     for (auto& kv : exec_bm_)
+         if (kv.second) cudaGraphExecDestroy(kv.second);
+@@ -784,7 +781,7 @@ Verifier::~Verifier() {
+     if (df_fork_) cudaEventDestroy(df_fork_);
+     for (cudaEvent_t e : df_join_)
+         if (e) cudaEventDestroy(e);
+-    if (arena_) cudaFree(arena_);
++    if (arena_ && !arena_ext_) cudaFree(arena_);   // (set_external_arena: the owner's)
+     if (hcount_d_) cudaFree(hcount_d_);
+     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
+@@ -1136,11 +1133,23 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+     };
+     Bump count;
+     carve(count);
+-    if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
+-        err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
+-        return false;
++    arena_bytes_ = count.used;
++    carve_sig_ = count.sig;
++    if (ext_arena_ != nullptr) {   // set_external_arena: another verifier's arena (zeroed by it; one_ is written below)
++        if (count.used > ext_bytes_ || (ext_sig_ != 0 && ext_sig_ != carve_sig_)) {
++            err = "verify: the shared arena (" + std::to_string(ext_bytes_ >> 20) + " MiB) is not laid out like this "
++                  "verifier's (" + std::to_string(count.used >> 20) + " MiB" + (ext_sig_ != 0 && ext_sig_ != carve_sig_ ? ", another carve" : "") + ")";
++            return false;
++        }
++        arena_ = ext_arena_;
++        arena_ext_ = true;
++    } else {
++        if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
++            err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
++            return false;
++        }
++        cudaMemset(arena_, 0, count.used);
+     }
+-    cudaMemset(arena_, 0, count.used);
+     if (hflag_out_d_ != nullptr && hcount_d_ == nullptr) {   // the overlapped split's hand-off counter
+         if (cudaMalloc((void**) &hcount_d_, 64) != cudaSuccess) { err = "verify: hand-off counter allocation failed"; return false; }
+         cudaMemset(hcount_d_, 0, 64);
+@@ -1368,6 +1377,25 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+     return true;
+ }
+ 
++bool Verifier::poison_arena(cudaStream_t s, int byte, std::string& err) {
++    if (arena_ == nullptr) return true;
++    const OnDevice on_device(device_);
++    uint8_t* const a = (uint8_t*) arena_;
++    uint8_t* const keep0 = arg_scratch_;           // argmax_rows' scratch, then one_ (carve: adjacent, in this order)
++    uint8_t* const keep1 = (uint8_t*) hist_snap_;  // the buffer carved after one_
++    if (!strata::core::arena_carve::keep_range_ok(a, arena_bytes_, keep0, (const uint8_t*) one_, keep1)) {
++        err = "verify: poison: the carve is not the one poison_arena knows";
++        return false;
++    }
++    if (cudaMemsetAsync(a, byte & 0xff, (size_t) (keep0 - a), s) != cudaSuccess ||
++        cudaMemsetAsync(keep1, byte & 0xff, (size_t) (a + arena_bytes_ - keep1), s) != cudaSuccess) {
++        (void) cudaGetLastError();
++        err = "verify: poison: a fill failed";
++        return false;
++    }
++    return true;
++}
++
+ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+ 
+ // ================================ THE WINDOW, AS CAPTURED ================================
+@@ -1400,7 +1428,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+     // at most kVerifyMaxT, what the per-group kernels and the CPU experts take)
+     const int G = ((split_ && T >= 2) || T > kVerifyMaxT) && !batch_rec_ ? 2 : 1;
+     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
+-    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
++    const bool self_commit = T == 1 && !always_publish_ && !pl_mode_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
+     const int side_mixer_mode = g_side_mixer();
+@@ -1929,8 +1957,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 auto idx_append = [&](cudaStream_t ns) {
+                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
++                        // (rope_base_: a lane's slot region, STRATA_SPEC_LANES; 0 otherwise)
+                         native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
+-                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
++                                                        n, rope_base_, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                         rope_scaling(), ns);
+                     } else {
+                         for (int t = tb; t < te; ++t) {
+@@ -2320,7 +2349,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+ #endif
+             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
+             // whatever the device's residency table says (pipelined windows)
+-            if (remote_opt_ || always_publish_)
++            if (remote_opt_ || always_publish_ || pl_mode_)
+                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+             else {
+@@ -2810,7 +2839,10 @@ void Verifier::refresh_ar() {
+ 
+ bool Verifier::capture(int T, std::string& err) {
+     const auto cap_t0 = std::chrono::steady_clock::now();
+-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
++    // set_pl_mode: an all-resident stage records its pipelined windows only while it is all-resident (its exec_ is
++    // the zero-doorbell graph; set_pl_mode refuses it otherwise)
++    if (pl_mode_ && all_resident_ && ar_off_) { err = "verify: pipelined windows with experts out of VRAM"; return false; }
++    cudaGraphExec_t& exec_t = pl_mode_ ? pl_exec(sel_long_, T) : ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
+     if (exec_t != nullptr) return true;
+     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
+         size_t free_b = 0, total_b = 0;
+@@ -3043,7 +3075,7 @@ bool Verifier::capture_commit(std::string& err) {
+             }
+             if (ok && fits && nq > 0) {
+                 native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
+-                                                       (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
++                                                       (int) MT, rope_base_, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                 qsa_batched = true;
+             }
+         }
+@@ -3078,12 +3110,13 @@ bool Verifier::capture_commit(std::string& err) {
+                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
+                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                 if (!g_no_batch_kv) {
+-                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+-                                                    (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
++                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT,
++                                                    rope_base_, (const float*) wikn->data, EPS, ib, s, st.max_cells,
++                                                    rope_scaling(), cs_);
+                 } else {
+                     for (int64_t t = 0; t < MT; ++t)
+-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+-                                                  (const float*) wikn->data, EPS, ib, s, st.max_cells,
++                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t,
++                                                  rope_base_, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                   rope_scaling(), cs_);
+                 }
+                 ++qsa_index;
+@@ -3121,7 +3154,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
+     for (int t = 0; t < T; ++t) {
+         h_tok_[t] = tokens[t];
+         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
+-        const int32_t pos_t = (int32_t) (pos0 + t);
++        // the rope rows: the cell (a lane's slot region from rope_base_, STRATA_SPEC_LANES; the step keeps the cell)
++        const int32_t pos_t = (int32_t) (rope_base_ + pos0 + t);
+         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
+         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
+         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
+@@ -3327,6 +3361,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+     const ModelGeometry& g = *g_;
+     SessionState& ss = *ss_;
+     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
++    if (pl_mode_) { err = "verify: a serial window while set_pl_mode is on"; return false; }
+     // the overlapped split launched this stage's window already: keep the graph variant (#871) chosen for it then,
+     // or this thread would serve the window as the other variant
+     const bool pre = prelaunched_ == T;
+@@ -3942,7 +3977,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
+     h_commit_[0] = n_keep;
+     h_commit_[1] = n_keep - 1;
+     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit() && !g_qfuse()) {
++    if (last_t_ == 1 && !always_publish_ && !pl_mode_ && one_token_self_commit() && !g_qfuse()) {
+         // a one-token window has advanced the state itself (record_window): no commit graph. (Not with STRATA_QFUSE: its windows
+         // do not self-commit, see `self_commit` there - skipping the commit here left the GDN state and the indexer tail one token behind.)
+     } else {
+@@ -5334,7 +5369,7 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
+                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
+ }
+ 
+-bool Verifier::capture_all(std::string& err) {
++bool Verifier::capture_all(std::string& err, int up_to) {
+     const OnDevice on_device(device_);
+     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
+     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
+@@ -5346,9 +5381,10 @@ bool Verifier::capture_all(std::string& err) {
+     } no_evict(no_window_eviction_);
+     // STRATA_SELECT_LONG: both select variants (see select_long_at): pl_launch takes the one its window's context
+     // needs, and nothing can be captured once pipelined windows are in flight.  Without it only [0]
++    pl_up_to_ = up_to;
+     for (int sl = 0; sl < (select_long_on() ? 2 : 1); ++sl) {
+         sel_long_ = sl;
+-        for (int T = 1; T <= max_t_; ++T)
++        for (int T = 1; T <= (up_to > 0 ? std::min(up_to, max_t_) : max_t_); ++T)
+             if (!capture(T, err)) return false;
+     }
+     sel_long_ = 0;
+@@ -5407,7 +5443,8 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     SessionState& ss = *ss_;
+     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+     const int sl = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;   // the variant this window's context pays off with
+-    if (exec_[sl][T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
++    cudaGraphExec_t const ex_t = pl_mode_ ? pl_exec(sl, T) : exec_[sl][T];   // (set_pl_mode: its own graphs)
++    if (ex_t == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
+         err = "verify: pipelined window not prepared (capture_all)";
+         return false;
+     }
+@@ -5430,7 +5467,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
+     ms_host += ms_since(t0);
+     strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+-    const cudaError_t le = cudaGraphLaunch(exec_[sl][T], cs_);
++    const cudaError_t le = cudaGraphLaunch(ex_t, cs_);
+     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
+@@ -5609,6 +5646,50 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
+     return true;
+ }
+ 
++bool Verifier::set_pl_mode(bool on, std::string& err) {
++    if (fl_active_) { err = "verify: a window is in flight on this verifier"; return false; }
++    // a window staged ahead (prestage) and never launched: the batch and serial windows stage over its inputs between
++    pl_prestaged_ = false;
++    if (!on) {
++        pl_mode_ = false;
++        return true;
++    }
++    if (g_ == nullptr) { err = "verify: set_pl_mode before init"; return false; }
++    if (always_publish_) { pl_mode_ = false; return true; }   // its normal graphs are the pipelined ones already
++    if (device_plan_) { err = "the device-planned layers (STRATA_VERIFY_DEVICE_PLAN)"; return false; }
++    if (remote_opt_ != nullptr) { err = "--remote-expert-opt"; return false; }
++    refresh_ar();
++    if (all_resident_ && ar_off_) { err = "experts out of VRAM (a prompt loan, a shrink or a swap)"; return false; }
++    pl_mode_ = true;
++    // #3702: a serial window's capture may have freed a window graph of another size (evict_window_graph), and an
++    // all-resident stage's T >= 2 pipelined windows share exec_: capture what capture_all made and is gone now (nothing
++    // in flight, no eviction: every size is wanted at once).  Before capture_all (pl_ple_rows_ empty): nothing yet
++    if (!pl_ple_rows_.empty()) {
++        const OnDevice on_device(device_);
++        struct NoEvict {
++            bool& f;
++            explicit NoEvict(bool& flag) : f(flag) { f = true; }
++            ~NoEvict() { f = false; }
++        } no_evict(no_window_eviction_);
++        const int keep_sl = sel_long_;
++        const int top = pl_up_to_ > 0 ? std::min(pl_up_to_, max_t_) : max_t_;
++        bool ok = true;
++        std::string cerr;
++        for (int sl = 0; ok && sl < (select_long_on() ? 2 : 1); ++sl) {
++            sel_long_ = sl;
++            for (int T = 1; ok && T <= top; ++T)
++                if (pl_exec(sl, T) == nullptr && !capture(T, cerr)) ok = false;
++        }
++        sel_long_ = keep_sl;
++        if (!ok) {
++            pl_mode_ = false;
++            err = "a window graph was freed (#3702) and could not be captured again (" + cerr + ")";
++            return false;
++        }
++    }
++    return true;
++}
++
+ void Verifier::absorb_stats(Verifier& o) {
+     ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
+     windows += o.windows;
+diff --git a/tests/core/arena_carve_test.cpp b/tests/core/arena_carve_test.cpp
+new file mode 100644
+index 00000000..170b34a1
+--- /dev/null
++++ b/tests/core/arena_carve_test.cpp
+@@ -0,0 +1,67 @@
++// The verifier's arena carve (include/strata/core/arena_carve.hpp): the counting pass and the carving pass agree, every
++// buffer is 256-aligned, the signature tells two layouts apart, and poison_arena's keep range is what it checks.
++// Host only: no model, no GPU.
++#include "strata/core/arena_carve.hpp"
++
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++namespace ac = strata::core::arena_carve;
++
++namespace {
++int failures = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++// a carve shaped like Verifier::init's tail: scratch rows (T), the head's logits, argmax_rows' scratch, one_, hist_snap_
++struct Ptrs { float* rows; float* logits; uint8_t* arg; int32_t* one; float* hist; };
++Ptrs carve(ac::Bump& b, uint64_t T, uint64_t vocab) {
++    Ptrs p;
++    p.rows = b.take<float>(T * 4096);
++    p.logits = b.take<float>(T * vocab);
++    p.arg = b.take<uint8_t>(T * 24 + 8);
++    p.one = b.take<int32_t>(4);
++    p.hist = b.take<float>(T * 64);
++    return p;
++}
++}  // namespace
++
++int main() {
++    ac::Bump c1, c2, c3;
++    carve(c1, 8, 1000);
++    carve(c2, 8, 1000);
++    carve(c3, 6, 1000);
++    check(c1.used == c2.used && c1.sig == c2.sig, "the same carve: the same bytes and signature");
++    check(c1.sig != c3.sig, "another T: another signature");
++    ac::Bump c4;
++    carve(c4, 8, 1001);
++    check(c4.sig != c1.sig, "another size of one buffer: another signature");
++    // the same total with the buffers in another order: still another signature (offsets are hashed)
++    ac::Bump x, y;
++    x.take<uint8_t>(256); x.take<uint8_t>(512);
++    y.take<uint8_t>(512); y.take<uint8_t>(256);
++    check(x.used == y.used && x.sig != y.sig, "another order: another signature");
++
++    std::vector<uint8_t> mem(c1.used + 256);
++    ac::Bump real;
++    real.base = mem.data();
++    const Ptrs p = carve(real, 8, 1000);
++    check(real.used == c1.used && real.sig == c1.sig, "the carving pass is the counting pass");
++    for (const void* q : {(const void*) p.rows, (const void*) p.logits, (const void*) p.arg, (const void*) p.one,
++                          (const void*) p.hist})
++        check(((const uint8_t*) q - mem.data()) % 256 == 0, "every buffer 256-aligned from the base");
++    const uint8_t* a = mem.data();
++    check(ac::keep_range_ok(a, real.used, p.arg, (const uint8_t*) p.one, (const uint8_t*) p.hist), "the keep range: ordered");
++    check(!ac::keep_range_ok(a, real.used, (const uint8_t*) p.one, p.arg, (const uint8_t*) p.hist), "swapped: refused");
++    check(!ac::keep_range_ok(a, (size_t) ((const uint8_t*) p.hist - a) - 1, p.arg, (const uint8_t*) p.one,
++                             (const uint8_t*) p.hist), "the next buffer past the end: refused");
++    check(!ac::keep_range_ok(nullptr, real.used, p.arg, (const uint8_t*) p.one, (const uint8_t*) p.hist), "no arena: refused");
++    // the persistent offset (Verifier::persist_offset) is argmax_rows' scratch: what lies below it is scratch
++    const size_t persist = (size_t) (p.arg - a);
++    check(persist > (size_t) ((const uint8_t*) p.logits - a), "the persistent tail after the logits");
++    return failures == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

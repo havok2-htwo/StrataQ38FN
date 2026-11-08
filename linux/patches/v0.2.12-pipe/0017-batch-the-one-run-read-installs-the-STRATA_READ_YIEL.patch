@@ -1,0 +1,43 @@
+From a099d2953b6b70084d92da0f3ac7b015719a4d5e Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 04:11:04 +0100
+Subject: [PATCH 17/17] batch: the one-run read installs the STRATA_READ_YIELD
+ hook only beside slots, so it never turns off the layer-major walk upstream
+ picks on a small card (STRATA_READ_YIELD, fixup of 044326f8)
+
+lm_prepare declines the layer-major walk while should_yield is set, and
+on one small CUDA card small_card_prompt_path sets
+STRATA_PREFILL_LAYER_MAJOR=1 itself. Without --batch no BYIELD comes, so
+the hook only cost that walk (9-50 % on the prompt). With --batch the
+hook stays (a BYIELD may come for any read): READ_YIELD beside slots
+still reads chunk-major there, as upstream's stop_at_chunk does. The
+prompt-cache case is the switch's own now (read_yield_on), and a picture
+keeps the hook (the walk declines image prompts anyway). Production
+(a layer split, layer-major off) is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index bbca4691..bd2715cf 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -21857,9 +21857,12 @@ int main(int argc, char** argv) {
+                     }
+                 }
+                 int64_t piece = piece_now();
+-                if (piece <= 0 && read_yield_on && !(!co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty())) {
++                if (piece <= 0 && read_yield_on && o.batch > 0 &&
++                    !(!co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty())) {
+                     // STRATA_READ_YIELD: one run, which stops at a chunk boundary for an armed BYIELD.  The hook runs on
+                     // this thread (the first stage's), so it takes the BYIELD lines itself (BSTOPs stay for the loop).
++                    // Only beside slots: the hook turns the layer-major walk off (lm_prepare), which upstream turns on
++                    // by itself on a small card (small_card_prompt_path).  (A picture keeps it: that walk declines it.)
+                     // Not for a run that co-reads (STRATA_COALESCE_PREFILL: layer-major, which never asks the hook)
+                     struct HookReset {
+                         decltype(sp)& p;
+-- 
+2.43.0
+
