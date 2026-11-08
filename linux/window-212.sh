@@ -101,6 +101,7 @@ done
 [ "${DRY:-0}" = 1 ] && MODE=dry
 if [ "$RUN" = w212b ]; then ARMS=${ARMS:-A P PT PTD PT4 PTX}; else ARMS=${ARMS:-A B C D E E2 F G H I H2 H3}; fi
 P_REF=${P_REF:-$L/results/w212/sweep.requests.jsonl}   # last night's w212-I-short: P's reference without an I run
+PT_REF=${PT_REF:-$L/results/w212c/sweep.requests.jsonl}   # w212c's w212-PT-short (= A 62/62, presence 0): ref-PT-short for PT C S without P
 R2_FIRST=${R2_FIRST-auto}   # r2 repeats run first (those in ARMS that ran ok), then the close pairs; auto: "A PT P" with pipe arms
 IDENT_GATE=${IDENT_GATE:-strict}; HTTP_GATE=${HTTP_GATE:-1}; HOST_TESTS=${HOST_TESTS:-1}; GPU_CTEST=${GPU_CTEST:-1}
 IDENTITY=${IDENTITY:-1}; SPARE=${SPARE:-1}; FORCE=${FORCE:-0}; RESTORE_SMOKE=${RESTORE_SMOKE:-1}
@@ -132,12 +133,12 @@ for v in $(compgen -e | grep '^STRATA_'); do unset "$v"; done   # nothing of our
 
 # arm -> binary key, server tree, engine source tree (for the name checks)
 declare -A BIN_SRC=([prod]=$ENG/strata-g3-ll10b [stocktab]=$ENG/strata-212-stocktab [port]=$ENG/strata-212m-p2
-                    [int]=$ENG/strata-212i [pipe]=$ENG/strata-212p)
-declare -A BIN_TREE=([prod]=$OURS [stocktab]=$UP [port]=$PWT [int]=$IWT [pipe]=$PPT)
+                    [int]=$ENG/strata-212i [pipe]=$ENG/strata-212p [stock]=$ENG/strata-212-stocktab)
+declare -A BIN_TREE=([prod]=$OURS [stocktab]=$UP [port]=$PWT [int]=$IWT [pipe]=$PPT [stock]=$UP)
 declare -A ARM_BIN=([A]=prod [B]=stocktab [C]=stocktab [D]=stocktab [E]=stocktab [E2]=stocktab [F]=stocktab [G]=stocktab
-                    [H]=port [H2]=port [H3]=port [H3d]=port [I]=int [P]=pipe [PT]=pipe [PTD]=pipe [PT4]=pipe [PTX]=pipe)
+                    [H]=port [H2]=port [H3]=port [H3d]=port [I]=int [P]=pipe [PT]=pipe [PTD]=pipe [PT4]=pipe [PTX]=pipe [S]=stock)
 declare -A ARM_SRV=([A]=$PRODSRV [B]=$UP [C]=$UP [D]=$UP [E]=$UP [E2]=$UP [F]=$UP [G]=$UP [H]=$PWT [H2]=$PWT [H3]=$PWT [H3d]=$PWT
-                    [I]=$IWT [P]=$PPT [PT]=$PPT [PTD]=$PPT [PT4]=$PPT [PTX]=$PPT)
+                    [I]=$IWT [P]=$PPT [PT]=$PPT [PTD]=$PPT [PT4]=$PPT [PTX]=$PPT [S]=$UP)
 EXACT_ARMS=" C D H H2 H3 H3d I P PT PTD PT4 "   # greedy replies must equal B's (I: H's; P: I's; PT*: P's); PTX is not exact
 PIPE_ARMS="P PT PTD PT4 PTX"
 ICB=$IWT/build                           # 212i's ctest build (phase 3's INFO conversation_* tests)
@@ -187,7 +188,7 @@ declare -A WANT_BOOT=([A]="STRATA_SPEC_LANES=4: lanes on slots;;STRATA_SOLO_PIPE
     [H2]="$ES;;$DAILY" [H3]="$ES" [H3d]="$ES;;$DAILY"
     [I]="$MMQD;;$ES;;$SLOTS;;$IPARK;;$ISLOT;;$ITIER;;$IMMAP;;$IGATE;;$ITAIL"
     [P]="$P_BOOT" [PT]="$P_BOOT;;$SM86_8;;$SLOTSS" [PTD]="${P_BOOT//";;$SLOTS"/};;$SM86_8;;$DAILY" [PT4]="$P_BOOT;;$SM86_8;;$SLOTSS"
-    [PTX]="$P_BOOT;;$SM86_8")
+    [PTX]="$P_BOOT;;$SM86_8" [S]="$SM86")
 declare -A FAILPAT=([B]="$SM86|STRATA_MMQ_DIRECT=[0-9] is ignored" [H]="$SM86" [H2]="$SM86" [H3]="$SM86" [H3d]="$SM86"
     [E]="STRATA_PIPED_CONCURRENT is off beside" [F]="--pipeline-windows 2 is off"
     [G]="WARNING: STRATA_PIPED_MTP is off|WARNING: --batch-mtp is off"
@@ -405,6 +406,7 @@ SRVENV_ALL=$(systemctl --user show strata.service -p Environment --value 2>/dev/
 srv_reads() { local f; for f in "$1"/serve/*.py; do case $f in */test_*) continue ;; esac
     grep -qF "\"$2\"" "$f" && return 0; done; return 1; }
 srv_env() { local a=$1 kv k out=
+    [ "$a" = S ] && { echo ""; return; }    # S = stock as shipped: none of production's drop-in env
     for kv in $SRVENV_ALL; do k=${kv%%=*}
         if [ "$a" = A ] || srv_reads "${ARM_SRV[$a]}" "$k"; then out="$out $kv"; fi; done
     echo "${out# }"; }
@@ -540,6 +542,40 @@ grep_all() {   # <file> <pattern;;pattern...>: prints the patterns NOT found
     for p in $(echo "$2" | sed 's/;;/\n/g'); do [ -n "$p" ] && ! grep -a -q -E -- "$p" "$f" 2>/dev/null && miss="$miss [$p]"; done
     echo "${miss# }"; }
 
+# ---- upstream's own benchmarks (w212d, INFO): docs/BENCHMARK_PROTOCOL.md `strata bench run` as the FIRST workload
+# of a freshly loaded server (its cache-hit limit; one run per start, so r1 + r2 = two runs), then (first start only)
+# the community quick check tools/strata_bench.py --runs 3 --clients 16 --long.  Both runners from the arm's own server
+# tree (they record its commit; strata_cli / bench/prompts / tools/strata_bench.py are identical in 146df3c4 and
+# a099d295).  --profile <run cfg> --no-start: uses the server on the config's port (8091), never starts one, and lists
+# the config's 4 GPUs.  The runner first hashes ~94 GB of GGUF (GPUs idle, no log growth): MON_HANG 900 for that step.
+# A failure here is INFO: the arm's own benches still run (a crash / hang of the server ends the arm as usual).
+STDBENCH_ARMS=${STDBENCH_ARMS-S C PT}; QUICK_ARMS=${QUICK_ARMS-S C PT}   # all compared arms: the same preconditioning
+std_bench() { local a=$1 lab=$2 cfg=$3 st=${ARM_SRV[$1]} mh=$MON_HANG notes
+    case " $STDBENCH_ARMS " in *" $a "*) ;; *) return 0 ;; esac
+    notes="w212d $lab: $(basename "$st")@$(git -C "$st" rev-parse --short=8 HEAD), engine $(basename "$(cfgget "$cfg" exe)"), CUDA 13.0 source build (STRATA_MMQ_TAB=ON), 4x RTX 3090 320 W, layer split over 4 cards; "
+    case $a in
+        S) notes+="stock v0.2.12: the args/env stock setup writes for this box (128K, int8 KV, MTP, parallel 3 as strata launch sets for 24 GB), vision off, sampling.presence_penalty 0 (inert here: the suite sends 0)" ;;
+        C) notes+="stock v0.2.12 with our production args/env (16 slots, 262K, int8 KV, MTP, resident experts, conversation cache) + upstream's sm_86 table + stack, bit-changing defaults pinned to 0, sampling.presence_penalty 0" ;;
+        *) notes+="v0.2.12 + our series (havok2-htwo) + P9-P11 + upstream's sm_86 table, 16 slots, 262K, int8 KV, MTP, bit-changing defaults pinned to 0 (exact)" ;;
+    esac
+    notes+="; server env: [$(srv_env "$a")]"
+    MON_HANG=900; WATCH="$WATCH $OUT/$lab-stdbench.txt"   # (a crash here counts for "two crashes in a row")
+    run_step "$lab-stdbench" 2400 env -C "$st" STRATA_NO_HANDOVER=1 "$PY" -B "$st/strata.py" bench run --profile "$cfg" --no-start \
+        --out "$OUT/stdbench-$lab" --optional-concurrency --track custom --track-notes "$notes" \
+        --quantization UD-IQ4_XS --build-options "CUDA 13.0, sm_86, STRATA_MMQ_TAB=ON, NATIVE_EXPERTS=ON, Q6K_EXPERTS=ON, MMQ_KQUANTS=ON" --output json
+    MON_HANG=$mh
+    stw stdbench "rc $STEP_RC${STEP_WHY:+ $STEP_WHY}"
+    log "    [stdbench $lab] ==> rc $STEP_RC${STEP_WHY:+ ($STEP_WHY)} $(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get('run',{}).get('status'),d.get('extensions',{}).get('status_reasons'))" "$OUT/stdbench-$lab/results.json" 2>/dev/null) INFO"
+    if [ -n "$STEP_WHY" ] && [ "$STEP_WHY" != timeout ]; then stw status fail; stw why "stdbench: $STEP_WHY"; arm_end "$lab"; return 1; fi
+    if [ "$lab" = "$a" ] && case " $QUICK_ARMS " in *" $a "*) true ;; *) false ;; esac; then
+        mkdir -p "$OUT/community-$lab"; INFO_STEP=1
+        run_step "$lab-quick" 1500 "$PY" -B "$st/tools/strata_bench.py" --url "$TURL" --config "$cfg" --runs 3 --clients 16 --long --out "$OUT/community-$lab"
+        INFO_STEP=0; stw quick "rc $STEP_RC${STEP_WHY:+ $STEP_WHY}"
+        log "    [quick $lab] ==> rc $STEP_RC${STEP_WHY:+ ($STEP_WHY)} $(ls "$OUT/community-$lab" 2>/dev/null | head -1) INFO"
+        if [ -n "$STEP_WHY" ] && [ "$STEP_WHY" != timeout ]; then stw status fail; stw why "quick: $STEP_WHY"; arm_end "$lab"; return 1; fi
+    fi
+    WATCH="$OUT/engine-$lab.log $OUT/server-$lab.out"; return 0; }
+
 # ---- one arm --------------------------------------------------------------------------------------------------------
 ST=""   # the status file of the arm running now
 stw() { echo "$1=$2" >> "$ST"; }
@@ -556,6 +592,7 @@ print(' '.join(d) or 'none', '| args +', ' '.join(x) or '-')" "$C/production.jso
     el=$OUT/engine-$lab.log
     if ! srv_up "$lab" "$cfg" "$a"; then stw status "$( [ "$STEP_WHY" = deadline ] && echo skip || echo fail)"; stw why "start: $STEP_WHY"; arm_end "$lab"; return 1; fi
     stw boot_s "$BOOT_S"; stw vram_boot "$(vram)"
+    std_bench "$a" "$lab" "$cfg" || return 0
     local B="$PY -I -B $L/bench_concurrency.py --url $TURL --temperature 0"
     run_step "$lab-warm" 300 $B --label "w212-$lab-warm" --levels 1 --rounds 1 --max-tok 16 --prompt-tok 100 --out "$OUT/warm.jsonl"
     run_step "$lab-probe" 300 $B --label "w212-$lab-probe" --levels 4 --rounds 1 --max-tok 64 --prompt-tok 100 --warmup 0 --out "$OUT/warm.jsonl"
@@ -574,18 +611,22 @@ print(' '.join(d) or 'none', '| args +', ' '.join(x) or '-')" "$C/production.jso
     # the pipe arms: P against I (this run's, else last night's as ref-I-short); PT PTD PT4 against P (its first run),
     # I when P has none or P's were not I's; PTX against PT (INFO: DIFF expected).  The compared file: this run's replies + the reference
     local rf=$OUT/sweep.requests.jsonl
+    has_lab() { grep -qF "\"label\":\"$1\"" "$rf" 2>/dev/null || grep -qF "\"label\": \"$1\"" "$rf" 2>/dev/null; }
     case $a in
+        C|S) if ! in_arms B; then   # w212d (no B): against w212c's PT (C exact, S INFO)
+                rf=$OUT/cmp.requests.jsonl; cat "$OUT/ref.requests.jsonl" "$OUT/sweep.requests.jsonl" > "$rf" 2>/dev/null
+                ref=none; has_lab ref-PT-short && ref=ref-PT-short; fi ;;
         P|PT|PTD|PT4|PTX)
             rf=$OUT/cmp.requests.jsonl; cat "$OUT/ref.requests.jsonl" "$OUT/sweep.requests.jsonl" > "$rf" 2>/dev/null
-            has_lab() { grep -qF "\"label\":\"$1\"" "$rf" 2>/dev/null || grep -qF "\"label\": \"$1\"" "$rf" 2>/dev/null; }
             ref=""; has_lab w212-I-short && ref=w212-I-short || { has_lab ref-I-short && ref=ref-I-short; }
+            [ "$a" = PT ] && ! in_arms P && has_lab ref-PT-short && ref=ref-PT-short
             case $a in PT|PTD|PT4) has_lab w212-P-short && grep -qx 'ident=same' "$OUT/arm-P.st" 2>/dev/null && ref=w212-P-short ;;
                        PTX) ref=""; has_lab w212-PT-short && ref=w212-PT-short ;; esac
             [ -n "$ref" ] || ref=none ;;
     esac
     local rn=${ref#w212-}; rn=${rn%-short}
     if [ "$ref" = none ]; then stw ident "-"; log "arm $lab: short replies: no reference reply set (INFO '-')"
-    elif [ "$a" = PTX ]; then
+    elif [ "$a" = PTX ] || [ "$a" = S ]; then
         "$PY" -I "$L/compare_replies.py" "$rf" "$ref" "w212-$lab-short" --show 3 > "$OUT/$lab-ident.txt" 2>&1; r=$?
         cmp=$( { [ $r = 0 ] && echo same; } || { [ $r = 1 ] && echo DIFF; } || echo "-"); stw ident "DIFF-expected:$cmp"
         log "arm $lab: short replies vs $rn: $cmp (non-exact arm: DIFF expected, INFO, never gated) $(tail -1 "$OUT/$lab-ident.txt" | cut -c1-160)"
@@ -637,6 +678,13 @@ print(' '.join(d) or 'none', '| args +', ' '.join(x) or '-')" "$C/production.jso
             stw vision "rc $STEP_RC${STEP_WHY:+ $STEP_WHY}"; INFO_STEP=0
             [ -n "$STEP_WHY" ] && { stw status ok; stw why "vision (INFO, after the benches): $STEP_WHY"; arm_end "$lab"; return 0; }
         fi
+    fi
+    if [ "$a" = C ] && [ "$lab" = C ] && [ "${STOCK_VISION:-0}" = 1 ]; then   # w212d R5, INFO: is #1242 still in stock
+        INFO_STEP=1                                  # v0.2.12? (212p's tool: stock has none; stock's server puts every
+        run_step "$lab-vision" 900 "$PY" -I -B "$PPT/tools/vision_batch_check.py" --url "$TURL/v1" --out "$OUT/vision-$lab.json"
+        log "    [vision C, stock] ==> rc $STEP_RC${STEP_WHY:+ ($STEP_WHY)} $(grep -a -m1 -E '^  ==> ' "$OUT/$lab-vision.txt" | sed 's/^ *//') (0 GO, 2 NO-GO = #1242 still there, 3 INCONCLUSIVE) INFO"
+        stw vision "rc $STEP_RC${STEP_WHY:+ $STEP_WHY}"; INFO_STEP=0     # image request into a slot beside text rows)
+        [ -n "$STEP_WHY" ] && { stw status ok; stw why "vision (INFO, after the benches): $STEP_WHY"; arm_end "$lab"; return 0; }
     fi
     stw status ok; arm_end "$lab"; CONSEC_CRASH=0; return 0; }
 arm_end() { local lab=$1 a cg miss el=$OUT/engine-$1.log
@@ -740,8 +788,9 @@ print("# window 212: one fresh server per arm on 127.0.0.1:8091, greedy; agg = a
       "dec = per-user decode p50 tok/s at 1/2/4 users, mt = bench_multiturn 16x3 (wall s / follow-up TTFT p50 s), "
       "join = cold 32K joiner beside 4 streams (joiner TTFT / worst stream gap s), pfx = prefix reuse %, "
       "VRAM = lowest free MiB per card during the arm, mem = memory.peak GiB of the scope")
-hdr = (f"{'arm':6s} {'status':10s} {'boot':>4s} {'agg16s':>7s} {'vsA':>6s} {'vsB':>6s} {'TTFT s p50/p95/max':>18s} {'agg16l':>7s} "
-       f"{'vsA':>6s} {'TTFT l p50/p95':>14s} {'dec 1/2/4':>16s} {'mt wall/fu':>11s} {'join ttft/gap':>13s} {'pfx':>5s} "
+RA = "A" if any(st(l).get("arm") == "A" for l in labs) else "PT"   # w212d: no A (production = PT since 2026-11-08)
+hdr = (f"{'arm':6s} {'status':10s} {'boot':>4s} {'agg16s':>7s} {'vs' + RA:>6s} {'vsB':>6s} {'TTFT s p50/p95/max':>18s} {'agg16l':>7s} "
+       f"{'vs' + RA:>6s} {'TTFT l p50/p95':>14s} {'dec 1/2/4':>16s} {'mt wall/fu':>11s} {'join ttft/gap':>13s} {'pfx':>5s} "
        f"{'mem':>5s} {'ident':>8s}  VRAM min")
 print(hdr); print("-" * len(hdr))
 base = {}
@@ -754,7 +803,7 @@ for lab in labs:
     a16, l16 = g(lab, "short", 16, "agg_out_tps"), g(lab, "long", 16, "agg_out_tps")
     def rel(x, ref):
         return "-" if x is None or not ref else f"{100 * (x / ref - 1):+.1f}"
-    A, B = base.get("A", (None, None)), base.get("B", (None, None))
+    A, B = base.get(RA, (None, None)), base.get("B", (None, None))
     ts = "/".join(f(g(lab, "short", 16, k), 2) for k in ("ttft_p50", "ttft_p95", "ttft_max"))
     tl = "/".join(f(g(lab, "long", 16, k), 2) for k in ("ttft_p50", "ttft_p95"))
     dec = "/".join(f(g(lab, "short", u, "dec_tps_p50"), 1) for u in (1, 2, 4))
@@ -846,6 +895,24 @@ if any(st(l).get("arm") in PIPE for l in labs):
     block("PT", "PT4", "PT4 vs PT (IQ4_W4A8 + SELECT_TWO_PASS)", dec=False)
     block("PT", "PTX", "PTX vs PT (non-exact: the bit-changing upstream defaults on - how much speed is on the table; "
                        "never a candidate)")
+if any(st(l).get("arm") == "S" for l in labs):   # w212d: stock without the model-card penalty against PT
+    block("S", "PT", "PT vs stock as shipped (S: stock setup's config, parallel 3, presence 0; S's join is queue-bound, not shown)")
+    block("C", "PT", "PT vs stock + our args + sm_86 table (C, presence 0; exact)", join_=True)
+    block("S", "C", "C vs S (what our production args alone give stock)")
+print("\n# upstream's own benchmarks (INFO)")
+for d in sorted(out.glob("stdbench-*")):
+    try:
+        r = json.load(open(d / "results.json"))
+    except (OSError, ValueError):
+        print(f"  {d.name}: no results.json"); continue
+    print(f"  {d.name}: status {r.get('run', {}).get('status')} {r.get('extensions', {}).get('status_reasons') or ''}")
+    print("    " + json.dumps(r.get("summaries") or r.get("summary") or {}, separators=(",", ":"))[:1500])
+for d in sorted(out.glob("community-*/*/results.json")):
+    try:
+        r = json.load(open(d))
+    except (OSError, ValueError):
+        continue
+    print(f"  {d.parent.parent.name}/{d.parent.name}: " + json.dumps({k: r[k] for k in r if k not in ("system", "config", "env")}, separators=(",", ":"))[:1500])
 PYEOF
 }
 if [ "$MODE" = summary ]; then summary; exit 0; fi
@@ -861,6 +928,9 @@ prep() {
              "$PWT/tools/batch_interleave_test.py" "$PWT/tools/batch_groups_cache_test.py" "$PWT/tools/cancel_park_test.py" \
              "$PRODSRV/serve/server.py" "$UP/serve/server.py" "$PWT/serve/server.py" "$C/T212.manifest.json"; do
         [ -e "$f" ] || bad "missing $f"; done
+    for a in $STDBENCH_ARMS; do in_arms "$a" || continue
+        env -C "${ARM_SRV[$a]}" STRATA_NO_HANDOVER=1 "$PY" -B "${ARM_SRV[$a]}/strata.py" bench run --help > /dev/null 2>&1 || bad "${ARM_SRV[$a]}/strata.py bench run --help fails"
+        "$PY" -B "${ARM_SRV[$a]}/tools/strata_bench.py" --help > /dev/null 2>&1 || bad "${ARM_SRV[$a]}/tools/strata_bench.py --help fails"; done
     if pipe_on; then for f in "$PPT/tools/batch_interleave_test.py" "$PPT/tools/batch_groups_cache_test.py" "$PPT/tools/cancel_park_test.py" \
                               "$PPT/tools/batch_overlap_test.py" "$PPT/tools/early_close_test.py" "$PPT/tools/stop_resend_test.py"; do
         [ -e "$f" ] || bad "missing $f"; done
@@ -882,20 +952,21 @@ prep() {
     psha=$(sha256sum "$PRODSRC" | cut -c1-16)
     [ "$msha" = "$psha" ] || { [ "${ALLOW_PROD_CHANGED:-0}" = 1 ] && note "production.json changed since --gen-configs (ALLOW_PROD_CHANGED=1)" \
         || bad "production.json (sha $psha) is not what configs/T212-*.json were made from ($msha): run --gen-configs again"; }
-    for a in A B C D E E2 F G H H2 H3 H3d; do
+    for a in A B C D E E2 F G H H2 H3 H3d $(in_arms S && echo S); do
         f=$C/T212-$a.json; [ -f "$f" ] || { bad "missing $f"; continue; }
-        python3 -c "import json,sys; c=json.load(open(sys.argv[1])); assert c['port']==int(sys.argv[2]) and c['log'].startswith(sys.argv[3])" "$f" "$TPORT" "$OUT/engine-" 2>/dev/null \
-            || bad "$f: port/log not as expected (port $TPORT, log under $OUT)"
+        python3 -c "import json,sys; c=json.load(open(sys.argv[1])); assert c['port']==int(sys.argv[2]) and c['log'].startswith(sys.argv[3])" "$f" "$TPORT" "$L/results/w212" 2>/dev/null \
+            || bad "$f: port/log not as expected (port $TPORT, log under $L/results/w212*; mkrun sets the run's own)"
         for k in $(python3 -c "import json,sys; print(' '.join(k for k in json.load(open(sys.argv[1]))['env'] if not k.startswith('MALLOC_')))" "$f"); do
             git -C "${BIN_TREE[${ARM_BIN[$a]}]}" grep -q -F "\"$k\"" -- src include serve strata_control || bad "T212-$a: $k is not in ${BIN_TREE[${ARM_BIN[$a]}]}"; done
         case $a in A) ;; *) grep -q '"STRATA_PARK_ASYNC"' "$f" && bad "T212-$a sets STRATA_PARK_ASYNC (another feature in v0.2.12)" ;; esac
     done
     for a in $ARMS; do [ -n "${ARM_BIN[$a]:-}" ] || bad "unknown arm $a"; done
-    for k in prod stocktab port $(in_arms I && echo int) $(pipe_on && echo pipe); do
+    for k in prod stocktab port $(in_arms I && echo int) $(pipe_on && echo pipe) $(in_arms S && echo stock); do
         if [ -x "${BIN_SRC[$k]}" ]; then note "binary $k: ${BIN_SRC[$k]} sha256 $(sha256sum "${BIN_SRC[$k]}" | cut -c1-16), $(date -r "${BIN_SRC[$k]}" '+%F %T')"
         else note "binary $k: ${BIN_SRC[$k]} MISSING now - its arms/identity steps are skipped unless it exists at run time"; fi; done
     [ -x "${BIN_SRC[prod]}" ] || bad "production's binary ${BIN_SRC[prod]} is missing"
-    [ "$(cfgget "$PRODSRC" exe)" = "${BIN_SRC[prod]}" ] || bad "production.json's exe is $(cfgget "$PRODSRC" exe), not ${BIN_SRC[prod]}"
+    [ "$(cfgget "$C/T212-A.json" exe)" = "${BIN_SRC[prod]}" ] || bad "T212-A.json's exe is $(cfgget "$C/T212-A.json" exe), not ${BIN_SRC[prod]}"
+    [ "$(cfgget "$PRODSRC" exe)" = "${BIN_SRC[prod]}" ] || note "production runs $(basename "$(cfgget "$PRODSRC" exe)"), not arm A's ${BIN_SRC[prod]} (since 2026-11-08 15:56 production = PT; A = the former production)"
     if [ -x "${BIN_SRC[port]}" ]; then
         for k in STRATA_QSA_SLOTS_STREAM STRATA_GR_DOWN_PF STRATA_EARLY_SAMPLE; do grep -qa "$k" "${BIN_SRC[port]}" || bad "${BIN_SRC[port]} has no $k"; done; fi
     if [ -x "${BIN_SRC[stocktab]}" ]; then grep -qa STRATA_PIPED_MTP "${BIN_SRC[stocktab]}" || bad "${BIN_SRC[stocktab]} is no v0.2.12 build (no STRATA_PIPED_MTP)"; fi
@@ -924,8 +995,8 @@ prep() {
 # the pipe arms (212p): tree_problems <arm> <tree> <binary key> checks one arm's config against its tree
 tree_problems() { local a=$1 t=$2 bk=$3 f=$C/T212-$1.json k
     [ -f "$f" ] || { echo "missing $f (run --gen-configs)"; return; }
-    python3 -c "import json,sys; c=json.load(open(sys.argv[1])); assert c['port']==int(sys.argv[2]) and c['log'].startswith(sys.argv[3]) and c['env']['STRATA_CONV_TIER_DIR'].startswith('/media/raid0/strata-kvspill-bench/') and c['exe']==sys.argv[4]" "$f" "$TPORT" "$OUT/engine-" "${BIN_SRC[$bk]}" 2>/dev/null \
-        || echo "$f: port/log/tier dir/exe not as expected (port $TPORT, log under $OUT, tier under the bench dir, exe ${BIN_SRC[$bk]})"
+    python3 -c "import json,sys; c=json.load(open(sys.argv[1])); assert c['port']==int(sys.argv[2]) and c['log'].startswith(sys.argv[3]) and c['env']['STRATA_CONV_TIER_DIR'].startswith('/media/raid0/strata-kvspill-bench/') and c['exe']==sys.argv[4]" "$f" "$TPORT" "$L/results/w212" "${BIN_SRC[$bk]}" 2>/dev/null \
+        || echo "$f: port/log/tier dir/exe not as expected (port $TPORT, log under $L/results/w212*, tier under the bench dir, exe ${BIN_SRC[$bk]})"
     [ -f "$t/serve/server.py" ] || { echo "missing $t/serve/server.py"; return; }
     git -C "$t" diff --quiet HEAD -- serve 2>/dev/null || echo "$t has uncommitted changes under serve/"
     "$PY" -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$t/serve/server.py" 2>/dev/null || echo "$t/serve/server.py does not parse"
@@ -1193,6 +1264,19 @@ sys.exit(0 if n else 1)
 PYEOF
     fi
     [ -s "$OUT/ref.requests.jsonl" ] || in_arms I || log "P's reference: none (no w212-I-short in $P_REF): P's short identity is INFO '-'"
+    if ! in_arms P && [ -f "$PT_REF" ]; then   # w212d: PT, C and S against w212c's PT (the same binary, server, prompts)
+        python3 - "$PT_REF" "$OUT/ref.requests.jsonl" <<'PYEOF' && log "PT's reference: levels of w212-PT-short from $PT_REF (sha256 $(sha256sum "$PT_REF" | cut -c1-16)) as ref-PT-short"
+import json, sys
+n = 0
+with open(sys.argv[2], "a") as o:
+    for ln in open(sys.argv[1]):
+        if ln.strip():
+            r = json.loads(ln)
+            if r.get("label") == "w212-PT-short":
+                r["label"] = "ref-PT-short"; o.write(json.dumps(r) + "\n"); n += 1
+sys.exit(0 if n else 1)
+PYEOF
+    fi
 fi
 # ---- phase 0: production as it is
 mkdir -p "$OUT/prod-before"
