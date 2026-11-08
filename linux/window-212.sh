@@ -133,8 +133,9 @@ for v in $(compgen -e | grep '^STRATA_'); do unset "$v"; done   # nothing of our
 
 # arm -> binary key, server tree, engine source tree (for the name checks)
 declare -A BIN_SRC=([prod]=$ENG/strata-g3-ll10b [stocktab]=$ENG/strata-212-stocktab [port]=$ENG/strata-212m-p2
-                    [int]=$ENG/strata-212i [pipe]=$ENG/strata-212p [stock]=$ENG/strata-212-stocktab)
-declare -A BIN_TREE=([prod]=$OURS [stocktab]=$UP [port]=$PWT [int]=$IWT [pipe]=$PPT [stock]=$UP)
+                    [int]=$ENG/strata-212i [pipe]=$ENG/strata-212p [stock]=$ENG/strata-212-stocktab
+                    [pipeq]=$ENG/strata-212q)   # pipeq: 212p + STRATA_PIPE_OVERLAP_MIN (e55fa457), ABL arms only
+declare -A BIN_TREE=([prod]=$OURS [stocktab]=$UP [port]=$PWT [int]=$IWT [pipe]=$PPT [stock]=$UP [pipeq]=$PPT)
 declare -A ARM_BIN=([A]=prod [B]=stocktab [C]=stocktab [D]=stocktab [E]=stocktab [E2]=stocktab [F]=stocktab [G]=stocktab
                     [H]=port [H2]=port [H3]=port [H3d]=port [I]=int [P]=pipe [PT]=pipe [PTD]=pipe [PT4]=pipe [PTX]=pipe [S]=stock)
 declare -A ARM_SRV=([A]=$PRODSRV [B]=$UP [C]=$UP [D]=$UP [E]=$UP [E2]=$UP [F]=$UP [G]=$UP [H]=$PWT [H2]=$PWT [H3]=$PWT [H3d]=$PWT
@@ -181,6 +182,7 @@ SM86_8='sm_86 \(Ampere\): 8 exact speed switches on by default'
 SLOTSS='batch decode attention: slots-stream \(.*STRATA_ATTN_DAILY=0'
 P_BOOT="$MMQD;;$ES;;$SLOTS;;$IPARK;;$ISLOT;;$ITIER;;$IMMAP;;$IGATE;;$ITAIL;;$LANES;;$SOLO"
 P_FAIL="STRATA_PARK_CAPTURE is off|STRATA_SLOT_PARK is off|STRATA_PARK_ASYNC=1 is ignored|conversation tier: off|STRATA_SPEC_LANES is off|STRATA_SOLO_PIPELINE is off|STRATA_READ_YIELD is off beside"
+OVL='overlapped read of [0-9]+ tokens'; OVK='STRATA_PIPE_OVERLAP_KVS=1: first overlapped read with a streamed'   # (ABL drop names)
 P_END="overlapped read of [0-9]+ tokens;;STRATA_PIPE_OVERLAP_KVS=1: first overlapped read with a streamed;;conversation tier: on;;conversation cache: restored [0-9]+"
 declare -A WANT_BOOT=([A]="STRATA_SPEC_LANES=4: lanes on slots;;STRATA_SOLO_PIPELINE;;$MMQD" [B]="$MMQD" [C]="$MMQD;;$SM86"
     [D]="$SM86" [E]="$SM86" [E2]="$SM86" [F]="$SM86;;--pipeline-windows 2 stays on for the solo path"
@@ -217,6 +219,51 @@ declare -A LEVER_TESTS=([STRATA_QSA_SLOTS_STREAM]="qsa_slots_stream_parity qsa_s
     [STRATA_MMQ_DIRECT]="prefill_mmq_tab_test expert_cache_slot_guard_test" [STRATA_PIPE_OVERLAP_KVS]="kv_stream_overlap_parity")
 declare -A ARM_POINT=([D]="STRATA_IQ4_W4A8 STRATA_SELECT_TWO_PASS" [H2]="STRATA_ATTN_DAILY"   # all dropped: the arm is skipped
     [PTD]="STRATA_ATTN_DAILY" [PT4]="STRATA_IQ4_W4A8 STRATA_SELECT_TWO_PASS")
+# ablation arms (w212e on): ABL=<json> {"<arm>": {"env": {"STRATA_X": "0" | null, ...}, "srv": "pipe" | "stock",
+#   "exact": true|false, "drop": ["LANES", ...], "fail_drop": ["STRATA_SPEC_LANES is off", ...], "note": "...",
+#   "srv_env": {"STRATA_ADMIT_BY_NEW": null, ...}}}: each arm
+#   is T212-PT.json with the env changes (null removes the key) on 212p's binary, its server 212p's (pipe) or stock's; drop
+#   names the INFO pattern variables above it no longer wants ("bin": "pipeq" = strata-212q instead of 212p) (boot and end), fail_drop the P_FAIL alternatives it may
+#   print.  Compared with this run's PT (short replies; exact arms gate like PT's) and C; the summary reads $OUT/abl.json
+ABL=${ABL:-}; ABL_ARMS=""; declare -A ABL_NOTE=() ABL_SRV=()   # ABL_SRV: "K=V K=" (empty: K removed) over srv_env
+is_abl() { case " $ABL_ARMS " in *" $1 "*) return 0 ;; esac; return 1; }
+if [ -n "$ABL" ]; then
+    _abl=$(python3 - "$ABL" "$C" <<'PYEOF'
+import json, re, sys
+spec, cdir = json.load(open(sys.argv[1])), sys.argv[2]
+base = json.load(open(f"{cdir}/T212-PT.json"))
+for a, d in spec.items():
+    if not re.fullmatch(r"[A-Z][A-Za-z0-9]{1,7}", a) or a in ("PT", "PTD", "PT4", "PTX", "P", "S", "C", "A", "B", "I"):
+        sys.exit(f"ABL: bad or taken arm name {a}")
+    c = json.loads(json.dumps(base)); e = c["env"]
+    for k, v in d.get("env", {}).items():
+        if v is None: e.pop(k, None)
+        else: e[k] = str(v)
+    for k, v in d.get("cfg", {}).items():
+        c[k] = v
+    if d.get("bin", "pipe") == "pipeq":
+        c["exe"] = "/media/raid0/StrataQ38FN/Strata/engine/strata-212q"
+    json.dump(c, open(f"{cdir}/T212-{a}.json", "w"), indent=1)
+    print("\x1f".join([a, d.get("srv", "pipe") + ":" + d.get("bin", "pipe"), "1" if d.get("exact", True) else "0", " ".join(d.get("drop", [])),
+                     ";;".join(d.get("fail_drop", [])), d.get("note", "").replace("\x1f", " "),
+                     " ".join(f"{k}={'' if v is None else v}" for k, v in d.get("srv_env", {}).items())]))
+PYEOF
+) || { echo "ABL $ABL: cannot make the ablation configs"; exit 2; }
+    while IFS=$'\x1f' read -r _a _srv _ex _drop _fdrop _note _senv; do
+        [ -n "$_a" ] || continue
+        ABL_ARMS="$ABL_ARMS $_a"; ABL_NOTE[$_a]=$_note; ABL_SRV[$_a]=$_senv; ARM_BIN[$_a]=${_srv#*:}; _srv=${_srv%%:*}
+        case ${ARM_BIN[$_a]} in pipe|pipeq) ;; *) echo "ABL $_a: bin must be pipe or pipeq"; exit 2 ;; esac
+        PIPE_ARMS="$PIPE_ARMS $_a"
+        case $_srv in pipe) ARM_SRV[$_a]=$PPT ;; stock) ARM_SRV[$_a]=$UP ;; *) echo "ABL $_a: srv must be pipe or stock"; exit 2 ;; esac
+        [ "$_ex" = 1 ] && EXACT_ARMS="$EXACT_ARMS$_a "
+        _wb=${WANT_BOOT[PT]}; _we=${WANT_END[PT]}
+        for _n in $_drop; do [ -n "${!_n+x}" ] || { echo "ABL $_a: no pattern variable $_n"; exit 2; }
+            _p=${!_n}; _wb=${_wb//"$_p"/}; _we=${_we//"$_p"/}; done
+        WANT_BOOT[$_a]=$_wb; WANT_END[$_a]=$_we
+        FAILPAT[$_a]=$(python3 -c 'import sys; f=sys.argv[2].split(";;"); print("|".join(x for x in sys.argv[1].split("|") if x and x not in f))' "${FAILPAT[PT]}" "$_fdrop")
+    done <<< "$_abl"
+    ABL_ARMS=${ABL_ARMS# }
+fi
 GPU_TESTS="prefill_mmq_tab_test expert_cache_slot_guard_test qsa_slots_parity qsa_slots_parity_lanecell qsa_slots_stream_parity
  qsa_slots_stream_parity_lanecell gr_parity gr_parity_down_pf2 gr_parity_down_pf3 conversation_snapshot_test
  conversation_snapshot_test_ckpt_async conversation_snapshot_test_ckpt_vram_slots conversation_copy_streams_test batch_rows_parity
@@ -409,6 +456,8 @@ srv_env() { local a=$1 kv k out=
     [ "$a" = S ] && { echo ""; return; }    # S = stock as shipped: none of production's drop-in env
     for kv in $SRVENV_ALL; do k=${kv%%=*}
         if [ "$a" = A ] || srv_reads "${ARM_SRV[$a]}" "$k"; then out="$out $kv"; fi; done
+    if is_abl "$a"; then for kv in ${ABL_SRV[$a]:-}; do k=${kv%%=*}   # the ablation's server env over production's
+        out=$(echo " $out " | sed -E "s/ $k=[^ ]*//g"); [ -n "${kv#*=}" ] && out="$out $kv"; done; out=$(echo $out); fi
     echo "${out# }"; }
 srv_env_dropped() { local a=$1 kv k out=
     for kv in $SRVENV_ALL; do k=${kv%%=*}; [ "$a" = A ] || srv_reads "${ARM_SRV[$a]}" "$k" || out="$out $k"; done
@@ -625,7 +674,11 @@ print(' '.join(d) or 'none', '| args +', ' '.join(x) or '-')" "$C/production.jso
     # I when P has none or P's were not I's; PTX against PT (INFO: DIFF expected).  The compared file: this run's replies + the reference
     local rf=$OUT/sweep.requests.jsonl
     has_lab() { grep -qF "\"label\":\"$1\"" "$rf" 2>/dev/null || grep -qF "\"label\": \"$1\"" "$rf" 2>/dev/null; }
-    case $a in
+    if is_abl "$a"; then
+        rf=$OUT/cmp.requests.jsonl; cat "$OUT/ref.requests.jsonl" "$OUT/sweep.requests.jsonl" > "$rf" 2>/dev/null
+        ref=none; has_lab ref-PT-short && ref=ref-PT-short
+        has_lab w212-PT-short && grep -qx 'status=ok' "$OUT/arm-PT.st" 2>/dev/null && ref=w212-PT-short
+    else case $a in
         C|S) if ! in_arms B; then   # w212d (no B): against w212c's PT (C exact, S INFO)
                 rf=$OUT/cmp.requests.jsonl; cat "$OUT/ref.requests.jsonl" "$OUT/sweep.requests.jsonl" > "$rf" 2>/dev/null
                 ref=none; has_lab ref-PT-short && ref=ref-PT-short; fi ;;
@@ -636,7 +689,7 @@ print(' '.join(d) or 'none', '| args +', ' '.join(x) or '-')" "$C/production.jso
             case $a in PT|PTD|PT4) has_lab w212-P-short && grep -qx 'ident=same' "$OUT/arm-P.st" 2>/dev/null && ref=w212-P-short ;;
                        PTX) ref=""; has_lab w212-PT-short && ref=w212-PT-short ;; esac
             [ -n "$ref" ] || ref=none ;;
-    esac
+    esac; fi
     local rn=${ref#w212-}; rn=${rn%-short}
     if [ "$ref" = none ]; then stw ident "-"; log "arm $lab: short replies: no reference reply set (INFO '-')"
     elif [ "$a" = PTX ] || [ "$a" = S ]; then
@@ -752,7 +805,8 @@ ctest_status() {  # <ctest output>: "name status" per test
     sed -nE 's/.*Test +#[0-9]+: ([A-Za-z0-9_.-]+) \.*[ *]*([A-Za-z][A-Za-z: ()]*[A-Za-z)]) +[0-9.]+ sec.*/\1 \2/p' "$1" | sed 's/ (.*//; s/  */ /g'; }
 
 # ---- summary (no GPU) ---------------------------------------------------------------------------------------------------
-summary() { "$PY" -I - "$OUT" "$L/compare_replies.py" <<'PYEOF'
+summary() { [ -n "$ABL" ] && cp "$ABL" "$OUT/abl.json"
+    "$PY" -I - "$OUT" "$L/compare_replies.py" <<'PYEOF'
 import json, os, re, subprocess, sys
 from pathlib import Path
 out, cmp = Path(sys.argv[1]), sys.argv[2]
@@ -912,6 +966,26 @@ if any(st(l).get("arm") == "S" for l in labs):   # w212d: stock without the mode
     block("S", "PT", "PT vs stock as shipped (S: stock setup's config, parallel 3, presence 0; S's join is queue-bound, not shown)")
     block("C", "PT", "PT vs stock + our args + sm_86 table (C, presence 0; exact)", join_=True)
     block("S", "C", "C vs S (what our production args alone give stock)")
+try:   # the ablation arms (ABL): each against PT (the series' switch it turns off) and against C (stock + our config)
+    abl = json.load(open(out / "abl.json"))
+except (OSError, ValueError):
+    abl = {}
+if abl:
+    print("  -- ablation arms (PT with one lever changed; means over the arm's runs)")
+    for x in ("PT", "C"):
+        for kind in ("short", "long"):
+            (t5, n) = mean(x, kind, 16, "ttft_p95"); (e5, _) = mean(x, kind, 16, "e2e_p95"); (sd, _) = mean(x, kind, 16, "agg_out_tps_steady")
+            print(f"     {x} {kind} 16: TTFT p95 {f(t5, 2)} s, e2e p95 {f(e5, 2)} s, steady {f(sd)} tok/s ({n} run(s))")
+for y, d in abl.items():
+    block("PT", y, f"{y} vs PT: {d.get('note', '')} (env {json.dumps(d.get('env', {}))}{', stock server' if d.get('srv') == 'stock' else ''})", join_=True)
+    mpair("C", y, "short agg 16 vs C", "agg_out_tps")
+    mpair("C", y, "long agg 16 vs C", "agg_out_tps", kind="long")
+    for kind in ("short", "long"):
+        mpair("PT", y, f"TTFT p95 {kind} 16 vs PT", "ttft_p95", kind=kind, lower=True)
+        mpair("PT", y, f"e2e p95 {kind} 16 vs PT", "e2e_p95", kind=kind, lower=True)
+        mpair("PT", y, f"steady agg {kind} 16 vs PT", "agg_out_tps_steady", kind=kind)
+    mt_x = [mt.get(f"w212-{l}-mt") for l in runs(y)]
+    print(f"     {y} mt: " + ", ".join(f"wall {f(m.get('wall_s'))} s" for m in mt_x if m) if any(mt_x) else f"     {y} mt: -")
 print("\n# upstream's own benchmarks (INFO)")
 for d in sorted(out.glob("stdbench-*")):
     try:
@@ -1026,7 +1100,7 @@ int_problems() { local k
 # the pipe arms: every listed one's config (a problem skips the pipe arms, never production or the other arms); the
 # five switches P puts back must be production's values, PTX must be the only one without the pins
 pipe_problems() { local a k
-    for a in $PIPE_ARMS; do in_arms "$a" || [ "$a" = P ] || continue; tree_problems "$a" "$PPT" pipe; done
+    for a in $PIPE_ARMS; do in_arms "$a" || [ "$a" = P ] || continue; tree_problems "$a" "$PPT" "${ARM_BIN[$a]}"; done
     [ "$(git -C "$PPT" rev-parse --abbrev-ref HEAD 2>/dev/null)" = g3-212-pipe ] || echo "$PPT is not on branch g3-212-pipe"
     git -C "$PPT" merge-base --is-ancestor 98001378 HEAD 2>/dev/null || echo "$PPT does not contain 212i's 98001378"
     python3 - "$C" "$PRODSRC" $PIPE_ARMS <<'PYEOF' || echo "the pipe configs cannot be checked"
@@ -1069,6 +1143,8 @@ PYEOF
         && echo "${BIN_SRC[pipe]} sha256 $(sha256sum "${BIN_SRC[pipe]}" | cut -c1-16) is not the expected $PIPE_SHA (PIPE_SHA=)"
     if [ -x "${BIN_SRC[pipe]}" ]; then for k in STRATA_PIPE_OVERLAP_KVS STRATA_SPEC_LANES STRATA_SOLO_PIPELINE STRATA_READ_YIELD STRATA_PARK_CAPTURE STRATA_SLOT_PARK STRATA_QSA_SLOTS_STREAM; do
         grep -qa "$k" "${BIN_SRC[pipe]}" || echo "${BIN_SRC[pipe]} has no $k"; done
+        # (only when the 212p ctests run: since e55fa457 the build dir holds strata-212q's build)
+        [ "$GPU_CTEST" = 1 ] || [ "$HOST_TESTS" = 1 ] || return 0
         [ "$(sha256sum "${BIN_SRC[pipe]}" | cut -c1-16)" = "$(sha256sum "$PCB/strata" 2>/dev/null | cut -c1-16)" ] \
             || echo "${BIN_SRC[pipe]} is not $PCB/strata (the ctests would test another build)"; fi; }
 vision_problems() { local a=${1:-I} t=${2:-$IWT} f=$C/T212-${1:-I}.json
