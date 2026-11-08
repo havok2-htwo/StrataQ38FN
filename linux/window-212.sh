@@ -348,6 +348,7 @@ for a in exe:
         c["env"] = envs[a]
         c["args"] = list(c["args"]) + args_add.get(a, [])
         c["tool_call_recovery"] = False                    # upstream flipped the default to true (0.2.8)
+        c["sampling"] = {"presence_penalty": 0}            # v0.2.12 model-card default (#2685, thinking off: presence 1.5) penalises every request: no solo pipeline, lanes, merge-first; production's server sends none
         c["drafting"] = "mtp"                              # the MTP draft layer, as production (inert with slots anyway)
     for k in c["env"]:
         if not k.startswith("MALLOC_") and not has(tree[a], k):
@@ -1045,7 +1046,7 @@ body = {"model": "x", "max_tokens": 16, "temperature": 0, "messages": [{"role": 
 try:
     r = urllib.request.urlopen(urllib.request.Request(sys.argv[1] + "/v1/chat/completions", json.dumps(body).encode(),
                                                       {"Content-Type": "application/json"}), timeout=300)
-    print("ok:", repr(json.load(r)["choices"][0]["message"].get("content", "")[:60]))
+    m = json.load(r)["choices"][0]["message"]; print("ok:", repr((m.get("content") or m.get("reasoning_content") or "")[:60]))
 except Exception as e:  # noqa: BLE001
     print("FAIL", repr(e)[:120])
 PYEOF
