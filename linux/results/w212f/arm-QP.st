@@ -1,0 +1,16 @@
+arm=QP
+label=QP
+bin=pipeq
+server=Strata-212p@e55fa457
+sha=9743c131b36ed22b
+boot_s=97
+vram_boot=0,1028 1,1016 2,1920 3,960 
+engaged_boot=yes
+ident=same
+status=ok
+mem_peak_gib=85.1
+rss_max_gib=84
+vram_min=0:876 1:862 2:1764 3:814 
+engaged_end=all seen
+warn=
+engine_starts=1
