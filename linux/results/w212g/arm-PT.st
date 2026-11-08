@@ -1,0 +1,17 @@
+arm=PT
+label=PT
+bin=pipe
+server=Strata-212p@e55fa457
+sha=74702164d1e5e37d
+boot_s=97
+vram_boot=0,1028 1,1016 2,1920 3,960 
+engaged_boot=yes
+ident=same
+vision=rc 0
+status=ok
+mem_peak_gib=87.1
+rss_max_gib=86
+vram_min=0:869 1:862 2:1764 3:814 
+engaged_end=all seen
+warn=
+engine_starts=1
