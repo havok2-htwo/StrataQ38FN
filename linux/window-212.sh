@@ -221,19 +221,21 @@ declare -A ARM_POINT=([D]="STRATA_IQ4_W4A8 STRATA_SELECT_TWO_PASS" [H2]="STRATA_
     [PTD]="STRATA_ATTN_DAILY" [PT4]="STRATA_IQ4_W4A8 STRATA_SELECT_TWO_PASS")
 # ablation arms (w212e on): ABL=<json> {"<arm>": {"env": {"STRATA_X": "0" | null, ...}, "srv": "pipe" | "stock",
 #   "exact": true|false, "drop": ["LANES", ...], "fail_drop": ["STRATA_SPEC_LANES is off", ...], "note": "...",
-#   "srv_env": {"STRATA_ADMIT_BY_NEW": null, ...}, "late": ["SLOTSS", ...]}}: each arm
+#   "srv_env": {"STRATA_ADMIT_BY_NEW": null, ...}, "late": ["SLOTSS", ...], "base": "PT" | "C",
+#   "steps": "all" | "pingpong" (only repro_park_ram.py pingpong after the probe: the borrow A/B)}}: each arm
 #   is T212-PT.json with the env changes (null removes the key) on 212p's binary, its server 212p's (pipe) or stock's; drop
 #   names the INFO pattern variables above it no longer wants ("bin": "pipeq" = strata-212q instead of 212p) (boot and end), fail_drop the P_FAIL alternatives it may
 #   print, late the boot patterns checked at the arm's end instead (without the overlapped read the first batch
 #   window, and its attention line, comes after the probe).  Compared with this run's PT (short replies; exact arms gate like PT's) and C; the summary reads $OUT/abl.json
-ABL=${ABL:-}; ABL_ARMS=""; declare -A ABL_NOTE=() ABL_SRV=()   # ABL_SRV: "K=V K=" (empty: K removed) over srv_env
+ABL=${ABL:-}; ABL_ARMS=""; declare -A ABL_NOTE=() ABL_SRV=() ABL_STEPS=()   # ABL_SRV: "K=V K=" (empty: K removed) over srv_env
 is_abl() { case " $ABL_ARMS " in *" $1 "*) return 0 ;; esac; return 1; }
 if [ -n "$ABL" ]; then
     _abl=$(python3 - "$ABL" "$C" <<'PYEOF'
 import json, re, sys
 spec, cdir = json.load(open(sys.argv[1])), sys.argv[2]
-base = json.load(open(f"{cdir}/T212-PT.json"))
+bases = {b: json.load(open(f"{cdir}/T212-{b}.json")) for b in ("PT", "C")}
 for a, d in spec.items():
+    base = bases[d.get("base", "PT")]
     if not re.fullmatch(r"[A-Z][A-Za-z0-9]{1,7}", a) or a in ("PT", "PTD", "PT4", "PTX", "P", "S", "C", "A", "B", "I"):
         sys.exit(f"ABL: bad or taken arm name {a}")
     c = json.loads(json.dumps(base)); e = c["env"]
@@ -248,12 +250,16 @@ for a, d in spec.items():
     print("\x1f".join([a, d.get("srv", "pipe") + ":" + d.get("bin", "pipe"), "1" if d.get("exact", True) else "0", " ".join(d.get("drop", [])),
                      ";;".join(d.get("fail_drop", [])), d.get("note", "").replace("\x1f", " "),
                      " ".join(f"{k}={'' if v is None else v}" for k, v in d.get("srv_env", {}).items()),
-                     " ".join(d.get("late", []))]))
+                     " ".join(d.get("late", [])), d.get("base", "PT"), d.get("steps", "all")]))
 PYEOF
 ) || { echo "ABL $ABL: cannot make the ablation configs"; exit 2; }
-    while IFS=$'\x1f' read -r _a _srv _ex _drop _fdrop _note _senv _late; do
+    while IFS=$'\x1f' read -r _a _srv _ex _drop _fdrop _note _senv _late _base _steps; do
         [ -n "$_a" ] || continue
         ABL_ARMS="$ABL_ARMS $_a"; ABL_NOTE[$_a]=$_note; ABL_SRV[$_a]=$_senv; ARM_BIN[$_a]=${_srv#*:}; _srv=${_srv%%:*}
+        ABL_STEPS[$_a]=$_steps; case $_steps in all|pingpong) ;; *) echo "ABL $_a: steps must be all or pingpong"; exit 2 ;; esac
+        if [ "$_base" = C ]; then   # stock v0.2.12's binary and server with our config (arm C) + the changes
+            ARM_BIN[$_a]=stocktab; ARM_SRV[$_a]=$UP; [ "$_ex" = 1 ] && EXACT_ARMS="$EXACT_ARMS$_a "
+            WANT_BOOT[$_a]=${WANT_BOOT[C]}; WANT_END[$_a]=${WANT_END[C]:-}; FAILPAT[$_a]=${FAILPAT[C]:-}; continue; fi
         case ${ARM_BIN[$_a]} in pipe|pipeq) ;; *) echo "ABL $_a: bin must be pipe or pipeq"; exit 2 ;; esac
         PIPE_ARMS="$PIPE_ARMS $_a"
         case $_srv in pipe) ARM_SRV[$_a]=$PPT ;; stock) ARM_SRV[$_a]=$UP ;; *) echo "ABL $_a: srv must be pipe or stock"; exit 2 ;; esac
@@ -670,6 +676,14 @@ print(' '.join(d) or 'none', '| args +', ' '.join(x) or '-')" "$C/production.jso
         log "arm $lab: NOT ENGAGED FAIL: ${miss:+missing $miss}${fp:+ / says: $fp} - the arm stops"
         stw status notengaged; stw why "${miss:+missing $miss}${fp:+ says: $fp}"; arm_end "$lab"; return 1; fi
     stw engaged_boot yes; log "arm $lab: INFO lines present: $(echo "${WANT_BOOT[$a]:-none}" | sed 's/;;/ + /g' | tr -d '\\')"
+    if is_abl "$a" && [ "${ABL_STEPS[$a]:-all}" = pingpong ]; then   # the borrow A/B: main chat / sub-agent ping-pong only
+        run_step "$lab-pingpong" 1800 "$PY" -I -B "$L/repro_park_ram.py" --url "$TURL" --label "w212-$lab" --scenarios pingpong \
+            --sizes "${PP_SIZE:-136000}" --cycles "${PP_CYCLES:-2}" --fillers "${PP_FILLERS:-4}" --pp-other "${PP_OTHER:-900}" --pressure none --unit "$BUNIT.scope" \
+            --engine-log "$OUT/engine-$lab.log" --out "$OUT/repro.jsonl"
+        log "    [pingpong $lab] ==> rc $STEP_RC${STEP_WHY:+ ($STEP_WHY)} $(grep -a -m3 -E '^==>' "$OUT/$lab-pingpong.txt" | tr '\n' ' ' | cut -c1-400)"
+        log "    [pingpong $lab] engine: $(grep -a 'conversation cache' "$OUT/engine-$lab.log" | grep -c borrow) borrow, $(grep -ac 'conversation cache: restored' "$OUT/engine-$lab.log") restored, $(grep -ac superseded "$OUT/engine-$lab.log") superseded lines"
+        [ -n "$STEP_WHY" ] && { stw status fail; stw why "pingpong: $STEP_WHY"; arm_end "$lab"; return 1; }
+        stw status ok; arm_end "$lab"; CONSEC_CRASH=0; return 0; fi
     run_step "$lab-short" 900 $B --label "w212-$lab-short" --levels 1,2,4,8,16 --rounds 2 --max-tok 512 --prompt-tok 100 --out "$OUT/sweep.jsonl"
     [ -n "$STEP_WHY" ] && { stw status fail; stw why "short: $STEP_WHY"; arm_end "$lab"; return 1; }
     ref=w212-B-short   # I: against H (same kernels), B when H has no short replies tonight

@@ -827,6 +827,9 @@ def pingpong(a, size, seed, ctx, rows, step, pressure, rows_out):
             back = answer_of(cur_reply)
             rc, _ = step("CHECK" + sfx, cur + [back, {"role": "user", "content": a.check_question}], head,
                          a.check_reply_tokens, a.effort)
+            if a.pp_other:   # an unrelated request overwrites CHECK's slot: the main chat is then only in the RAM cache,
+                om, ot = short_other(seed + 70 + c, a.pp_other)   # and SUB's 8192-token root match restores from there
+                step("OTHER" + sfx, om, ot, a.b_reply_tokens, a.effort)   # (production's Genesis case, TESTLOG #94)
             sm = sub_base if c == 0 else sub_base[:-1] + [sub_task(seed + 50 + c)]   # SUB2..: a sibling of SUB
             rs, _ = step("SUB" + sfx, sm, sub_tools, a.sub_reply_tokens, a.effort)
             took = took_slot(rs, slot_of(rc), rc["prompt_tokens"])
@@ -1172,6 +1175,9 @@ def main():
     ap.add_argument("--sub-system-tokens", type=int, default=1500, help="pingpong / OTHER: the sub-agent's system prompt")
     ap.add_argument("--sub-reply-tokens", type=int, default=64, help="pingpong: max_tokens of SUB")
     ap.add_argument("--cycles", type=int, default=2, help="pingpong: CHECK/SUB/next-turn cycles (2: A2 and A3)")
+    ap.add_argument("--pp-other", type=int, default=0,
+                    help="pingpong: an unrelated request of this many tokens between CHECK and SUB (0 = none): it takes "
+                         "CHECK's slot, so SUB's shared head is found in the RAM cache (the main chat's parked copy)")
     ap.add_argument("--pp-target", type=float, default=0.95, help="pingpong: a turn's reuse needed for PASS")
     ap.add_argument("--grid", type=int, default=None,
                     help="the test config's --prompt-cache-every (default: production.json's, else 8192); pingpong "
