@@ -64,6 +64,9 @@ V_CAP=${V_CAP:-2100}                                        # V's cap: A (est. A
 VR_EST=${VR_EST:-780}; VR_CAP=${VR_CAP:-1200}               # VR (start + smoke + short + long + mt + cold)
 R2_EST=${R2_EST:-480}; R2_CAP=${R2_CAP:-1200}               # an r2 arm (start + short + long)
 V_SPLIT=${V_SPLIT:-13,25,36}; V_RESERVE=${V_RESERVE:-1024}; R2=${R2:-1}; EVAL=${EVAL:-1}
+V_EXE=${V_EXE:-}; V_PARALLEL=${V_PARALLEL:-}                 # V's engine / slot count (empty: production's)
+PLAN=${PLAN:-full}                                          # full: V, A, VR (+ eval); speed: GPU tests, V, A speed only
+GPU_TESTS=${GPU_TESTS:-}                                    # PLAN=speed: test binaries run on CUDA0 first (V needs them to pass)
 TIER_CAP_GB=${TIER_CAP_GB:-8}                               # the test servers' disk tier cap (production: 500)
 MEMMAX=${MEMMAX:-224G}
 TAG=v31w$(date +%m%d%H%M)                                   # label prefix (eval_results.jsonl and the sweep files are shared)
@@ -79,6 +82,7 @@ vram() { nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,nohea
 # kills only engines of $R/Strata* (production is stopped when this runs)
 free_gpus() { local i p e; for i in $(seq 45); do [ -z "$(gpu_apps)" ] && return 0; sleep 2; done
     for p in $(gpu_apps); do e=$(readlink -f "/proc/$p/exe" 2>/dev/null)
+        grep -qs '/strata\.service$' "/proc/$p/cgroup" && continue        # never production's engine
         case "$e" in "$R"/Strata*) kill "$p" ;; esac; done
     for i in $(seq 30); do [ -z "$(gpu_apps)" ] && return 0; sleep 2; done; return 1; }
 prod_loaded() { curl -s -m 3 "$URL/health" | grep -q '"loaded": *true'; }
@@ -130,13 +134,14 @@ left() { echo $(( T0 + WINDOW_S - RESERVE - $(date +%s) )); }
 # step <name> <expected s> <cap s> <cmd...>: skipped when the expected time no longer fits the window; the cap is cut
 # to what is left; the output goes to $OUT/<name>.txt and its '==>' verdict lines into window.log
 step() { local name=$1 est=$2 limit=$3; shift 3; local l rc; l=$(left)
+    systemctl --user is-active -q strata.service && on_sig "strata.service was started during the window"
     if [ "$l" -lt "$est" ]; then log "step $name: SKIP (needs ~${est} s, ${l} s left in the window)"; echo skip > "$OUT/rc_$name"; return 1; fi
     [ "$limit" -gt "$l" ] && limit=$l
     log "step $name: start (expected ~${est} s, cap ${limit} s); VRAM (index, used, free): $(vram)"
     timeout -s INT -k 120 "$limit" bash -c '"$@"' "$name" "$@" > "$OUT/$name.txt" 2>&1 < /dev/null &
     STEP_PID=$!; echo "$STEP_PID" > "$OUT/step.pgid"; wait "$STEP_PID"; rc=$?; STEP_PID=; : > "$OUT/step.pgid"
     echo $rc > "$OUT/rc_$name"
-    [ $rc -eq 124 ] && log "step $name: TIMEOUT after ${limit} s FAIL"
+    { [ $rc -eq 124 ] || [ $rc -eq 137 ]; } && log "step $name: TIMEOUT after ${limit} s FAIL"
     grep -aE '^==>' "$OUT/$name.txt" | cut -c1-700 | sed "s/^/    [$name] /" | tee -a "$OUT/window.log" >/dev/null
     log "step $name: exit $rc"
     bench_down "$name"; return $rc; }
@@ -169,27 +174,27 @@ arm_run() { local a=$1 lab=$2 mode=$3 cfg rc=0 u=http://127.0.0.1:$TPORT elog mo
         echo "==> $lab experts: NOT every expert in the GPU caches: $(grep -aE 'layer split: CUDA[0-9] runs' "$elog" | sed 's/.*runs //' | tr '\n' ';' | cut -c1-400) WARN"; fi
     echo "$(vram)" > "$OUT/vram-$lab.txt"; echo "==> $lab VRAM after the warm-up (index, used, free): $(cat "$OUT/vram-$lab.txt") INFO"
     if [ "$mode" != r2 ]; then
-        timeout -s INT 600 "$PY" -I "$L/v31_smoke.py" --url "$u" --model "$model" --label "$TAG-$lab" --out "$OUT/smoke.jsonl" \
+        timeout --foreground -s INT -k 30 600 "$PY" -I "$L/v31_smoke.py" --url "$u" --model "$model" --label "$TAG-$lab" --out "$OUT/smoke.jsonl" \
             > "$OUT/$lab-smoke.txt" 2>&1 || rc=1
         grep -a '^==>' "$OUT/$lab-smoke.txt" || echo "==> smoke $lab: no verdict (see $OUT/$lab-smoke.txt) FAIL"; fi
     B="$PY -I -B $L/bench_concurrency.py --url $u --temperature 0"
-    if tup; then timeout -s INT 900 $B --label "$TAG-$lab-short" --levels 1,2,4,8,16 --rounds 2 --max-tok 512 --prompt-tok 100 \
+    if tup; then timeout --foreground -s INT -k 30 900 $B --label "$TAG-$lab-short" --levels 1,2,4,8,16 --rounds 2 --max-tok 512 --prompt-tok 100 \
             --out "$OUT/sweep.jsonl" > "$OUT/$lab-short.txt" 2>&1 || rc=1
         echo "==> $lab short: $(grep -aE '^ *16 ' "$OUT/$lab-short.txt" | head -1 | tr -s ' ' | cut -c1-160) INFO"
     else echo "==> $lab: the server is gone before short FAIL"; return 1; fi
-    if tup; then timeout -s INT 600 $B --label "$TAG-$lab-long" --levels 16 --rounds 2 --max-tok 512 --warmup 0 \
+    if tup; then timeout --foreground -s INT -k 30 600 $B --label "$TAG-$lab-long" --levels 16 --rounds 2 --max-tok 512 --warmup 0 \
             --out "$OUT/sweep.jsonl" > "$OUT/$lab-long.txt" 2>&1 || rc=1
     else echo "==> $lab: the server is gone after short FAIL"; return 1; fi
     if [ "$mode" != r2 ]; then
-        if tup; then timeout -s INT 900 "$PY" -I -B "$L/bench_multiturn.py" --url "$u" --users 16 --turns 3 --doc 8000 --temperature 0 \
+        if tup; then timeout --foreground -s INT -k 30 900 "$PY" -I -B "$L/bench_multiturn.py" --url "$u" --users 16 --turns 3 --doc 8000 --temperature 0 \
                 --label "$TAG-$lab-mt" --out "$OUT/multiturn.jsonl" > "$OUT/$lab-mt.txt" 2>&1 || rc=1
             echo "==> $lab multiturn: $(tail -1 "$OUT/$lab-mt.txt" | cut -c1-200) INFO"
         else echo "==> $lab: the server is gone after long FAIL"; return 1; fi
-        if tup; then timeout -s INT 600 $B --label "$TAG-$lab-cold" --levels 1 --rounds 1 --max-tok 32 --prompt-tok 128000 --warmup 0 \
+        if tup; then timeout --foreground -s INT -k 30 600 $B --label "$TAG-$lab-cold" --levels 1 --rounds 1 --max-tok 32 --prompt-tok 128000 --warmup 0 \
                 --out "$OUT/sweep.jsonl" > "$OUT/$lab-cold.txt" 2>&1 || rc=1
         else echo "==> $lab: the server is gone after multiturn FAIL"; return 1; fi
         if [ "$mode" = full ] && [ "$EVAL" = 1 ] && tup; then
-            timeout -s INT 1800 "$PY" -I -B "$L/eval/quick_eval.py" --url "$u" --model "$model" --label "$TAG-$lab" --workers 8 \
+            timeout --foreground -s INT -k 30 1800 "$PY" -I -B "$L/eval/quick_eval.py" --url "$u" --model "$model" --label "$TAG-$lab" --workers 8 \
                 --max-tokens 2048 > "$OUT/$lab-eval.txt" 2>&1 || rc=1
             echo "==> $lab eval: $(tail -1 "$OUT/$lab-eval.txt" | cut -c1-200) INFO"; fi
         tup || { echo "==> $lab: the server is gone after the eval FAIL"; rc=1; }
@@ -313,9 +318,9 @@ PROD_SHA=$(sha256sum "$PEXE" | cut -c1-16); PRODCFG_SHA=$(sha256sum "$PRODSRC" |
 [ -e "$OUT" ] && { echo "$OUT exists"; exit 1; }
 mkdir -p "$OUT" "$CF"
 # the configs: A = production.json as is; V = A with the v3.1 files and layer_split $V_SPLIT; VR = V + STRATA_SPLIT_OWN_RESERVE_MIB
-python3 - "$PRODSRC" "$CF" "$V31_PACK" "$V31_GGUF" "$V31_NAME" "$V_SPLIT" "$V_RESERVE" <<'PYEOF' || { echo "cannot write the configs"; exit 1; }
+python3 - "$PRODSRC" "$CF" "$V31_PACK" "$V31_GGUF" "$V31_NAME" "$V_SPLIT" "$V_RESERVE" "$V_EXE" "$V_PARALLEL" <<'PYEOF' || { echo "cannot write the configs"; exit 1; }
 import json, sys, copy
-src, cf, pack, gguf, name, split, reserve = sys.argv[1:8]
+src, cf, pack, gguf, name, split, reserve, vexe, vpar = sys.argv[1:10]
 a = json.load(open(src)); json.dump(a, open(f"{cf}/A.json", "w"), indent=1)
 v = copy.deepcopy(a); args = v["args"]
 def setarg(flag, val):
@@ -329,6 +334,8 @@ v["model_name"] = name
 assert not any(x == old_pack or x.startswith(old_pack + "/") or x == old_gguf for x in args), "a v3.0 path is left in V's args"
 assert isinstance(a.get("layer_split"), str), a.get("layer_split")
 v["layer_split"] = split
+if vexe: v["exe"] = vexe
+if vpar: v["parallel"] = int(vpar)
 json.dump(v, open(f"{cf}/V.json", "w"), indent=1)
 vr = copy.deepcopy(v); vr["env"]["STRATA_SPLIT_OWN_RESERVE_MIB"] = reserve; json.dump(vr, open(f"{cf}/VR.json", "w"), indent=1)
 PYEOF
@@ -340,7 +347,7 @@ d=[f'{k}: {p.get(k)} -> {c[k]}' for k in c if k not in ('args','env') and p.get(
 d+=[f'arg {x} -> {y}' for x,y in zip(p['args'],c['args']) if x!=y]
 e=c['env']; pe=p['env']; d+=[f'env {k}={e[k]}' for k in e if pe.get(k)!=e[k]]+[f'env -{k}' for k in pe if k not in e]
 print('; '.join(d))" "$CF/A.json" "$CF/$a.json")"; done
-NEED_S=$(( 2 * ARM_EST + VR_EST + ( R2 == 1 ? 2 * R2_EST : 0 ) + 300 ))
+NEED_S=$(( 2 * ARM_EST + VR_EST + ( R2 == 1 ? 2 * R2_EST : 0 ) + 300 )); [ "$PLAN" = speed ] && NEED_S=$(( 120 + 2 * VR_EST + ( R2 == 1 ? 2 * R2_EST : 0 ) + 300 ))
 if [ "$DRY" = 1 ]; then
     log "dry run: prep and configs ok, production untouched ($CF); expected outage ~$(( NEED_S / 60 )) min (cap $(( WINDOW_S / 60 )) min, steps until $(( (WINDOW_S - RESERVE) / 60 )))"
     echo "  step arm_V  (expected ~$(( ARM_EST / 60 )) min, cap $(( V_CAP / 60 ))): up, smoke, short 1/2/4/8/16 x2, long 16 x2, mt 16x3, cold 128K, eval$([ "$EVAL" = 1 ] || echo ' (EVAL=0: skipped)') on the v3.1 files, layer_split $V_SPLIT"
@@ -368,13 +375,24 @@ STOPPED=1; T0=$(date +%s)
 trap 'on_sig signal' INT TERM HUP
 ( sleep $(( WINDOW_S + 300 )); tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null | grep -q window-v31 && kill -TERM $$ ) 2>/dev/null & WD=$!
 for _ in $(seq 60); do ss -Hltn 'sport = :8090' | grep -q . || break; sleep 2; done
+ss -Hltn 'sport = :8090' | grep -q . && on_sig "port 8090 still open after the stop"
 free_gpus || on_sig "GPUs not free"
 
 # V (full, with the quality eval), A (full: the baseline; V is capped at V_CAP so that A still fits), VR (speed only, the
 # optional arm: skipped when the window has no room left), then r2 while time is left
+gpu_tests() { local t rc=0; for t in $GPU_TESTS; do
+        if CUDA_VISIBLE_DEVICES=0 timeout --foreground -k 30 600 $t > "$OUT/test-$(basename "${t%% *}").txt" 2>&1; then echo "==> gpu test $t PASS"
+        else rc=1; echo "==> gpu test $t FAIL: $(tail -2 "$OUT/test-$(basename "${t%% *}").txt" | tr '\n' ' ' | cut -c1-200)"; fi; done; return $rc; }
+export -f gpu_tests; export GPU_TESTS
+if [ "$PLAN" = speed ]; then
+    if [ -n "$GPU_TESTS" ] && ! step gpu_tests 120 900 gpu_tests; then log "GPU tests failed: V skipped"
+    else step arm_V "$VR_EST" "$VR_CAP" arm_run V V speed; fi
+    step arm_A "$VR_EST" "$VR_CAP" arm_run A A speed
+else
 step arm_V "$ARM_EST" "$V_CAP" arm_run V V full
 step arm_A "$ARM_EST" "$ARM_CAP" arm_run A A full
 step arm_VR "$VR_EST" "$VR_CAP" arm_run VR VR speed
+fi
 if [ "$R2" = 1 ]; then
     step r2_A "$R2_EST" "$R2_CAP" arm_run A Ar2 r2
     step r2_V "$R2_EST" "$R2_CAP" arm_run V Vr2 r2
