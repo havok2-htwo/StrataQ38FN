@@ -20,19 +20,19 @@
 #   mt     bench_multiturn 16 users x 3 turns --doc 8000 greedy (window-212's mt)                                  ~1.5 min
 #   cold   1 request with a ~128K-token prompt, 32 tokens: TTFT = one cold read                                   ~0.5 min
 #   eval   eval/quick_eval.py: MMLU-Pro 240 + GSM8K 150, greedy, thinking off, 8 workers (answers-<tag>-<arm>.jsonl)  ~12-15 min
-#   + engine start ~2-3 min.  Order A, V (full), then while time is left r2 = V, A again (short + long only): AVVA
+#   + engine start ~2-3 min.  Order V, A (full), then while time is left r2 = A, V again (short + long only): VAAV
 # The summary (after production is back): per arm short agg tok/s 1/4/16 + per-user decode, long agg + TTFT, mt wall +
 # follow-up TTFT, cold 128K TTFT, MMLU-Pro / GSM8K with the paired count (questions only one arm got right, exact McNemar
 # p), smoke, VRAM, expert fit, peak RSS.  Nothing is deployed: a switch to v3.1 needs the owner's "deploy ja".
 # Isolation and restore as window-borrow.sh: test servers only on 127.0.0.1:8091, tier dirs under
-# /media/raid0/strata-kvspill-bench/v31 (removed at the end), results in results/v31-<MMDD-HHMM>; production.json, the unit
+# /media/raid0/strata-kvspill-bench/v31 (capped at TIER_CAP_GB, removed at the end), results in results/v31-<MMDD-HHMM>; production.json, the unit
 # and its drop-in are only read.  Production is stopped only once it reports loaded and started again on EVERY exit path:
 # the EXIT trap, v31-guard.service (waits for this PID: kills the step, stops strata-bench.scope, starts strata.service) on a
 # SIGKILL / OOM kill of this script, and the independent backstop v31-restore.timer (WINDOW_S + 15 min after the stop).
 #   ./window-v31.sh --dry-run          # prep checks + configs + the plan; production untouched
 #   ./window-v31.sh                    # the window (GPU window: coordinate with the bench session first)
 #   ./window-v31.sh --summary DIR      # the summary table again from results/v31-...
-#   env: WINDOW_S=4500 V_SPLIT2=13,25,37 R2=1 EVAL=1 MEMMAX=224G
+#   env: WINDOW_S=4500 V_SPLIT2=13,25,37 R2=1 EVAL=1 MEMMAX=224G TIER_CAP_GB=8
 set -u
 R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs
 URL=http://127.0.0.1:8090; TPORT=8091; PY=$R/Strata/.venv/bin/python
@@ -53,8 +53,10 @@ while [ $# -gt 0 ]; do
 done
 WINDOW_S=${WINDOW_S:-4500}; RESERVE=480                     # outage cap (stop -> restart), room kept for the restart
 ARM_EST=${ARM_EST:-1500}; ARM_CAP=${ARM_CAP:-2700}          # a full arm: expected / hard cap (s)
+V_CAP=${V_CAP:-2100}                                        # V's / V2's cap: A (est. ARM_EST) still fits after a slow V
 R2_EST=${R2_EST:-480}; R2_CAP=${R2_CAP:-1200}               # an r2 arm (start + short + long)
 V_SPLIT2=${V_SPLIT2:-13,25,37}; R2=${R2:-1}; EVAL=${EVAL:-1}
+TIER_CAP_GB=${TIER_CAP_GB:-8}                               # the test servers' disk tier cap (production: 500)
 MEMMAX=${MEMMAX:-224G}
 TAG=v31w$(date +%m%d%H%M)                                   # label prefix (eval_results.jsonl and the sweep files are shared)
 OUT=${SUMMARY_DIR:-$L/results/v31-$(date +%m%d-%H%M)}; [ "$DRY" = 1 ] && OUT=$L/results/v31-dry
@@ -134,9 +136,11 @@ step() { local name=$1 est=$2 limit=$3; shift 3; local l rc; l=$(left)
 # ---- helpers the arm runs (exported: step runs them under timeout through bash -c) ------------------------------------
 tup() { curl -s -m 3 "http://127.0.0.1:$TPORT/health" | grep -q '"loaded": *true'; }
 # runcfg <NAME> <run>: a copy of $CF/NAME.json for one server start: its own engine log and a fresh, empty tier dir
+# capped at $TIER_CAP_GB (the disk tier only takes RAM-cache evictions, which these benches do not cause; the cap bounds
+# the disk all the same while the disk is near its floor - every arm gets it)
 runcfg() { local d=$TIER/$2 f=$CF/run-$2.json; rm -rf "$d"; mkdir -p "$d"; rm -f "$OUT/engine-$2.log"
-    python3 -c "import json,sys; c=json.load(open(sys.argv[1])); c['env']['STRATA_CONV_TIER_DIR']=sys.argv[2]; c['log']=sys.argv[3]; json.dump(c,open(sys.argv[4],'w'),indent=1)" \
-        "$CF/$1.json" "$d" "$OUT/engine-$2.log" "$f" && echo "$f"; }
+    python3 -c "import json,sys; c=json.load(open(sys.argv[1])); c['env']['STRATA_CONV_TIER_DIR']=sys.argv[2]; c['env']['STRATA_CONV_TIER_CAP_GB']=sys.argv[5]; c['log']=sys.argv[3]; json.dump(c,open(sys.argv[4],'w'),indent=1)" \
+        "$CF/$1.json" "$d" "$OUT/engine-$2.log" "$f" "$TIER_CAP_GB" && echo "$f"; }
 # srv <cmd...>: the command with production's server checkout and server env, on 127.0.0.1:$TPORT
 srv() { ( cd "$L" && env SERVER_DIR="$SRV" $SRVENV PORT=$TPORT BIND=127.0.0.1 MEMMAX=$MEMMAX "$@" ); }
 up() { srv env KEEP=1 ./run_strata_variant.sh "$1" "$2" 1 --rounds 1 --max-tok 16 --prompt-tok 100 --temperature 0 2>&1 | tail -3
@@ -189,7 +193,7 @@ arm_run() { local a=$1 lab=$2 mode=$3 gate=${4:-} cfg rc=0 u=http://127.0.0.1:$T
     grep -acE 'CUDA error|out of memory|cudaMalloc failed' "$elog" | sed "s/^/==> $lab engine errors (CUDA error \/ out of memory): /;s/$/ INFO/"
     sleep 2; systemctl --user stop strata-bench.scope; return $rc; }
 export -f tup runcfg srv up rss_peak arm_run vram
-export R L C CF OUT TIER TPORT PY SRV MEMMAX TAG EVAL
+export R L C CF OUT TIER TPORT PY SRV MEMMAX TAG EVAL TIER_CAP_GB
 
 summary() {   # summary <OUT>: the comparison table (python: the sweep / multiturn rows, the eval answers, the smoke lines)
     python3 - "$1" "$L/eval" <<'PYEOF'
@@ -316,10 +320,10 @@ d+=['env differs' for _ in [0] if p['env']!=c['env']]; print('; '.join(d))" "$CF
 NEED_S=$(( 2 * ARM_EST + ( R2 == 1 ? 2 * R2_EST : 0 ) + 300 ))
 if [ "$DRY" = 1 ]; then
     log "dry run: prep and configs ok, production untouched ($CF); expected outage ~$(( NEED_S / 60 )) min (cap $(( WINDOW_S / 60 )) min, steps until $(( (WINDOW_S - RESERVE) / 60 )))"
-    echo "  step arm_A  (expected ~$(( ARM_EST / 60 )) min, cap $(( ARM_CAP / 60 ))): up, smoke, short 1/2/4/8/16 x2, long 16 x2, mt 16x3, cold 128K, eval$([ "$EVAL" = 1 ] || echo ' (EVAL=0: skipped)') on production.json as is"
-    echo "  step arm_V  (expected ~$(( ARM_EST / 60 )) min): the same on the v3.1 files; ends after its warm-up when not every expert is in the GPU caches"
-    echo "  step arm_V2 only then (layer_split $V_SPLIT2), in V's place"
-    [ "$R2" = 1 ] && echo "  steps r2_V, r2_A (expected ~$(( R2_EST / 60 )) min each, while time is left): up, short, long"
+    echo "  step arm_V  (expected ~$(( ARM_EST / 60 )) min, cap $(( V_CAP / 60 ))): up, smoke, short 1/2/4/8/16 x2, long 16 x2, mt 16x3, cold 128K, eval$([ "$EVAL" = 1 ] || echo ' (EVAL=0: skipped)') on the v3.1 files; ends after its warm-up when not every expert is in the GPU caches"
+    echo "  step arm_V2 only then (layer_split $V_SPLIT2), in V's place (cap $(( V_CAP / 60 )))"
+    echo "  step arm_A  (expected ~$(( ARM_EST / 60 )) min, cap $(( ARM_CAP / 60 ))): the same on production.json as is"
+    [ "$R2" = 1 ] && echo "  steps r2_A, r2_V (expected ~$(( R2_EST / 60 )) min each, while time is left): up, short, long"
     echo "  then: production restarted (EXIT trap; $GUNIT.service on a SIGKILL; $RUNIT.timer backstop), summary -> $OUT/summary.txt"
     exit 0
 fi
@@ -343,17 +347,18 @@ trap 'on_sig signal' INT TERM HUP
 for _ in $(seq 60); do ss -Hltn 'sport = :8090' | grep -q . || break; sleep 2; done
 free_gpus || on_sig "GPUs not free"
 
-# A first (the baseline always runs), V (ends after its warm-up when the experts do not all fit: V2 then), r2 in reverse: AVVA
-step arm_A "$ARM_EST" "$ARM_CAP" arm_run A A full
-step arm_V "$ARM_EST" "$ARM_CAP" arm_run V V full fitgate
+# V first (does v3.1 load and fit: ends after its warm-up when not every expert is in the GPU caches, V2 then), A, r2 in
+# reverse: VAAV.  V and V2 are capped at V_CAP so that A (the baseline) still fits after them
+step arm_V "$ARM_EST" "$V_CAP" arm_run V V full fitgate
 VL=V                                             # V2 (another split) replaces V when V's engine did not hold every expert
 if ! grep -aq 'every expert is in the GPU caches' "$OUT/engine-V.log" 2>/dev/null; then
     log "V: no 'every expert is in the GPU caches' line (no fit, or V failed before it): V2 with layer_split $V_SPLIT2"
-    step arm_V2 "$ARM_EST" "$ARM_CAP" arm_run V2 V2 full
+    step arm_V2 "$ARM_EST" "$V_CAP" arm_run V2 V2 full
     grep -aq 'every expert is in the GPU caches' "$OUT/engine-V2.log" 2>/dev/null && VL=V2
 fi
+step arm_A "$ARM_EST" "$ARM_CAP" arm_run A A full
 if [ "$R2" = 1 ]; then
-    step "r2_$VL" "$R2_EST" "$R2_CAP" arm_run "$VL" "${VL}r2" r2
     step r2_A "$R2_EST" "$R2_CAP" arm_run A Ar2 r2
+    step "r2_$VL" "$R2_EST" "$R2_CAP" arm_run "$VL" "${VL}r2" r2
 fi
 exit 0                                           # -> EXIT trap: production back, then the summary
