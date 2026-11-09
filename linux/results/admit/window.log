@@ -34,3 +34,45 @@
 [13:09:50] admit-B-1 engine: 0 overlapped reads, 0 BYIELD mentions (give-way, if the engine logs it); server: 0 admit lines, 0 waited-notes
 [13:09:53] benches done; starting production
 [13:09:56] production start requested (production.json -> T16-1441g-lanes4-prod262r-vision-cpu.json)
+[13:11:36] production loaded again
+== multiturn 16 users x 3 turns, greedy: TTFT p50/p95 (s) per turn, follow-up p50, wall, output tok/s
+run                 turn1        turn2        turn3 follow p50  wall  tok/s
+admit-A-1     19.69/36.76  18.93/26.45  10.28/12.10      12.02    87  160.6
+admit-E-1     25.10/58.21   3.38/11.72   2.46/12.86       3.01    86  161.8
+admit-E-2     27.08/58.69   3.43/13.20    4.07/6.41       3.64    89  157.2
+admit-A-2     19.63/36.91  21.42/25.38  10.66/12.76      12.68    88  158.9
+admit-B-1     15.43/28.85    1.89/4.80    1.87/3.86       1.87    89  157.1
+per arm (mean over runs):
+  A    n=2 turn1 p50 19.66  turn2 p50/p95 20.18/25.91  turn3 p50/p95 10.47/12.43  follow p50 12.35  wall 88  tok/s 159.8
+  E    n=2 turn1 p50 26.09  turn2 p50/p95 3.41/12.46  turn3 p50/p95 3.27/9.63  follow p50 3.33  wall 88  tok/s 159.5
+  B    n=1 turn1 p50 15.43  turn2 p50/p95 1.89/4.80  turn3 p50/p95 1.87/3.86  follow p50 1.87  wall 89  tok/s 157.1
+
+== agentic (greedy; chat user timing dependent): TTFT p50/p95/max per role, wall, tok/s
+admit-A-1    main 2.58/7.15/7.15  sub 3.02/8.31/8.63  chat 1.09/1.81/1.81  wall 118  72.3 tok/s
+admit-E-1    main 2.34/11.59/11.59  sub 1.95/7.7/9.67  chat 1.81/4.69/4.69  wall 124  68.7 tok/s
+admit-E-2    main 2.47/7.95/7.95  sub 2.31/9.37/12.78  chat 1.99/3.5/3.5  wall 119  71.5 tok/s
+admit-A-2    main 2.43/6.93/6.93  sub 3.04/8.57/9.33  chat 0.88/2.13/2.13  wall 118  72.4 tok/s
+admit-B-1    main 2.21/6.45/6.45  sub 1.06/5.94/7.49  chat 0.27/1.93/1.93  wall 127  65.0 tok/s
+
+== short/long 16 users (ab_quick style): agg tok/s, TTFT p50
+admit-A-1    short 523.5 tok/s TTFT 0.37  long 406.2 tok/s TTFT 0.83
+admit-E-1    short 521.6 tok/s TTFT 0.36  long 405.6 tok/s TTFT 0.78
+admit-E-2    short 520.3 tok/s TTFT 0.36  long 402.2 tok/s TTFT 0.79
+admit-A-2    short 521.6 tok/s TTFT 0.37  long 406.3 tok/s TTFT 0.86
+admit-B-1    short 536.1 tok/s TTFT 1.13  long 418.4 tok/s TTFT 1.79
+
+== reply identity vs the first A run (greedy; order only => identical)
+admit-E-1    vs admit-A-1: mt 48/48 identical; short: 32 common uids - identical 32, different 0; long: 32 common uids - identical 32, different 0  PASS
+admit-E-2    vs admit-A-1: mt 48/48 identical; short: 32 common uids - identical 32, different 0; long: 32 common uids - identical 32, different 0  PASS
+admit-A-2    vs admit-A-1: mt 48/48 identical; short: 32 common uids - identical 32, different 0; long: 32 common uids - identical 32, different 0  PASS
+admit-B-1    vs admit-A-1: mt 48/48 identical; short: 32 common uids - identical 32, different 0; long: 32 common uids - identical 32, different 0  (info)
+identity: PASS
+
+== admission diag (server log '[strata] admit:' lines, STRATA_ADMIT_BY_NEW runs only), per section
+admit-E-1    mt         48 admits, long 11, long, max-wait 5, short 32; total p50 15498, est.new p50 4347; waited p50 2.6 max 54.5 s; total>8192 but est.new<=8192: 32/48
+admit-E-1    agentic    61 admits, long 17, short 44; total p50 21561, est.new p50 4629; waited p50 0.6 max 8.8 s; total>8192 but est.new<=8192: 39/56
+admit-E-1    short/long 65 admits, short 65; total p50 153, est.new p50 153; waited p50 0.1 max 9.3 s; total>8192 but est.new<=8192: 0/0
+admit-E-2    mt         48 admits, long 11, long, max-wait 5, short 32; total p50 15498, est.new p50 4347; waited p50 3.2 max 54.7 s; total>8192 but est.new<=8192: 32/48
+admit-E-2    agentic    61 admits, long 17, short 44; total p50 21561, est.new p50 4629; waited p50 0.7 max 10.7 s; total>8192 but est.new<=8192: 39/56
+admit-E-2    short/long 65 admits, short 65; total p50 153, est.new p50 153; waited p50 0.0 max 9.3 s; total>8192 but est.new<=8192: 0/0
+[13:11:36] window done (production was started again above); summary: /media/raid0/StrataQ38FN/linux/results/admit/summary.txt

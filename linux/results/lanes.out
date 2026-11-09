@@ -44,3 +44,57 @@
 [23:13:43] step prefill: start (expected ~480 s, cap 1500 s); VRAM (index, used, free): 0, 325 MiB, 23793 MiB;1, 15 MiB, 24110 MiB;2, 15 MiB, 24110 MiB;3, 15 MiB, 24110 MiB;
 [23:17:26] step prefill: exit 0
 [23:17:27] starting production as before (production.json -> T16-1441d-ov-prod262r-vision-cpu.json)
+[23:19:02] production loaded after 95 s: {"status": "ok", "max_context": 262144, "model": "qwen3.8-flash-next-unsloth-ud-iq4_xs", "images": true, "api_key": false, "image_generation": false, "loaded": true, "service": "strata"}
+[23:19:02] production engine: /media/raid0/StrataQ38FN/Strata/engine/strata-vision-cpu /media/raid0/StrataQ38FN/Strata/engine/strata-g3-1441b-ovkv 
+[23:19:02] window done after 76 min
+    [encode] ==> encode: pictures A 300 tokens, B 256 tokens -> /media/raid0/StrataQ38FN/linux/results/lanes/pics/pics.json PASS
+    [boot_OFF] ==> boot LN-OFF: no loan on 4/4 cards, 0 borrow lines, VRAM free with everything loaded 1307/1433/2299/1641 MiB, LOW lines 0 PASS
+    [ref] ==> solo REF: 25/25 requests done, pipelined lines {'None': 25}, errors 0 PASS
+    [m1a_exact] ==> solo M1A: 11/11 requests done, pipelined lines {'1': 11}, errors 0 PASS
+    [cmp_m1a_exact] ==> M1a exact: 11/11 requests token-identical to the env-off reference PASS
+    [cmp_m1a_exact] ==> M1a exact: 'request pipelined=1' for 11/11 requests  PASS
+    [cmp_m1a_exact] ==> M1a exact: resume above 32K from the conversation cache (prompt 40056, REUSED 39986, 'conversation cache: restored' yes, the follow-up's own K/V read from RAM by its KV-streaming line 72.7 MiB, want > 0) PASS
+    [cmp_m1a_exact] ==> M1a exact: >= 48K prompt (48994 tokens) streamed K/V from RAM: 52.7 MiB PASS
+    [m1a_fm] ==> solo M1A-FM: 5/5 requests done, pipelined lines {'1': 5}, errors 0 PASS
+    [cmp_m1a_fm] ==> M1a FORCE_MISS=3: 5/5 requests token-identical to the env-off reference PASS
+    [cmp_m1a_fm] ==> M1a FORCE_MISS=3: 'request pipelined=1' for 5/5 requests  PASS
+    [cmp_m1a_fm] ==> M1a FORCE_MISS=3: rollbacks with FORCE_MISS 160 of 240 speculative windows (forced every 3rd: >= ~80) vs 120 without it (m1a_exact, same requests) PASS
+    [m1a_http_ident] ==> M1a 1-user replies short 1 users LN-M1A: replies identical 4, different 0; identical 4, different 0 PASS
+    [m1a_http_ident] ==> M1a 1-user replies long 1 users LN-M1A: replies identical 4, different 0; identical 4, different 0 PASS
+    [m1a_http_speed] ==> lnm1a short 1 user(s): agg +12.75 % (want >= +5.0 %) PASS
+    [m1a_http_speed] ==> lnm1a long 1 user(s): agg +10.43 % (want >= +5.0 %) PASS
+    [m1a_http_speed] ==> lnm1a: request errors over all arms and levels: 0 PASS
+    [m1a_http_log] ==> M1a HTTP engines: 2 logs, pipelined=1 18, pipelined=0 0 {} PASS
+    [hold] ==> lanes HOLD: 7/7 pairs ran, errors 0 PASS
+    [cmp_hold] ==> M1b HOLD: 14/14 lane slots token-identical to serial solo spec (over the lane phase; full length 14/14) PASS
+    [cmp_hold] ==> M1b HOLD: lanes started at each slot's admission position with drafts and a level drafter: 14/14 PASS
+    [cmp_hold] ==> M1b HOLD: HOLD kept slot 0 untouched until slot 4's BADM in 7/7 pairs PASS
+    [hold_one] ==> lanes HOLD-ONE: 4/4 pairs ran, errors 0 PASS
+    [cmp_hold_one] ==> M1b ONE: 8/8 lane slots token-identical to serial solo spec (full length) PASS
+    [cmp_hold_one] ==> M1b ONE: lanes started at each slot's admission position with drafts and a level drafter: 8/8 PASS
+    [lanes_http_ident] ==> M1b replies (identical at 1 user: solo path; INFO beyond: lanes are another numerical path) short 1 users LN-M1B: replies identical 2, different 0; identical 2, different 0 PASS
+    [lanes_http_ident] ==> M1b replies (identical at 1 user: solo path; INFO beyond: lanes are another numerical path) long 1 users LN-M1B: replies identical 2, different 0; identical 2, different 0 PASS
+    [lanes_http_speed] ==> lnm1b short 1 users: agg +0.17 %, dec p50 +0.21 % (no loss beyond -1.5 %) PASS
+    [lanes_http_speed] ==> lnm1b short 2 users: decode p50 per user 83.6 -> 121.2 tok/s (target >= 100) PASS
+    [lanes_http_speed] ==> lnm1b short 4 users: agg -1.12 %, dec p50 -1.26 % (no loss beyond -1.5 %) PASS
+    [lanes_http_speed] ==> lnm1b long 1 users: agg +0.13 %, dec p50 +0.12 % (no loss beyond -1.5 %) PASS
+    [lanes_http_speed] ==> lnm1b long 2 users: decode p50 per user 81.8 -> 112.8 tok/s (target >= 100) PASS
+    [lanes_http_speed] ==> lnm1b long 4 users: agg -0.73 %, dec p50 -1.11 % (no loss beyond -1.5 %) PASS
+    [lanes_http_speed] ==> lnm1b: request errors over all arms and levels: 0 PASS
+    [lanes_http_log] ==> M1b HTTP engines: 2 logs, 14 'lanes start', 14 'lanes ran' (per-slot lane tok/s median 119.7), 0 watchdog, 0 ERR (want lane starts) PASS
+    [bt] ==> batch_test16 OFF vs production's binary: 16/16 slots token-identical PASS
+    [bt] ==> batch_test16 NOSTART vs production's binary: 16/16 slots token-identical PASS
+    [bt] ==> batch_test16 NOSTART vs OFF (same binary): 16/16 slots token-identical PASS
+    [bt] ==> NOSTART boot: 1 'NOSTART - the lanes never start' lines (want 1), 0 'STRATA_SPEC_LANES=2 is off' lines (want 0) PASS
+    [nostart_ident] ==> NOSTART 16-user replies short 16 users LN-NOSTART: replies identical 32, different 0 PASS
+    [nostart_ident] ==> NOSTART 16-user replies long 16 users LN-NOSTART: replies identical 32, different 0 PASS
+    [nostart_log] ==> NOSTART engines (bt + HTTP): 2 logs, 0 'lanes start', 0 'lanes ran' (per-slot lane tok/s median n/a), 0 watchdog, 0 ERR (want no lane start) PASS
+    [hold_ov] ==> lanes HOLD-OV: 2/2 pairs ran, errors 0 PASS
+    [cmp_hold_ov] ==> M1b HOLD + overlap: 4/4 lane slots token-identical to serial solo spec (over the lane phase; full length 4/4) PASS
+    [cmp_hold_ov] ==> M1b HOLD + overlap: lanes started at each slot's admission position with drafts and a level drafter: 4/4 PASS
+    [cmp_hold_ov] ==> M1b HOLD + overlap: HOLD kept slot 0 untouched until slot 4's BADM in 2/2 pairs PASS
+    [cmp_hold_ov] ==> M1b HOLD + overlap: the overlap gate refused with 'a lane slot is held' (1 pair logs; said once per process) and no read beside a held lane slot overlapped (1 overlapped reads) FAIL
+    [s28ov_ident] ==> s28r+overlap 16-user replies short 16 users LN-S28ROV: replies identical 32, different 0; identical 32, different 0 PASS
+    [s28ov_ident] ==> s28r+overlap 16-user replies long 16 users LN-S28ROV: replies identical 32, different 0; identical 32, different 0 PASS
+[23:13:43]     [s28ov] r1: no loan 4/4, borrows 0, LOW 0; VRAM free 3802/657/1237/1845/ MiB; 62 overlapped reads, refused:  PASS
+[23:13:43]     [s28ov] r2: no loan 4/4, borrows 0, LOW 0; VRAM free 3802/657/1237/1845/ MiB; 62 overlapped reads, refused:  PASS
