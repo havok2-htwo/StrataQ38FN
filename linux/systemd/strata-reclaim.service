@@ -1,0 +1,12 @@
+# One-shot after each Strata start: drop the GGUF expert pages (already in VRAM) from strata.service's page cache,
+# so the conversation cache's RAM guard sees that room. Started --no-block by strata.service's ExecStartPost, so a
+# slow load or a failed reclaim can never fail or delay the Strata unit. Script: linux/strata-reclaim-gguf.sh.
+[Unit]
+Description=Reclaim the GGUF expert page cache of strata.service after load
+After=strata.service
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/bin:/bin
+ExecStart=/media/raid0/StrataQ38FN/linux/strata-reclaim-gguf.sh
+TimeoutStartSec=1500

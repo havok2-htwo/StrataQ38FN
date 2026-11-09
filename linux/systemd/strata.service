@@ -1,4 +1,6 @@
 # Strata (Qwen3.8-Flash-Next UD-IQ4_XS, 4x RTX 3090) as a user service. Config: linux/configs/production.json (symlink).
+# Server code: Strata-143-prod = detached worktree of the g3-143 commit production was validated on (no uncommitted
+# development); update it deliberately: git -C /media/raid0/StrataQ38FN/Strata-143-prod checkout --detach <commit>
 # Install: linux/systemd/install-user-services.sh; boot without login needs: sudo loginctl enable-linger administrator
 [Unit]
 Description=Strata server (Qwen3.8-Flash-Next) on port 8090
@@ -6,10 +8,12 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/media/raid0/StrataQ38FN/Strata-143
+WorkingDirectory=/media/raid0/StrataQ38FN/Strata-143-prod
 Environment=PATH=/usr/local/cuda-13.0/bin:/usr/bin:/bin
-ExecStart=/media/raid0/StrataQ38FN/Strata/.venv/bin/python /media/raid0/StrataQ38FN/Strata-143/serve/server.py --engine strata --config /media/raid0/StrataQ38FN/linux/configs/production.json --port 8090 --host 0.0.0.0
-MemoryMax=200G
+ExecStart=/media/raid0/StrataQ38FN/Strata/.venv/bin/python /media/raid0/StrataQ38FN/Strata-143-prod/serve/server.py --engine strata --config /media/raid0/StrataQ38FN/linux/configs/production.json --port 8090 --host 0.0.0.0
+# 251.5 GiB - 224 - ~11 GiB other apps = ~16 GiB that Strata can never take from the desktop (no MemoryHigh:
+# the conversation cache's RAM guard reads memory.high as a limit too)
+MemoryMax=224G
 MemorySwapMax=0
 KillMode=mixed
 TimeoutStopSec=60
@@ -17,6 +21,8 @@ Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
 LimitMEMLOCK=infinity
+# drop the GGUF expert pages (in VRAM) from this cgroup's page cache once loaded; --no-block: never delays or fails this unit
+ExecStartPost=-/usr/bin/systemctl --user --no-block start strata-reclaim.service
 
 [Install]
 WantedBy=default.target

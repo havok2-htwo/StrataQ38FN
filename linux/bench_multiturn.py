@@ -92,12 +92,14 @@ def main():
     ap.add_argument("--think", type=float, default=1.0, help="seconds a user waits between turns")
     ap.add_argument("--temperature", type=float, default=0.7, help="0 = greedy (reply hashes comparable across arms)")
     ap.add_argument("--out", default="")
+    ap.add_argument("--uid-offset", type=int, default=0,
+                    help="first user id: another offset = other documents = new conversations (soak cycles)")
     a = ap.parse_args()
     rows, lock = [], threading.Lock()
     ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(a.users) as ex:
-        list(ex.map(lambda u: user(a, u, rows, lock), range(a.users)))
+        list(ex.map(lambda u: user(a, u, rows, lock), range(a.uid_offset, a.uid_offset + a.users)))
     wall = time.perf_counter() - t0
     print(f"# {a.label}: {a.users} users x {a.turns} turns, doc {a.doc} + {a.add}/turn, {a.max_tok} out")
     print(f"{'turn':>4} {'prompt':>7} {'cached':>7} {'TTFT p50':>9} {'TTFT p95':>9} {'dec p50':>8}")
