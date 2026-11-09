@@ -66,7 +66,7 @@ R2_EST=${R2_EST:-480}; R2_CAP=${R2_CAP:-1200}               # an r2 arm (start +
 V_SPLIT=${V_SPLIT:-13,25,36}; V_RESERVE=${V_RESERVE:-1024}; R2=${R2:-1}; EVAL=${EVAL:-1}
 V_EXE=${V_EXE:-}; V_PARALLEL=${V_PARALLEL:-}                 # V's engine / slot count (empty: production's)
 PLAN=${PLAN:-full}                                          # full: V, A, VR (+ eval); speed: GPU tests, V, A speed only
-GPU_TESTS=${GPU_TESTS:-}                                    # PLAN=speed: test binaries run on CUDA0 first (V needs them to pass)
+GPU_TESTS=${GPU_TESTS:-}                                    # PLAN=speed: ';'-separated test commands run on CUDA0 first (V needs them to pass)
 TIER_CAP_GB=${TIER_CAP_GB:-8}                               # the test servers' disk tier cap (production: 500)
 MEMMAX=${MEMMAX:-224G}
 TAG=v31w$(date +%m%d%H%M)                                   # label prefix (eval_results.jsonl and the sweep files are shared)
@@ -380,7 +380,7 @@ free_gpus || on_sig "GPUs not free"
 
 # V (full, with the quality eval), A (full: the baseline; V is capped at V_CAP so that A still fits), VR (speed only, the
 # optional arm: skipped when the window has no room left), then r2 while time is left
-gpu_tests() { local t rc=0; for t in $GPU_TESTS; do
+gpu_tests() { local t rc=0 IFS=';'; for t in $GPU_TESTS; do IFS=' '   # tests separated by ';' (a test may carry arguments)
         if CUDA_VISIBLE_DEVICES=0 timeout --foreground -k 30 600 $t > "$OUT/test-$(basename "${t%% *}").txt" 2>&1; then echo "==> gpu test $t PASS"
         else rc=1; echo "==> gpu test $t FAIL: $(tail -2 "$OUT/test-$(basename "${t%% *}").txt" | tr '\n' ' ' | cut -c1-200)"; fi; done; return $rc; }
 export -f gpu_tests; export GPU_TESTS
