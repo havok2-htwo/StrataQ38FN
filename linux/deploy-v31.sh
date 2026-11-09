@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Production: Unsloth Dynamic v3.1 UD-IQ4_XS (window v31, 2026-11-09, arm VR) on production's Q8k engine, server and env
-# (deploy-212q.sh): config T16-212q-v31-prod262r-vision-cpu.json = T16-212q-prod262r-vision-cpu.json with the v3.1 files
-# (--pack Strata-data/packs/unsloth-ud-iq4_xs-v31, --native the 4-shard GGUF, tokenizer, vision.model), layer_split
-# 13,25,36 and STRATA_SPLIT_OWN_RESERVE_MIB=1024: with v3.1's experts (+0.86 GiB) production's 12,25,37 made CUDA1/CUDA2 lend
-# expert cache slots to the prompt path (CPU experts, no overlapped read: multiturn 171 s vs ~91 s); 13,25,36 alone still
-# left CUDA3 short by ~0.2 GiB of the default 1.5 GiB reserve.  model_name stays production's (G3 / Genesis send it).
+# Production: Unsloth Dynamic v3.1 UD-IQ4_XS (window v31 run 4, 2026-11-09, TESTLOG #105) on engine strata-212q50 = production's
+# Q8k engine (212q) + STRATA_ORCA_Q4KS_MMQ=ON + Q5_0 in the MMQ pointer table (v3.1's Q5_0 downs otherwise miss prompt MMQ:
+# 15 of 48 layers, prompt reads ~2.4x slower), production's server and env.  Config T16-212q-v31-prod262r-vision-cpu.json =
+# T16-212q-prod262r-vision-cpu.json with that exe, the v3.1 files (--pack Strata-data/packs/unsloth-ud-iq4_xs-v31, --native the
+# 4-shard GGUF, tokenizer, vision.model), layer_split 14,26,37 and parallel 12 (v3.1's experts are +0.86 GiB: with 16 slots no
+# split leaves every card its prompt buffers + 1.5 GiB; 12 slots free ~1.1 GiB on CUDA0).  model_name stays production's.
 #   ./deploy-v31.sh               # switch production.json, restart, check the engine's placement and the 6 request shapes;
 #                                 # rolls back to v3.0 by itself when v3.1 does not load, an expert is not in VRAM, a card
 #                                 # lends slots to the prompt path (seen at the smoke's first reads) or the smoke fails
@@ -14,20 +14,22 @@ R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs; URL=http://127.0.0.1:8090
 BASE=T16-212q-prod262r-vision-cpu.json; TARGET=T16-212q-v31-prod262r-vision-cpu.json
 V31_PACK=$R/Strata-data/packs/unsloth-ud-iq4_xs-v31
 V31_GGUF=/media/raid0/Models/Strata-GGUF/unsloth-UD-IQ4_XS-v31/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf
-SPLIT=13,25,36; RESERVE=1024
+SPLIT=14,26,37; PARALLEL=12
+EXE=$R/Strata/engine/strata-212q50-8b46bbdf; EXE_SHA=8b46bbdfd5358a1d   # Strata-212q50 @85277f09: STRATA_ORCA_Q4KS_MMQ=ON + Q5_0 pointer table
 case "${1:-}" in
   --rollback) NEW=$BASE ;;
   "") NEW=$TARGET
       [ -s "$V31_PACK/native_experts.txt" ] && [ -s "$V31_GGUF.done" ] || { echo "v3.1 pack or GGUF missing"; exit 1; }
-      python3 - "$C/$BASE" "$C/$TARGET" "$V31_PACK" "$V31_GGUF" "$SPLIT" "$RESERVE" <<'PY'
+      [ "$(sha256sum "$EXE" | cut -c1-16)" = "$EXE_SHA" ] || { echo "engine $EXE missing or not $EXE_SHA"; exit 1; }
+      python3 - "$C/$BASE" "$C/$TARGET" "$V31_PACK" "$V31_GGUF" "$SPLIT" "$PARALLEL" "$EXE" <<'PY'
 import json, sys
-src, dst, pack, gguf, split, reserve = sys.argv[1:7]
+src, dst, pack, gguf, split, parallel, exe = sys.argv[1:8]
 c = json.load(open(src)); a = c["args"]
 old_pack = a[a.index("--pack") + 1]; old_gguf = a[a.index("--native") + 1]
 a[a.index("--pack") + 1] = pack; a[a.index("--native") + 1] = gguf
 assert c["tokenizer"].startswith(old_pack + "/"); c["tokenizer"] = pack + c["tokenizer"][len(old_pack):]
 if c.get("vision", {}).get("model") == old_gguf: c["vision"]["model"] = gguf
-c["layer_split"] = split; c["env"]["STRATA_SPLIT_OWN_RESERVE_MIB"] = reserve
+c["layer_split"] = split; c["parallel"] = int(parallel); c["exe"] = exe
 assert not any(x == old_pack or x.startswith(old_pack + "/") or x == old_gguf for x in a)
 json.dump(c, open(dst, "w"), indent=1)
 PY

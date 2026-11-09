@@ -4,6 +4,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (production) - 2026-11-09 20:23
+- **Model: Unsloth Dynamic v3.1 UD-IQ4_XS** on engine `strata-212q50-8b46bbdf` (production's 212q + `STRATA_ORCA_Q4KS_MMQ=ON` + Q5_0 in
+  the MMQ pointer table, Strata-212q50 @85277f09), config `T16-212q-v31-prod262r-vision-cpu.json`: layer_split 14,26,37, `parallel` 12
+  (was 16: v3.1's experts are +0.86 GiB), model_name unchanged. TESTLOG #105: up to 4 users as fast or faster (1 user +6 %), cold
+  ~151K prompt 26.9 s vs 25.6 s, 8-16 users 8-21 % less aggregate. Deploy/rollback: `linux/deploy-v31.sh [--rollback]`.
+
 ### Tested, not deployed - 2026-11-09
 - **Unsloth Dynamic v3.1 UD-IQ4_XS** (Hub d9620119, 2026-11-04) against production's v3.0 in GPU window v31 (TESTLOG #104,
   `linux/window-v31.sh`, smoke `linux/v31_smoke.py`): loads, fits all experts in VRAM with layer_split 14,26,37 and 12 slots,
