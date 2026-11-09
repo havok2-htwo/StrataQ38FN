@@ -4,6 +4,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Tested, not deployed - 2026-11-09
+- **Unsloth Dynamic v3.1 UD-IQ4_XS** (Hub d9620119, 2026-11-04) against production's v3.0 in GPU window v31 (TESTLOG #104,
+  `linux/window-v31.sh`, smoke `linux/v31_smoke.py`): loads, fits all experts in VRAM with layer_split 14,26,37 and 12 slots,
+  answers all G3 request shapes, but reads prompts ~2.4x slower on sm_86 (cold ~151K 61 s vs 26 s, multiturn 164 s vs 92 s)
+  and is not measurably better on MMLU-Pro / GSM8K (paired p 0.80). Cause: the 33 layers with Q5_0 downs miss prompt MMQ
+  (`STRATA_ORCA_Q4KS_MMQ` off; log `MMQ_DIRECT ... 15 of 48 layers`). Production stays on v3.0; `linux/deploy-v31.sh` is ready
+  for after a Q5_0-MMQ build. Upstream issue draft: `linux/upstream/DRAFT-engine-issue-v31-q5_0-mmq.md` (not posted).
+
 ### Changed (production) - 2026-11-07
 - **Default start = arm N3 of the night window** (TESTLOG #95): engine `strata-g3-ll10b` (Strata-ll10-borrow @23588120,
   sha256 99bbe1d2…, `linux/patches/v0.1.44.1-ll10-borrow/` 0001-0008), config
