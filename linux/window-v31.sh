@@ -6,13 +6,19 @@
 # (attention / GDN / shared-expert projections Q8_0 -> Q6_K, token_embd Q8_0 -> IQ4_XS, gate/up IQ3_S -> IQ3_XXS / IQ4_XS /
 # IQ2_S, downs IQ4_NL -> Q5_0 / Q2_0), experts 59.52 -> 60.38 GB, the same tokenizer and chat template.
 #   A   production.json as is (v3.0)
-#   V   A with the v3.1 files: --pack, --native (GGUF shard 1), tokenizer, vision.model, model_name ...-v31, its own log.
-#       Production's layer split (12,25,37) puts ~+0.8 GiB on CUDA1 and ~+1.5 GiB on CUDA2 (CUDA0 -1.5, CUDA3 -0.5); by the
-#       engine's room lines of 2026-11-08 it fits (CUDA1 ~0.15 GiB spare).  When V's engine log does not say "every expert is
-#       in the GPU caches", V runs once more as V2 with layer_split $V_SPLIT2 (13,25,37: CUDA1 ~1.3 GiB spare by the same
-#       count) and V2 replaces V in the comparison (INFO: another split)
+#   V   A with the v3.1 files (--pack, --native = GGUF shard 1, tokenizer, vision.model, model_name ...-v31) and layer_split
+#       $V_SPLIT (13,25,36).  The first run (results/v31-1109-1736, aborted) kept production's 12,25,37: every expert was in
+#       the GPU caches, but CUDA1 / CUDA2 lent 307 / 292 expert cache slots to the prompt path (a split stage keeps its own
+#       prompt buffers, 0.73 GiB, only with STRATA_SPLIT_OWN_RESERVE_MIB = 1536 MiB free beside them; a lent slot's expert runs
+#       on the CPU and the overlapped read is off): bench_multiturn 16x3 wall 171 s against ~91 s for production (w212g).
+#       v3.1's experts (+0.86 GiB) leave no split with that room on all four cards; 13,25,36 is the best (expert cache spare
+#       ~1.32 / 1.31 / 1.55 / 0.56 GiB by the engine's room lines of that run: CUDA3 short by ~0.2 GiB)
+#   VR  V + STRATA_SPLIT_OWN_RESERVE_MIB=$V_RESERVE (1024): CUDA3 keeps its own prompt buffers too (no loan on any card);
+#       speed only (smoke, short, long, mt, cold - no eval: V's weights).  A smaller reserve than the default 1.5 GiB (the
+#       verify windows, draft head and cuBLAS workspaces made after the buffers): the arm reports CUDA errors / OOM lines
 # Per arm one fresh server on 127.0.0.1:8091 (strata-bench.scope, MemoryMax $MEMMAX, empty tier dir, its own engine log):
-#   up     1 warm-up request; the engine's expert placement (layer split lines, "every expert is in the GPU caches"), VRAM
+#   up     1 warm-up request; the engine's expert placement (layer split lines, "every expert is in the GPU caches"), VRAM;
+#          at the arm's end the prompt path's loans (lend sizing / "CUDAn prompt path borrows N of its M slots")
 #   smoke  v31_smoke.py: the 6 request shapes Genesis sends via G3 (thinking off, json_object, streamed tool call with
 #          reasoning_budget + chat_template_kwargs, the tool result turn, xhigh with reasoning_budget 512, an image)  ~0.5 min
 #   short  bench_concurrency 1/2/4/8/16 users x 2, 512 tokens, ~100-token prompts, greedy (window-212's short)   ~3 min
@@ -20,10 +26,11 @@
 #   mt     bench_multiturn 16 users x 3 turns --doc 8000 greedy (window-212's mt)                                  ~1.5 min
 #   cold   1 request with a ~128K-token prompt, 32 tokens: TTFT = one cold read                                   ~0.5 min
 #   eval   eval/quick_eval.py: MMLU-Pro 240 + GSM8K 150, greedy, thinking off, 8 workers (answers-<tag>-<arm>.jsonl)  ~12-15 min
-#   + engine start ~2-3 min.  Order V, A (full), then while time is left r2 = A, V again (short + long only): VAAV
+#   + engine start ~2-3 min.  Order V (full), A (full), VR (speed: skipped when the window has no room left), then while
+#   time is left r2 = A, V again (short + long only)
 # The summary (after production is back): per arm short agg tok/s 1/4/16 + per-user decode, long agg + TTFT, mt wall +
 # follow-up TTFT, cold 128K TTFT, MMLU-Pro / GSM8K with the paired count (questions only one arm got right, exact McNemar
-# p), smoke, VRAM, expert fit, peak RSS.  Nothing is deployed: a switch to v3.1 needs the owner's "deploy ja".
+# p), smoke, VRAM, expert fit, prompt-path loans, peak RSS.  Nothing is deployed: a switch to v3.1 needs the owner's "deploy ja".
 # Isolation and restore as window-borrow.sh: test servers only on 127.0.0.1:8091, tier dirs under
 # /media/raid0/strata-kvspill-bench/v31 (capped at TIER_CAP_GB, removed at the end), results in results/v31-<MMDD-HHMM>; production.json, the unit
 # and its drop-in are only read.  Production is stopped only once it reports loaded and started again on EVERY exit path:
@@ -32,7 +39,7 @@
 #   ./window-v31.sh --dry-run          # prep checks + configs + the plan; production untouched
 #   ./window-v31.sh                    # the window (GPU window: coordinate with the bench session first)
 #   ./window-v31.sh --summary DIR      # the summary table again from results/v31-...
-#   env: WINDOW_S=4500 V_SPLIT2=13,25,37 R2=1 EVAL=1 MEMMAX=224G TIER_CAP_GB=8
+#   env: WINDOW_S=4500 V_SPLIT=13,25,36 V_RESERVE=1024 R2=1 EVAL=1 MEMMAX=224G TIER_CAP_GB=8
 set -u
 R=/media/raid0/StrataQ38FN; L=$R/linux; C=$L/configs
 URL=http://127.0.0.1:8090; TPORT=8091; PY=$R/Strata/.venv/bin/python
@@ -53,9 +60,10 @@ while [ $# -gt 0 ]; do
 done
 WINDOW_S=${WINDOW_S:-4500}; RESERVE=480                     # outage cap (stop -> restart), room kept for the restart
 ARM_EST=${ARM_EST:-1500}; ARM_CAP=${ARM_CAP:-2700}          # a full arm: expected / hard cap (s)
-V_CAP=${V_CAP:-2100}                                        # V's / V2's cap: A (est. ARM_EST) still fits after a slow V
+V_CAP=${V_CAP:-2100}                                        # V's cap: A (est. ARM_EST) still fits after a slow V
+VR_EST=${VR_EST:-780}; VR_CAP=${VR_CAP:-1200}               # VR (start + smoke + short + long + mt + cold)
 R2_EST=${R2_EST:-480}; R2_CAP=${R2_CAP:-1200}               # an r2 arm (start + short + long)
-V_SPLIT2=${V_SPLIT2:-13,25,37}; R2=${R2:-1}; EVAL=${EVAL:-1}
+V_SPLIT=${V_SPLIT:-13,25,36}; V_RESERVE=${V_RESERVE:-1024}; R2=${R2:-1}; EVAL=${EVAL:-1}
 TIER_CAP_GB=${TIER_CAP_GB:-8}                               # the test servers' disk tier cap (production: 500)
 MEMMAX=${MEMMAX:-224G}
 TAG=v31w$(date +%m%d%H%M)                                   # label prefix (eval_results.jsonl and the sweep files are shared)
@@ -148,9 +156,9 @@ up() { srv env KEEP=1 ./run_strata_variant.sh "$1" "$2" 1 --rounds 1 --max-tok 1
 rss_peak() { local cg; cg=$(systemctl --user show -p ControlGroup --value strata-bench.scope 2>/dev/null)
     if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.peak" ]; then
         awk '{printf "%.2f", $1 / 1073741824}' "/sys/fs/cgroup$cg/memory.peak"; else echo "?"; fi; }
-# arm_run <CFG> <run label> <full|r2> [fitgate]: one server start and the arm's steps (r2: short + long only); fitgate: the
-# arm ends after the warm-up when its engine did not put every expert into the GPU caches (V: V2 runs instead)
-arm_run() { local a=$1 lab=$2 mode=$3 gate=${4:-} cfg rc=0 u=http://127.0.0.1:$TPORT elog model B
+# arm_run <CFG> <run label> <full|speed|r2>: one server start and the arm's steps (full: smoke, short, long, mt, cold, eval;
+# speed: the same without the eval; r2: short + long only)
+arm_run() { local a=$1 lab=$2 mode=$3 cfg rc=0 u=http://127.0.0.1:$TPORT elog model B lent
     cfg=$(runcfg "$a" "$lab") || return 1; elog=$OUT/engine-$lab.log
     model=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['model_name'])" "$cfg")
     up "$TAG-$lab-up" "$cfg" || return 1
@@ -160,10 +168,7 @@ arm_run() { local a=$1 lab=$2 mode=$3 gate=${4:-} cfg rc=0 u=http://127.0.0.1:$T
     else echo nofit > "$OUT/fit-$lab"
         echo "==> $lab experts: NOT every expert in the GPU caches: $(grep -aE 'layer split: CUDA[0-9] runs' "$elog" | sed 's/.*runs //' | tr '\n' ';' | cut -c1-400) WARN"; fi
     echo "$(vram)" > "$OUT/vram-$lab.txt"; echo "==> $lab VRAM after the warm-up (index, used, free): $(cat "$OUT/vram-$lab.txt") INFO"
-    if [ -n "$gate" ] && [ -e "$OUT/fit-$lab" ]; then
-        echo "==> $lab: ends after the warm-up (not every expert in the GPU caches: the next arm takes another split) INFO"
-        systemctl --user stop strata-bench.scope; return 3; fi
-    if [ "$mode" = full ]; then
+    if [ "$mode" != r2 ]; then
         timeout -s INT 600 "$PY" -I "$L/v31_smoke.py" --url "$u" --model "$model" --label "$TAG-$lab" --out "$OUT/smoke.jsonl" \
             > "$OUT/$lab-smoke.txt" 2>&1 || rc=1
         grep -a '^==>' "$OUT/$lab-smoke.txt" || echo "==> smoke $lab: no verdict (see $OUT/$lab-smoke.txt) FAIL"; fi
@@ -175,7 +180,7 @@ arm_run() { local a=$1 lab=$2 mode=$3 gate=${4:-} cfg rc=0 u=http://127.0.0.1:$T
     if tup; then timeout -s INT 600 $B --label "$TAG-$lab-long" --levels 16 --rounds 2 --max-tok 512 --warmup 0 \
             --out "$OUT/sweep.jsonl" > "$OUT/$lab-long.txt" 2>&1 || rc=1
     else echo "==> $lab: the server is gone after short FAIL"; return 1; fi
-    if [ "$mode" = full ]; then
+    if [ "$mode" != r2 ]; then
         if tup; then timeout -s INT 900 "$PY" -I -B "$L/bench_multiturn.py" --url "$u" --users 16 --turns 3 --doc 8000 --temperature 0 \
                 --label "$TAG-$lab-mt" --out "$OUT/multiturn.jsonl" > "$OUT/$lab-mt.txt" 2>&1 || rc=1
             echo "==> $lab multiturn: $(tail -1 "$OUT/$lab-mt.txt" | cut -c1-200) INFO"
@@ -183,13 +188,16 @@ arm_run() { local a=$1 lab=$2 mode=$3 gate=${4:-} cfg rc=0 u=http://127.0.0.1:$T
         if tup; then timeout -s INT 600 $B --label "$TAG-$lab-cold" --levels 1 --rounds 1 --max-tok 32 --prompt-tok 128000 --warmup 0 \
                 --out "$OUT/sweep.jsonl" > "$OUT/$lab-cold.txt" 2>&1 || rc=1
         else echo "==> $lab: the server is gone after multiturn FAIL"; return 1; fi
-        if [ "$EVAL" = 1 ] && tup; then
+        if [ "$mode" = full ] && [ "$EVAL" = 1 ] && tup; then
             timeout -s INT 1800 "$PY" -I -B "$L/eval/quick_eval.py" --url "$u" --model "$model" --label "$TAG-$lab" --workers 8 \
                 --max-tokens 2048 > "$OUT/$lab-eval.txt" 2>&1 || rc=1
             echo "==> $lab eval: $(tail -1 "$OUT/$lab-eval.txt" | cut -c1-200) INFO"; fi
         tup || { echo "==> $lab: the server is gone after the eval FAIL"; rc=1; }
     fi
     echo "$(rss_peak)" > "$OUT/rss-$lab.txt"; echo "==> rss $lab: peak $(cat "$OUT/rss-$lab.txt") GiB (memory.peak) INFO"
+    grep -aE 'lend sizing|prompt path borrows [0-9]+ of|keeps its own prompt buffers|overlapped read off' "$elog" | sort | uniq -c > "$OUT/$lab-lend.txt"
+    lent=$(grep -aoE 'CUDA[0-9] prompt path borrows [0-9]+ of its [0-9]+ slots' "$elog" | sort -u | sed 's/ prompt path borrows / /;s/ of its [0-9]* slots//' | tr '\n' ' ')
+    echo "${lent:-none}" > "$OUT/lend-$lab.txt"; echo "==> $lab prompt-path loans (card slots): ${lent:-none} INFO"
     grep -acE 'CUDA error|out of memory|cudaMalloc failed' "$elog" | sed "s/^/==> $lab engine errors (CUDA error \/ out of memory): /;s/$/ INFO/"
     sleep 2; systemctl --user stop strata-bench.scope; return $rc; }
 export -f tup runcfg srv up rss_peak arm_run vram
@@ -221,7 +229,7 @@ def ev(lab):
     return {(x["set"], x["i"]): x["ok"] for x in map(json.loads, open(p))}
 print(f"window {tag}: arms {' '.join(labs)} (r2 = second start, short + long only)")
 print(f"{'arm':6} {'short agg 1/4/16 tok/s':>24} {'dec p50 @1':>10} {'long agg16':>10} {'long ttft p50/p95':>17} "
-      f"{'mt wall/fu p50':>15} {'cold128K ttft':>13} {'MMLU-Pro':>8} {'GSM8K':>6} {'smoke':>6} {'fit':>4} {'rss GiB':>7}")
+      f"{'mt wall/fu p50':>15} {'cold128K ttft':>13} {'MMLU-Pro':>8} {'GSM8K':>6} {'smoke':>6} {'fit':>4} {'loans':>12} {'rss GiB':>7}")
 smoke = {}
 for l in rows("smoke.jsonl"):
     smoke[l["label"][len(tag) + 1:]] = "PASS" if all(l["ok"].values()) else "FAIL:" + "".join(k for k, v in l["ok"].items() if not v)
@@ -233,11 +241,12 @@ for lab in labs:
         e = next((x for x in map(json.loads, open(ep)) if x.get("label") == f"{tag}-{lab}"), None)
     rss = open(os.path.join(out, f"rss-{lab}.txt")).read().strip() if os.path.exists(os.path.join(out, f"rss-{lab}.txt")) else "?"
     fit = "no" if os.path.exists(os.path.join(out, f"fit-{lab}")) else "yes"
+    lp = os.path.join(out, f"lend-{lab}.txt"); lend = open(lp).read().strip().replace("CUDA", "") if os.path.exists(lp) else "?"
     print(f"{lab:6} {'/'.join(str(x['agg_out_tps']) if x else '-' for x in s):>24} {str(s[0]['dec_tps_p50']) if s[0] else '-':>10} "
           f"{str(lg['agg_out_tps']) if lg else '-':>10} {(str(lg['ttft_p50']) + '/' + str(lg['ttft_p95'])) if lg else '-':>17} "
           f"{(str(m['wall_s']) + '/' + str(m.get('follow_ttft_p50'))) if m else '-':>15} "
           f"{(str(cd['ttft_p50']) + ' s') if cd else '-':>13} {str(e['mmlu_pro']) if e else '-':>8} {str(e['gsm8k']) if e else '-':>6} "
-          f"{smoke.get(lab, '-'):>6} {fit:>4} {rss:>7}")
+          f"{smoke.get(lab, '-'):>6} {fit:>4} {lend:>12} {rss:>7}")
 def pair(x, y, name):
     a, b = ev(x), ev(y)
     if not a or not b: return
@@ -248,12 +257,23 @@ def pair(x, y, name):
         p = min(1.0, 2 * sum(math.comb(n, i) for i in range(min(only_a, only_b) + 1)) / 2 ** n) if n else 1.0
         print(f"  {name} {st}: {len(ks)} questions, only {x} right {only_a}, only {y} right {only_b}, both right "
               f"{sum(1 for k in ks if a[k] and b[k])}; exact McNemar p = {p:.3f}")
-v = "V2" if "V2" in labs else "V"
-pair("A", v, f"paired A vs {v}:")
+pair("A", "V", "paired A vs V:")
+def pct(x, y): return f"{100 * (x / y - 1):+.1f} %"
 for kind, users in (("short", 1), ("short", 4), ("short", 16), ("long", 16)):
-    pairs = [(get(x, kind, users), get(y, kind, users)) for x, y in ((v, "A"), (v + "r2" if v + "r2" in labs else "Vr2", "Ar2"))]
-    d = [f"{100 * (vv['agg_out_tps'] / aa['agg_out_tps'] - 1):+.1f} %" for vv, aa in pairs if vv and aa]
-    if d: print(f"  {kind} {users} users: {v} vs A agg tok/s {' / '.join(d)} (run 1 / r2)")
+    for v, pairs in (("V", (("V", "A"), ("Vr2", "Ar2"))), ("VR", (("VR", "A"),))):
+        pr = [(get(x, kind, users), get(y, kind, users)) for x, y in pairs]
+        d = [pct(vv["agg_out_tps"], aa["agg_out_tps"]) for vv, aa in pr if vv and aa]
+        if d: print(f"  {kind} {users} users: {v} vs A agg tok/s {' / '.join(d)}" + (" (run 1 / r2)" if len(d) > 1 else ""))
+def mtrow(lab): return next((r for r in mt if r["label"] == f"{tag}-{lab}-mt"), None)
+for v in ("V", "VR"):
+    m, ma = mtrow(v), mtrow("A")
+    if m and ma:
+        print(f"  mt: {v} vs A wall {m['wall_s']} / {ma['wall_s']} s ({pct(m['wall_s'], ma['wall_s'])}), turn-1 TTFT p50 "
+              f"{m['turn1']['ttft_p50']} / {ma['turn1']['ttft_p50']} s, follow-up TTFT p50 {m.get('follow_ttft_p50')} / {ma.get('follow_ttft_p50')} s")
+    c, ca = get(v, "cold", 1), get("A", "cold", 1)
+    if c and ca:
+        print(f"  cold 128K: {v} vs A TTFT {c['ttft_p50']} / {ca['ttft_p50']} s ({pct(c['ttft_p50'], ca['ttft_p50'])}), "
+              f"prompt {c.get('prompt_tok_avg')} / {ca.get('prompt_tok_avg')} tokens")
 PYEOF
 }
 if [ -n "$SUMMARY_DIR" ]; then summary "$SUMMARY_DIR"; exit 0; fi
@@ -292,10 +312,10 @@ PROD_SHA=$(sha256sum "$PEXE" | cut -c1-16); PRODCFG_SHA=$(sha256sum "$PRODSRC" |
 [ "$DRY" = 1 ] && rm -rf "$OUT"
 [ -e "$OUT" ] && { echo "$OUT exists"; exit 1; }
 mkdir -p "$OUT" "$CF"
-# the configs: A = production.json as is; V = A with the v3.1 files; V2 = V with layer_split $V_SPLIT2
-python3 - "$PRODSRC" "$CF" "$V31_PACK" "$V31_GGUF" "$V31_NAME" "$V_SPLIT2" <<'PYEOF' || { echo "cannot write the configs"; exit 1; }
+# the configs: A = production.json as is; V = A with the v3.1 files and layer_split $V_SPLIT; VR = V + STRATA_SPLIT_OWN_RESERVE_MIB
+python3 - "$PRODSRC" "$CF" "$V31_PACK" "$V31_GGUF" "$V31_NAME" "$V_SPLIT" "$V_RESERVE" <<'PYEOF' || { echo "cannot write the configs"; exit 1; }
 import json, sys, copy
-src, cf, pack, gguf, name, split2 = sys.argv[1:7]
+src, cf, pack, gguf, name, split, reserve = sys.argv[1:8]
 a = json.load(open(src)); json.dump(a, open(f"{cf}/A.json", "w"), indent=1)
 v = copy.deepcopy(a); args = v["args"]
 def setarg(flag, val):
@@ -307,22 +327,25 @@ v["tokenizer"] = pack + v["tokenizer"][len(old_pack):]
 if v.get("vision", {}).get("model") == old_gguf: v["vision"]["model"] = gguf
 v["model_name"] = name
 assert not any(x == old_pack or x.startswith(old_pack + "/") or x == old_gguf for x in args), "a v3.0 path is left in V's args"
+assert isinstance(a.get("layer_split"), str), a.get("layer_split")
+v["layer_split"] = split
 json.dump(v, open(f"{cf}/V.json", "w"), indent=1)
-v2 = copy.deepcopy(v); v2["layer_split"] = split2; json.dump(v2, open(f"{cf}/V2.json", "w"), indent=1)
+vr = copy.deepcopy(v); vr["env"]["STRATA_SPLIT_OWN_RESERVE_MIB"] = reserve; json.dump(vr, open(f"{cf}/VR.json", "w"), indent=1)
 PYEOF
 POWER=$(nvidia-smi --query-gpu=index,power.limit --format=csv,noheader | tr '\n' ';')
 log "window prep ($TAG): production $(basename "$PRODSRC") sha256 $PRODCFG_SHA, exe $(basename "$PEXE") sha256 $PROD_SHA, server $SRV @$SRV_REV; server env: $SRVENV; GPU power limits: $POWER"
-for a in V V2; do log "    [cfg] $a vs A: $(python3 -c "
+for a in V VR; do log "    [cfg] $a vs A: $(python3 -c "
 import json,sys; p=json.load(open(sys.argv[1])); c=json.load(open(sys.argv[2]))
 d=[f'{k}: {p.get(k)} -> {c[k]}' for k in c if k not in ('args','env') and p.get(k)!=c[k]]
 d+=[f'arg {x} -> {y}' for x,y in zip(p['args'],c['args']) if x!=y]
-d+=['env differs' for _ in [0] if p['env']!=c['env']]; print('; '.join(d))" "$CF/A.json" "$CF/$a.json")"; done
-NEED_S=$(( 2 * ARM_EST + ( R2 == 1 ? 2 * R2_EST : 0 ) + 300 ))
+e=c['env']; pe=p['env']; d+=[f'env {k}={e[k]}' for k in e if pe.get(k)!=e[k]]+[f'env -{k}' for k in pe if k not in e]
+print('; '.join(d))" "$CF/A.json" "$CF/$a.json")"; done
+NEED_S=$(( 2 * ARM_EST + VR_EST + ( R2 == 1 ? 2 * R2_EST : 0 ) + 300 ))
 if [ "$DRY" = 1 ]; then
     log "dry run: prep and configs ok, production untouched ($CF); expected outage ~$(( NEED_S / 60 )) min (cap $(( WINDOW_S / 60 )) min, steps until $(( (WINDOW_S - RESERVE) / 60 )))"
-    echo "  step arm_V  (expected ~$(( ARM_EST / 60 )) min, cap $(( V_CAP / 60 ))): up, smoke, short 1/2/4/8/16 x2, long 16 x2, mt 16x3, cold 128K, eval$([ "$EVAL" = 1 ] || echo ' (EVAL=0: skipped)') on the v3.1 files; ends after its warm-up when not every expert is in the GPU caches"
-    echo "  step arm_V2 only then (layer_split $V_SPLIT2), in V's place (cap $(( V_CAP / 60 )))"
+    echo "  step arm_V  (expected ~$(( ARM_EST / 60 )) min, cap $(( V_CAP / 60 ))): up, smoke, short 1/2/4/8/16 x2, long 16 x2, mt 16x3, cold 128K, eval$([ "$EVAL" = 1 ] || echo ' (EVAL=0: skipped)') on the v3.1 files, layer_split $V_SPLIT"
     echo "  step arm_A  (expected ~$(( ARM_EST / 60 )) min, cap $(( ARM_CAP / 60 ))): the same on production.json as is"
+    echo "  step arm_VR (expected ~$(( VR_EST / 60 )) min, cap $(( VR_CAP / 60 ))): V + STRATA_SPLIT_OWN_RESERVE_MIB=$V_RESERVE, speed only (smoke, short, long, mt, cold)"
     [ "$R2" = 1 ] && echo "  steps r2_A, r2_V (expected ~$(( R2_EST / 60 )) min each, while time is left): up, short, long"
     echo "  then: production restarted (EXIT trap; $GUNIT.service on a SIGKILL; $RUNIT.timer backstop), summary -> $OUT/summary.txt"
     exit 0
@@ -347,18 +370,13 @@ trap 'on_sig signal' INT TERM HUP
 for _ in $(seq 60); do ss -Hltn 'sport = :8090' | grep -q . || break; sleep 2; done
 free_gpus || on_sig "GPUs not free"
 
-# V first (does v3.1 load and fit: ends after its warm-up when not every expert is in the GPU caches, V2 then), A, r2 in
-# reverse: VAAV.  V and V2 are capped at V_CAP so that A (the baseline) still fits after them
-step arm_V "$ARM_EST" "$V_CAP" arm_run V V full fitgate
-VL=V                                             # V2 (another split) replaces V when V's engine did not hold every expert
-if ! grep -aq 'every expert is in the GPU caches' "$OUT/engine-V.log" 2>/dev/null; then
-    log "V: no 'every expert is in the GPU caches' line (no fit, or V failed before it): V2 with layer_split $V_SPLIT2"
-    step arm_V2 "$ARM_EST" "$V_CAP" arm_run V2 V2 full
-    grep -aq 'every expert is in the GPU caches' "$OUT/engine-V2.log" 2>/dev/null && VL=V2
-fi
+# V (full, with the quality eval), A (full: the baseline; V is capped at V_CAP so that A still fits), VR (speed only, the
+# optional arm: skipped when the window has no room left), then r2 while time is left
+step arm_V "$ARM_EST" "$V_CAP" arm_run V V full
 step arm_A "$ARM_EST" "$ARM_CAP" arm_run A A full
+step arm_VR "$VR_EST" "$VR_CAP" arm_run VR VR speed
 if [ "$R2" = 1 ]; then
     step r2_A "$R2_EST" "$R2_CAP" arm_run A Ar2 r2
-    step "r2_$VL" "$R2_EST" "$R2_CAP" arm_run "$VL" "${VL}r2" r2
+    step r2_V "$R2_EST" "$R2_CAP" arm_run V Vr2 r2
 fi
 exit 0                                           # -> EXIT trap: production back, then the summary
