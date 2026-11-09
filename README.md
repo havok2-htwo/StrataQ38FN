@@ -28,7 +28,10 @@ users, with a measurably lower quality checkpoint ([linux/README.md](linux/READM
 repository holds the deployment (configs, start scripts, a vLLM-compatible facade, a dashboard) and the engine patch
 series. The engine itself is upstream Strata plus our patches, applied in a clone (`linux/patches/v0.1.43/`, 43
 patches). The patches are kept upstream-ready (opt-in switches, default path unchanged), so they can be offered back
-to Strata.
+to Strata. Since 2026-11-08 the 4× RTX 3090 production runs on upstream **v0.2.12** with the series ported
+(`linux/patches/v0.2.12-*`), and since 2026-11-09 on the Unsloth v3.1 GGUF; the table above is from the 0.1.43 series,
+the current state and a stock-v0.2.12 comparison on the same box are in
+[linux/README.md](linux/README.md#upstream-v0212-port-default-since-2026-11-08).
 
 ## What the fork changes
 
@@ -195,7 +198,7 @@ Not in the repository (`.gitignore`): `Strata/` and `Strata-*/` (engine clones +
 Strata commit `82f46a8` (0.1.42 in the Unreleased measurements) · models on NVMe (WD SN850X, `C:\StrataQ38FN-models`).
 
 **Linux** (see [linux/README.md](linux/README.md)): Ubuntu, kernel 7.0 · AMD Threadripper 3990X · 128 GB RAM ·
-4× NVIDIA RTX 3090 (driver 580, CUDA 13.0) · Strata v0.1.43 plus our patch series · models on RAID
+4× NVIDIA RTX 3090 (driver 580, CUDA 13.0) · Strata v0.2.12 plus our patch series (since 2026-11-08; before: v0.1.43-0.1.44.1) · models on RAID
 (`/media/raid0/Models/Strata-GGUF`).
 
 ## License

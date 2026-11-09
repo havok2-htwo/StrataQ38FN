@@ -496,9 +496,39 @@ to Strata and checks every service, `linux/rollback.sh` goes back. Boot without 
 day 380 W, night mode 280 W from 22:00 to 07:00 (`G3_VLLM/logs/genesis_power_settings.json`, NOPASSWD sudo rule
 for `nvidia-smi -pl`).
 
-**Current production (since 2026-11-07 03:12 CET):** `production.json -> T16-ll10b-g8-mmap1m-prod262r-vision-cpu.json`,
-engine `strata-g3-ll10b`, server Strata-143-prod @22f4781f, conversation cache 124 GiB; deploy and the two ways back:
-`linux/deploy-ll10b.sh [--prev|--rollback]` (see the next section).
+**Current production (since 2026-11-09 20:23 CET):** `production.json -> T16-212q-v31-prod262r-vision-cpu.json`, model
+Unsloth Dynamic **v3.1** UD-IQ4_XS, engine `strata-212q50-8b46bbdf` (upstream v0.2.12 + our series, Strata-212q50
+@85277f09), layer_split 14,26,37, **12 slots** (v3.1's experts need +0.86 GiB), server Strata-143-prod @a099d295,
+conversation cache 124 GiB; deploy and the way back to v3.0: `linux/deploy-v31.sh [--rollback]` (TESTLOG #104/#105).
+Compared with the v3.0 production (Q8k) before it: up to 4 users as fast or faster (1 user +6-7 %), cold ~151K prompt
+26.9 vs 25.6 s, 8-16 users 8-21 % less aggregate (12 slots), MMLU-Pro / GSM8K not measurably different.
+
+History: 2026-11-07 03:12 ll10b on 0.1.44.1 (`deploy-ll10b.sh`); 2026-11-08 15:56 PT = the v0.2.12 port
+(`deploy-212pt.sh`); 2026-11-08 21:51 Q8k = PT + `STRATA_PIPE_OVERLAP_MIN=8192` + `STRATA_PIPE_OVERLAP_PRIO=0`
+(`MIN=8192 deploy-212q.sh`, config `T16-212q-prod262r-vision-cpu.json`).
+
+## Upstream v0.2.12 port (default since 2026-11-08)
+
+Our series (lanes, solo pipeline, overlapped admission, conversation cache with borrow/mmap/gate-evict, vision, server
+batch) is ported onto upstream v0.2.12 (146df3c4); plan and per-commit classification in `linux/upstream/PLAN-0212-*`,
+patches in `linux/patches/v0.2.12-*`, build with `linux/build-212.sh`, A/B windows with `linux/window-212.sh` (TESTLOG
+#98-#103). Upstream's own replacements (PIPED_CONCURRENT, PIPED_MTP, PW_WITH_BATCH) do not reach ours (join gap 5.8 vs
+0.12 s). Traps: upstream `STRATA_PARK_ASYNC` is a different feature (ours is `STRATA_PARK_CAPTURE`), and the v0.2.12
+server adds the model card's `presence_penalty` 1.5 to thinking-off requests, which turns off the solo pipeline and
+the lanes; production's config sets `"sampling": {"presence_penalty": 0}`.
+
+Same box, penalty-free, mean of 2 runs (TESTLOG #100/#102, greedy, 512 output tokens):
+
+| | stock v0.2.12 as `setup` writes it | stock v0.2.12 + our config | ours (Q8k, v3.0 model) |
+|---|---|---|---|
+| agg tok/s, 16 users, short / 1.2K prompts | 220 / 175 | 539 / 401 | 541 / 421 |
+| decode per user at 1 / 2 / 4 users | 142 / 86 / 82 | 131 / 87 / 76 | 146 / 128 / 89 |
+| 16 users x 3 turns: wall / follow-up TTFT p50 | 266-281 s / 24-49 s | 98 s / 2.1 s | 91 s / 1.8 s |
+| worst stream gap when a 32K prompt joins 4 streams | 7.3 s | 5.8 s | 0.11 s |
+
+Borrow on a layer split (TESTLOG #103, upstream issue #5612): a sub-agent sharing only the 8192-token head of a parked
+137K main chat leaves the next main turn 99.8 % reused (0.67 s first token) with `STRATA_PARK_BORROW`; without it and on
+stock v0.2.12 only 5.9 % (23 s).
 
 ## Conversation cache: borrow, mmap'd buffers, evicting RAM gates (default since 2026-11-07)
 

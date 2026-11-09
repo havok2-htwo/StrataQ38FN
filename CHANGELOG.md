@@ -18,6 +18,47 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`STRATA_ORCA_Q4KS_MMQ` off; log `MMQ_DIRECT ... 15 of 48 layers`). Production stays on v3.0; `linux/deploy-v31.sh` is ready
   for after a Q5_0-MMQ build. Upstream issue draft: `linux/upstream/DRAFT-engine-issue-v31-q5_0-mmq.md` (not posted).
 
+### Changed (upstream contribution) - 2026-11-09
+- Issue #5612 edited to the issue-form layout (`### Area`, text directly under "What do you want to do?"): upstream's intake
+  bot (`.github/scripts/item-check.js`) reads only `###` headings and had set a 5-day close notice; it now reports the format ok.
+
+### Changed (production) - 2026-11-08 21:51
+- **Q8k = PT + `STRATA_PIPE_OVERLAP_MIN=8192` + `STRATA_PIPE_OVERLAP_PRIO=0`** (TESTLOG #101/#102): engine `strata-212q-9743c131`
+  (212p + e55fa457: a segment of fewer than N new tokens is read serially instead of beside decode), config
+  `T16-212q-prod262r-vision-cpu.json`, server unchanged (a099d295). Cause of PT's 16-user gap: 16 short prompts arriving
+  at once were read one after another beside decode (230-265 ms each instead of ~155 ms), so later admissions started
+  ~1.4 s later. agg16 short / long +2.3 / +3.2 % vs PT (541 / 421 tok/s), long TTFT p95 9.4 → 6.8 s, multi-turn follow-up
+  TTFT p50 3.2 → 1.8 s, join gap kept (0.11 s), all replies identical; price: TTFT p50 inside a burst 0.37 → ~1 s.
+  Deploy `MIN=8192 linux/deploy-212q.sh`, rollback `linux/deploy-212pt.sh`.
+
+### Changed (production) - 2026-11-08 15:56
+- **PT: production on upstream v0.2.12** (TESTLOG #98/#99): engine `strata-212p-74702164` (v0.2.12 146df3c4 + our series
+  ported, P9-P11, sm_86 MMQ table), server Strata-143-prod @a099d295, config `T16-212pt-prod262r-vision-cpu.json` with
+  `"sampling": {"temperature": 0, "presence_penalty": 0}` and `answer_room` false (the old production's behaviour).
+  vs the 0.1.44.1 production: agg16 short +3.8 %, long +3.2 %, decode +5 %, replies 62/62 identical. Deploy
+  `linux/deploy-212pt.sh`, rollback `linux/deploy-ll10b.sh`.
+- **Trap found in the v0.2.12 server** (#2685 model-card sampling): thinking-off requests without `presence_penalty` get
+  penalty 1.5 from the model card, and the engine then turns off the solo pipeline, the lanes and merge-first. All server
+  runs of the first w212 window were penalised. Fix: the run config's `sampling` block above.
+
+### Added (Linux tooling) - 2026-11-08
+- `linux/window-212.sh`: ablation arms from a JSON spec (`ABL=<file>`, e.g. `configs/abl-w212e.json`…`abl-w212h.json`: env
+  changes, server, binary, base PT or C, patterns checked late, `steps pingpong`), compared with the run's own PT.
+- `linux/repro_park_ram.py --pp-other N`: an unrelated N-token request between CHECK and SUB, so SUB's shared head comes
+  from the RAM cache (the Genesis case; TESTLOG #103).
+- `linux/deploy-212pt.sh`, `linux/deploy-212q.sh` (`MIN=<tokens>`, pins the engine by sha256).
+
+### Added (upstream contributions) - 2026-11-08
+- Posted after the owner's text approval, as havok2-htwo:
+  - Comment on [#3354](https://github.com/Niko1221/Strata/issues/3354#issuecomment-6727457601): the model card's penalty
+    reaches `temperature: 0` requests; numbers from this box; upstream tools affected.
+  - Issue [#5612](https://github.com/Niko1221/Strata/issues/5612): borrow on a layer split. Upstream gates the borrow on
+    `stages.empty()`; A/B (TESTLOG #103): next main turn 99.8 % reused / 0.67 s with our `STRATA_PARK_BORROW` vs 5.9 % /
+    23 s without it and on stock v0.2.12.
+  - PR [#5613](https://github.com/Niko1221/Strata/pull/5613): `[Benchmark]` 4x RTX 3090, six `strata bench run`
+    standard runs (stock as shipped, stock with our config, PT) + the multi-user data (TESTLOG #100), paths redacted.
+  The patch branch itself is not published yet (it contains a private client parser and local paths).
+
 ### Changed (production) - 2026-11-07
 - **Default start = arm N3 of the night window** (TESTLOG #95): engine `strata-g3-ll10b` (Strata-ll10-borrow @23588120,
   sha256 99bbe1d2…, `linux/patches/v0.1.44.1-ll10-borrow/` 0001-0008), config
