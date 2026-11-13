@@ -13,3 +13,12 @@ v0.2.12-pipe/ (branch g3-212-pipe on top of g3-212-int, HEAD a099d295, engine st
   P9  PIPE_OVERLAP + PIPE_OVERLAP_KVS (+ BYIELD_NODRAIN condition), P10 SOLO_PIPELINE + SPEC_LANES (LC_SHARE),
   P11 READ_YIELD engine side; each group reviewed by two independent reviewers, 7 fixups. Not GPU-tested yet.
   Open: lane VRAM calibration (LC_LAZY_MIB / kStageLateAllocMib) needs a v0.2.12 boot log + soak.
+
+Production engines after the port (each one patch on top of the previous):
+  v0.2.12-pipe/0018  e55fa457  STRATA_PIPE_OVERLAP_MIN=N (a segment of < N new tokens is read serially); engine strata-212q
+                     sha256 9743c131, production "Q8k" (MIN=8192 + STRATA_PIPE_OVERLAP_PRIO=0) 2026-11-08 21:51 - 2026-11-09 20:23
+  v0.2.12-q50/0001   85277f09  (branch g3-212-q50, worktree Strata-212q50) Q5_0 in the MMQ pointer table, active in a build with
+                     -DSTRATA_ORCA_Q4KS_MMQ=ON (needed for Unsloth v3.1's Q5_0 downs); engine strata-212q50 sha256 8b46bbdf,
+                     production since 2026-11-09 20:23 (TESTLOG #105, linux/deploy-v31.sh)
+Rebuild production: g3-212-int + v0.2.12-pipe/*.patch + v0.2.12-q50/*.patch, then
+  linux/build-212.sh <worktree> strata-212q50 -DSTRATA_ORCA_Q4KS_MMQ=ON   (sm_86, MMQ_TAB/KQUANTS/Q6K on, CUDA 13.0)

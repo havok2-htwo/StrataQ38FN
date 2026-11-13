@@ -1,0 +1,88 @@
+From 85277f09feac998dba7ee09fe27521b2f8d4b4ae Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:57:41 +0100
+Subject: [PATCH] mmq: Q5_0 pointer table in a STRATA_ORCA_Q4KS_MMQ build
+ (Unsloth v3.1's Q5_0 downs: 33 of 48 layers missed prompt MMQ and its
+ in-place read on CUDA); prefill_mmq_tab_test checks Q5_0's table and 88 B
+ over-read there
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                     | 7 +++++++
+ src/prefill/moe_mmq.cu             | 6 +++++-
+ tests/cuda/prefill_mmq_tab_test.cu | 9 +++++++++
+ 3 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fdfee763..ebb2db5d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2536,6 +2536,10 @@ if(STRATA_NATIVE_EXPERTS)
+       # the native packs' nine types, the ones prefill_mmq_tab_test checks bit for bit; the optional Q5_0 / K-quant
+       # instances (STRATA_ORCA_Q4KS_MMQ, STRATA_MMQ_KQUANTS) get no pointer table and keep the gather
+       set(_strata_mmq_tab_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
++      # STRATA_ORCA_Q4KS_MMQ: Q5_0 too (Unsloth v3.1's downs: 33 of 48 layers would otherwise miss the in-place read)
++      if(STRATA_ORCA_Q4KS_MMQ)
++        list(APPEND _strata_mmq_tab_types q5_0)
++      endif()
+       foreach(_t IN LISTS _strata_mmq_tab_types)
+         string(TOUPPER ${_t} _strata_tab_T)
+         configure_file(src/prefill/mmq_tab_instance.cu.in ${CMAKE_BINARY_DIR}/mmq_tab/mmq-tab-${_t}.cu @ONLY)
+@@ -2665,6 +2669,9 @@ if(STRATA_NATIVE_EXPERTS)
+       # STRATA_MMQ_DIRECT: the pointer-table MMQ bit for bit against the gathered MMQ (exit 77 below sm_80)
+       add_executable(prefill_mmq_tab_test tests/cuda/prefill_mmq_tab_test.cu)
+       target_link_libraries(prefill_mmq_tab_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
++      if(STRATA_ORCA_Q4KS_MMQ)
++        target_compile_definitions(prefill_mmq_tab_test PRIVATE STRATA_ORCA_Q4KS_MMQ=1)   # Q5_0 has a pointer table then
++      endif()
+       add_test(NAME prefill_mmq_tab_test COMMAND prefill_mmq_tab_test)
+       set_tests_properties(prefill_mmq_tab_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+     endif()
+diff --git a/src/prefill/moe_mmq.cu b/src/prefill/moe_mmq.cu
+index a26bcb1e..c515754d 100644
+--- a/src/prefill/moe_mmq.cu
++++ b/src/prefill/moe_mmq.cu
+@@ -261,7 +261,8 @@ __global__ void prep_group_kernel(GuardTab g, int64_t guard, uint8_t* tail_gu, u
+ }
+ 
+ // the pointer-table MMQ per type: the native packs' nine types (CMake's _strata_mmq_tab_types, all of them checked
+-// bit for bit by prefill_mmq_tab_test).  false: no instance - the optional Q5_0 and K-quant experts keep the gather
++// bit for bit by prefill_mmq_tab_test), + Q5_0 in a STRATA_ORCA_Q4KS_MMQ build (the Unsloth v3.1 downs).  false: no
++// instance - the K-quant experts keep the gather
+ bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab* tab, cudaStream_t s) {
+     const ggml_type t = a ? a->type_x : GGML_TYPE_COUNT;
+ #define STRATA_TAB_CASE(T) case T: return ctx == nullptr || mul_mat_q_tab_case<T>(*ctx, *a, *tab, s)
+@@ -275,6 +276,9 @@ bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab*
+         STRATA_TAB_CASE(GGML_TYPE_IQ4_NL);
+         STRATA_TAB_CASE(GGML_TYPE_IQ4_XS);
+         STRATA_TAB_CASE(GGML_TYPE_Q8_0);
++#ifdef STRATA_ORCA_Q4KS_MMQ
++        STRATA_TAB_CASE(GGML_TYPE_Q5_0);   // the Unsloth v3.1 sets' Q5_0 downs, read in place as the other nine
++#endif
+         default: return false;
+     }
+ #undef STRATA_TAB_CASE
+diff --git a/tests/cuda/prefill_mmq_tab_test.cu b/tests/cuda/prefill_mmq_tab_test.cu
+index 69518299..5b1e069d 100644
+--- a/tests/cuda/prefill_mmq_tab_test.cu
++++ b/tests/cuda/prefill_mmq_tab_test.cu
+@@ -534,7 +534,16 @@ int main() {
+                                      {GGML_TYPE_IQ4_NL, 2560, 640, "down"},
+                                      {GGML_TYPE_Q8_0, 2560, 640, "down"}};
+         // the types without a pointer table (the optional Q5_0 / K-quant instances) must keep the gather
++#ifdef STRATA_ORCA_Q4KS_MMQ
++        // Q5_0 has a pointer table in this build (the Unsloth v3.1 downs): 640 columns end 4 blocks into a tile, 4 x 22 B
++        if (!mmq::tab_fits((int) GGML_TYPE_Q5_0, 2560) || mmq::overread_bytes((int) GGML_TYPE_Q5_0, 640) != 88) {
++            std::printf("FAIL: Q5_0 down: no pointer table or over-read %zu != 88\n", mmq::overread_bytes((int) GGML_TYPE_Q5_0, 640));
++            return 1;
++        }
++        for (const ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q6_K}) {
++#else
+         for (const ggml_type t : {GGML_TYPE_Q5_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q6_K}) {
++#endif
+             if (mmq::tab_fits((int) t, 1280) || mmq::tab_fits((int) t, 2560)) {
+                 std::printf("FAIL: %s reports a pointer table (only the nine tested types have one)\n", ggml_type_name(t));
+                 return 1;
+-- 
+2.43.0
+

@@ -1,0 +1,46 @@
+From e55fa4578f7575ce442db1f28e572717519ddac9 Mon Sep 17 00:00:00 2001
+From: havok2-htwo <havok2-htwo@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:54:05 +0100
+Subject: [PATCH] batch: STRATA_PIPE_OVERLAP_MIN=N reads a segment of fewer
+ than N new tokens serially (a burst of short admissions is read one after
+ another, so overlapping them only admits the later ones later)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/program/generate.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index bd2715cf..42cfd738 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -372,6 +372,18 @@ bool pipe_overlap_kvs_env() {
+     }();
+     return on;
+ }
++// STRATA_PIPE_OVERLAP_MIN=N (read once; unset or 0: every segment the gate passes overlaps): a segment of fewer than N
++// new tokens is read serially, the windows stopped.  A short read costs the windows about as much stopped as beside them
++// (4x3090, 140 tokens: 150-160 ms stopped, 230-265 ms overlapped losing 105-120 ms of decode), and a burst of short
++// admissions is read one after another, so overlapping them only admits the later ones later (16 users: TTFT p95
++// 4.3 vs 3.0 s, 2 % less output); a long read (a 32K joiner) still overlaps
++int64_t pipe_overlap_min_env() {
++    static const int64_t n = [] {
++        const char* v = std::getenv("STRATA_PIPE_OVERLAP_MIN");
++        return v ? std::max<int64_t>(0, std::atoll(v)) : int64_t(0);
++    }();
++    return n;
++}
+ // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
+ // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+ // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+@@ -20875,6 +20887,7 @@ int main(int argc, char** argv) {
+             };
+             auto overlap_gate = [&](int64_t a0, int64_t b0, std::string& why) -> bool {
+                 if (admit_slot < 0) { why = "not a batch admission (a request beside the slots)"; return false; }
++                if (b0 - a0 < pipe_overlap_min_env()) { why = "a short segment (STRATA_PIPE_OVERLAP_MIN)"; return false; }
+                 if (pipe_inflight()) { why = "slot groups in flight"; return false; }
+                 // STRATA_SPEC_LANES: every line but BSTOP/BYIELD drains the lanes first, so they are never live here (and
+                 // lanes_may_begin waits while ov_active); said, should that ever change.  STRATA_SPEC_LANES_HOLD: a held
+-- 
+2.43.0
+
